@@ -76,7 +76,8 @@ def start_streamlit():
         sys.executable, "-m", "streamlit", "run", "Home.py",
         "--server.port=8080",
         "--server.address=0.0.0.0",
-        "--server.headless=true"
+        "--server.headless=true",
+        "--global.developmentMode=false"
     ])
 
 
