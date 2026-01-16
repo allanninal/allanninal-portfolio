@@ -4,8 +4,15 @@ Generates databases from CSV files, then starts Streamlit.
 """
 import subprocess
 import sys
+import logging
 from pathlib import Path
-from loguru import logger
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -55,7 +62,7 @@ def run_pipelines():
             elif hasattr(module, '__name__'):
                 # For database modules that run on import
                 pass
-            logger.success(f"Completed {pipeline}")
+            logger.info(f"Completed {pipeline}")
         except Exception as e:
             logger.warning(f"Pipeline {pipeline} failed: {e}")
 
