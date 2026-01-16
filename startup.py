@@ -77,7 +77,10 @@ def start_streamlit():
         "--server.port=8080",
         "--server.address=0.0.0.0",
         "--server.headless=true",
-        "--global.developmentMode=false"
+        "--global.developmentMode=false",
+        "--server.enableCORS=false",
+        "--server.enableXsrfProtection=false",
+        "--server.enableWebsocketCompression=false"
     ])
 
 
