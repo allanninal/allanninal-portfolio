@@ -86,7 +86,7 @@ export const products: Product[] = [
     description:
       'Design walkthroughs of automated cloud infrastructure on AWS, each centered on a practical AI-powered application — from booking assistants to voice agents.',
     category: 'Cloud / AWS',
-    url: 'https://build.allanninal.dev/',
+    url: 'https://www.allanninal.dev/build/',
     stack: ['AWS', 'System Design'],
   },
   {
