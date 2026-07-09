@@ -1,0 +1,1 @@
+const e=document.querySelector(".mobile-toggle"),d=document.getElementById("mobile-nav");e&&d&&(e.addEventListener("click",()=>{const t=e.getAttribute("aria-expanded")==="true";e.setAttribute("aria-expanded",String(!t)),d.hidden=t}),d.querySelectorAll("a").forEach(t=>{t.addEventListener("click",()=>{e.setAttribute("aria-expanded","false"),d.hidden=!0})}));

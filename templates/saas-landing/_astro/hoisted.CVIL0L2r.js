@@ -1,0 +1,1 @@
+const c=document.getElementById("theme-toggle");c?.addEventListener("click",()=>{const t=document.documentElement,e=t.classList.toggle("dark");t.dataset.theme=e?"dark":"light";try{localStorage.setItem("theme",e?"dark":"light")}catch{}});
