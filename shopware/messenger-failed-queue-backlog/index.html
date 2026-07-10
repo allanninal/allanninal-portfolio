@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Failed Messages Piling Up in the Shopware Messenger Failure Queue</title>
+<meta name="description" content="A message throws, Symfony Messenger retries it, and it lands in the failed transport, but almost no install runs a worker against that queue. Learn why the backlog grows silently and build a Python or Node.js script that flags it before it hides a real recurring failure.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/messenger-failed-queue-backlog/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Failed Messages Piling Up in the Shopware Messenger Failure Queue">
+<meta property="og:description" content="Why rejected messages pile up unseen in Shopware's failed transport, and a safe Python or Node.js script that reports the backlog with message-stats.json before it hides a real failure.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/messenger-failed-queue-backlog/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/messenger-failed-queue-backlog/#article","headline":"Fix Failed Messages Piling Up in the Shopware Messenger Failure Queue","description":"Why rejected messages pile up unseen in Shopware's failed transport, and a safe Python or Node.js script that reports the backlog with message-stats.json before it hides a real recurring failure.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/messenger-failed-queue-backlog/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Message Queue and Scheduled Tasks","keywords":"Shopware messenger failed queue, messenger_messages, MESSENGER_TRANSPORT_FAILURE_DSN, message-stats.json, messenger:failed:retry, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Shopware field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Failed messages accumulate in the messenger failure queue","item":"https://www.allanninal.dev/shopware/messenger-failed-queue-backlog/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do failed messages pile up in Shopware's messenger queue?","acceptedAnswer":{"@type":"Answer","text":"Shopware runs on Symfony Messenger. A message that throws is retried automatically, and if every retry fails it moves into the separate failed transport. Most installs only run messenger:consume against the default or async queues, so nothing ever consumes the failed transport and rejected messages just sit there and grow."}},{"@type":"Question","name":"Can I detect the failed queue backlog through the Shopware Admin API?","acceptedAnswer":{"@type":"Answer","text":"There is no entity endpoint for individual failed messages, since messenger_messages is a raw Symfony transport table, not a Shopware entity. You detect the backlog through the aggregate GET /api/_info/message-stats.json route, which returns the size of each transport by name, including the one named failed."}},{"@type":"Question","name":"Should a script automatically retry or delete failed messenger messages?","acceptedAnswer":{"@type":"Answer","text":"No. Retrying a stale indexing message or an expired webhook call can cause duplicate side effects such as double emails or double stock adjustments. The safe pattern is to detect and report the backlog and its growth, then let a human run messenger:failed:show and decide between messenger:failed:retry and messenger:failed:remove."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Message Queue and Scheduled Tasks</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Message Queue and Scheduled Tasks</p>
+    <h1>Failed messages accumulate in the messenger failure queue</h1>
+    <p class="lead">A webhook payload comes in malformed, an indexing job times out, a third party API in a flow action errors out. Symfony Messenger retries the message a few times with backoff, and when it still fails it quietly moves into the separate failed transport. Almost nobody runs a worker against that queue, so the failures just sit there, growing the messenger_messages table and hiding real recurring problems behind an ever bigger pile. Here is why it happens and a small script that flags the backlog before it gets out of hand.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Shopware Admin API</span>
+      <span class="chip">Report only, no auto-retry</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Shopware 6 runs on Symfony Messenger. A message that throws during processing is retried automatically (three attempts with backoff by default), and if it still fails it is moved into the transport configured by <code>MESSENGER_TRANSPORT_FAILURE_DSN</code>, which defaults to <code>doctrine://default?queue_name=failed</code>. That is the same <code>messenger_messages</code> Doctrine table, just with <code>queue_name='failed'</code>. Shopware's own docs warn that you must run a CLI worker against that failed queue separately, and most installs never do, so the run a small Python or Node.js script that polls <code>GET /api/_info/message-stats.json</code>, reads the size of the transport named <code>failed</code>, tracks whether it is growing between polls, and reports it. It does not retry or delete anything automatically. Full code, tests, and the reasoning are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every background job in Shopware, sending an order confirmation email, running a product indexer, delivering a flow action, calling a third party API, goes through Symfony Messenger. Messenger's whole design assumes some messages will fail, so it retries them a few times with a growing delay between attempts.</p>
+  <p>The part that trips up almost every store is what happens after the retries run out. The message does not vanish, and it is not requeued forever. It gets moved into a second, separate transport, the failed transport, so that a stuck message stops blocking the queue behind it. That is good design. The trouble is that this failed transport needs its own worker to ever be looked at again, and the standard setup most people copy from a tutorial only runs <code>messenger:consume</code> against <code>default</code> and <code>async</code>. The failed queue is left completely unconsumed, so every rejected message, a bad webhook body, a timed out indexing job, a database deadlock, a third party API error inside a flow action, just accumulates there forever.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A message throws during processing, Messenger retries it three times with backoff, it still fails, and is moved into the failed transport. No worker consumes the failed transport, so the message queue and the messenger_messages table just keep growing.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#0f2830">Message throws</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#4a5b62">bad payload or timeout</text>
+      <line x1="163" y1="103" x2="205" y2="103" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="70" width="150" height="66" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="283" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#0f2830">Retried 3x</text>
+      <text x="283" y="112" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#4a5b62">with backoff</text>
+      <text x="283" y="128" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#4a5b62">still fails</text>
+      <line x1="361" y1="103" x2="410" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="413" y="70" width="160" height="66" rx="10" fill="#fce9e7" stroke="#cf4b3f"></rect>
+      <text x="493" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">failed transport</text>
+      <text x="493" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">queue_name='failed'</text>
+      <text x="493" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">messenger_messages</text>
+      <line x1="576" y1="103" x2="618" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="621" y="70" width="130" height="66" rx="10" fill="#fce9e7" stroke="#cf4b3f"></rect>
+      <text x="686" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">No worker</text>
+      <text x="686" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">consumes it</text>
+      <text x="686" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f" font-weight="700">grows forever</text>
+      <line x1="686" y1="60" x2="686" y2="40" stroke="none"></line>
+      <text x="410" y="52" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="200" y="165" width="380" height="50" rx="10" fill="#fce9e7" stroke="#cf4b3f" stroke-dasharray="4 4"></rect>
+      <text x="390" y="185" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Real recurring failures hide behind the growing backlog</text>
+      <text x="390" y="202" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">webhook bugs, deadlocks, expired API calls all mixed together</text>
+    </svg>
+    <figcaption>Retries exhaust, the message moves to the failed transport, and because nothing consumes that transport it just keeps growing, mixing one-off spikes with real recurring bugs.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Symfony Messenger's failure handling is correct by design. The surprise is entirely in what Shopware installs typically run in production:</p>
+  <ul>
+    <li>The Shopware docs run a worker like <code>bin/console messenger:consume default async low_priority</code>, and it is easy to copy that command and never notice the failed transport was never named.</li>
+    <li>Shopware's documentation says explicitly that you must set up a CLI worker for the failed queue too, otherwise failed messages are never processed, but that line is easy to miss in a hosting guide read once during setup.</li>
+    <li>There is no Shopware Admin API entity for individual failed messages. <code>messenger_messages</code> is a raw Symfony transport table, not a Shopware entity with a <code>/api/{entity}</code> route, so there is nothing to search or page through the normal way.</li>
+    <li>Bad webhook payloads, indexing jobs that time out, transient database deadlocks, and third party API errors thrown from flow actions all land in the same bucket, so a growing failed queue can hide one urgent recurring bug inside a hundred harmless one-off retries.</li>
+  </ul>
+  <p>The result is a table that quietly grows in the database while every dashboard looks fine, because dashboards usually watch the live queues, not the failure transport sitting off to the side.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot safely automate the fix here, only the detection. Symfony and Shopware only expose retry and purge through the CLI or direct database access, and a generic script that blindly retries arbitrary failed jobs can cause duplicate side effects, a second confirmation email, a second stock adjustment, because it has no way to know if the original attempt partially succeeded. So the right shaped tool is a reporter: read the failed transport's size and its growth trend, corroborate with scheduled task health, and hand a clear recommendation to a human who runs <code>messenger:failed:retry</code> or <code>messenger:failed:remove</code> deliberately.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script authenticates once, polls the message stats endpoint, and compares the failed transport's current size against the previous poll and against a threshold. It also checks the scheduled_task list for tasks stuck in queued with a next execution time far in the past, a corroborating sign that no worker is consuming anything, failed queue included. It never writes. It only decides ok, warn, or critical and prints the reasons.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the solution. A scheduled poll authenticates, reads message-stats.json for the failed transport size, reads scheduled task health for stale queued tasks, evaluates the pure decision function, and reports ok, warn, or critical with reasons, without ever retrying or deleting anything automatically.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#06b6d4"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Scheduled poll</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">message-stats.json</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">read failed transport size</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="352" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">scheduled_task health</text>
+      <text x="352" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">stale queued tasks?</text>
+      <line x1="445" y1="138" x2="487" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">evaluate</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">backlog</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="185" width="132" height="50" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="206" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report only</text>
+      <text x="684" y="223" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">ok / warn / critical</text>
+      <path d="M695,138 C715,138 684,150 684,183" fill="none" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></path>
+      <text x="240" y="215" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4c9a2a" font-weight="700">Human runs messenger:failed:retry or :remove, or stands up a dedicated worker</text>
+    </svg>
+    <figcaption>The script only ever reports. Retrying or removing a failed message is a decision a human makes deliberately, on the CLI.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get Admin API credentials</h3>
+      <p>Create an Integration in Settings, System, Integrations and note the access key id and secret access key. Keep the shop URL and both values in environment variables, never in the file. Start with <code>DRY_RUN</code> on, though for this script mutation is always effectively off since it never writes.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://your-shop.example.com"
+export SHOPWARE_CLIENT_ID="your access key id"
+export SHOPWARE_CLIENT_SECRET="your secret access key"
+export FAILED_THRESHOLD="0"
+export STALE_TASK_AGE_SECONDS="900"
+export DRY_RUN="true"   # this script only ever reports, never writes</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://your-shop.example.com"
+export SHOPWARE_CLIENT_ID="your access key id"
+export SHOPWARE_CLIENT_SECRET="your secret access key"
+export FAILED_THRESHOLD="0"
+export STALE_TASK_AGE_SECONDS="900"
+export DRY_RUN="true"   // this script only ever reports, never writes</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the client id and secret for a bearer token at <code>POST /api/oauth/token</code> with <code>grant_type: client_credentials</code>. Every later call sends that token in the <code>Authorization</code> header along with <code>Accept: application/json</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the failed transport size</h3>
+      <p>Call <code>GET /api/_info/message-stats.json</code>. It returns per-transport stats keyed by name, such as <code>default</code>, <code>async</code>, <code>low_priority</code>, and <code>failed</code>. Read the size for the transport named <code>failed</code>. The older <code>GET /api/_info/queue.json</code> route is deprecated as of 6.7.8.0, so use the stats route.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def get_failed_transport_size(token):
+    r = requests.get(
+        f"{SHOPWARE_URL}/api/_info/message-stats.json",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    stats = r.json()
+    # stats is a list or dict of transports; normalize to a list of entries
+    entries = stats if isinstance(stats, list) else stats.get("transports", stats)
+    for entry in entries if isinstance(entries, list) else entries.values():
+        name = entry.get("name") or entry.get("queue_name") or entry.get("queueName")
+        if name == "failed":
+            return int(entry.get("size", 0))
+    return 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function getFailedTransportSize(token) {
+  const res = await fetch(`${SHOPWARE_URL}/api/_info/message-stats.json`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const stats = await res.json();
+  const entries = Array.isArray(stats) ? stats : Object.values(stats.transports || stats);
+  for (const entry of entries) {
+    const name = entry.name || entry.queue_name || entry.queueName;
+    if (name === "failed") return Number(entry.size || 0);
+  }
+  return 0;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Check for a stale queued scheduled task</h3>
+      <p>Cross-check with <code>POST /api/search/scheduled-task</code>, reading each task's <code>status</code> and <code>nextExecutionTime</code>. A task stuck in <code>queued</code> with a next execution time far in the past is a corroborating symptom that no worker is consuming any transport, the failed one included.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">import datetime
+
+def get_oldest_queued_task_age_seconds(token):
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/scheduled-task",
+        json={"filter": [{"type": "equals", "field": "status", "value": "queued"}]},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    tasks = r.json().get("data", [])
+    if not tasks:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    oldest = None
+    for task in tasks:
+        attrs = task.get("attributes", task)
+        next_exec = attrs.get("nextExecutionTime")
+        if not next_exec:
+            continue
+        when = datetime.datetime.fromisoformat(next_exec.replace("Z", "+00:00"))
+        age = (now - when).total_seconds()
+        if oldest is None or age &gt; oldest:
+            oldest = age
+    return oldest</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function getOldestQueuedTaskAgeSeconds(token) {
+  const res = await fetch(`${SHOPWARE_URL}/api/search/scheduled-task`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ filter: [{ type: "equals", field: "status", value: "queued" }] }),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const body = await res.json();
+  const tasks = body.data || [];
+  if (tasks.length === 0) return null;
+  const now = Date.now();
+  let oldest = null;
+  for (const task of tasks) {
+    const attrs = task.attributes || task;
+    const nextExec = attrs.nextExecutionTime;
+    if (!nextExec) continue;
+    const age = (now - Date.parse(nextExec)) / 1000;
+    if (oldest === null || age &gt; oldest) oldest = age;
+  }
+  return oldest;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>The decision has no I/O in it at all. It takes the current failed size, the previous failed size from the last poll, a threshold count, the oldest queued task age if any, and a staleness threshold, and returns a status of ok, warn, or critical along with the reasons. Critical means the backlog is both over the threshold and growing. Warn means it is over the threshold but not growing, or a scheduled task looks stuck even if the failed count is small.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def evaluate_failed_queue_backlog(
+    current_failed_size,
+    previous_failed_size,
+    threshold_count,
+    oldest_queued_task_age_seconds,
+    stale_task_age_threshold_seconds,
+):
+    growing = previous_failed_size is None or current_failed_size &gt; previous_failed_size
+    reasons = []
+    over_threshold = current_failed_size &gt; threshold_count
+    task_is_stale = (
+        oldest_queued_task_age_seconds is not None
+        and oldest_queued_task_age_seconds &gt; stale_task_age_threshold_seconds
+    )
+
+    if over_threshold:
+        reasons.append(
+            f"failed transport has {current_failed_size} message(s), over threshold {threshold_count}"
+        )
+        if growing:
+            reasons.append(
+                f"backlog is growing (previous {previous_failed_size}, current {current_failed_size})"
+            )
+    if task_is_stale:
+        reasons.append(
+            f"oldest queued scheduled task is {int(oldest_queued_task_age_seconds)}s "
+            f"past its next execution time (threshold {stale_task_age_threshold_seconds}s)"
+        )
+
+    if over_threshold and growing:
+        status = "critical"
+    elif over_threshold or task_is_stale:
+        status = "warn"
+    else:
+        status = "ok"
+
+    return {"status": status, "growing": growing, "reasons": reasons}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function evaluateFailedQueueBacklog(
+  currentFailedSize,
+  previousFailedSize,
+  thresholdCount,
+  oldestQueuedTaskAgeSeconds,
+  staleTaskAgeThresholdSeconds
+) {
+  const growing = previousFailedSize === null || currentFailedSize &gt; previousFailedSize;
+  const reasons = [];
+  const overThreshold = currentFailedSize &gt; thresholdCount;
+  const taskIsStale =
+    oldestQueuedTaskAgeSeconds !== null &amp;&amp;
+    oldestQueuedTaskAgeSeconds &gt; staleTaskAgeThresholdSeconds;
+
+  if (overThreshold) {
+    reasons.push(`failed transport has ${currentFailedSize} message(s), over threshold ${thresholdCount}`);
+    if (growing) {
+      reasons.push(`backlog is growing (previous ${previousFailedSize}, current ${currentFailedSize})`);
+    }
+  }
+  if (taskIsStale) {
+    reasons.push(
+      `oldest queued scheduled task is ${Math.floor(oldestQueuedTaskAgeSeconds)}s past its next execution time (threshold ${staleTaskAgeThresholdSeconds}s)`
+    );
+  }
+
+  let status;
+  if (overThreshold &amp;&amp; growing) status = "critical";
+  else if (overThreshold || taskIsStale) status = "warn";
+  else status = "ok";
+
+  return { status, growing, reasons };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together and persist the last size</h3>
+      <p>The loop authenticates, reads the failed transport size and the oldest stale task age, loads the previous size from a small state file, evaluates the decision, and logs the status and reasons. It then saves the current size for next time. There is no write path to the Admin API at all here, retrying or purging failed messages stays a manual, deliberate CLI step.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Report, do not auto-repair</div>
+    <p>This script never calls <code>messenger:failed:retry</code> or <code>messenger:failed:remove</code> for you, and it cannot, those exist only on the CLI or through direct database access. When it reports critical, run <code>bin/console messenger:failed:show</code> yourself, look at what actually failed, and decide case by case. If the backlog is chronic rather than a one-off spike, stand up a dedicated <code>messenger:consume failed</code> worker instead of clearing it by hand every time.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, authenticates, polls the failed transport size and scheduled task health, evaluates the pure decision function, and prints a report. It keeps its last-seen size in a small local state file so it can tell whether the backlog is growing between runs.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/messenger-failed-queue-backlog" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">messenger_failed_queue_backlog.py</div>
+      <pre><code class="language-python">"""Report on failed messages piling up in Shopware's messenger failure queue.
+
+Symfony Messenger retries a failing message a few times, and if every retry fails
+it moves the message into the failed transport (MESSENGER_TRANSPORT_FAILURE_DSN).
+Most installs never run a worker against that transport, so it grows silently.
+This script only detects and reports the backlog. It never retries or deletes
+anything, that stays a deliberate, manual CLI step.
+Run on a schedule. Safe to run again and again.
+"""
+import os
+import json
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("messenger_failed_queue_backlog")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+FAILED_THRESHOLD = int(os.environ.get("FAILED_THRESHOLD", "0"))
+STALE_TASK_AGE_SECONDS = float(os.environ.get("STALE_TASK_AGE_SECONDS", "900"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+STATE_FILE = os.environ.get("STATE_FILE", ".messenger_failed_queue_backlog_state.json")
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def get_failed_transport_size(token):
+    r = requests.get(
+        f"{SHOPWARE_URL}/api/_info/message-stats.json",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    stats = r.json()
+    entries = stats if isinstance(stats, list) else stats.get("transports", stats)
+    for entry in entries if isinstance(entries, list) else entries.values():
+        name = entry.get("name") or entry.get("queue_name") or entry.get("queueName")
+        if name == "failed":
+            return int(entry.get("size", 0))
+    return 0
+
+
+def get_oldest_queued_task_age_seconds(token):
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/scheduled-task",
+        json={"filter": [{"type": "equals", "field": "status", "value": "queued"}]},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    tasks = r.json().get("data", [])
+    if not tasks:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    oldest = None
+    for task in tasks:
+        attrs = task.get("attributes", task)
+        next_exec = attrs.get("nextExecutionTime")
+        if not next_exec:
+            continue
+        when = datetime.datetime.fromisoformat(next_exec.replace("Z", "+00:00"))
+        age = (now - when).total_seconds()
+        if oldest is None or age &gt; oldest:
+            oldest = age
+    return oldest
+
+
+def evaluate_failed_queue_backlog(
+    current_failed_size,
+    previous_failed_size,
+    threshold_count,
+    oldest_queued_task_age_seconds,
+    stale_task_age_threshold_seconds,
+):
+    growing = previous_failed_size is None or current_failed_size &gt; previous_failed_size
+    reasons = []
+    over_threshold = current_failed_size &gt; threshold_count
+    task_is_stale = (
+        oldest_queued_task_age_seconds is not None
+        and oldest_queued_task_age_seconds &gt; stale_task_age_threshold_seconds
+    )
+
+    if over_threshold:
+        reasons.append(
+            f"failed transport has {current_failed_size} message(s), over threshold {threshold_count}"
+        )
+        if growing:
+            reasons.append(
+                f"backlog is growing (previous {previous_failed_size}, current {current_failed_size})"
+            )
+    if task_is_stale:
+        reasons.append(
+            f"oldest queued scheduled task is {int(oldest_queued_task_age_seconds)}s "
+            f"past its next execution time (threshold {stale_task_age_threshold_seconds}s)"
+        )
+
+    if over_threshold and growing:
+        status = "critical"
+    elif over_threshold or task_is_stale:
+        status = "warn"
+    else:
+        status = "ok"
+
+    return {"status": status, "growing": growing, "reasons": reasons}
+
+
+def load_previous_size():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f).get("failed_size")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_current_size(size):
+    with open(STATE_FILE, "w") as f:
+        json.dump({"failed_size": size}, f)
+
+
+def run():
+    token = get_token()
+    current_size = get_failed_transport_size(token)
+    previous_size = load_previous_size()
+    oldest_age = get_oldest_queued_task_age_seconds(token)
+
+    result = evaluate_failed_queue_backlog(
+        current_size, previous_size, FAILED_THRESHOLD, oldest_age, STALE_TASK_AGE_SECONDS
+    )
+
+    log.info(
+        "Failed transport size=%d previous=%s status=%s growing=%s",
+        current_size, previous_size, result["status"], result["growing"],
+    )
+    for reason in result["reasons"]:
+        log.warning("Reason: %s", reason)
+
+    if result["status"] in ("warn", "critical"):
+        log.warning(
+            "Run 'bin/console messenger:failed:show' and either "
+            "'messenger:failed:retry' or 'messenger:failed:remove' manually, "
+            "or stand up a dedicated 'messenger:consume failed' worker if this is chronic."
+        )
+
+    if not DRY_RUN:
+        save_current_size(current_size)
+    else:
+        log.info("DRY_RUN is on, not persisting state for the next comparison.")
+
+    return result
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">messenger-failed-queue-backlog.js</div>
+      <pre><code class="language-javascript">/**
+ * Report on failed messages piling up in Shopware's messenger failure queue.
+ *
+ * Symfony Messenger retries a failing message a few times, and if every retry fails
+ * it moves the message into the failed transport (MESSENGER_TRANSPORT_FAILURE_DSN).
+ * Most installs never run a worker against that transport, so it grows silently.
+ * This script only detects and reports the backlog. It never retries or deletes
+ * anything, that stays a deliberate, manual CLI step.
+ * Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/shopware/messenger-failed-queue-backlog/
+ */
+import { pathToFileURL } from "node:url";
+import { readFile, writeFile } from "node:fs/promises";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://demo.example.com").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "SWIAxxx";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "secret_dummy";
+const FAILED_THRESHOLD = Number(process.env.FAILED_THRESHOLD || 0);
+const STALE_TASK_AGE_SECONDS = Number(process.env.STALE_TASK_AGE_SECONDS || 900);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const STATE_FILE = process.env.STATE_FILE || ".messenger_failed_queue_backlog_state.json";
+
+export function evaluateFailedQueueBacklog(
+  currentFailedSize,
+  previousFailedSize,
+  thresholdCount,
+  oldestQueuedTaskAgeSeconds,
+  staleTaskAgeThresholdSeconds
+) {
+  const growing = previousFailedSize === null || currentFailedSize &gt; previousFailedSize;
+  const reasons = [];
+  const overThreshold = currentFailedSize &gt; thresholdCount;
+  const taskIsStale =
+    oldestQueuedTaskAgeSeconds !== null &amp;&amp;
+    oldestQueuedTaskAgeSeconds &gt; staleTaskAgeThresholdSeconds;
+
+  if (overThreshold) {
+    reasons.push(`failed transport has ${currentFailedSize} message(s), over threshold ${thresholdCount}`);
+    if (growing) {
+      reasons.push(`backlog is growing (previous ${previousFailedSize}, current ${currentFailedSize})`);
+    }
+  }
+  if (taskIsStale) {
+    reasons.push(
+      `oldest queued scheduled task is ${Math.floor(oldestQueuedTaskAgeSeconds)}s past its next execution time (threshold ${staleTaskAgeThresholdSeconds}s)`
+    );
+  }
+
+  let status;
+  if (overThreshold &amp;&amp; growing) status = "critical";
+  else if (overThreshold || taskIsStale) status = "warn";
+  else status = "ok";
+
+  return { status, growing, reasons };
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function getFailedTransportSize(token) {
+  const res = await fetch(`${SHOPWARE_URL}/api/_info/message-stats.json`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const stats = await res.json();
+  const entries = Array.isArray(stats) ? stats : Object.values(stats.transports || stats);
+  for (const entry of entries) {
+    const name = entry.name || entry.queue_name || entry.queueName;
+    if (name === "failed") return Number(entry.size || 0);
+  }
+  return 0;
+}
+
+async function getOldestQueuedTaskAgeSeconds(token) {
+  const res = await fetch(`${SHOPWARE_URL}/api/search/scheduled-task`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ filter: [{ type: "equals", field: "status", value: "queued" }] }),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const body = await res.json();
+  const tasks = body.data || [];
+  if (tasks.length === 0) return null;
+  const now = Date.now();
+  let oldest = null;
+  for (const task of tasks) {
+    const attrs = task.attributes || task;
+    const nextExec = attrs.nextExecutionTime;
+    if (!nextExec) continue;
+    const age = (now - Date.parse(nextExec)) / 1000;
+    if (oldest === null || age &gt; oldest) oldest = age;
+  }
+  return oldest;
+}
+
+async function loadPreviousSize() {
+  try {
+    const raw = await readFile(STATE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return typeof parsed.failedSize === "number" ? parsed.failedSize : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveCurrentSize(size) {
+  await writeFile(STATE_FILE, JSON.stringify({ failedSize: size }));
+}
+
+export async function run() {
+  const token = await getToken();
+  const currentSize = await getFailedTransportSize(token);
+  const previousSize = await loadPreviousSize();
+  const oldestAge = await getOldestQueuedTaskAgeSeconds(token);
+
+  const result = evaluateFailedQueueBacklog(
+    currentSize, previousSize, FAILED_THRESHOLD, oldestAge, STALE_TASK_AGE_SECONDS
+  );
+
+  console.log(
+    `Failed transport size=${currentSize} previous=${previousSize} status=${result.status} growing=${result.growing}`
+  );
+  for (const reason of result.reasons) {
+    console.warn(`Reason: ${reason}`);
+  }
+
+  if (result.status === "warn" || result.status === "critical") {
+    console.warn(
+      "Run 'bin/console messenger:failed:show' and either 'messenger:failed:retry' or " +
+      "'messenger:failed:remove' manually, or stand up a dedicated 'messenger:consume failed' " +
+      "worker if this is chronic."
+    );
+  }
+
+  if (!DRY_RUN) {
+    await saveCurrentSize(currentSize);
+  } else {
+    console.log("DRY_RUN is on, not persisting state for the next comparison.");
+  }
+
+  return result;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides whether the operator gets paged. Since <code>evaluate_failed_queue_backlog</code> takes every input as a plain argument and does no I/O, the tests need no network and no Shopware account, just plain numbers in and a status out.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_messenger_backlog.py</div>
+      <pre><code class="language-python">from messenger_failed_queue_backlog import evaluate_failed_queue_backlog
+
+
+def test_ok_when_under_threshold_and_no_stale_task():
+    result = evaluate_failed_queue_backlog(0, None, 0, None, 900)
+    assert result["status"] == "ok"
+    assert result["reasons"] == []
+
+
+def test_critical_when_over_threshold_and_growing():
+    result = evaluate_failed_queue_backlog(12, 5, 0, None, 900)
+    assert result["status"] == "critical"
+    assert result["growing"] is True
+
+
+def test_warn_when_over_threshold_but_not_growing():
+    result = evaluate_failed_queue_backlog(5, 10, 0, None, 900)
+    assert result["status"] == "warn"
+    assert result["growing"] is False
+
+
+def test_critical_when_no_previous_size_counts_as_growing():
+    result = evaluate_failed_queue_backlog(3, None, 0, None, 900)
+    assert result["status"] == "critical"
+    assert result["growing"] is True
+
+
+def test_warn_when_stale_task_even_with_small_failed_count():
+    result = evaluate_failed_queue_backlog(0, 0, 0, 1200, 900)
+    assert result["status"] == "warn"
+    assert any("queued scheduled task" in r for r in result["reasons"])
+
+
+def test_ok_when_stale_task_age_under_threshold():
+    result = evaluate_failed_queue_backlog(0, 0, 5, 300, 900)
+    assert result["status"] == "ok"
+
+
+def test_reasons_include_backlog_and_growth_lines():
+    result = evaluate_failed_queue_backlog(8, 2, 0, None, 900)
+    assert len(result["reasons"]) == 2</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">messenger-backlog.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { evaluateFailedQueueBacklog } from "./messenger-failed-queue-backlog.js";
+
+test("ok when under threshold and no stale task", () =&gt; {
+  const result = evaluateFailedQueueBacklog(0, null, 0, null, 900);
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.reasons, []);
+});
+
+test("critical when over threshold and growing", () =&gt; {
+  const result = evaluateFailedQueueBacklog(12, 5, 0, null, 900);
+  assert.equal(result.status, "critical");
+  assert.equal(result.growing, true);
+});
+
+test("warn when over threshold but not growing", () =&gt; {
+  const result = evaluateFailedQueueBacklog(5, 10, 0, null, 900);
+  assert.equal(result.status, "warn");
+  assert.equal(result.growing, false);
+});
+
+test("critical when no previous size counts as growing", () =&gt; {
+  const result = evaluateFailedQueueBacklog(3, null, 0, null, 900);
+  assert.equal(result.status, "critical");
+  assert.equal(result.growing, true);
+});
+
+test("warn when stale task even with small failed count", () =&gt; {
+  const result = evaluateFailedQueueBacklog(0, 0, 0, 1200, 900);
+  assert.equal(result.status, "warn");
+  assert.ok(result.reasons.some((r) =&gt; r.includes("queued scheduled task")));
+});
+
+test("ok when stale task age under threshold", () =&gt; {
+  const result = evaluateFailedQueueBacklog(0, 0, 5, 300, 900);
+  assert.equal(result.status, "ok");
+});
+
+test("reasons include backlog and growth lines", () =&gt; {
+  const result = evaluateFailedQueueBacklog(8, 2, 0, null, 900);
+  assert.equal(result.reasons.length, 2);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Webhook payloads</span>
+      <h4>The integration that quietly stopped mattering</h4>
+      <p>A store connected a third party fulfillment service through webhooks and flow actions. A schema change on the fulfillment side made a small percentage of payloads invalid. Messenger retried each one three times and moved every one of them to the failed transport, which nobody was watching. Months later, support noticed a pattern of orders never reaching fulfillment, and by then thousands of rows sat in messenger_messages.</p>
+      <p>Running the report script on a schedule surfaced the growing failed count within the first day, well before it reached a scale where digging through it by hand was painful. The team ran <code>messenger:failed:show</code>, spotted the schema mismatch, fixed the integration, and cleared the backlog deliberately.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Indexing timeouts</span>
+      <h4>The reindex that looked fine from the admin</h4>
+      <p>A large catalog import triggered a wave of product indexing messages. A handful timed out against an overloaded database during the import window and ended up in the failed transport. Nobody had configured a worker for that queue, since the setup guide the team followed only mentioned <code>default</code> and <code>async</code>.</p>
+      <p>Adding the poll caught the failed count sitting above zero and not shrinking across repeated checks, which is exactly the growing-critical case the pure function is built to catch. The fix was mundane, run <code>messenger:consume failed</code> once to drain the backlog, then decide whether a permanent worker for that transport made sense given how often it happened.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, the failed transport is no longer a blind spot. A one-off spike shows up as a warn that stops growing and can wait, while a true recurring problem shows up as critical fast, with reasons attached, long before it buries a real bug under thousands of harmless retries. Nothing gets retried or deleted without a human looking at it first, which is what keeps the backlog trustworthy as a signal instead of becoming one more thing to ignore.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do failed messages pile up in Shopware's messenger queue?</summary>
+      <p>Shopware runs on Symfony Messenger. A message that throws is retried automatically, and if every retry fails it moves into the separate failed transport. Most installs only run messenger:consume against the default or async queues, so nothing ever consumes the failed transport and rejected messages just sit there and grow.</p>
+    </details>
+    <details>
+      <summary>Can I detect the failed queue backlog through the Shopware Admin API?</summary>
+      <p>There is no entity endpoint for individual failed messages, since messenger_messages is a raw Symfony transport table, not a Shopware entity. You detect the backlog through the aggregate GET /api/_info/message-stats.json route, which returns the size of each transport by name, including the one named failed.</p>
+    </details>
+    <details>
+      <summary>Should a script automatically retry or delete failed messenger messages?</summary>
+      <p>No. Retrying a stale indexing message or an expired webhook call can cause duplicate side effects such as double emails or double stock adjustments. The safe pattern is to detect and report the backlog and its growth, then let a human run messenger:failed:show and decide between messenger:failed:retry and messenger:failed:remove.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/shopware/">Browse all Shopware field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Shopware Documentation: Message Queue, the failure transport, retry-then-move behavior, and the CLI worker requirement for the failed queue. <a href="https://developer.shopware.com/docs/guides/hosting/infrastructure/message-queue.html" rel="noopener">developer.shopware.com/docs/guides/hosting/infrastructure/message-queue.html</a></li>
+      <li>Shopware Documentation: Tutorials and FAQ, Message Queue and Scheduled Tasks. <a href="https://docs.shopware.com/en/shopware-6-en/tutorials-and-faq/message-queue-and-scheduled-tasks" rel="noopener">docs.shopware.com/en/shopware-6-en/tutorials-and-faq/message-queue-and-scheduled-tasks</a></li>
+      <li>Shopware Community Forum: Messenger queue full of errors. <a href="https://forum.shopware.com/t/messenger-queue-voller-fehler/106267" rel="noopener">forum.shopware.com/t/messenger-queue-voller-fehler/106267</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Documentation: Message Queue, MESSENGER_TRANSPORT_FAILURE_DSN and worker setup. <a href="https://developer.shopware.com/docs/guides/hosting/infrastructure/message-queue.html" rel="noopener">developer.shopware.com/docs/guides/hosting/infrastructure/message-queue.html</a></li>
+      <li>Shopware Documentation: Scheduled Task. <a href="https://developer.shopware.com/docs/guides/hosting/infrastructure/scheduled-task.html" rel="noopener">developer.shopware.com/docs/guides/hosting/infrastructure/scheduled-task.html</a></li>
+      <li>Shopware Admin API reference (Stoplight): MessageQueueStats schema. <a href="https://shopware.stoplight.io/docs/admin-api/adminapi.json/components/schemas/MessageQueueStats" rel="noopener">shopware.stoplight.io/docs/admin-api/adminapi.json/components/schemas/MessageQueueStats</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware order states, stock, message queue, or data integrity that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear your failed queue confusion?</h3>
+    <p>If this saved you from a silent backlog or a masked bug, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware 6.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>

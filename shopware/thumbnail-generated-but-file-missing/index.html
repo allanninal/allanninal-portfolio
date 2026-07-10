@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Shopware 6 Thumbnail Marked Generated but the File Is Missing</title>
+<meta name="description" content="Shopware 6 wrote a media_thumbnail row for every configured size, but the actual image file never landed on disk or S3, so the storefront 404s and regeneration skips it forever. Learn why it happens and build a Python or Node.js script that finds and repairs the orphaned records.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/thumbnail-generated-but-file-missing/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Shopware 6 Thumbnail Marked Generated but the File Is Missing">
+<meta property="og:description" content="Why Shopware 6 can record a media_thumbnail row while the physical file never got written, and a safe Python or Node.js script that finds and repairs the orphaned records.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/thumbnail-generated-but-file-missing/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/thumbnail-generated-but-file-missing/#article","headline":"Fix a Shopware 6 Thumbnail Marked Generated but the File Is Missing","description":"Why Shopware 6 can record a media_thumbnail row for a size while the physical file never got written to the configured filesystem, and a safe Python or Node.js script that finds and repairs the orphaned records.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/thumbnail-generated-but-file-missing/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Products, Variants and Media","keywords":"Shopware 6 thumbnail missing file, media_thumbnail orphaned record, ThumbnailService, media generate-thumbnails strict, Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Shopware field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Thumbnail marked generated but the physical file is missing","item":"https://www.allanninal.dev/shopware/thumbnail-generated-but-file-missing/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Shopware 6 think a thumbnail exists when the file returns a 404?","acceptedAnswer":{"@type":"Answer","text":"ThumbnailService writes a media_thumbnail row for every configured size as soon as generation starts, and Shopware treats the media as done once those records exist. If the resize or upload step fails partway, such as a storage timeout, a full disk, an S3 permission error, or an interrupted async message, the database row survives but the image file never lands on the configured filesystem. The default regeneration logic only checks whether a record exists, not whether the file exists, so the broken thumbnail is skipped forever and keeps 404ing on the storefront."}},{"@type":"Question","name":"Is it safe to delete a media_thumbnail row automatically?","acceptedAnswer":{"@type":"Answer","text":"Yes, once you have confirmed the physical file truly does not exist at the expected path and the media's folder configuration still has createThumbnails enabled. Deleting the row does not touch the parent media entity, its price, or its product association, it only removes a stale record so Shopware's own generator will treat that size as missing and rebuild it on the next generate-thumbnails call."}},{"@type":"Question","name":"How do I find Shopware 6 thumbnails that are missing their physical file using the Admin API?","acceptedAnswer":{"@type":"Answer","text":"Authenticate with POST /api/oauth/token using client_credentials, then POST /api/search/media-thumbnail with the media association included to list every thumbnail record and its parent media. For each media, request GET /api/media/{mediaId} with associations.thumbnails to read each thumbnail's resolved url, then check whether that URL or file actually exists. A thumbnail row with no matching file, on a folder where mediaFolderConfiguration.createThumbnails is true, is the defect signature."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Products, Variants and Media</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Products, Variants and Media</p>
+    <h1>Thumbnail marked generated but the physical file is missing</h1>
+    <p class="lead">Somewhere on your storefront a product image loads fine, but the thumbnail it should shrink down to comes back as a 404. Shopware's own records say the thumbnail exists. The size is right, the width and height are in the database, everything about the row looks done. But the file itself was never actually written to disk or to S3, and because Shopware only checks whether the record exists, not whether the file exists, it never tries to fix it again on its own. Here is why it happens and a small script that finds the orphaned records and repairs them.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Shopware Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>When Shopware generates thumbnails, whether through <code>ThumbnailService::updateThumbnails</code>, the <code>media.thumbnail.update</code> message handler, the <code>media:generate-thumbnails</code> console command, or the admin's Generate thumbnails action, it writes a <code>media_thumbnail</code> row for every configured size up front and treats the media as done once those rows exist. If the resize or upload step fails partway, the row and its width, height, and path stay in the database while the file itself never gets written to the configured filesystem. Because the default regeneration logic only asks does a record exist, not does the file exist, the broken thumbnail is skipped on every future run and 404s on the storefront indefinitely. Run a small Python or Node.js script that lists <code>media-thumbnail</code> rows, checks whether each expected file actually exists, and deletes the orphaned records so Shopware's own generator treats them as missing and rebuilds them. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When Shopware needs a thumbnail for a media file, it does the work in two separate steps: it inserts a database row describing the thumbnail (its width, height, and the path it expects the file to live at), and then it actually resizes the source image and writes the result to the configured filesystem, whether that is local disk or a remote adapter like S3. Those two steps are supposed to happen together, but they are not atomic.</p>
+  <p>If the second step fails, a storage timeout, a full disk, an S3 permission error, an interrupted async message, or even a thumbnail-processing plugin being uninstalled mid-run, the first step already committed. The <code>media_thumbnail</code> row is sitting in the database claiming a file exists at a specific path, and no file is there. Shopware has no built-in trigger that goes back and double-checks that claim.</p>
+  <p>The result shows up quietly. A customer or a crawler requests the thumbnail URL and gets a 404. Nobody sees an error in the admin, because as far as Shopware is concerned, the thumbnail was already generated. The next time someone runs thumbnail generation again, hoping it will fix itself, it does not, because the row it would have needed to see as missing is right there in the table.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. Thumbnail generation writes a media_thumbnail database row, then tries to write the resized file to storage, the write fails partway, the row still says the thumbnail is done, and the storefront gets a 404 while regeneration skips it forever.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="72" width="155" height="66" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="87" y="98" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Generate thumbnails</text>
+      <text x="87" y="116" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">writes DB row first</text>
+      <line x1="168" y1="105" x2="210" y2="105" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="213" y="72" width="175" height="66" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="300" y="98" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Resize and upload</text>
+      <text x="300" y="116" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">disk or S3 write</text>
+      <line x1="391" y1="105" x2="435" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="413" y="65" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="413" y="132" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">write fails partway</text>
+      <rect x="438" y="72" width="165" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="520" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Row says "done"</text>
+      <text x="520" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">file never written</text>
+      <line x1="606" y1="105" x2="646" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="649" y="72" width="101" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="699" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Storefront</text>
+      <text x="699" y="110" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">404</text>
+      <text x="380" y="175" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#4a5b62">Regeneration only checks "does the record exist," never "does the file exist"</text>
+      <text x="380" y="195" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">so the broken thumbnail is skipped on every future run</text>
+    </svg>
+    <figcaption>The database row and the physical file are written in two separate steps. When the second step fails, the row survives and Shopware never checks it again.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a gap between what a database row claims and what actually exists on the filesystem. A few things make it easy to hit:</p>
+  <ul>
+    <li>The write to storage is not wrapped in the same transaction as the database insert. A timeout, a disk-full condition, or an S3 permission error can interrupt the file write after the row already committed.</li>
+    <li>Thumbnail generation for large catalogs often runs through the async message queue, and an interrupted or failed <code>media.thumbnail.update</code> message can leave a batch of rows half-finished with no automatic retry that re-checks the file.</li>
+    <li>Uninstalling or disabling a plugin that processes thumbnails mid-run can leave records behind for sizes that plugin was supposed to generate.</li>
+    <li>By default, non-strict regeneration in <code>media:generate-thumbnails</code> only asks whether a <code>media_thumbnail</code> record already exists for a given size, not whether the file behind it exists, so it silently skips every media this has already happened to.</li>
+  </ul>
+  <p>This exact gap is documented in Shopware's own issue tracker and was significant enough that the core team shipped a fix for it. See the citations at the end for the exact threads and the pull request that added an opt-in strict mode.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Shopware's fix for this, NEXT-7754, added a <code>--strict</code> flag to <code>media:generate-thumbnails</code> that performs the missing <code>file_exists</code> check before deciding a thumbnail can be skipped. That flag is opt-in on purpose, because checking every file on every run is slower than trusting the database. The Admin API does not expose that flag at all, so the equivalent fix from outside the server is to find the orphaned rows yourself, delete them, and then ask Shopware to regenerate just those media. Once the stale row is gone, Shopware's own generator behaves correctly again.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not guess which thumbnails are broken. The script lists <code>media-thumbnail</code> rows with their parent media, resolves the expected file URL for each one, and checks whether that file actually exists. Only rows where the folder configuration expects thumbnails and the file is confirmed missing get deleted, and only the affected media get queued for regeneration.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. List media-thumbnail rows with their parent media, check the folder configuration and whether the physical file exists, if the file is missing delete the thumbnail record and re-trigger generation for that media, otherwise leave it alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#06b6d4"></path></marker></defs>
+      <rect x="10" y="20" width="190" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="105" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">List media-thumbnail</text>
+      <text x="105" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">with media association</text>
+      <line x1="105" y1="80" x2="105" y2="106" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Check folder config</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">createThumbnails?</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="362" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Resolve expected URL</text>
+      <text x="362" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">HEAD or stat the file</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="580" y="134" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f2830">File</text>
+      <text x="580" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f2830">exists?</text>
+      <text x="588" y="198" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">no, missing</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="608" y="185" width="145" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="680" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Delete record and</text>
+      <text x="680" y="221" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">re-trigger generation</text>
+      <text x="680" y="236" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">for that media</text>
+      <text x="672" y="128" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">yes, leave it</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>The script only deletes a thumbnail record once the file is confirmed missing and the folder still expects thumbnails, then asks Shopware to regenerate just that media.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get Admin API credentials</h3>
+      <p>Create an Integration in your Shopware Administration under Settings, System, Integrations. Copy the access key id and secret access key. The script exchanges these for a bearer token at <code>POST /api/oauth/token</code> with a <code>client_credentials</code> grant, so keep them in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://your-shop.example.com"
+export SHOPWARE_CLIENT_ID="SWIAxxx"
+export SHOPWARE_CLIENT_SECRET="your secret access key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://your-shop.example.com"
+export SHOPWARE_CLIENT_ID="SWIAxxx"
+export SHOPWARE_CLIENT_SECRET="your secret access key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and talk to the Admin API</h3>
+      <p>A small helper trades the client id and secret for an access token, then sends it as <code>Authorization: Bearer &lt;token&gt;</code> on every call. We reuse this helper for the searches, the delete, and the regenerate call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api(method, path, token, json_body=None):
+    r = requests.request(
+        method,
+        f"{SHOPWARE_URL}{path}",
+        json=json_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function api(method, path, token, jsonBody) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: jsonBody ? JSON.stringify(jsonBody) : undefined,
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List thumbnail records with their parent media</h3>
+      <p>Search <code>media-thumbnail</code> with the <code>media</code> association included, so each hit carries its <code>mediaId</code>, width, height, and the parent media's path and folder. We page through with <code>page</code> and <code>limit</code> so a large media library is handled safely.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def find_thumbnails(token, page=1, limit=500):
+    body = {
+        "page": page,
+        "limit": limit,
+        "filter": [],
+        "associations": {"media": {}},
+        "sort": [{"field": "createdAt", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    return api("POST", "/api/search/media-thumbnail", token, body)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function findThumbnails(token, page = 1, limit = 500) {
+  const body = {
+    page,
+    limit,
+    filter: [],
+    associations: { media: {} },
+    sort: [{ field: "createdAt", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  return api("POST", "/api/search/media-thumbnail", token, body);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Confirm the physical file is actually missing</h3>
+      <p>For each thumbnail, resolve the expected URL, either from the thumbnail's own computed <code>url</code> when you request the media with <code>associations: {"thumbnails": {}}</code>, or by reconstructing the public path from <code>media.path</code>. A plain HEAD request against the public filesystem URL tells you whether the file exists without downloading it. A 404 while the record still exists is the defect signature.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def thumbnail_file_exists(url):
+    try:
+        r = requests.head(url, timeout=15, allow_redirects=True)
+        return r.status_code < 400
+    except requests.RequestException:
+        return False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function thumbnailFileExists(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD", redirect: "follow" });
+    return res.status < 400;
+  } catch {
+    return false;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision out of the network code entirely. This function takes a thumbnail, whether its file exists, and the folder's configuration, and returns one of three plain outcomes: skip when thumbnails are disabled for the folder or the file is present, or delete and requeue when the file is confirmed missing on a folder that expects thumbnails. There is no I/O inside it, so it is trivially testable against a matrix of inputs.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_thumbnail_repair(thumbnail, file_exists, folder_config):
+    if not folder_config.get("createThumbnails"):
+        return {"action": "skip", "reason": "thumbnails disabled for folder"}
+    if file_exists:
+        return {"action": "skip", "reason": "file present, record consistent"}
+    return {
+        "action": "delete_and_requeue",
+        "reason": "thumbnail record exists but physical file missing",
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideThumbnailRepair(thumbnail, fileExists, folderConfig) {
+  if (!folderConfig.createThumbnails) {
+    return { action: "skip", reason: "thumbnails disabled for folder" };
+  }
+  if (fileExists) {
+    return { action: "skip", reason: "file present, record consistent" };
+  }
+  return {
+    action: "delete_and_requeue",
+    reason: "thumbnail record exists but physical file missing",
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Delete the orphaned record and re-trigger generation, guarded by dry run</h3>
+      <p>When the decision is <code>delete_and_requeue</code> and <code>DRY_RUN</code> is off, call <code>DELETE /api/media-thumbnail/{thumbnailId}</code> so Shopware's own generator no longer thinks that size is already handled. Once every affected thumbnail for a media is cleared, call <code>POST /api/_action/media/generate-thumbnails</code> with <code>{"mediaIds": [...]}</code> to force regeneration for just those media. The Admin API has no equivalent of the CLI's <code>--strict</code> flag, so this delete-then-regenerate pair is the required substitute. Where you can, also schedule <code>bin/console media:generate-thumbnails --strict</code> outside the Admin API as the authoritative bulk fix.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Confirm the file truly is missing, not just slow to respond, before deleting anything, and only delete rows on folders where <code>mediaFolderConfiguration.createThumbnails</code> is still true. If write access is not appropriate for your situation, fall back to flag mode: log the list of <code>{mediaId, thumbnailId, expectedPath}</code> for a human to review instead of deleting.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and is safe to run again and again because it only deletes thumbnail records confirmed to have a missing file, then re-triggers generation for the affected media.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/thumbnail-generated-but-file-missing" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair_missing_thumbnail_files.py</div>
+      <pre><code class="language-python">"""Find Shopware 6 media_thumbnail rows whose physical file is missing and repair them.
+
+ThumbnailService writes a media_thumbnail row for every configured size before the
+resize and upload step runs, and Shopware treats the media as done once those rows
+exist. If the write to the configured filesystem (local or S3) fails partway, the row
+survives while the file never lands. The default regeneration logic only checks
+whether a record exists, not whether the file exists, so the broken thumbnail is
+skipped forever and 404s on the storefront. This script finds the orphaned records,
+confirms the file is missing, deletes the stale row, and re-triggers generation for
+the affected media. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("repair_missing_thumbnail_files")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def api(method, path, token, json_body=None):
+    r = requests.request(
+        method,
+        f"{SHOPWARE_URL}{path}",
+        json=json_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def find_thumbnails(token, page=1, limit=500):
+    body = {
+        "page": page,
+        "limit": limit,
+        "filter": [],
+        "associations": {"media": {}},
+        "sort": [{"field": "createdAt", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    return api("POST", "/api/search/media-thumbnail", token, body)
+
+
+def thumbnail_file_exists(url):
+    try:
+        r = requests.head(url, timeout=15, allow_redirects=True)
+        return r.status_code < 400
+    except requests.RequestException:
+        return False
+
+
+def decide_thumbnail_repair(thumbnail, file_exists, folder_config):
+    if not folder_config.get("createThumbnails"):
+        return {"action": "skip", "reason": "thumbnails disabled for folder"}
+    if file_exists:
+        return {"action": "skip", "reason": "file present, record consistent"}
+    return {
+        "action": "delete_and_requeue",
+        "reason": "thumbnail record exists but physical file missing",
+    }
+
+
+def delete_thumbnail(token, thumbnail_id):
+    api("DELETE", f"/api/media-thumbnail/{thumbnail_id}", token)
+
+
+def regenerate_thumbnails(token, media_ids):
+    if not media_ids:
+        return
+    api(
+        "POST",
+        "/api/_action/media/generate-thumbnails",
+        token,
+        {"mediaIds": list(media_ids)},
+    )
+
+
+def run():
+    token = get_token()
+    repaired = 0
+    affected_media = set()
+    page = 1
+
+    while True:
+        data = find_thumbnails(token, page=page)
+        rows = data.get("data", [])
+        if not rows:
+            break
+
+        for row in rows:
+            media = row.get("media") or {}
+            folder = (media.get("mediaFolder") or {}) if isinstance(media.get("mediaFolder"), dict) else {}
+            folder_config = folder.get("configuration") or {"createThumbnails": True}
+
+            url = row.get("url") or row.get("path")
+            if not url:
+                continue
+
+            file_exists = thumbnail_file_exists(url)
+            decision = decide_thumbnail_repair(row, file_exists, folder_config)
+
+            if decision["action"] == "skip":
+                continue
+
+            log.warning(
+                "Thumbnail %s (media %s) has no physical file. %s",
+                row["id"], row.get("mediaId"),
+                "would delete and requeue" if DRY_RUN else "deleting and requeuing",
+            )
+            if not DRY_RUN:
+                delete_thumbnail(token, row["id"])
+            affected_media.add(row.get("mediaId"))
+            repaired += 1
+
+        if page * 500 >= data.get("total", 0):
+            break
+        page += 1
+
+    if not DRY_RUN:
+        regenerate_thumbnails(token, affected_media)
+
+    log.info(
+        "Done. %d thumbnail record(s) %s across %d media.",
+        repaired, "to repair" if DRY_RUN else "repaired", len(affected_media),
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair-missing-thumbnail-files.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Shopware 6 media_thumbnail rows whose physical file is missing and repair them.
+ *
+ * ThumbnailService writes a media_thumbnail row for every configured size before the
+ * resize and upload step runs, and Shopware treats the media as done once those rows
+ * exist. If the write to the configured filesystem (local or S3) fails partway, the row
+ * survives while the file never lands. The default regeneration logic only checks
+ * whether a record exists, not whether the file exists, so the broken thumbnail is
+ * skipped forever and 404s on the storefront. This script finds the orphaned records,
+ * confirms the file is missing, deletes the stale row, and re-triggers generation for
+ * the affected media. Run on a schedule. Safe to run again and again.
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://demo.example.com").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "SWIAxxx";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "secret_dummy";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decideThumbnailRepair(thumbnail, fileExists, folderConfig) {
+  if (!folderConfig.createThumbnails) {
+    return { action: "skip", reason: "thumbnails disabled for folder" };
+  }
+  if (fileExists) {
+    return { action: "skip", reason: "file present, record consistent" };
+  }
+  return {
+    action: "delete_and_requeue",
+    reason: "thumbnail record exists but physical file missing",
+  };
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function api(method, path, token, jsonBody) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: jsonBody ? JSON.stringify(jsonBody) : undefined,
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function findThumbnails(token, page = 1, limit = 500) {
+  const body = {
+    page,
+    limit,
+    filter: [],
+    associations: { media: {} },
+    sort: [{ field: "createdAt", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  return api("POST", "/api/search/media-thumbnail", token, body);
+}
+
+async function thumbnailFileExists(url) {
+  try {
+    const res = await fetch(url, { method: "HEAD", redirect: "follow" });
+    return res.status < 400;
+  } catch {
+    return false;
+  }
+}
+
+async function deleteThumbnail(token, thumbnailId) {
+  await api("DELETE", `/api/media-thumbnail/${thumbnailId}`, token);
+}
+
+async function regenerateThumbnails(token, mediaIds) {
+  if (mediaIds.length === 0) return;
+  await api("POST", "/api/_action/media/generate-thumbnails", token, {
+    mediaIds,
+  });
+}
+
+export async function run() {
+  const token = await getToken();
+  let repaired = 0;
+  const affectedMedia = new Set();
+  let page = 1;
+
+  while (true) {
+    const data = await findThumbnails(token, page);
+    const rows = data.data || [];
+    if (rows.length === 0) break;
+
+    for (const row of rows) {
+      const media = row.media || {};
+      const folder = media.mediaFolder || {};
+      const folderConfig = folder.configuration || { createThumbnails: true };
+
+      const url = row.url || row.path;
+      if (!url) continue;
+
+      const fileExists = await thumbnailFileExists(url);
+      const decision = decideThumbnailRepair(row, fileExists, folderConfig);
+
+      if (decision.action === "skip") continue;
+
+      console.warn(
+        `Thumbnail ${row.id} (media ${row.mediaId}) has no physical file. ${DRY_RUN ? "would delete and requeue" : "deleting and requeuing"}`
+      );
+      if (!DRY_RUN) await deleteThumbnail(token, row.id);
+      affectedMedia.add(row.mediaId);
+      repaired++;
+    }
+
+    if (page * 500 >= (data.total || 0)) break;
+    page++;
+  }
+
+  if (!DRY_RUN) await regenerateThumbnails(token, [...affectedMedia]);
+
+  console.log(
+    `Done. ${repaired} thumbnail record(s) ${DRY_RUN ? "to repair" : "repaired"} across ${affectedMedia.size} media.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a database row gets deleted. Because <code>decide_thumbnail_repair</code> is pure, with <code>fileExists</code> and <code>folderConfig</code> precomputed and passed in, no network and no Shopware instance is needed. It just takes plain objects in and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_thumbnail_missing_file_repair.py</div>
+      <pre><code class="language-python">from repair_missing_thumbnail_files import decide_thumbnail_repair
+
+
+def thumbnail(**over):
+    base = {
+        "id": "thumb-1",
+        "mediaId": "media-1",
+        "width": 400,
+        "height": 400,
+        "expectedPath": "media/thumbnail/product_400x400.jpg",
+    }
+    base.update(over)
+    return base
+
+
+def test_skip_when_folder_disables_thumbnails():
+    result = decide_thumbnail_repair(thumbnail(), False, {"createThumbnails": False})
+    assert result == {"action": "skip", "reason": "thumbnails disabled for folder"}
+
+
+def test_skip_when_file_present():
+    result = decide_thumbnail_repair(thumbnail(), True, {"createThumbnails": True})
+    assert result == {"action": "skip", "reason": "file present, record consistent"}
+
+
+def test_delete_and_requeue_when_file_missing_and_folder_enabled():
+    result = decide_thumbnail_repair(thumbnail(), False, {"createThumbnails": True})
+    assert result == {
+        "action": "delete_and_requeue",
+        "reason": "thumbnail record exists but physical file missing",
+    }
+
+
+def test_disabled_folder_wins_even_if_file_is_also_missing():
+    result = decide_thumbnail_repair(thumbnail(), False, {"createThumbnails": False})
+    assert result["action"] == "skip"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">thumbnail-missing-file-repair.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideThumbnailRepair } from "./repair-missing-thumbnail-files.js";
+
+const thumbnail = (over = {}) =&gt; ({
+  id: "thumb-1",
+  mediaId: "media-1",
+  width: 400,
+  height: 400,
+  expectedPath: "media/thumbnail/product_400x400.jpg",
+  ...over,
+});
+
+test("skip when folder disables thumbnails", () =&gt; {
+  const result = decideThumbnailRepair(thumbnail(), false, { createThumbnails: false });
+  assert.deepEqual(result, { action: "skip", reason: "thumbnails disabled for folder" });
+});
+
+test("skip when file present", () =&gt; {
+  const result = decideThumbnailRepair(thumbnail(), true, { createThumbnails: true });
+  assert.deepEqual(result, { action: "skip", reason: "file present, record consistent" });
+});
+
+test("delete and requeue when file missing and folder enabled", () =&gt; {
+  const result = decideThumbnailRepair(thumbnail(), false, { createThumbnails: true });
+  assert.deepEqual(result, {
+    action: "delete_and_requeue",
+    reason: "thumbnail record exists but physical file missing",
+  });
+});
+
+test("disabled folder wins even if file is also missing", () =&gt; {
+  const result = decideThumbnailRepair(thumbnail(), false, { createThumbnails: false });
+  assert.equal(result.action, "skip");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">S3 permission error</span>
+      <h4>A bucket policy change quietly broke thumbnail uploads for a week</h4>
+      <p>A furniture retailer moved its media storage to a new S3 bucket and updated the IAM policy, but missed one write permission for a specific prefix. Thumbnail generation kept running as scheduled, database rows kept getting created, and nobody noticed anything was wrong until a marketing email went out with broken product thumbnails.</p>
+      <p>Running the script in dry run against the product folder found several hundred thumbnail records where the HEAD request came back 404. Once the bucket policy was fixed, deleting those orphaned rows and re-triggering generation rebuilt every missing file in one pass, and the next campaign email rendered cleanly.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Interrupted message queue</span>
+      <h4>A restart mid-batch left a scattering of half-generated thumbnails</h4>
+      <p>A home goods store ran a large catalog import that queued thousands of <code>media.thumbnail.update</code> messages. A deploy restarted the message workers partway through, and a small percentage of thumbnails ended up with a database row but no file, scattered unpredictably across the catalog.</p>
+      <p>Because the failure was silent, nobody could tell which products were affected without checking the storefront by hand. The script found the exact list by checking every thumbnail's URL directly, and only 42 of the several thousand generated needed cleanup, letting the team regenerate just that small set instead of the whole catalog.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs, a thumbnail record no longer gets to lie about a file that was never written. Storage failures during generation stop turning into permanent, silent 404s that regeneration would otherwise skip forever, and every repair only touches records confirmed to be orphaned, never a media entity, a product, or a price. Where possible, pair this with a scheduled <code>media:generate-thumbnails --strict</code> run for the authoritative bulk fix.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Shopware 6 think a thumbnail exists when the file returns a 404?</summary>
+      <p>ThumbnailService writes a media_thumbnail row for every configured size as soon as generation starts, and Shopware treats the media as done once those records exist. If the resize or upload step fails partway, such as a storage timeout, a full disk, an S3 permission error, or an interrupted async message, the database row survives but the image file never lands on the configured filesystem. The default regeneration logic only checks whether a record exists, not whether the file exists, so the broken thumbnail is skipped forever and keeps 404ing on the storefront.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete a media_thumbnail row automatically?</summary>
+      <p>Yes, once you have confirmed the physical file truly does not exist at the expected path and the media's folder configuration still has createThumbnails enabled. Deleting the row does not touch the parent media entity, its price, or its product association, it only removes a stale record so Shopware's own generator will treat that size as missing and rebuild it on the next generate-thumbnails call.</p>
+    </details>
+    <details>
+      <summary>How do I find Shopware 6 thumbnails that are missing their physical file using the Admin API?</summary>
+      <p>Authenticate with POST /api/oauth/token using client_credentials, then POST /api/search/media-thumbnail with the media association included to list every thumbnail record and its parent media. For each media, request GET /api/media/{mediaId} with associations.thumbnails to read each thumbnail's resolved url, then check whether that URL or file actually exists. A thumbnail row with no matching file, on a folder where mediaFolderConfiguration.createThumbnails is true, is the defect signature.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/shopware/">Browse all Shopware field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Shopware GitHub Issues: Regenerating Thumbnails not working as expected. <a href="https://github.com/shopware/shopware/issues/6134" rel="noopener">github.com/shopware/shopware/issues/6134</a></li>
+      <li>Shopware GitHub Pull Request: NEXT-7754, fix thumbnail generation when the physical file is missing, adding the --strict flag. <a href="https://github.com/shopware/shopware/pull/1937" rel="noopener">github.com/shopware/shopware/pull/1937</a></li>
+      <li>Shopware GitHub Issues: Thumbnails generate command fail. <a href="https://github.com/shopware/shopware/issues/383" rel="noopener">github.com/shopware/shopware/issues/383</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Developer Documentation: Working with Media and Thumbnails. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/storefront/use-media-thumbnails.html" rel="noopener">developer.shopware.com use-media-thumbnails</a></li>
+      <li>Shopware Admin API Reference: the MediaThumbnail entity. <a href="https://shopware.stoplight.io/docs/admin-api/603cdb6005627-media-thumbnail" rel="noopener">shopware.stoplight.io admin-api media-thumbnail</a></li>
+      <li>Shopware Admin API Reference: Media Management. <a href="https://shopware.stoplight.io/docs/admin-api/c042ae0cd330f-media-management" rel="noopener">shopware.stoplight.io admin-api media-management</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware order states, stock, message queue, or data integrity that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear a broken thumbnail?</h3>
+    <p>If this saved you a confusing support ticket or a broken product image, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware 6.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>

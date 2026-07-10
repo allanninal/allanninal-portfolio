@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shopware 6 Orders Force Cancelled Outside Allowed Transitions</title>
+<meta name="description" content="Shopware 6 historically let any order be cancelled through the API even when cancel was not a legal transition from its current state. Learn why the state machine had a cancel escape hatch and build a Python or Node.js script that audits order history for illegal force cancels.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/order-force-cancel-illegal-transition/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Shopware 6 Orders Force Cancelled Outside Allowed Transitions">
+<meta property="og:description" content="Why StateMachineRegistry once let a cancel action through regardless of the state graph, and a Python or Node.js script that audits order history for orders that were force cancelled illegally.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/order-force-cancel-illegal-transition/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/order-force-cancel-illegal-transition/#article","headline":"Shopware 6 Orders Force Cancelled Outside Allowed Transitions","description":"Why StateMachineRegistry historically special-cased the cancel action and let it bypass the state machine graph entirely, and a Python or Node.js script that audits order state machine history for orders that were force cancelled outside a legal transition.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/order-force-cancel-illegal-transition/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Order State Machine","keywords":"Shopware 6 order cancel, StateMachineRegistry, getTransitionDestinationById, force cancel, illegal transition, order.state, state-machine-history, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Orders can be force cancelled outside allowed transitions","item":"https://www.allanninal.dev/shopware/order-force-cancel-illegal-transition/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why could a Shopware 6 order be cancelled even when cancel was not a valid transition?","acceptedAnswer":{"@type":"Answer","text":"StateMachineRegistry::getTransitionDestinationById() contained a hardcoded rule to always allow a cancel action, regardless of whether that transition actually existed as an edge from the order's current state in the state machine graph. Calling the cancel transition endpoint on an order in a state like completed, which has no completed to cancelled edge in the default order.state flow, still succeeded and force-set the order to cancelled."}},{"@type":"Question","name":"Has Shopware fixed the cancel escape hatch in the state machine?","acceptedAnswer":{"@type":"Answer","text":"Yes. Shopware removed the special-cased branch in the platform repository in PR #3732, which closed issue #3730 and was tracked internally as NEXT-23423. After the fix, every transition, including cancel, is validated strictly against the configured state_machine_transition edges for that state machine, so an illegal cancel is rejected instead of silently applied."}},{"@type":"Question","name":"Can I safely reverse an order that was force cancelled outside a legal transition?","acceptedAnswer":{"@type":"Answer","text":"Not automatically. There is no guaranteed inverse transition back to the order's original state, and stock, documents, or payment records may already have reacted to the cancellation. The safe approach is to detect and report every illegal cancel from state_machine_history for manual review, and to prevent new ones going forward by checking the transition against the legal edge graph before ever calling the cancel endpoint."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Order State Machine</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Order State Machine</p>
+    <h1>Orders can be force cancelled outside allowed transitions</h1>
+    <p class="lead">A support script, an impatient admin user, or a retry loop calls the order cancel endpoint on an order that is already completed, or otherwise nowhere near a legal cancel edge. It should fail. For a long stretch of Shopware 6's life, it did not. A hardcoded escape hatch inside the state machine let the cancel action through no matter what, quietly corrupting the state graph. Here is why that happened, how Shopware fixed it, and a small script that audits your order history for every order this force cancel touched.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p><code>StateMachineRegistry::getTransitionDestinationById()</code> historically contained a special case: "Always allow to cancel a payment whether its a valid transition or not." It matched any transition whose action name was <code>cancel</code> and returned the target state without checking whether that edge actually existed for the current state, and it ran for every state machine, not just the payment one it was written for. So <code>POST /api/_action/order/{orderId}/state/cancel</code> on an order sitting in <code>completed</code>, which has no <code>completed</code> to <code>cancelled</code> edge, still succeeded and force-set <code>stateMachineState</code> to <code>cancelled</code>. Shopware deleted that branch in PR #3732, closing issue #3730 (tracked internally as NEXT-23423), so cancel is now validated exactly like any other transition. A small Python or Node.js script can rebuild the legal edge graph, walk <code>state-machine-history</code>, and flag every order that was force cancelled outside a real transition. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every order in Shopware 6 moves through its <code>order.state</code> state machine along named edges: <code>open</code> to <code>in_progress</code> by <code>process</code>, <code>in_progress</code> to <code>completed</code> by <code>complete</code>, and so on. The whole point of a state machine is that a state can only move along an edge that is actually defined, so <code>StateMachineRegistry</code> is supposed to check the current state's outgoing transitions before letting anything move.</p>
+  <p>Except for one action name. Deep in <code>getTransitionDestinationById()</code>, a comment reading "Always allow to cancel a payment whether its a valid transition or not" guarded a branch that matched on <code>actionName === 'cancel'</code> and returned the destination state without ever consulting the graph. That check was meant for the payment state machine, where forcing a cancel through made some operational sense, but it was written generically, so it fired for <code>order.state</code> too. Call the cancel transition on an order that is <code>completed</code>, a state with no outgoing cancel edge in the default flow, and it still worked. The order flipped straight to <code>cancelled</code>, no error, no warning, and the state graph was now saying something that could never have happened through a legal path.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A cancel transition is requested on a completed order, which has no completed to cancelled edge, but the hardcoded cancel escape hatch in getTransitionDestinationById lets it through anyway, so the order is force-set to cancelled without validation.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="170" height="66" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="95" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">POST .../state/cancel</text>
+      <text x="95" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">order is completed</text>
+      <text x="95" y="127" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">no legal cancel edge</text>
+      <line x1="183" y1="103" x2="222" y2="103" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="225" y="70" width="205" height="66" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="327" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">getTransitionDestinationById</text>
+      <text x="327" y="112" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">actionName === 'cancel' ?</text>
+      <text x="327" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">skip the graph check</text>
+      <line x1="433" y1="103" x2="472" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="452" y="60" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="452" y="150" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">no validation</text>
+      <rect x="475" y="70" width="150" height="66" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="550" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Succeeds anyway</text>
+      <text x="550" y="112" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">200 OK, no error</text>
+      <line x1="633" y1="103" x2="662" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="633" y="150" width="117" height="55" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="691" y="173" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stateMachineState</text>
+      <text x="691" y="190" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">forced to cancelled</text>
+      <line x1="550" y1="136" x2="665" y2="146" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>The cancel action bypassed the state machine graph entirely, so an order that had no legal path to cancelled still landed there, corrupting the state history.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The root cause sits in one method, but it surfaces in ordinary operational moments. A few common ways teams ran into it:</p>
+  <ul>
+    <li>A support agent or admin user clicks cancel on an order that is already <code>completed</code> or otherwise terminal, expecting Shopware to refuse, and it quietly complies instead.</li>
+    <li>A custom plugin or automation calls <code>POST /api/_action/order/{id}/state/cancel</code> as a blunt "just stop this order" tool without first checking the order's current <code>stateMachineState.technicalName</code> against the legal edges.</li>
+    <li>A retry loop in an integration fires the cancel transition more than once, and because the check never validated the edge, every retry succeeded rather than failing loudly after the first one.</li>
+    <li>A migration or bulk cleanup script assumes cancel is always safe to call, since Shopware's own Admin UI cancel button relies on the same permissive endpoint underneath.</li>
+  </ul>
+  <p>This was a real defect in the platform, not a misunderstanding of the docs. It is tracked publicly as GitHub issue #3730, "every order can be canceled, even if not allowed via statemachine transition," and Shopware closed it by removing the special case entirely in PR #3732. See the citations at the end for the exact issue and fix.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The fix is not to special-case <code>cancel</code> at all, in either direction. Shopware's corrected <code>StateMachineRegistry</code> validates cancel exactly like every other transition: the edge from the current state to the target state, under that specific action name, must exist in the state machine's configured <code>state_machine_transition</code> rows. A detection script should mirror that same rule. Build the real edge graph once, then check every historical cancel against it rather than trusting that <code>toStateMachineState.technicalName === 'cancelled'</code> ever implies the move was legal.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never try to auto-reverse anything, since there is no guaranteed inverse transition and money, stock, or documents may already have reacted to the bad cancel. Instead the script pulls the real <code>order.state</code> transition graph, walks <code>state-machine-history</code> for every recorded order transition, and flags any row where the action was <code>cancel</code> but that exact fromState to cancelled edge does not exist in the graph. Each flagged row becomes an audit record for manual review.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job fetches the legal order.state transition graph, walks state-machine-history for order transitions, and a pure function checks each cancel against the graph. If the edge is missing it is flagged as an illegal force cancel for manual review, otherwise it is left alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0891b2"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Fetch legal edges</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">state-machine, order.state</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="112" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Walk transition history</text>
+      <text x="112" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">state-machine-history</text>
+      <text x="112" y="164" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">entityName: order</text>
+      <line x1="215" y1="140" x2="257" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">isLegalTransition</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">pure decision function</text>
+      <text x="350" y="165" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">no special-case for cancel</text>
+      <line x1="440" y1="140" x2="482" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,140 575,174 488,140" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="575" y="135" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">Edge exists</text>
+      <text x="575" y="150" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">for cancel?</text>
+      <text x="590" y="205" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">no, illegal cancel</text>
+      <line x1="575" y1="174" x2="575" y2="210" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Audit record</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">flagged for review</text>
+      <text x="665" y="130" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">yes, legal</text>
+      <line x1="662" y1="140" x2="690" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="700" y="118" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">left alone</text>
+    </svg>
+    <figcaption>The pure check applies the same rule Shopware's corrected state machine applies: cancel must have a real edge from the order's actual prior state, or the history row gets flagged instead of trusted.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create an integration in Shopware under Settings, System, Integrations, and note its access key id and secret key. Exchange them for a bearer token with <code>POST /api/oauth/token</code> using <code>grant_type: client_credentials</code>. Keep the shop URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   # start safe, this script only ever reports</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   // start safe, this script only ever reports</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and call the Admin API</h3>
+      <p>A small helper gets a bearer token once, then sends every request with <code>Authorization: Bearer &lt;token&gt;</code> and <code>Accept: application/json</code>. We reuse it for the state machine graph search, the order search, and the history search.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiPost(path, token, body = {}) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${path}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the real order.state transition graph</h3>
+      <p>Search <code>state-machine</code> filtered to <code>technicalName: order.state</code>, with the <code>transitions</code> association nested with <code>fromStateMachineState</code> and <code>toStateMachineState</code>. Fold the response into a map of <code>fromState.technicalName -&gt; {actionName: toState.technicalName}</code>, the same shape the corrected <code>StateMachineRegistry</code> checks against.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def fetch_order_state_edges(token):
+    body = {
+        "filter": [{"type": "equals", "field": "technicalName", "value": "order.state"}],
+        "associations": {
+            "transitions": {"associations": {"fromStateMachineState": {}, "toStateMachineState": {}}}
+        },
+        "limit": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/state-machine",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()["data"]
+    machine = data[0] if data else {}
+    transitions = ((machine.get("transitions") or {}).get("data")) or machine.get("transitions") or []
+    if isinstance(transitions, dict):
+        transitions = transitions.get("data", [])
+
+    edges = {}
+    for t in transitions:
+        from_name = (t.get("fromStateMachineState") or {}).get("technicalName")
+        to_name = (t.get("toStateMachineState") or {}).get("technicalName")
+        action = t.get("actionName")
+        if not (from_name and to_name and action):
+            continue
+        edges.setdefault(from_name, {})[action] = to_name
+    return edges</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function fetchOrderStateEdges(token) {
+  const body = {
+    filter: [{ type: "equals", field: "technicalName", value: "order.state" }],
+    associations: {
+      transitions: { associations: { fromStateMachineState: {}, toStateMachineState: {} } },
+    },
+    limit: 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/state-machine`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on state-machine search`);
+  const payload = await res.json();
+  const machine = payload.data?.[0] || {};
+  const raw = machine.transitions;
+  const transitions = Array.isArray(raw) ? raw : raw?.data || [];
+
+  const edges = {};
+  for (const t of transitions) {
+    const fromName = t.fromStateMachineState?.technicalName;
+    const toName = t.toStateMachineState?.technicalName;
+    const action = t.actionName;
+    if (!fromName || !toName || !action) continue;
+    edges[fromName] = edges[fromName] || {};
+    edges[fromName][action] = toName;
+  }
+  return edges;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>The rule mirrors the corrected <code>StateMachineRegistry</code> exactly: no special case for <code>actionName === 'cancel'</code>. Look up the edges for the from state, get the candidate target for that action name, and require it to equal the actual target. If the from state is not in the map, or the action does not lead to that target, the transition was not legal.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def is_legal_transition(from_state, to_state, action_name, allowed_edges):
+    edges = allowed_edges.get(from_state)
+    if edges is None:
+        return False
+    candidate = edges.get(action_name)
+    return candidate is not None and candidate == to_state</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function isLegalTransition(fromState, toState, actionName, allowedEdges) {
+  const edges = allowedEdges[fromState];
+  if (edges === undefined) return false;
+  const candidate = edges[actionName];
+  return candidate !== undefined && candidate === toState;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Walk state-machine-history and flag illegal cancels</h3>
+      <p>Search <code>state-machine-history</code> filtered to <code>entityName: order</code>, sorted by <code>createdAt</code>, reading <code>entityId</code>, <code>fromStateMachineState.technicalName</code>, <code>toStateMachineState.technicalName</code>, <code>transitionActionName</code>, and <code>createdAt</code>. For each row where the action was <code>cancel</code>, run it through <code>isLegalTransition</code>. A false result means that order was force cancelled outside a real edge.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def fetch_order_cancel_history(token, limit=100):
+    body = {
+        "filter": [
+            {"type": "equals", "field": "entityName", "value": "order"},
+            {"type": "equals", "field": "transitionActionName", "value": "cancel"},
+        ],
+        "associations": {"fromStateMachineState": {}, "toStateMachineState": {}},
+        "sort": [{"field": "createdAt", "order": "ASC"}],
+        "limit": limit,
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/state-machine-history",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def build_audit_record(history_row):
+    from_name = (history_row.get("fromStateMachineState") or {}).get("technicalName")
+    to_name = (history_row.get("toStateMachineState") or {}).get("technicalName")
+    return {
+        "historyId": history_row.get("id"),
+        "orderId": history_row.get("entityId"),
+        "fromState": from_name,
+        "toState": to_name,
+        "transitionActionName": history_row.get("transitionActionName"),
+        "occurredAt": history_row.get("createdAt"),
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function fetchOrderCancelHistory(token, limit = 100) {
+  const body = {
+    filter: [
+      { type: "equals", field: "entityName", value: "order" },
+      { type: "equals", field: "transitionActionName", value: "cancel" },
+    ],
+    associations: { fromStateMachineState: {}, toStateMachineState: {} },
+    sort: [{ field: "createdAt", order: "ASC" }],
+    limit,
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/state-machine-history`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on state-machine-history search`);
+  const data = await res.json();
+  return data.data;
+}
+
+function buildAuditRecord(historyRow) {
+  return {
+    historyId: historyRow.id,
+    orderId: historyRow.entityId,
+    fromState: historyRow.fromStateMachineState?.technicalName,
+    toState: historyRow.toStateMachineState?.technicalName,
+    transitionActionName: historyRow.transitionActionName,
+    occurredAt: historyRow.createdAt,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together as a report-only run</h3>
+      <p>This job never writes anything. It reads the legal edges once, walks every cancel row in history, and prints an audit record for each one that <code>isLegalTransition</code> rejects. <code>DRY_RUN</code> stays on by convention since there is nothing safe to auto-repair, but if you extend this into a preventive guard in front of your own cancel calls, gate the actual transition call behind the same check and return a 409-style report instead of calling the endpoint.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Do not try to reverse a force cancelled order automatically. There is no guaranteed inverse transition, and stock, documents, or payment records may already have reacted. Treat every flagged row as a manual review and finance reconciliation task, and if you build a preventive guard for new cancels, make it reject before ever calling <code>/api/_action/order/{orderId}/state/cancel</code>.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, fetches the real <code>order.state</code> edge graph, walks <code>state-machine-history</code> for cancel actions on orders, and prints an audit record for every one that did not have a legal edge, entirely read-only.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/order-force-cancel-illegal-transition" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">audit_force_cancels.py</div>
+      <pre><code class="language-python">"""Audit Shopware 6 orders that were force cancelled outside a legal
+state machine transition.
+
+StateMachineRegistry::getTransitionDestinationById() historically special-cased
+actionName === 'cancel' and let it through regardless of whether the edge existed
+in the state machine graph (fixed in platform PR #3732, closing issue #3730).
+This script rebuilds the real order.state edge graph, walks state-machine-history
+for every order cancel, and reports the ones that had no legal edge. Read-only,
+report only. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("audit_force_cancels")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "100"))
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def fetch_order_state_edges(token):
+    body = {
+        "filter": [{"type": "equals", "field": "technicalName", "value": "order.state"}],
+        "associations": {
+            "transitions": {"associations": {"fromStateMachineState": {}, "toStateMachineState": {}}}
+        },
+        "limit": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/state-machine",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()["data"]
+    machine = data[0] if data else {}
+    transitions = ((machine.get("transitions") or {}).get("data")) or machine.get("transitions") or []
+    if isinstance(transitions, dict):
+        transitions = transitions.get("data", [])
+
+    edges = {}
+    for t in transitions:
+        from_name = (t.get("fromStateMachineState") or {}).get("technicalName")
+        to_name = (t.get("toStateMachineState") or {}).get("technicalName")
+        action = t.get("actionName")
+        if not (from_name and to_name and action):
+            continue
+        edges.setdefault(from_name, {})[action] = to_name
+    return edges
+
+
+def is_legal_transition(from_state, to_state, action_name, allowed_edges):
+    edges = allowed_edges.get(from_state)
+    if edges is None:
+        return False
+    candidate = edges.get(action_name)
+    return candidate is not None and candidate == to_state
+
+
+def fetch_order_cancel_history(token, limit=100):
+    body = {
+        "filter": [
+            {"type": "equals", "field": "entityName", "value": "order"},
+            {"type": "equals", "field": "transitionActionName", "value": "cancel"},
+        ],
+        "associations": {"fromStateMachineState": {}, "toStateMachineState": {}},
+        "sort": [{"field": "createdAt", "order": "ASC"}],
+        "limit": limit,
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/state-machine-history",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def build_audit_record(history_row):
+    from_name = (history_row.get("fromStateMachineState") or {}).get("technicalName")
+    to_name = (history_row.get("toStateMachineState") or {}).get("technicalName")
+    return {
+        "historyId": history_row.get("id"),
+        "orderId": history_row.get("entityId"),
+        "fromState": from_name,
+        "toState": to_name,
+        "transitionActionName": history_row.get("transitionActionName"),
+        "occurredAt": history_row.get("createdAt"),
+    }
+
+
+def run():
+    token = get_token()
+    allowed_edges = fetch_order_state_edges(token)
+    history = fetch_order_cancel_history(token, HISTORY_LIMIT)
+
+    flagged = 0
+    for row in history:
+        from_name = (row.get("fromStateMachineState") or {}).get("technicalName")
+        to_name = (row.get("toStateMachineState") or {}).get("technicalName")
+        action = row.get("transitionActionName")
+        if is_legal_transition(from_name, to_name, action, allowed_edges):
+            continue
+        record = build_audit_record(row)
+        log.warning("Illegal force cancel: order %s went %s -> %s via '%s' at %s",
+                    record["orderId"], record["fromState"], record["toState"],
+                    record["transitionActionName"], record["occurredAt"])
+        flagged += 1
+
+    log.info("Done. %d order(s) flagged as force cancelled outside a legal transition.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">audit-force-cancels.js</div>
+      <pre><code class="language-javascript">/**
+ * Audit Shopware 6 orders that were force cancelled outside a legal
+ * state machine transition.
+ *
+ * StateMachineRegistry::getTransitionDestinationById() historically special-cased
+ * actionName === 'cancel' and let it through regardless of whether the edge existed
+ * in the state machine graph (fixed in platform PR #3732, closing issue #3730).
+ * This script rebuilds the real order.state edge graph, walks state-machine-history
+ * for every order cancel, and reports the ones that had no legal edge. Read-only,
+ * report only. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/shopware/order-force-cancel-illegal-transition/
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://example.test").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "dummy-client-id";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "dummy-secret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const HISTORY_LIMIT = Number(process.env.HISTORY_LIMIT || 100);
+
+export function isLegalTransition(fromState, toState, actionName, allowedEdges) {
+  const edges = allowedEdges[fromState];
+  if (edges === undefined) return false;
+  const candidate = edges[actionName];
+  return candidate !== undefined && candidate === toState;
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function fetchOrderStateEdges(token) {
+  const body = {
+    filter: [{ type: "equals", field: "technicalName", value: "order.state" }],
+    associations: {
+      transitions: { associations: { fromStateMachineState: {}, toStateMachineState: {} } },
+    },
+    limit: 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/state-machine`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on state-machine search`);
+  const payload = await res.json();
+  const machine = payload.data?.[0] || {};
+  const raw = machine.transitions;
+  const transitions = Array.isArray(raw) ? raw : raw?.data || [];
+
+  const edges = {};
+  for (const t of transitions) {
+    const fromName = t.fromStateMachineState?.technicalName;
+    const toName = t.toStateMachineState?.technicalName;
+    const action = t.actionName;
+    if (!fromName || !toName || !action) continue;
+    edges[fromName] = edges[fromName] || {};
+    edges[fromName][action] = toName;
+  }
+  return edges;
+}
+
+async function fetchOrderCancelHistory(token, limit = 100) {
+  const body = {
+    filter: [
+      { type: "equals", field: "entityName", value: "order" },
+      { type: "equals", field: "transitionActionName", value: "cancel" },
+    ],
+    associations: { fromStateMachineState: {}, toStateMachineState: {} },
+    sort: [{ field: "createdAt", order: "ASC" }],
+    limit,
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/state-machine-history`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on state-machine-history search`);
+  const data = await res.json();
+  return data.data;
+}
+
+export function buildAuditRecord(historyRow) {
+  return {
+    historyId: historyRow.id,
+    orderId: historyRow.entityId,
+    fromState: historyRow.fromStateMachineState?.technicalName,
+    toState: historyRow.toStateMachineState?.technicalName,
+    transitionActionName: historyRow.transitionActionName,
+    occurredAt: historyRow.createdAt,
+  };
+}
+
+export async function run() {
+  const token = await getToken();
+  const allowedEdges = await fetchOrderStateEdges(token);
+  const history = await fetchOrderCancelHistory(token, HISTORY_LIMIT);
+
+  let flagged = 0;
+  for (const row of history) {
+    const fromName = row.fromStateMachineState?.technicalName;
+    const toName = row.toStateMachineState?.technicalName;
+    const action = row.transitionActionName;
+    if (isLegalTransition(fromName, toName, action, allowedEdges)) continue;
+    const record = buildAuditRecord(row);
+    console.warn(`Illegal force cancel: order ${record.orderId} went ${record.fromState} -> ${record.toState} via '${record.transitionActionName}' at ${record.occurredAt}`);
+    flagged++;
+  }
+
+  console.log(`Done. ${flagged} order(s) flagged as force cancelled outside a legal transition.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a historical cancel gets flagged as illegal. Because <code>isLegalTransition</code> is pure and takes the edge graph as a plain argument, the test needs no network and no Shopware store. It just feeds in fixture graphs and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_illegal_cancel.py</div>
+      <pre><code class="language-python">from audit_force_cancels import is_legal_transition
+
+ORDER_STATE_EDGES = {
+    "open": {"process": "in_progress", "cancel": "cancelled"},
+    "in_progress": {"complete": "completed", "cancel": "cancelled"},
+    "cancelled": {"reopen": "open"},
+    "completed": {},
+}
+
+
+def test_legal_cancel_from_open():
+    assert is_legal_transition("open", "cancelled", "cancel", ORDER_STATE_EDGES) is True
+
+
+def test_legal_cancel_from_in_progress():
+    assert is_legal_transition("in_progress", "cancelled", "cancel", ORDER_STATE_EDGES) is True
+
+
+def test_illegal_cancel_from_completed_has_no_edge():
+    assert is_legal_transition("completed", "cancelled", "cancel", ORDER_STATE_EDGES) is False
+
+
+def test_illegal_when_from_state_unknown_to_graph():
+    assert is_legal_transition("made_up_state", "cancelled", "cancel", ORDER_STATE_EDGES) is False
+
+
+def test_illegal_when_action_name_does_not_match_edge():
+    assert is_legal_transition("in_progress", "cancelled", "complete", ORDER_STATE_EDGES) is False
+
+
+def test_illegal_when_candidate_target_differs_from_actual_target():
+    assert is_legal_transition("open", "completed", "cancel", ORDER_STATE_EDGES) is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">illegal-cancel.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isLegalTransition } from "./audit-force-cancels.js";
+
+const ORDER_STATE_EDGES = {
+  open: { process: "in_progress", cancel: "cancelled" },
+  in_progress: { complete: "completed", cancel: "cancelled" },
+  cancelled: { reopen: "open" },
+  completed: {},
+};
+
+test("legal cancel from open", () => {
+  assert.equal(isLegalTransition("open", "cancelled", "cancel", ORDER_STATE_EDGES), true);
+});
+
+test("legal cancel from in_progress", () => {
+  assert.equal(isLegalTransition("in_progress", "cancelled", "cancel", ORDER_STATE_EDGES), true);
+});
+
+test("illegal cancel from completed has no edge", () => {
+  assert.equal(isLegalTransition("completed", "cancelled", "cancel", ORDER_STATE_EDGES), false);
+});
+
+test("illegal when from state unknown to graph", () => {
+  assert.equal(isLegalTransition("made_up_state", "cancelled", "cancel", ORDER_STATE_EDGES), false);
+});
+
+test("illegal when action name does not match edge", () => {
+  assert.equal(isLegalTransition("in_progress", "cancelled", "complete", ORDER_STATE_EDGES), false);
+});
+
+test("illegal when candidate target differs from actual target", () => {
+  assert.equal(isLegalTransition("open", "completed", "cancel", ORDER_STATE_EDGES), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Support tooling</span>
+      <h4>The internal helper that cancelled completed orders</h4>
+      <p>A furniture retailer built a small internal tool so support agents could cancel problem orders in one click. Nobody had checked whether cancel was actually legal from every state, since Shopware never complained. Months later a finance audit found dozens of <code>completed</code> orders sitting as <code>cancelled</code>, with shipped goods and settled payments that no longer matched the order's own status.</p>
+      <p>Running the history audit against the real <code>order.state</code> graph identified every affected order in minutes by matching each one to a cancel row with no legal edge. Finance reconciled each one by hand instead of guessing, and the support tool was rewritten to check <code>isLegalTransition</code> before ever calling cancel.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Retry loop</span>
+      <h4>An integration that cancelled the same order twice</h4>
+      <p>A marketplace sync integration retried a cancel call after a timeout, not realizing the first call had already succeeded. The second call landed on an order already <code>cancelled</code>, which should have been rejected outright, but the hardcoded escape hatch let it through as a no-op that still wrote a fresh history row, muddying the audit trail.</p>
+      <p>Once the platform fix landed, the same retry produced a proper validation failure instead of a phantom second cancel, and the team added the history audit as a weekly job to catch anything from before the upgrade.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After you run this audit, you have a precise list of every order that was force cancelled outside a legal transition, with the exact from state, to state, action name, and timestamp for each one, ready for finance or operations to reconcile by hand. Once you are on a Shopware version with PR #3732, new illegal cancels cannot happen from the platform itself. If you also gate your own cancel calls behind <code>isLegalTransition</code>, nothing in your stack can reintroduce the same corruption going forward.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why could a Shopware 6 order be cancelled even when cancel was not a valid transition?</summary>
+      <p>StateMachineRegistry::getTransitionDestinationById() contained a hardcoded rule to always allow a cancel action, regardless of whether that transition actually existed as an edge from the order's current state in the state machine graph. Calling the cancel transition endpoint on an order in a state like completed, which has no completed to cancelled edge in the default order.state flow, still succeeded and force-set the order to cancelled.</p>
+    </details>
+    <details>
+      <summary>Has Shopware fixed the cancel escape hatch in the state machine?</summary>
+      <p>Yes. Shopware removed the special-cased branch in the platform repository in PR #3732, which closed issue #3730 and was tracked internally as NEXT-23423. After the fix, every transition, including cancel, is validated strictly against the configured state_machine_transition edges for that state machine, so an illegal cancel is rejected instead of silently applied.</p>
+    </details>
+    <details>
+      <summary>Can I safely reverse an order that was force cancelled outside a legal transition?</summary>
+      <p>Not automatically. There is no guaranteed inverse transition back to the order's original state, and stock, documents, or payment records may already have reacted to the cancellation. The safe approach is to detect and report every illegal cancel from state_machine_history for manual review, and to prevent new ones going forward by checking the transition against the legal edge graph before ever calling the cancel endpoint.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/shopware/">Browse all Shopware field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>every order can be canceled, even if not allowed via statemachine transition. GitHub Issue #3730, shopware/shopware. <a href="https://github.com/shopware/shopware/issues/3730" rel="noopener">github.com/shopware/shopware/issues/3730</a></li>
+      <li>fix state-machine transition handling. GitHub PR #3732, shopware/shopware. <a href="https://github.com/shopware/shopware/pull/3732" rel="noopener">github.com/shopware/shopware/pull/3732</a></li>
+      <li>Shopware Developer Documentation: Using the State Machine. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html" rel="noopener">developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Admin API Reference (Stoplight): Order Management. <a href="https://shopware.stoplight.io/docs/admin-api/fdd24cc76f22d-order-management" rel="noopener">shopware.stoplight.io/docs/admin-api/fdd24cc76f22d-order-management</a></li>
+      <li>Shopware Admin API Reference (Stoplight): StateMachine. <a href="https://shopware.stoplight.io/docs/admin-api/4f023ac2306d8-state-machine" rel="noopener">shopware.stoplight.io/docs/admin-api/4f023ac2306d8-state-machine</a></li>
+      <li>Shopware Admin API Reference (Stoplight): StateMachineHistory. <a href="https://shopware.stoplight.io/docs/admin-api/9a2d77ad40c1e-state-machine-history" rel="noopener">shopware.stoplight.io/docs/admin-api/9a2d77ad40c1e-state-machine-history</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware orders, the state machine, stock, or the message queue that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a bad cancel?</h3>
+    <p>If this helped you find orders that were force cancelled outside a legal transition, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>

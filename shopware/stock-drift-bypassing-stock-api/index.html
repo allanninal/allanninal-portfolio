@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shopware 6 Stock and availableStock Drift After Direct Writes Bypass the Stock API</title>
+<meta name="description" content="A bulk import or ERP sync writes product.stock straight into the database and availableStock is never recomputed, so the storefront sells stock that is not really there. Learn why the StockUpdater subscriber never runs and build a Python or Node.js script that finds and repairs the drift with Shopware's own recalculation path.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/stock-drift-bypassing-stock-api/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Shopware 6 Stock and availableStock Drift After Direct Writes Bypass the Stock API">
+<meta property="og:description" content="Why product.stock and availableStock fall out of sync when a write skips the DAL indexing pipeline, and a safe Python or Node.js script that finds and repairs the drift.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/stock-drift-bypassing-stock-api/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/stock-drift-bypassing-stock-api/#article","headline":"Shopware 6 Stock and availableStock Drift After Direct Writes Bypass the Stock API","description":"Shopware 6 stores physical stock in product.stock, but availableStock is only recomputed by the StockUpdater subscriber inside the normal DAL write and indexing pipeline. Bulk imports, ERP syncs, and ad-hoc writes that set stock outside that pipeline leave availableStock stale, and a safe Python or Node.js script finds and repairs the drift by re-triggering Shopware's own recalculation.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/stock-drift-bypassing-stock-api/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory and Stock","keywords":"Shopware 6 availableStock, product stock drift, StockUpdater, ProductIndexer, Stock Manipulation API, AbstractStockStorage, Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Shopware field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Stock and availableStock drift after direct writes bypass the stock API","item":"https://www.allanninal.dev/shopware/stock-drift-bypassing-stock-api/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do product.stock and availableStock fall out of sync in Shopware 6?","acceptedAnswer":{"@type":"Answer","text":"Shopware 6 keeps two separate numbers: product.stock, the physical count, and availableStock, stock minus quantities from all open order line items. The second number is only recomputed by the StockUpdater subscriber inside ProductIndexer, and that only runs when a write touches the stock, isCloseout, or minPurchase fields through the normal DAL write and indexing pipeline. Bulk imports, ERP syncs, or direct database writes that set product.stock outside that pipeline never trigger the recalculation, so availableStock is left holding a stale value from before the write."}},{"@type":"Question","name":"Is it safe to fix drifted availableStock by patching it directly?","acceptedAnswer":{"@type":"Answer","text":"No. availableStock is being moved toward a write-protected, mirrored field as Shopware's Stock Manipulation API matures, so hand-editing it papers over one instance of the gap without fixing the pipeline that will drift it again on the next bypassed write. The safe repair is a no-op PATCH to the stock field itself, which forces Shopware's own StockUpdater and ProductIndexer to recompute availableStock the same way the standard indexing pipeline always would."}},{"@type":"Question","name":"How do I detect availableStock drift without guessing?","acceptedAnswer":{"@type":"Answer","text":"For every non-closeout product, independently sum the quantities of order line items belonging to orders whose state machine technicalName is open, and compute expected availableStock as stock minus that sum, floored at zero. Compare that expected value against the stored availableStock. Any mismatch is drift, and the difference tells you exactly how far off the storefront's sellable quantity really is."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Inventory and Stock</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory and Stock</p>
+    <h1>Stock and availableStock drift after direct writes bypass the stock API</h1>
+    <p class="lead">A bulk import runs, an ERP sync pushes numbers straight into the database, or someone patches product.stock by hand outside the normal admin flow. The physical stock count updates, but the storefront keeps selling from an availableStock number that never moved. Nothing looks broken in the Administration, the product page just quietly oversells or undersells until someone notices the mismatch in a support ticket. Here is why Shopware leaves that second number behind and a small script that finds every drifted product and repairs it the way Shopware's own pipeline would.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Shopware Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Shopware 6 stores physical stock in <code>product.stock</code>, but <code>availableStock</code> (stock minus the quantities held by all open, unfinished order line items) is only recomputed by the <code>StockUpdater</code> subscriber inside <code>ProductIndexer::update</code>, and that recalculation runs only when a write touches the <code>stock</code>, <code>isCloseout</code>, or <code>minPurchase</code> fields through the normal DAL write and indexing pipeline. Bulk imports, ERP syncs, or direct database writes that set <code>product.stock</code> outside that pipeline never call <code>updateAvailableStockAndSales</code>, so <code>availableStock</code> is left holding a stale value. Run a small Python or Node.js script that independently computes the expected <code>availableStock</code> for every non-closeout product by summing open reservations, flags every mismatch, and repairs it by issuing a no-op <code>PATCH</code> to the <code>stock</code> field, which forces Shopware to recompute <code>availableStock</code> through its own indexing pipeline. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every product in Shopware 6 carries two stock numbers that look similar but mean different things. <code>product.stock</code> is the raw physical count, the number a warehouse system cares about. <code>availableStock</code> is what the storefront actually checks before letting someone add an item to the cart, and it equals <code>stock</code> minus whatever quantity is tied up in orders that have not finished yet.</p>
+  <p>Shopware keeps these numbers in sync with a subscriber called <code>StockUpdater</code>, which listens for writes to a product and recalculates <code>availableStock</code> as part of <code>ProductIndexer::update</code>. That subscriber only fires when the write goes through the Data Abstraction Layer and touches one of a small set of fields: <code>stock</code>, <code>isCloseout</code>, or <code>minPurchase</code>. A write that never passes through that pipeline, an import tool that disables indexing for speed, a direct SQL update against the database, or an ERP integration that pushes stock through its own channel, changes <code>product.stock</code> but never tells <code>StockUpdater</code> anything happened. The physical number moves. The number the storefront actually reads does not.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A bulk import or direct database write sets product.stock directly, bypassing the DAL write and indexing pipeline, so the StockUpdater subscriber never runs and availableStock is left stale while the storefront keeps selling from the old number.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="18" width="220" height="54" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="120" y="40" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Bulk import / ERP sync</text>
+      <text x="120" y="58" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#4a5b62">writes product.stock directly</text>
+      <line x1="120" y1="72" x2="120" y2="106" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="108" width="220" height="54" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="120" y="130" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">DAL write pipeline</text>
+      <text x="120" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#4a5b62">bypassed, never entered</text>
+      <line x1="240" y1="80" x2="288" y2="80" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="264" y="60" text-anchor="middle" font-family="sans-serif" font-size="19" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="291" y="45" width="230" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="406" y="70" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">StockUpdater never fires</text>
+      <text x="406" y="88" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">ProductIndexer::update</text>
+      <text x="406" y="103" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">is not triggered</text>
+      <line x1="521" y1="80" x2="563" y2="80" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="566" y="45" width="184" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="658" y="65" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">availableStock stale</text>
+      <text x="658" y="83" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">storefront still sells</text>
+      <text x="658" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">from the old number</text>
+      <text x="406" y="198" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stock moved, but availableStock never caught up</text>
+    </svg>
+    <figcaption>The write changes the physical stock count but never passes through the pipeline that recalculates availableStock, so the storefront keeps trusting an old number.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This comes down to Shopware's dual-field design and how narrowly the recalculation trigger is scoped. A few common ways stores end up here:</p>
+  <ul>
+    <li>A bulk import or ERP integration writes <code>product.stock</code> in bulk, often through a path optimized for speed that disables indexing to avoid the cost of recalculating on every row.</li>
+    <li>A direct database write, whether a one-off SQL script or a migration, sets <code>stock</code> without going through the DAL at all, so no subscriber has any chance to react.</li>
+    <li>The recalculation only triggers when the write payload touches <code>stock</code>, <code>isCloseout</code>, or <code>minPurchase</code>. A write that changes other product fields, even ones related to inventory display, does not trip it.</li>
+    <li>Writes made while the checkout order route context flag suppresses the subscriber, a deliberate performance optimization during checkout, can also skip the recalculation in narrow windows.</li>
+    <li>Shopware's own 2023 Stock Manipulation API ADR explicitly calls out this dual-field design and the expensive, fragile SUM-based recalculation as the reason it introduced <code>AbstractStockStorage::alter()</code> as the single sanctioned mutation path, precisely so ad-hoc writes to stock can no longer silently desync <code>availableStock</code>.</li>
+  </ul>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>availableStock</code> is not a column you should ever hand-edit to match reality. It is a derived value, and the only trustworthy way to fix it is to make Shopware derive it again. Patching <code>availableStock</code> directly papers over one instance of the drift and leaves the next bypassed write free to desync it all over again. Patching <code>stock</code> instead, even with the same value it already has, forces <code>StockUpdater</code> and <code>ProductIndexer</code> to run their normal recalculation, which is the one place Shopware's own logic for counting open reservations lives.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never write to <code>availableStock</code>. The script authenticates, lists every non-closeout product, independently computes what <code>availableStock</code> should be by summing quantities from order line items on still-open orders, and compares that against the stored value. Anything that does not match gets a guarded, no-op <code>PATCH</code> to <code>stock</code>, which re-triggers Shopware's own indexing pipeline, and the script re-reads the product afterward to confirm the repair actually took.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. List non-closeout products, sum open reservations per product to compute expected availableStock, compare against the stored value, and if drifted PATCH the stock field to re-trigger StockUpdater, then re-fetch to confirm, otherwise leave the product alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#06b6d4"></path></marker></defs>
+      <rect x="10" y="20" width="195" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="107" y="44" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">List products</text>
+      <text x="107" y="61" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">isCloseout: false</text>
+      <line x1="107" y1="80" x2="107" y2="106" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="120" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Sum open reservations</text>
+      <text x="120" y="149" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">order-line-item, state: open</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="375" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Compute expected</text>
+      <text x="375" y="149" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">stock minus reserved</text>
+      <line x1="475" y1="138" x2="517" y2="138" stroke="#06b6d4" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="600,106 687,138 600,170 513,138" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="600" y="133" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#0f2830">Drifted from</text>
+      <text x="600" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#0f2830">availableStock?</text>
+      <text x="608" y="198" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">yes, repair it</text>
+      <line x1="600" y1="170" x2="600" y2="205" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">PATCH stock</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">re-fetch to confirm</text>
+      <text x="700" y="128" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">no, leave it</text>
+      <line x1="687" y1="138" x2="720" y2="138" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>The script never patches availableStock. It re-triggers Shopware's own recalculation with a write to stock, then confirms the repair by re-reading the product.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get Admin API credentials</h3>
+      <p>Create an Integration in your Shopware Administration under Settings, System, Integrations. Copy the access key id and secret access key. The script exchanges these for a bearer token at <code>POST /api/oauth/token</code> with a <code>client_credentials</code> grant, so keep them in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://your-shop.example.com"
+export SHOPWARE_CLIENT_ID="SWIAxxx"
+export SHOPWARE_CLIENT_SECRET="your secret access key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://your-shop.example.com"
+export SHOPWARE_CLIENT_ID="SWIAxxx"
+export SHOPWARE_CLIENT_SECRET="your secret access key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and talk to the Admin API</h3>
+      <p>A small helper trades the client id and secret for an access token, then sends it as <code>Authorization: Bearer &lt;token&gt;</code> on every call. We reuse this helper for the product search, the reservation search, and the repair write.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api(method, path, token, json_body=None):
+    r = requests.request(
+        method,
+        f"{SHOPWARE_URL}{path}",
+        json=json_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function api(method, path, token, jsonBody) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: jsonBody ? JSON.stringify(jsonBody) : undefined,
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List every non-closeout product</h3>
+      <p>Search for products where <code>isCloseout</code> is false, reading back <code>id</code>, <code>productNumber</code>, <code>stock</code>, and <code>availableStock</code>. Page with <code>page</code> and <code>limit</code>, and sort by <code>id</code> for a stable order across pages.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def find_stockable_products(token, page=1, limit=500):
+    body = {
+        "page": page,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "isCloseout", "value": False}],
+        "associations": {},
+        "sort": [{"field": "id", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    return api("POST", "/api/search/product", token, body)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function findStockableProducts(token, page = 1, limit = 500) {
+  const body = {
+    page,
+    limit,
+    filter: [{ type: "equals", field: "isCloseout", value: false }],
+    associations: {},
+    sort: [{ field: "id", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  return api("POST", "/api/search/product", token, body);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Sum open reservations for each product</h3>
+      <p>For a given product id, search <code>order-line-item</code> for rows whose <code>productId</code> matches and whose associated <code>order.stateMachineState.technicalName</code> is <code>open</code>, then add up the <code>quantity</code> field. This mirrors exactly what <code>availableStock</code> is supposed to represent: stock minus everything still tied up in an unfinished order.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def sum_open_reserved_quantity(token, product_id):
+    body = {
+        "page": 1,
+        "limit": 500,
+        "filter": [
+            {"type": "equals", "field": "productId", "value": product_id},
+            {"type": "equals", "field": "order.stateMachineState.technicalName", "value": "open"},
+        ],
+        "associations": {"order": {"associations": {"stateMachineState": {}}}},
+        "total-count-mode": 1,
+    }
+    data = api("POST", "/api/search/order-line-item", token, body)
+    return sum(row.get("quantity", 0) for row in data.get("data", []))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function sumOpenReservedQuantity(token, productId) {
+  const body = {
+    page: 1,
+    limit: 500,
+    filter: [
+      { type: "equals", field: "productId", value: productId },
+      { type: "equals", field: "order.stateMachineState.technicalName", value: "open" },
+    ],
+    associations: { order: { associations: { stateMachineState: {} } } },
+    "total-count-mode": 1,
+  };
+  const data = await api("POST", "/api/search/order-line-item", token, body);
+  return (data.data || []).reduce((sum, row) => sum + (row.quantity || 0), 0);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with two pure functions</h3>
+      <p>Keep the decision logic in its own pure functions that take only primitive numbers and a boolean and return an answer. <code>computeExpectedAvailableStock</code> subtracts the open reserved quantity from stock and floors at zero, since availableStock should never go negative. <code>isDrifted</code> compares the stored value against that expectation. Neither function does any I/O, so both are trivial to unit test.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def compute_expected_available_stock(stock, open_reserved_quantity):
+    return max(stock - open_reserved_quantity, 0)
+
+
+def is_drifted(available_stock, expected):
+    return available_stock != expected</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function computeExpectedAvailableStock(stock, openReservedQuantity) {
+  return Math.max(stock - openReservedQuantity, 0);
+}
+
+export function isDrifted(availableStock, expected) {
+  return availableStock !== expected;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Repair by re-triggering Shopware's own recalculation</h3>
+      <p>Do not patch <code>availableStock</code> directly. Instead <code>PATCH /api/product/{id}</code> with <code>{"stock": &lt;same or corrected stock value&gt;}</code>. Even a no-op write to <code>stock</code> forces <code>StockUpdater</code> and <code>ProductIndexer</code> to recompute <code>availableStock</code> through the standard indexing pipeline. Guard the write behind <code>DRY_RUN</code>, and after a real write, re-fetch the product with <code>GET /api/product/{id}</code> to confirm <code>availableStock</code> now equals the independently computed expected value before calling the record reconciled.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair.py</div>
+      <pre><code class="language-python">def repair_stock_drift(token, product_id, current_stock):
+    api("PATCH", f"/api/product/{product_id}", token, {"stock": current_stock})
+    refreshed = api("GET", f"/api/product/{product_id}", token)
+    return refreshed["data"]["availableStock"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair.js</div>
+      <pre><code class="language-javascript">async function repairStockDrift(token, productId, currentStock) {
+  await api("PATCH", `/api/product/${productId}`, token, { stock: currentStock });
+  const refreshed = await api("GET", `/api/product/${productId}`, token);
+  return refreshed.data.availableStock;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, which only logs the intended <code>{productId, currentStock, currentAvailableStock, expectedAvailableStock}</code> pairs. When you switch <code>DRY_RUN</code> to false, the script re-fetches every product it patches and confirms <code>availableStock</code> now matches the expected value before treating it as reconciled, so you never walk away trusting a repair that silently failed.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever writes to <code>stock</code>, never to <code>availableStock</code> directly.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/stock-drift-bypassing-stock-api" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_stock_drift.py</div>
+      <pre><code class="language-python">"""Find and repair Shopware 6 products whose availableStock has drifted from stock.
+
+product.stock is the physical count. availableStock is stock minus quantities from all
+open, unfinished order line items, and it is only recomputed by the StockUpdater
+subscriber inside ProductIndexer::update, which only runs when a write touches the
+stock, isCloseout, or minPurchase fields through the normal DAL write and indexing
+pipeline. Bulk imports, ERP syncs, or direct database writes that set product.stock
+outside that pipeline never trigger the recalculation, so availableStock is left stale.
+
+This script never patches availableStock directly. It independently computes the
+expected value by summing open reservations, flags any mismatch, and repairs it with a
+no-op PATCH to stock, which forces Shopware's own recalculation to run. Run on a
+schedule or on demand. Safe to run again and again.
+"""
+import os
+import json
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_stock_drift")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def api(method, path, token, json_body=None):
+    r = requests.request(
+        method,
+        f"{SHOPWARE_URL}{path}",
+        json=json_body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def find_stockable_products(token, page=1, limit=500):
+    body = {
+        "page": page,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "isCloseout", "value": False}],
+        "associations": {},
+        "sort": [{"field": "id", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    return api("POST", "/api/search/product", token, body)
+
+
+def sum_open_reserved_quantity(token, product_id):
+    body = {
+        "page": 1,
+        "limit": 500,
+        "filter": [
+            {"type": "equals", "field": "productId", "value": product_id},
+            {"type": "equals", "field": "order.stateMachineState.technicalName", "value": "open"},
+        ],
+        "associations": {"order": {"associations": {"stateMachineState": {}}}},
+        "total-count-mode": 1,
+    }
+    data = api("POST", "/api/search/order-line-item", token, body)
+    return sum(row.get("quantity", 0) for row in data.get("data", []))
+
+
+def compute_expected_available_stock(stock, open_reserved_quantity):
+    return max(stock - open_reserved_quantity, 0)
+
+
+def is_drifted(available_stock, expected):
+    return available_stock != expected
+
+
+def repair_stock_drift(token, product_id, current_stock):
+    api("PATCH", f"/api/product/{product_id}", token, {"stock": current_stock})
+    refreshed = api("GET", f"/api/product/{product_id}", token)
+    return refreshed["data"]["availableStock"]
+
+
+def run():
+    token = get_token()
+    reconciled = []
+    page = 1
+
+    while True:
+        data = find_stockable_products(token, page=page)
+        rows = data.get("data", [])
+        if not rows:
+            break
+
+        for product in rows:
+            product_id = product["id"]
+            stock = product.get("stock", 0)
+            available_stock = product.get("availableStock", 0)
+            open_reserved_quantity = sum_open_reserved_quantity(token, product_id)
+            expected = compute_expected_available_stock(stock, open_reserved_quantity)
+
+            if not is_drifted(available_stock, expected):
+                continue
+
+            record = {
+                "productId": product_id,
+                "productNumber": product.get("productNumber"),
+                "currentStock": stock,
+                "currentAvailableStock": available_stock,
+                "expectedAvailableStock": expected,
+            }
+            log.warning(
+                "Product %s drifted. availableStock=%s expected=%s. %s",
+                record["productNumber"], available_stock, expected,
+                "dry run, would PATCH stock" if DRY_RUN else "repairing now",
+            )
+
+            if not DRY_RUN:
+                confirmed_available_stock = repair_stock_drift(token, product_id, stock)
+                record["confirmedAvailableStock"] = confirmed_available_stock
+                if confirmed_available_stock != expected:
+                    log.error(
+                        "Product %s still drifted after repair. got=%s expected=%s",
+                        record["productNumber"], confirmed_available_stock, expected,
+                    )
+
+            reconciled.append(record)
+
+        if page * 500 >= data.get("total", 0):
+            break
+        page += 1
+
+    log.info("Done. %d product(s) %s.", len(reconciled), "flagged" if DRY_RUN else "repaired")
+    print(json.dumps(reconciled, indent=2))
+    return reconciled
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-stock-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and repair Shopware 6 products whose availableStock has drifted from stock.
+ *
+ * product.stock is the physical count. availableStock is stock minus quantities from all
+ * open, unfinished order line items, and it is only recomputed by the StockUpdater
+ * subscriber inside ProductIndexer::update, which only runs when a write touches the
+ * stock, isCloseout, or minPurchase fields through the normal DAL write and indexing
+ * pipeline. Bulk imports, ERP syncs, or direct database writes that set product.stock
+ * outside that pipeline never trigger the recalculation, so availableStock is left stale.
+ *
+ * This script never patches availableStock directly. It independently computes the
+ * expected value by summing open reservations, flags any mismatch, and repairs it with a
+ * no-op PATCH to stock, which forces Shopware's own recalculation to run. Run on a
+ * schedule or on demand. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/shopware/stock-drift-bypassing-stock-api/
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://demo.example.com").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "SWIAxxx";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "secret_dummy";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function computeExpectedAvailableStock(stock, openReservedQuantity) {
+  return Math.max(stock - openReservedQuantity, 0);
+}
+
+export function isDrifted(availableStock, expected) {
+  return availableStock !== expected;
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+    }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function api(method, path, token, jsonBody) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: jsonBody ? JSON.stringify(jsonBody) : undefined,
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function findStockableProducts(token, page = 1, limit = 500) {
+  const body = {
+    page,
+    limit,
+    filter: [{ type: "equals", field: "isCloseout", value: false }],
+    associations: {},
+    sort: [{ field: "id", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  return api("POST", "/api/search/product", token, body);
+}
+
+async function sumOpenReservedQuantity(token, productId) {
+  const body = {
+    page: 1,
+    limit: 500,
+    filter: [
+      { type: "equals", field: "productId", value: productId },
+      { type: "equals", field: "order.stateMachineState.technicalName", value: "open" },
+    ],
+    associations: { order: { associations: { stateMachineState: {} } } },
+    "total-count-mode": 1,
+  };
+  const data = await api("POST", "/api/search/order-line-item", token, body);
+  return (data.data || []).reduce((sum, row) => sum + (row.quantity || 0), 0);
+}
+
+async function repairStockDrift(token, productId, currentStock) {
+  await api("PATCH", `/api/product/${productId}`, token, { stock: currentStock });
+  const refreshed = await api("GET", `/api/product/${productId}`, token);
+  return refreshed.data.availableStock;
+}
+
+export async function run() {
+  const token = await getToken();
+  const reconciled = [];
+  let page = 1;
+
+  while (true) {
+    const data = await findStockableProducts(token, page);
+    const rows = data.data || [];
+    if (rows.length === 0) break;
+
+    for (const product of rows) {
+      const productId = product.id;
+      const stock = product.stock || 0;
+      const availableStock = product.availableStock || 0;
+      const openReservedQuantity = await sumOpenReservedQuantity(token, productId);
+      const expected = computeExpectedAvailableStock(stock, openReservedQuantity);
+
+      if (!isDrifted(availableStock, expected)) continue;
+
+      const record = {
+        productId,
+        productNumber: product.productNumber,
+        currentStock: stock,
+        currentAvailableStock: availableStock,
+        expectedAvailableStock: expected,
+      };
+      console.warn(
+        `Product ${record.productNumber} drifted. availableStock=${availableStock} expected=${expected}. ${DRY_RUN ? "dry run, would PATCH stock" : "repairing now"}`
+      );
+
+      if (!DRY_RUN) {
+        const confirmedAvailableStock = await repairStockDrift(token, productId, stock);
+        record.confirmedAvailableStock = confirmedAvailableStock;
+        if (confirmedAvailableStock !== expected) {
+          console.error(
+            `Product ${record.productNumber} still drifted after repair. got=${confirmedAvailableStock} expected=${expected}`
+          );
+        }
+      }
+
+      reconciled.push(record);
+    }
+
+    if (page * 500 >= (data.total || 0)) break;
+    page++;
+  }
+
+  console.log(`Done. ${reconciled.length} product(s) ${DRY_RUN ? "flagged" : "repaired"}.`);
+  console.log(JSON.stringify(reconciled, null, 2));
+  return reconciled;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a product gets repaired or left alone. Because <code>compute_expected_available_stock</code> and <code>is_drifted</code> are pure, taking only primitive integers and a boolean, the tests need no network and no Shopware instance. They just feed in plain numbers and check the answer, covering the not-drifted case, the drifted case, and the clamp-at-zero case.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_stock_drift.py</div>
+      <pre><code class="language-python">from reconcile_stock_drift import compute_expected_available_stock, is_drifted
+
+
+def test_not_drifted_when_available_stock_matches_expected():
+    expected = compute_expected_available_stock(100, 30)
+    assert expected == 70
+    assert is_drifted(70, expected) is False
+
+
+def test_drifted_when_available_stock_does_not_match_expected():
+    expected = compute_expected_available_stock(100, 45)
+    assert expected == 55
+    assert is_drifted(70, expected) is True
+
+
+def test_expected_clamps_at_zero_when_reserved_exceeds_stock():
+    expected = compute_expected_available_stock(0, 10)
+    assert expected == 0
+    assert is_drifted(0, expected) is False
+
+
+def test_expected_clamps_at_zero_with_positive_stock_but_larger_reservation():
+    expected = compute_expected_available_stock(5, 20)
+    assert expected == 0
+
+
+def test_no_reservations_means_expected_equals_stock():
+    assert compute_expected_available_stock(42, 0) == 42
+
+
+def test_is_drifted_true_when_available_stock_is_negative_but_expected_is_clamped():
+    expected = compute_expected_available_stock(0, 10)
+    assert is_drifted(-5, expected) is True</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">stock-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { computeExpectedAvailableStock, isDrifted } from "./reconcile-stock-drift.js";
+
+test("not drifted when availableStock matches expected", () =&gt; {
+  const expected = computeExpectedAvailableStock(100, 30);
+  assert.equal(expected, 70);
+  assert.equal(isDrifted(70, expected), false);
+});
+
+test("drifted when availableStock does not match expected", () =&gt; {
+  const expected = computeExpectedAvailableStock(100, 45);
+  assert.equal(expected, 55);
+  assert.equal(isDrifted(70, expected), true);
+});
+
+test("expected clamps at zero when reserved exceeds stock", () =&gt; {
+  const expected = computeExpectedAvailableStock(0, 10);
+  assert.equal(expected, 0);
+  assert.equal(isDrifted(0, expected), false);
+});
+
+test("expected clamps at zero with positive stock but larger reservation", () =&gt; {
+  assert.equal(computeExpectedAvailableStock(5, 20), 0);
+});
+
+test("no reservations means expected equals stock", () =&gt; {
+  assert.equal(computeExpectedAvailableStock(42, 0), 42);
+});
+
+test("is drifted true when availableStock is negative but expected is clamped", () =&gt; {
+  const expected = computeExpectedAvailableStock(0, 10);
+  assert.equal(isDrifted(-5, expected), true);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">ERP sync</span>
+      <h4>An overnight ERP push oversold a bestseller</h4>
+      <p>A furniture retailer synced warehouse counts from their ERP into Shopware every night through a bulk endpoint that wrote <code>stock</code> directly and skipped indexing to keep the run fast. The physical count updated correctly every time, but <code>availableStock</code> quietly fell behind whenever open orders changed between syncs. A popular chair sold out in the warehouse while the storefront still showed forty available, and a dozen orders came in for stock that no longer existed.</p>
+      <p>Running the reconciler nightly right after the ERP sync found the drifted products in minutes and repaired each one with a no-op patch to <code>stock</code>, forcing Shopware to recompute <code>availableStock</code> against the orders that had actually accumulated. Overselling on that bestseller stopped the same week.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Migration cleanup</span>
+      <h4>A one-off SQL fix left stock quietly wrong for months</h4>
+      <p>During a data cleanup after a platform migration, an engineer ran a direct SQL update to correct a batch of incorrect stock counts, reasoning it was a quick, safe fix since it only touched one column. The physical numbers were correct from that day forward, but <code>availableStock</code> on every one of those products stayed frozen at its pre-migration value, because the update never touched the DAL and <code>StockUpdater</code> never ran.</p>
+      <p>Months later, the reconciler's detection pass flagged the entire batch at once, each one showing the exact gap between the corrected physical stock and the stale <code>availableStock</code> left over from before the migration. A single dry run made the scope of the problem obvious, and the repair pass cleared all of it in one script run.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, any bypassed write, whether from a bulk import, an ERP sync, or a one-off SQL fix, gets caught before it can quietly oversell or undersell a product. The script never touches <code>availableStock</code> directly, it only nudges <code>stock</code> to make Shopware run its own recalculation, and it confirms the repair actually landed before calling a product reconciled. Inventory numbers on the storefront stay honest without anyone having to remember which import tools are safe.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do product.stock and availableStock fall out of sync in Shopware 6?</summary>
+      <p>Shopware 6 keeps two separate numbers: product.stock, the physical count, and availableStock, stock minus quantities from all open order line items. The second number is only recomputed by the StockUpdater subscriber inside ProductIndexer, and that only runs when a write touches the stock, isCloseout, or minPurchase fields through the normal DAL write and indexing pipeline. Bulk imports, ERP syncs, or direct database writes that set product.stock outside that pipeline never trigger the recalculation, so availableStock is left holding a stale value from before the write.</p>
+    </details>
+    <details>
+      <summary>Is it safe to fix drifted availableStock by patching it directly?</summary>
+      <p>No. availableStock is being moved toward a write-protected, mirrored field as Shopware's Stock Manipulation API matures, so hand-editing it papers over one instance of the gap without fixing the pipeline that will drift it again on the next bypassed write. The safe repair is a no-op PATCH to the stock field itself, which forces Shopware's own StockUpdater and ProductIndexer to recompute availableStock the same way the standard indexing pipeline always would.</p>
+    </details>
+    <details>
+      <summary>How do I detect availableStock drift without guessing?</summary>
+      <p>For every non-closeout product, independently sum the quantities of order line items belonging to orders whose state machine technicalName is open, and compute expected availableStock as stock minus that sum, floored at zero. Compare that expected value against the stored availableStock. Any mismatch is drift, and the difference tells you exactly how far off the storefront's sellable quantity really is.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopware/">Browse all Shopware field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Shopware Developer Documentation: Available stock improvements (ADR). <a href="https://developer.shopware.com/docs/resources/references/adr/2022-03-25-available-stock.html" rel="noopener">developer.shopware.com available-stock ADR</a></li>
+      <li>Shopware GitHub Discussions: Stock storage refactoring. <a href="https://github.com/shopware/shopware/discussions/3172" rel="noopener">github.com/shopware/shopware/discussions/3172</a></li>
+      <li>Shopware GitHub Issues: Product availableStock doesn't update. <a href="https://github.com/shopware/shopware/issues/3449" rel="noopener">github.com/shopware/shopware/issues/3449</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Developer Documentation: Stock Manipulation API (ADR). <a href="https://developer.shopware.com/docs/resources/references/adr/2023-05-15-stock-api.html" rel="noopener">developer.shopware.com stock-api ADR</a></li>
+      <li>Shopware Developer Documentation: Reading and Writing Stock. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/content/stock/reading-writing-stock.html" rel="noopener">developer.shopware.com reading-writing-stock</a></li>
+      <li>Shopware Developer Documentation: Stock Configuration. <a href="https://developer.shopware.com/docs/guides/hosting/configurations/shopware/stock.html" rel="noopener">developer.shopware.com stock configuration</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware order states, stock, message queue, or data integrity that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a drifted product?</h3>
+    <p>If this saved you from an oversold bestseller or a support ticket about phantom stock, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware 6.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>
