@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Charged Amount Stays Stale After a Manual Capture in Saleor</title>
+<meta name="description" content="A manual capture succeeds at the gateway, but Saleor's totalCharged and chargeStatus keep showing the pre-capture state because nothing reported a CHARGE_SUCCESS event yet. Learn why the ledger goes stale and build a Python or Node.js script that reconciles it safely.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/charged-amount-stale-after-manual-capture/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Charged Amount Stays Stale After a Manual Capture in Saleor">
+<meta property="og:description" content="Why Saleor's totalCharged never updates until an app reports a CHARGE_SUCCESS event, and a safe Python or Node.js script that reconciles the stale transactions against the gateway.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/charged-amount-stale-after-manual-capture/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/charged-amount-stale-after-manual-capture/#article","headline":"Charged Amount Stays Stale After a Manual Capture in Saleor","description":"Why Saleor's Order.totalCharged and TransactionItem.chargedAmount never update after a manual gateway capture until an app calls transactionEventReport with a CHARGE_SUCCESS event, and a safe Python or Node.js script that reconciles the stale transactions against the gateway before reporting anything.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/charged-amount-stale-after-manual-capture/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments & Transactions","keywords":"Saleor totalCharged, chargedAmount stale, manual capture, transactionEventReport, TransactionItem, pspReference, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Charged amount stays stale after manual capture","item":"https://www.allanninal.dev/saleor/charged-amount-stale-after-manual-capture/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Saleor still show the old charged amount after I captured the payment at the gateway?","acceptedAnswer":{"@type":"Answer","text":"Saleor's payments model is not a state machine that polls the gateway. Order.totalCharged and TransactionItem.chargedAmount are derived fields recalculated only from the TransactionEvent records attached to a TransactionItem. A manual capture made directly at the gateway produces no such event until an app reports it back with transactionEventReport or transactionUpdate, so the order keeps reflecting the pre-capture state even though the money has already moved."}},{"@type":"Question","name":"What is chargePendingAmount and why does it stay nonzero?","acceptedAnswer":{"@type":"Answer","text":"chargePendingAmount tracks money Saleor expects to be captured but has not yet confirmed with a CHARGE_SUCCESS or CHARGE_FAILURE event. If a manual or asynchronous capture is only reported back later, or never reported at all, that pending balance sits open indefinitely because nothing in Saleor recalculates it on its own."}},{"@type":"Question","name":"Is it safe to auto-report a CHARGE_SUCCESS event when I find a mismatch?","acceptedAnswer":{"@type":"Answer","text":"Only when the gateway confirms a successful capture that Saleor has no matching event for, and the amount direction is unambiguous. transactionEventReport is idempotent by pspReference, type, and amount, so re-reporting a real success is safe. If the gateway shows less than Saleor recorded, or a failed or reversed capture, do not report a synthetic success. Flag that order for manual finance review instead."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Payments &amp; Transactions</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Payments &amp; Transactions</p>
+    <h1>Charged amount stays stale after manual capture</h1>
+    <p class="lead">A merchant or an app captures a payment straight at the gateway, or fires off a transactionRequestAction, and the money moves. But the gateway's confirmation only comes back asynchronously, so Saleor never gets a chance to update its own books. Order.totalCharged and the transaction's chargedAmount keep sitting at the pre-capture number, chargePendingAmount stays open, and the order looks unpaid even though the customer's card was already charged. Here is why Saleor's ledger goes stale and a script that finds the mismatches against the gateway and reports the true state back, safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Report-first, human sign-off required</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Saleor's payments model is not a state machine that watches the gateway. <code>Order.totalCharged</code> and <code>TransactionItem.chargedAmount</code> are derived fields, recalculated only from the ledger of <code>TransactionEvent</code> records attached to a <code>TransactionItem</code>, never read live from the payment provider. When a manual capture happens directly at the gateway, or through <code>transactionRequestAction</code>, but the result only comes back asynchronously, Saleor has nothing to recalculate from until an app explicitly calls <code>transactionEventReport</code> (or <code>transactionUpdate</code>) with a <code>CHARGE_SUCCESS</code> event and the gateway's <code>pspReference</code>. Until that call lands, <code>chargePendingAmount</code> stays open and the order's <code>totalCharged</code> and <code>chargeStatus</code> keep reflecting the pre-capture state. Run a small Python or Node.js script that pages through orders and transactions, cross-checks each one against the gateway by <code>pspReference</code>, and reports every confirmed capture Saleor does not know about yet, safely and idempotently. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Saleor never asks the payment gateway "did this actually go through." It only knows what it has been told. Every number that matters on an order, <code>totalCharged</code>, <code>totalAuthorized</code>, <code>chargeStatus</code>, is computed by summing up the <code>TransactionEvent</code> records that an app or webhook has reported against a <code>TransactionItem</code>. If no event says the charge succeeded, Saleor has no reason to believe it did, no matter what actually happened at the gateway.</p>
+  <p>A manual capture breaks that assumption in a very ordinary way. Someone, a merchant, a support agent, or an app, triggers a capture directly against the gateway, or fires a <code>transactionRequestAction</code> mutation that asks the app to go capture it. The gateway accepts the request and starts processing, but its confirmation comes back later, asynchronously, on its own webhook or polling schedule. Until the app receives that confirmation and turns around and reports it to Saleor with <code>transactionEventReport</code>, nothing changes on the Saleor side. The money has moved. Saleor's books have not.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A manual capture is sent to the gateway and succeeds, but the confirmation only arrives asynchronously. Until an app calls transactionEventReport with a CHARGE_SUCCESS event, Saleor's TransactionItem and Order totals never recalculate, so chargePendingAmount stays open and totalCharged stays stale.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="72" width="170" height="62" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="95" y="98" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Manual capture</text>
+      <text x="95" y="115" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">sent to the gateway</text>
+      <line x1="183" y1="103" x2="223" y2="103" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="226" y="72" width="170" height="62" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="311" y="98" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Gateway succeeds</text>
+      <text x="311" y="115" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">confirms later, async</text>
+      <line x1="409" y1="103" x2="450" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="429" y="60" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="429" y="130" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">no CHARGE_SUCCESS yet</text>
+      <rect x="453" y="72" width="150" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">chargePendingAmount</text>
+      <text x="528" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">stays open</text>
+      <rect x="628" y="72" width="122" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">totalCharged</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">stays stale</text>
+      <line x1="606" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="475" y="170" font-family="sans-serif" font-size="11" fill="#55603f">Fix: an app must call</text>
+      <text x="475" y="188" font-family="sans-serif" font-size="11" font-weight="700" fill="#1e2611">transactionEventReport(CHARGE_SUCCESS)</text>
+      <text x="475" y="206" font-family="sans-serif" font-size="11" fill="#55603f">before Saleor's ledger will move</text>
+    </svg>
+    <figcaption>The gateway already moved the money, but Saleor's totalCharged only recalculates from reported TransactionEvent records, so it stays stuck at the pre-capture state until an app reports back.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Saleor's transactions model was built around apps reporting events, not around Saleor watching gateways. That design is deliberate, since Saleor supports many payment providers with very different APIs, but it creates a real gap in a few common situations:</p>
+  <ul>
+    <li>A merchant or support agent captures the charge directly in the payment provider's own dashboard, bypassing the Saleor app entirely, so nothing ever calls back into Saleor at all.</li>
+    <li>An app calls <code>transactionRequestAction</code> to ask for a capture, the gateway accepts and processes it, but the app's webhook handler for the confirmation is slow, fails silently, or the redelivery never arrives.</li>
+    <li>The gateway's own settlement is asynchronous by design, batch captures or delayed card network settlement, so there can be a real gap of minutes to hours between "money moved" and "gateway is ready to confirm it."</li>
+    <li>An app crashes, redeploys, or hits a rate limit right after triggering the capture and before it gets to call <code>transactionEventReport</code>, losing the one action that would have updated Saleor.</li>
+  </ul>
+  <p>In every case, Saleor is behaving exactly as designed. It has no event to recalculate from, so it does not change the numbers. The mismatch only becomes visible when someone cross-checks the order against the gateway directly and finds money that Saleor's ledger does not know about yet. See the citations at the end for the exact docs this behavior comes from.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Saleor will never poll a gateway on its own. If a capture happened outside the normal event flow, the only way to fix the ledger is to explicitly tell Saleor about it with <code>transactionEventReport</code>. That call is idempotent by <code>pspReference</code>, <code>type</code>, and <code>amount</code>, so reporting a real success is always safe to retry. What is not safe is guessing. If the gateway and Saleor disagree in a way that is not a clean "gateway succeeded, Saleor missed it," the right move is to flag the order for a human, not to write a number that might be wrong.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout or the capture flow itself. We add a job that lists candidate orders and their transactions, looks up each transaction's authoritative state at the gateway by <code>pspReference</code>, and only when the gateway confirms a success Saleor has not recorded reports it back with <code>transactionEventReport</code>. Anything ambiguous gets flagged for finance instead of guessed at.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists orders and transactions, looks up each pspReference at the gateway, and classifies the result. A confirmed success with no matching Saleor event gets reported with transactionEventReport. Anything ambiguous is flagged for manual review instead.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">List orders and</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">their transactions</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Look up pspReference</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">at the gateway</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">Gateway confirms,</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">no event yet?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="585" y="198" font-family="sans-serif" font-size="10.5" fill="#8a9a92" font-weight="700">ambiguous, flag it</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">transactionEventReport</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55603f">ledger catches up</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only reports a success when the gateway is unambiguous and Saleor has no matching event. Anything else, including a mismatch in the wrong direction, is flagged for a human instead.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token and set the environment</h3>
+      <p>Create an app in Saleor Dashboard with permission to manage orders and payments, or use a staff JWT from <code>tokenCreate</code>. Keep the API URL and token in environment variables, and keep <code>DRY_RUN</code> on until you have reviewed the report.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="..."
+export GATEWAY_API_URL="https://gateway.example.com/v1"
+export GATEWAY_API_KEY="..."
+export STALE_MINUTES="15"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="..."
+export GATEWAY_API_URL="https://gateway.example.com/v1"
+export GATEWAY_API_KEY="..."
+export STALE_MINUTES="15"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Everything is one endpoint, one header. A small helper sends a query or mutation and returns the data, and raises if Saleor reports an error. We reuse this for reading orders and for the report mutation.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List candidate orders and their transactions</h3>
+      <p>Pull orders with their totals, charge status, and every <code>TransactionItem</code> underneath, including the pending and charged amounts and the events already recorded. We page through with a cursor so a large store is not a problem.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number chargeStatus isPaid
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        transactions {
+          id pspReference
+          chargedAmount { amount currency }
+          chargePendingAmount { amount currency }
+          authorizedAmount { amount currency }
+          events { type pspReference createdAt }
+        }
+      }
+    }
+  }
+}"""
+
+def candidate_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"cursor": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDERS_QUERY = `
+query($cursor: String) {
+  orders(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number chargeStatus isPaid
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        transactions {
+          id pspReference
+          chargedAmount { amount currency }
+          chargePendingAmount { amount currency }
+          authorizedAmount { amount currency }
+          events { type pspReference createdAt }
+        }
+      }
+    }
+  }
+}`;
+
+async function* candidateOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Look up the authoritative state at the gateway</h3>
+      <p>For each transaction with a nonzero <code>chargePendingAmount</code>, call the gateway's own capture lookup API by <code>pspReference</code>. This is the one call that actually knows whether the money moved, since Saleor never asks this question on its own.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">gateway.py</div>
+      <pre><code class="language-python">GATEWAY_API_URL = os.environ.get("GATEWAY_API_URL", "")
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "")
+
+def fetch_gateway_capture(psp_reference):
+    r = requests.get(
+        f"{GATEWAY_API_URL}/charges/{psp_reference}",
+        headers={"Authorization": f"Bearer {GATEWAY_API_KEY}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    return {
+        "pspReference": psp_reference,
+        "capturedAmount": body["capturedAmount"],
+        "status": body["status"],  # "succeeded" | "failed" | "pending"
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">gateway.js</div>
+      <pre><code class="language-javascript">const GATEWAY_API_URL = process.env.GATEWAY_API_URL || "";
+const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || "";
+
+async function fetchGatewayCapture(pspReference) {
+  const res = await fetch(`${GATEWAY_API_URL}/charges/${pspReference}`, {
+    headers: { Authorization: `Bearer ${GATEWAY_API_KEY}` },
+  });
+  if (!res.ok) throw new Error(`Gateway ${res.status}`);
+  const body = await res.json();
+  return {
+    pspReference,
+    capturedAmount: body.capturedAmount,
+    status: body.status, // "succeeded" | "failed" | "pending"
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the reconciliation decision in its own function that takes the Saleor transaction and the gateway's capture and returns one of four outcomes. It never calls the network itself, which makes it trivial to test with plain objects. If the gateway is still pending there is nothing to reconcile yet. If it succeeded and Saleor has no matching event, we either need to report a success or, if Saleor already shows more charged than the gateway confirms, flag it instead of trusting a report. If the gateway failed and Saleor still shows an open pending amount, we need to report the failure so the ledger stops waiting on money that is never coming.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">classify.py</div>
+      <pre><code class="language-python">def classify_charge_reconciliation(saleor_txn, gateway_capture):
+    status = gateway_capture["status"]
+
+    if status == "pending":
+        return "IN_SYNC"
+
+    if status == "succeeded":
+        has_matching_success = any(
+            e.get("type") == "CHARGE_SUCCESS" and e.get("pspReference") == gateway_capture["pspReference"]
+            for e in saleor_txn.get("events", [])
+        )
+        if not has_matching_success:
+            if saleor_txn["chargedAmount"] < gateway_capture["capturedAmount"]:
+                return "NEEDS_REPORT_SUCCESS"
+            if saleor_txn["chargedAmount"] > gateway_capture["capturedAmount"]:
+                return "AMOUNT_MISMATCH_FLAG"
+        return "IN_SYNC"
+
+    if status == "failed" and saleor_txn.get("chargePendingAmount", 0) > 0:
+        return "NEEDS_REPORT_FAILURE"
+
+    return "IN_SYNC"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify.js</div>
+      <pre><code class="language-javascript">export function classifyChargeReconciliation(saleorTxn, gatewayCapture) {
+  const { status, pspReference, capturedAmount } = gatewayCapture;
+
+  if (status === "pending") return "IN_SYNC";
+
+  if (status === "succeeded") {
+    const hasMatchingSuccess = (saleorTxn.events || []).some(
+      (e) => e.type === "CHARGE_SUCCESS" && e.pspReference === pspReference
+    );
+    if (!hasMatchingSuccess) {
+      if (saleorTxn.chargedAmount < capturedAmount) return "NEEDS_REPORT_SUCCESS";
+      if (saleorTxn.chargedAmount > capturedAmount) return "AMOUNT_MISMATCH_FLAG";
+    }
+    return "IN_SYNC";
+  }
+
+  if (status === "failed" && (saleorTxn.chargePendingAmount || 0) > 0) {
+    return "NEEDS_REPORT_FAILURE";
+  }
+
+  return "IN_SYNC";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report the confirmed success or failure back to Saleor</h3>
+      <p>When the decision is <code>NEEDS_REPORT_SUCCESS</code> or <code>NEEDS_REPORT_FAILURE</code>, call <code>transactionEventReport</code> with the gateway's own amount and <code>pspReference</code>. Saleor dedupes on <code>(id, type, pspReference, amount)</code>, so calling it again with the same values is a no-op reported back as <code>alreadyReported</code>. <code>AMOUNT_MISMATCH_FLAG</code> is never auto-written. It is only ever logged for finance to look at by hand.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">report.py</div>
+      <pre><code class="language-python">REPORT_MUTATION = """
+mutation TransactionEventReport($id: ID!, $type: TransactionEventTypeEnum!, $amount: PositiveDecimal!, $pspReference: String!, $availableActions: [TransactionActionEnum!]) {
+  transactionEventReport(id: $id, type: $type, amount: $amount, pspReference: $pspReference, availableActions: $availableActions) {
+    alreadyReported
+    transaction { id chargedAmount { amount } }
+    errors { field message code }
+  }
+}"""
+
+def report_event(transaction_id, event_type, amount, psp_reference, available_actions=None):
+    result = gql(REPORT_MUTATION, {
+        "id": transaction_id,
+        "type": event_type,
+        "amount": amount,
+        "pspReference": psp_reference,
+        "availableActions": available_actions or [],
+    })["transactionEventReport"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">report.js</div>
+      <pre><code class="language-javascript">const REPORT_MUTATION = `
+mutation TransactionEventReport($id: ID!, $type: TransactionEventTypeEnum!, $amount: PositiveDecimal!, $pspReference: String!, $availableActions: [TransactionActionEnum!]) {
+  transactionEventReport(id: $id, type: $type, amount: $amount, pspReference: $pspReference, availableActions: $availableActions) {
+    alreadyReported
+    transaction { id chargedAmount { amount } }
+    errors { field message code }
+  }
+}`;
+
+async function reportEvent(transactionId, eventType, amount, pspReference, availableActions = []) {
+  const result = (await gql(REPORT_MUTATION, {
+    id: transactionId,
+    type: eventType,
+    amount,
+    pspReference,
+    availableActions,
+  })).transactionEventReport;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. The script should only ever report a <code>CHARGE_SUCCESS</code> or <code>CHARGE_FAILURE</code> event when the gateway's status is unambiguous. Any <code>AMOUNT_MISMATCH_FLAG</code> result goes straight to a report for finance, never to a write.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and is safe to run again and again because <code>transactionEventReport</code> is idempotent by <code>pspReference</code>, <code>type</code>, and <code>amount</code>.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/charged-amount-stale-after-manual-capture" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_charged_amount.py</div>
+      <pre><code class="language-python">"""Reconcile Saleor orders whose charged amount stays stale after a manual capture.
+
+Saleor's totalCharged and TransactionItem.chargedAmount only recalculate from
+reported TransactionEvent records, never live from the gateway. A manual capture
+made outside the normal event flow leaves chargePendingAmount open until an app
+reports it back. This script cross-checks stalled transactions against the
+gateway by pspReference and reports the confirmed state back with
+transactionEventReport. Ambiguous mismatches are flagged for finance, never
+auto-written. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_charged_amount")
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+GATEWAY_API_URL = os.environ.get("GATEWAY_API_URL", "")
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number chargeStatus isPaid
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        transactions {
+          id pspReference
+          chargedAmount { amount currency }
+          chargePendingAmount { amount currency }
+          authorizedAmount { amount currency }
+          events { type pspReference createdAt }
+        }
+      }
+    }
+  }
+}"""
+
+REPORT_MUTATION = """
+mutation TransactionEventReport($id: ID!, $type: TransactionEventTypeEnum!, $amount: PositiveDecimal!, $pspReference: String!, $availableActions: [TransactionActionEnum!]) {
+  transactionEventReport(id: $id, type: $type, amount: $amount, pspReference: $pspReference, availableActions: $availableActions) {
+    alreadyReported
+    transaction { id chargedAmount { amount } }
+    errors { field message code }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def fetch_gateway_capture(psp_reference):
+    r = requests.get(
+        f"{GATEWAY_API_URL}/charges/{psp_reference}",
+        headers={"Authorization": f"Bearer {GATEWAY_API_KEY}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    return {
+        "pspReference": psp_reference,
+        "capturedAmount": body["capturedAmount"],
+        "status": body["status"],
+    }
+
+
+def classify_charge_reconciliation(saleor_txn, gateway_capture):
+    status = gateway_capture["status"]
+
+    if status == "pending":
+        return "IN_SYNC"
+
+    if status == "succeeded":
+        has_matching_success = any(
+            e.get("type") == "CHARGE_SUCCESS" and e.get("pspReference") == gateway_capture["pspReference"]
+            for e in saleor_txn.get("events", [])
+        )
+        if not has_matching_success:
+            if saleor_txn["chargedAmount"] < gateway_capture["capturedAmount"]:
+                return "NEEDS_REPORT_SUCCESS"
+            if saleor_txn["chargedAmount"] > gateway_capture["capturedAmount"]:
+                return "AMOUNT_MISMATCH_FLAG"
+        return "IN_SYNC"
+
+    if status == "failed" and saleor_txn.get("chargePendingAmount", 0) > 0:
+        return "NEEDS_REPORT_FAILURE"
+
+    return "IN_SYNC"
+
+
+def report_event(transaction_id, event_type, amount, psp_reference):
+    result = gql(REPORT_MUTATION, {
+        "id": transaction_id,
+        "type": event_type,
+        "amount": amount,
+        "pspReference": psp_reference,
+        "availableActions": [],
+    })["transactionEventReport"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result
+
+
+def candidate_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"cursor": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def run():
+    reported = 0
+    flagged = 0
+    for order in candidate_orders():
+        for txn in order.get("transactions", []):
+            psp_reference = txn.get("pspReference")
+            pending = (txn.get("chargePendingAmount") or {}).get("amount", 0)
+            if not psp_reference or not pending:
+                continue
+
+            saleor_txn = {
+                "chargedAmount": (txn.get("chargedAmount") or {}).get("amount", 0),
+                "chargePendingAmount": pending,
+                "events": txn.get("events", []),
+            }
+            gateway_capture = fetch_gateway_capture(psp_reference)
+            decision = classify_charge_reconciliation(saleor_txn, gateway_capture)
+
+            if decision == "NEEDS_REPORT_SUCCESS":
+                log.info("Order %s txn %s: gateway confirms capture. %s",
+                          order["number"], txn["id"], "would report" if DRY_RUN else "reporting")
+                if not DRY_RUN:
+                    report_event(txn["id"], "CHARGE_SUCCESS", gateway_capture["capturedAmount"], psp_reference)
+                reported += 1
+            elif decision == "NEEDS_REPORT_FAILURE":
+                log.info("Order %s txn %s: gateway confirms failure. %s",
+                          order["number"], txn["id"], "would report" if DRY_RUN else "reporting")
+                if not DRY_RUN:
+                    report_event(txn["id"], "CHARGE_FAILURE", pending, psp_reference)
+                reported += 1
+            elif decision == "AMOUNT_MISMATCH_FLAG":
+                log.warning("Order %s txn %s: amount mismatch, flagged for finance review.",
+                            order["number"], txn["id"])
+                flagged += 1
+
+    log.info("Done. %d event(s) %s, %d flagged for review.",
+              reported, "to report" if DRY_RUN else "reported", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-charged-amount.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile Saleor orders whose charged amount stays stale after a manual capture.
+ *
+ * Saleor's totalCharged and TransactionItem.chargedAmount only recalculate from
+ * reported TransactionEvent records, never live from the gateway. A manual capture
+ * made outside the normal event flow leaves chargePendingAmount open until an app
+ * reports it back. This script cross-checks stalled transactions against the
+ * gateway by pspReference and reports the confirmed state back with
+ * transactionEventReport. Ambiguous mismatches are flagged for finance, never
+ * auto-written. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/charged-amount-stale-after-manual-capture/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const GATEWAY_API_URL = process.env.GATEWAY_API_URL || "https://gateway.example.com/v1";
+const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY || "dummy-key";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function classifyChargeReconciliation(saleorTxn, gatewayCapture) {
+  const { status, pspReference, capturedAmount } = gatewayCapture;
+
+  if (status === "pending") return "IN_SYNC";
+
+  if (status === "succeeded") {
+    const hasMatchingSuccess = (saleorTxn.events || []).some(
+      (e) => e.type === "CHARGE_SUCCESS" && e.pspReference === pspReference
+    );
+    if (!hasMatchingSuccess) {
+      if (saleorTxn.chargedAmount < capturedAmount) return "NEEDS_REPORT_SUCCESS";
+      if (saleorTxn.chargedAmount > capturedAmount) return "AMOUNT_MISMATCH_FLAG";
+    }
+    return "IN_SYNC";
+  }
+
+  if (status === "failed" && (saleorTxn.chargePendingAmount || 0) > 0) {
+    return "NEEDS_REPORT_FAILURE";
+  }
+
+  return "IN_SYNC";
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+async function fetchGatewayCapture(pspReference) {
+  const res = await fetch(`${GATEWAY_API_URL}/charges/${pspReference}`, {
+    headers: { Authorization: `Bearer ${GATEWAY_API_KEY}` },
+  });
+  if (!res.ok) throw new Error(`Gateway ${res.status}`);
+  const body = await res.json();
+  return { pspReference, capturedAmount: body.capturedAmount, status: body.status };
+}
+
+const ORDERS_QUERY = `
+query($cursor: String) {
+  orders(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number chargeStatus isPaid
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        transactions {
+          id pspReference
+          chargedAmount { amount currency }
+          chargePendingAmount { amount currency }
+          authorizedAmount { amount currency }
+          events { type pspReference createdAt }
+        }
+      }
+    }
+  }
+}`;
+
+const REPORT_MUTATION = `
+mutation TransactionEventReport($id: ID!, $type: TransactionEventTypeEnum!, $amount: PositiveDecimal!, $pspReference: String!, $availableActions: [TransactionActionEnum!]) {
+  transactionEventReport(id: $id, type: $type, amount: $amount, pspReference: $pspReference, availableActions: $availableActions) {
+    alreadyReported
+    transaction { id chargedAmount { amount } }
+    errors { field message code }
+  }
+}`;
+
+async function* candidateOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function reportEvent(transactionId, eventType, amount, pspReference) {
+  const result = (await gql(REPORT_MUTATION, {
+    id: transactionId,
+    type: eventType,
+    amount,
+    pspReference,
+    availableActions: [],
+  })).transactionEventReport;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result;
+}
+
+export async function run() {
+  let reported = 0;
+  let flagged = 0;
+  for await (const order of candidateOrders()) {
+    for (const txn of order.transactions || []) {
+      const pspReference = txn.pspReference;
+      const pending = txn.chargePendingAmount?.amount || 0;
+      if (!pspReference || !pending) continue;
+
+      const saleorTxn = {
+        chargedAmount: txn.chargedAmount?.amount || 0,
+        chargePendingAmount: pending,
+        events: txn.events || [],
+      };
+      const gatewayCapture = await fetchGatewayCapture(pspReference);
+      const decision = classifyChargeReconciliation(saleorTxn, gatewayCapture);
+
+      if (decision === "NEEDS_REPORT_SUCCESS") {
+        console.log(`Order ${order.number} txn ${txn.id}: gateway confirms capture. ${DRY_RUN ? "would report" : "reporting"}`);
+        if (!DRY_RUN) await reportEvent(txn.id, "CHARGE_SUCCESS", gatewayCapture.capturedAmount, pspReference);
+        reported++;
+      } else if (decision === "NEEDS_REPORT_FAILURE") {
+        console.log(`Order ${order.number} txn ${txn.id}: gateway confirms failure. ${DRY_RUN ? "would report" : "reporting"}`);
+        if (!DRY_RUN) await reportEvent(txn.id, "CHARGE_FAILURE", pending, pspReference);
+        reported++;
+      } else if (decision === "AMOUNT_MISMATCH_FLAG") {
+        console.warn(`Order ${order.number} txn ${txn.id}: amount mismatch, flagged for finance review.`);
+        flagged++;
+      }
+    }
+  }
+  console.log(`Done. ${reported} event(s) ${DRY_RUN ? "to report" : "reported"}, ${flagged} flagged for review.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classifier is the part most worth testing, because it decides whether Saleor's ledger gets written to or an order gets flagged for a human. Because <code>classify_charge_reconciliation</code> is pure, no network or Saleor account is needed. It just takes plain objects and checks the decision.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_charged_reconciliation.py</div>
+      <pre><code class="language-python">from reconcile_charged_amount import classify_charge_reconciliation
+
+
+def saleor_txn(**over):
+    base = {"chargedAmount": 0, "chargePendingAmount": 100, "events": []}
+    base.update(over)
+    return base
+
+
+def gateway(**over):
+    base = {"pspReference": "psp_1", "capturedAmount": 100, "status": "succeeded"}
+    base.update(over)
+    return base
+
+
+def test_pending_gateway_is_in_sync():
+    assert classify_charge_reconciliation(saleor_txn(), gateway(status="pending")) == "IN_SYNC"
+
+
+def test_succeeded_with_no_matching_event_needs_report_success():
+    assert classify_charge_reconciliation(saleor_txn(chargedAmount=0), gateway()) == "NEEDS_REPORT_SUCCESS"
+
+
+def test_succeeded_with_matching_event_is_in_sync():
+    txn = saleor_txn(chargedAmount=100, events=[{"type": "CHARGE_SUCCESS", "pspReference": "psp_1"}])
+    assert classify_charge_reconciliation(txn, gateway()) == "IN_SYNC"
+
+
+def test_saleor_over_reports_flags_mismatch():
+    txn = saleor_txn(chargedAmount=150, events=[])
+    assert classify_charge_reconciliation(txn, gateway()) == "AMOUNT_MISMATCH_FLAG"
+
+
+def test_failed_gateway_with_open_pending_needs_report_failure():
+    txn = saleor_txn(chargePendingAmount=100)
+    assert classify_charge_reconciliation(txn, gateway(status="failed")) == "NEEDS_REPORT_FAILURE"
+
+
+def test_failed_gateway_with_no_pending_is_in_sync():
+    txn = saleor_txn(chargePendingAmount=0)
+    assert classify_charge_reconciliation(txn, gateway(status="failed")) == "IN_SYNC"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyChargeReconciliation } from "./reconcile-charged-amount.js";
+
+const saleorTxn = (over = {}) =&gt; ({ chargedAmount: 0, chargePendingAmount: 100, events: [], ...over });
+const gateway = (over = {}) =&gt; ({ pspReference: "psp_1", capturedAmount: 100, status: "succeeded", ...over });
+
+test("pending gateway is in sync", () =&gt; {
+  assert.equal(classifyChargeReconciliation(saleorTxn(), gateway({ status: "pending" })), "IN_SYNC");
+});
+
+test("succeeded with no matching event needs report success", () =&gt; {
+  assert.equal(classifyChargeReconciliation(saleorTxn({ chargedAmount: 0 }), gateway()), "NEEDS_REPORT_SUCCESS");
+});
+
+test("succeeded with matching event is in sync", () =&gt; {
+  const txn = saleorTxn({ chargedAmount: 100, events: [{ type: "CHARGE_SUCCESS", pspReference: "psp_1" }] });
+  assert.equal(classifyChargeReconciliation(txn, gateway()), "IN_SYNC");
+});
+
+test("saleor over-reports flags mismatch", () =&gt; {
+  const txn = saleorTxn({ chargedAmount: 150, events: [] });
+  assert.equal(classifyChargeReconciliation(txn, gateway()), "AMOUNT_MISMATCH_FLAG");
+});
+
+test("failed gateway with open pending needs report failure", () =&gt; {
+  const txn = saleorTxn({ chargePendingAmount: 100 });
+  assert.equal(classifyChargeReconciliation(txn, gateway({ status: "failed" })), "NEEDS_REPORT_FAILURE");
+});
+
+test("failed gateway with no pending is in sync", () =&gt; {
+  const txn = saleorTxn({ chargePendingAmount: 0 });
+  assert.equal(classifyChargeReconciliation(txn, gateway({ status: "failed" })), "IN_SYNC");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Manual dashboard capture</span>
+      <h4>The support agent who captured straight at the gateway</h4>
+      <p>A support agent needed to release a held order fast, so they logged into the payment gateway's dashboard directly and captured the authorization by hand, skipping the Saleor app entirely. The order kept showing <code>chargeStatus: NONE</code> and an open <code>chargePendingAmount</code> for two days, and the warehouse would not ship because the order still looked unpaid.</p>
+      <p>Running the reconciliation job found the transaction's <code>pspReference</code>, looked it up at the gateway, confirmed a clean <code>succeeded</code> capture with no matching <code>CHARGE_SUCCESS</code> event in Saleor, and reported it. <code>totalCharged</code> updated immediately and the order was released for fulfillment the same day.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Webhook that never arrived</span>
+      <h4>An app crash between the request and the report</h4>
+      <p>An app called <code>transactionRequestAction</code> to trigger a capture, the gateway processed it successfully, but the app's worker crashed before it could call <code>transactionEventReport</code> with the result. The webhook redelivery queue on the gateway side had already exhausted its retries by the time anyone noticed, so nothing was ever going to call Saleor back.</p>
+      <p>The nightly reconciliation run caught nine transactions in that exact state, all with a confirmed gateway success and a stale Saleor record. All nine were unambiguous, so the script reported them and the ledger caught up without anyone touching a dashboard.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a manual capture stops being an invisible gap between the gateway and Saleor's ledger. Every stale transaction gets checked against the authority that actually knows what happened, and <code>totalCharged</code> catches up on its own for the clean cases. Anything that does not resolve cleanly, an amount that runs the wrong direction, a reversed or ambiguous capture, goes to a human instead of getting written on a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Saleor still show the old charged amount after I captured the payment at the gateway?</summary>
+      <p>Saleor's payments model is not a state machine that polls the gateway. Order.totalCharged and TransactionItem.chargedAmount are derived fields recalculated only from the TransactionEvent records attached to a TransactionItem. A manual capture made directly at the gateway produces no such event until an app reports it back with transactionEventReport or transactionUpdate, so the order keeps reflecting the pre-capture state even though the money has already moved.</p>
+    </details>
+    <details>
+      <summary>What is chargePendingAmount and why does it stay nonzero?</summary>
+      <p>chargePendingAmount tracks money Saleor expects to be captured but has not yet confirmed with a CHARGE_SUCCESS or CHARGE_FAILURE event. If a manual or asynchronous capture is only reported back later, or never reported at all, that pending balance sits open indefinitely because nothing in Saleor recalculates it on its own.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-report a CHARGE_SUCCESS event when I find a mismatch?</summary>
+      <p>Only when the gateway confirms a successful capture that Saleor has no matching event for, and the amount direction is unambiguous. transactionEventReport is idempotent by pspReference, type, and amount, so re-reporting a real success is safe. If the gateway shows less than Saleor recorded, or a failed or reversed capture, do not report a synthetic success. Flag that order for manual finance review instead.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Saleor Commerce Documentation: transactions and how chargedAmount is derived. <a href="https://docs.saleor.io/developer/payments/transactions" rel="noopener">docs.saleor.io/developer/payments/transactions</a></li>
+      <li>Saleor Commerce Documentation: the payments lifecycle. <a href="https://docs.saleor.io/developer/payments/lifecycle" rel="noopener">docs.saleor.io/developer/payments/lifecycle</a></li>
+      <li>Saleor Commerce Documentation: payment events (legacy). <a href="https://docs.saleor.io/developer/extending/webhooks/synchronous-events/payment" rel="noopener">docs.saleor.io/developer/extending/webhooks/synchronous-events/payment</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor API Reference: the TransactionItem object. <a href="https://docs.saleor.io/api-reference/payments/objects/transaction-item" rel="noopener">docs.saleor.io/api-reference/payments/objects/transaction-item</a></li>
+      <li>Saleor Commerce Documentation: transaction events (transactionEventReport). <a href="https://docs.saleor.io/developer/extending/webhooks/synchronous-events/transaction" rel="noopener">docs.saleor.io/developer/extending/webhooks/synchronous-events/transaction</a></li>
+      <li>Saleor API Reference: the Order object. <a href="https://docs.saleor.io/api-reference/orders/objects/order" rel="noopener">docs.saleor.io/api-reference/orders/objects/order</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, payments, stock, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a stale ledger for you?</h3>
+    <p>If this saved your team from a stuck fulfillment or an untrustworthy revenue report, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>

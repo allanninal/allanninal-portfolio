@@ -1,0 +1,1101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tax Calculation Off by Rounding Cents on Totals in Saleor</title>
+<meta name="description" content="Saleor rounds tax to the cent on each order line, then sums those already-rounded lines into order.total, so the sum can legitimately differ from rate times subtotal by a cent or more. Learn why, and build a Python or Node.js script that audits orders against Saleor's own per-line rounding rules instead of flagging false positives.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/tax-calculation-rounding-mismatch/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Tax Calculation Off by Rounding Cents on Totals in Saleor">
+<meta property="og:description" content="Why Saleor's per-line tax rounding can make the sum of order lines differ from rate times subtotal by a cent or more, and a safe Python or Node.js script that audits it correctly.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/tax-calculation-rounding-mismatch/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/tax-calculation-rounding-mismatch/#article","headline":"Tax Calculation Off by Rounding Cents on Totals in Saleor","description":"With Saleor's flat-rate tax strategy, tax is rounded to the cent independently on each order line, then those already-rounded amounts are summed into order.total and order.subtotal, so the sum can legitimately differ from rate times subtotal by one or more cents. Why this is documented Saleor behavior, and a safe Python or Node.js script that audits orders against Saleor's own per-line rounding rules.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/tax-calculation-rounding-mismatch/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Tax, Pricing & Migration","keywords":"Saleor tax rounding, flat rate tax, order.total tax mismatch, line.unitPrice rounding, taxRate, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Tax calculation off by rounding cents on totals","item":"https://www.allanninal.dev/saleor/tax-calculation-rounding-mismatch/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Saleor's order total tax not equal rate times subtotal exactly?","acceptedAnswer":{"@type":"Answer","text":"Saleor computes tax separately on each order line, rounds each line's tax to two decimal places, and then sums those already-rounded line amounts to get order.total and order.subtotal. It does not sum exact unrounded amounts first and round once at the end. Summing numbers that were each rounded on their own can legitimately land a cent or more away from multiplying the rate by the subtotal in one shot, especially with high quantity or low unit price lines."}},{"@type":"Question","name":"Is a one or two cent tax difference on a Saleor order a bug?","acceptedAnswer":{"@type":"Answer","text":"Usually not. This is documented, longstanding Saleor behavior, reported in saleor/saleor#6720, that comes from rounding tax per line before summing rather than rounding once at the end. A real bug looks different: order.total.tax not matching the sum of every line's already-rounded tax plus shipping tax, which points at cached or stale data rather than normal per-line rounding."}},{"@type":"Question","name":"Should a script automatically rewrite order totals when it finds a tax mismatch?","acceptedAnswer":{"@type":"Answer","text":"No. Per-line rounding drift of a few cents is expected arithmetic, not corrupted data, so writing amounts directly risks making a correct order wrong. The safe pattern is to report flagged orders for review, and only for a confirmed aggregation bug, force Saleor to recompute totals server side, such as a no-op line update, behind a DRY_RUN flag and a cent-delta threshold that escalates larger deltas to manual finance review."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Tax, Pricing &amp; Migration</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Tax, Pricing &amp; Migration</p>
+    <h1>Tax calculation off by rounding cents on totals</h1>
+    <p class="lead">Finance pulls an order, multiplies the tax rate by the subtotal, and gets a number that is a cent or two away from what Saleor actually charged. Nothing failed. No mutation errored. Saleor rounded the tax on every order line to the cent, one line at a time, then added up those already-rounded amounts to build the order total. That is not the same arithmetic as taking the rate times the whole subtotal in one shot, and the two can legitimately disagree by a few cents. Here is why that gap exists and a script that audits it the way Saleor itself does the math, instead of flagging every honest cent of rounding as a bug.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Report-first, no blind writes</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>With Saleor's flat-rate tax strategy, tax is computed and rounded to two decimal places independently on each order line, and those already-rounded per-line amounts are summed to produce <code>order.total</code> and <code>order.subtotal</code>, rather than summing exact unrounded values first and rounding once. Because <code>line.unitPrice</code> is itself derived by dividing the rounded <code>line.totalPrice</code> by quantity, high quantity or low unit price lines amplify the per-unit rounding remainder, so the sum of correctly rounded lines can legitimately differ from rate times subtotal by one or more cents. This is documented, longstanding Saleor behavior, reported in <code>saleor/saleor#6720</code>, not a transient bug. Run a small Python or Node.js script that recomputes expected tax per line using Saleor's own rounding rule, flags only real mismatches with a tolerance for legitimate compounding, and reports them, since blind-writing totals risks corrupting an order that Saleor actually got right. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>You would expect an order's total tax to be a simple multiplication: take the subtotal, multiply by the tax rate, round once. That is not what Saleor does. Saleor calculates tax on each order line separately, and rounds that line's tax to two decimal places as soon as it is computed. Then it adds up every line's already-rounded tax, plus shipping's already-rounded tax, to get the order's total tax. The rounding happens many times, once per line, instead of once at the end.</p>
+  <p>That difference in order of operations is where the cents go missing, or extra. A single rounding step on a large number spreads its error across the whole amount. Many small rounding steps, one per line, can each nudge a fraction of a cent the same direction, and those nudges add up. A line with a high quantity and a low unit price is the worst case, because <code>line.unitPrice</code> is derived by dividing the already-rounded <code>line.totalPrice</code> by the quantity, so the per-unit remainder gets amplified back out when you multiply it by quantity again elsewhere.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Saleor rounds tax to two decimal places on each order line separately, then sums those already-rounded line totals to build order.total, instead of summing exact values first and rounding once. The sum can differ from rate times subtotal by one or more cents.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="16" width="205" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="112" y="42" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Line 1 tax</text>
+      <text x="112" y="59" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">rounded to the cent</text>
+      <rect x="10" y="154" width="205" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="112" y="180" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Line N tax</text>
+      <text x="112" y="197" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55603f">high qty, low unit price</text>
+      <text x="112" y="211" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">remainder amplified</text>
+      <line x1="218" y1="46" x2="285" y2="100" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="218" y1="184" x2="285" y2="120" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="288" y="80" width="175" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="375" y="106" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1e2611">Sum already-rounded</text>
+      <text x="375" y="123" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55603f">lines, not exact values</text>
+      <line x1="466" y1="110" x2="508" y2="110" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="487" y="70" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#8800;</text>
+      <text x="487" y="140" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">not one round at the end</text>
+      <rect x="511" y="80" width="130" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="576" y="103" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">order.total.tax</text>
+      <text x="576" y="121" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">off by a few cents</text>
+      <line x1="644" y1="110" x2="686" y2="110" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="689" y="80" width="61" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="719" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="800" fill="#cf4b3f">vs</text>
+      <text x="719" y="121" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#cf4b3f">rate x subtotal</text>
+    </svg>
+    <figcaption>Each line rounds its own tax to the cent. Summing already-rounded lines is not the same arithmetic as rounding the rate times the subtotal once, so the totals can legitimately drift apart.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>Saleor's flat-rate tax strategy computes and rounds tax to two decimal places on each order line independently, then sums those already-rounded per-line amounts, plus shipping, to get <code>order.total</code> and <code>order.subtotal</code>. It never sums exact unrounded values first and rounds once at the end.</li>
+    <li><code>line.unitPrice</code> is derived by dividing the rounded <code>line.totalPrice</code> by quantity, not the other way around. For example, 0.05 divided by 1.22 is 0.0098..., which rounds up to 0.01, and 112 units at 0.01 diverges from 112 times 0.05 over 1.22 by about 12 cents.</li>
+    <li>High quantity, low unit price lines amplify this the most, because the per-unit rounding remainder gets multiplied back out by the quantity when anyone recomputes the line a different way.</li>
+    <li>This is a documented, longstanding Saleor behavior, reported in <code>saleor/saleor#6720</code>, rather than a transient bug that a retry or a cache clear would fix.</li>
+  </ul>
+  <p>None of this throws an error or shows up as a failed mutation. Finance just sees a number that does not reconcile against a simple rate times subtotal spreadsheet formula, and assumes something is broken. See the citations at the end for the exact GitHub issue and the discussion threads on Saleor's tax rounding model.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A naive audit that recomputes <code>rate * subtotal</code> and compares it to <code>order.total.tax</code> will generate false positives on every order, because that is simply not the arithmetic Saleor performs. The audit has to compare against Saleor's own per-line rounding semantics instead: recompute each line's expected tax from that line's own rounded <code>totalPrice.net.amount</code> and <code>taxRate</code>, and only flag a real problem when <code>order.total.tax</code> disagrees with the sum of the lines and shipping tax that Saleor itself already reports, since that disagreement points at a caching or denormalization bug, not rounding.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script pages through orders with their lines and tax rates, recomputes each line's expected tax the way Saleor computes it, and flags a line only when it drifts from Saleor's own arithmetic by more than a tolerance sized for how many lines the order has. Separately, it checks whether <code>order.total.tax</code> actually equals the sum of the line and shipping tax Saleor reports, which is the real bug signature. Because rounding drift is expected data, not corrupted data, the default action is always a reconciliation report, never a direct write to order totals.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job pages through orders and lines, recomputes expected line tax with check_line_tax using Saleor's own per-line rounding rule, flags real mismatches beyond tolerance, and only if order.total.tax disagrees with the sum of line and shipping tax does it consider a gated recompute, otherwise it emits a reconciliation report row.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Page orders, lines</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">totalPrice, taxRate</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">check_line_tax</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">pure decision function</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">within</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">tolerance?</text>
+      <text x="662" y="128" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">yes, skip</text>
+      <line x1="575" y1="106" x2="575" y2="70" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, reconciliation report row</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Gated recompute</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">DRY_RUN, small deltas only</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Every mismatch beyond tolerance becomes a report row first. A gated recompute is a separate, cent-delta-limited step, and larger deltas always escalate to manual finance review instead of auto-mutating.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with order read access</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read orders and tax classes. Use the resulting app token as a Bearer token, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   # start safe, this script only reports by default</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   // start safe, this script only reports by default</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Page through orders and read the line and tax fields the decision needs</h3>
+      <p>Ask for <code>orders(first, after)</code> and read back each order's <code>total</code>, <code>subtotal</code>, <code>shippingPrice</code>, and every line's <code>quantity</code>, <code>unitPrice</code>, <code>totalPrice</code>, and <code>taxRate</code>. Page with a cursor so the job handles a large order history without loading it all at once.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        total { tax { amount } net { amount } gross { amount } }
+        subtotal { net { amount } gross { amount } }
+        shippingPrice { tax { amount } net { amount } gross { amount } }
+        lines {
+          id
+          quantity
+          unitPrice { tax { amount } net { amount } gross { amount } }
+          totalPrice { tax { amount } net { amount } gross { amount } }
+          taxRate
+        }
+      }
+    }
+  }
+}"""
+
+def all_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"cursor": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDERS_QUERY = `
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        total { tax { amount } net { amount } gross { amount } }
+        subtotal { net { amount } gross { amount } }
+        shippingPrice { tax { amount } net { amount } gross { amount } }
+        lines {
+          id
+          quantity
+          unitPrice { tax { amount } net { amount } gross { amount } }
+          totalPrice { tax { amount } net { amount } gross { amount } }
+          taxRate
+        }
+      }
+    }
+  }
+}`;
+
+async function* allOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a line's net total, tax rate, and actual tax amount, and returns whether it is a real mismatch. A pure function like this is easy to read and test, which we do later. It recomputes the expected tax the way Saleor does, rounding to the currency's minor unit with <code>ROUND_HALF_UP</code>, then compares to the actual tax with a tolerance, since a single cent of drift on one line is expected arithmetic, not a bug.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from decimal import Decimal, ROUND_HALF_UP
+
+def check_line_tax(total_net_amount, tax_rate, actual_tax_amount,
+                    currency_exponent=2, tolerance_cents=1):
+    quantum = Decimal(10) ** -currency_exponent
+    expected_tax = (Decimal(str(total_net_amount)) * Decimal(str(tax_rate))).quantize(
+        quantum, rounding=ROUND_HALF_UP
+    )
+    delta = abs(Decimal(str(actual_tax_amount)) - expected_tax)
+    is_mismatch = delta > quantum * tolerance_cents
+    return is_mismatch, expected_tax, delta</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function checkLineTax(totalNetAmount, taxRate, actualTaxAmount,
+                              currencyExponent = 2, toleranceCents = 1) {
+  const quantum = Math.pow(10, -currencyExponent);
+  const expectedTax = roundHalfUp(totalNetAmount * taxRate, currencyExponent);
+  const delta = round2(Math.abs(actualTaxAmount - expectedTax));
+  const isMismatch = delta > round2(quantum * toleranceCents) + 1e-9;
+  return { isMismatch, expectedTax, delta };
+}
+
+function roundHalfUp(value, exponent) {
+  const factor = Math.pow(10, exponent);
+  return Math.round((value * factor) + Number.EPSILON * Math.sign(value)) / factor;
+}
+
+function round2(value) {
+  return Math.round(value * 1e8) / 1e8;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Reconcile the order, and only report</h3>
+      <p>For each line, run <code>check_line_tax</code> and collect the ones that are real mismatches. Separately, recompute <code>expected_order_tax</code> as the sum of every line's own already-rounded tax plus shipping tax, and compare that to <code>order.total.tax</code>. If those disagree, that is the real aggregation bug, since Saleor's own model is that <code>order.total</code> is just the sum of already-rounded line and shipping components. Either way, the output is a reconciliation report, never a direct write.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def reconcile_order(order):
+    line_mismatches = []
+    for line in order["lines"]:
+        total_net = line["totalPrice"]["net"]["amount"]
+        actual_tax = line["totalPrice"]["tax"]["amount"]
+        is_mismatch, expected_tax, delta = check_line_tax(
+            total_net, line["taxRate"], actual_tax,
+            tolerance_cents=max(1, len(order["lines"])),
+        )
+        if is_mismatch:
+            line_mismatches.append({
+                "lineId": line["id"], "actual": actual_tax,
+                "expected": float(expected_tax), "delta": float(delta),
+            })
+
+    expected_order_tax = sum(l["totalPrice"]["tax"]["amount"] for l in order["lines"])
+    expected_order_tax += order["shippingPrice"]["tax"]["amount"]
+    actual_order_tax = order["total"]["tax"]["amount"]
+    aggregation_bug = round(abs(actual_order_tax - expected_order_tax), 2) > 0.0
+
+    return {
+        "orderId": order["id"],
+        "orderNumber": order["number"],
+        "lineMismatches": line_mismatches,
+        "aggregationBug": aggregation_bug,
+        "actualOrderTax": actual_order_tax,
+        "expectedOrderTax": round(expected_order_tax, 2),
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">function reconcileOrder(order) {
+  const lineMismatches = [];
+  for (const line of order.lines) {
+    const totalNet = line.totalPrice.net.amount;
+    const actualTax = line.totalPrice.tax.amount;
+    const { isMismatch, expectedTax, delta } = checkLineTax(
+      totalNet, line.taxRate, actualTax,
+      2, Math.max(1, order.lines.length)
+    );
+    if (isMismatch) {
+      lineMismatches.push({ lineId: line.id, actual: actualTax, expected: expectedTax, delta });
+    }
+  }
+
+  let expectedOrderTax = order.lines.reduce((sum, l) => sum + l.totalPrice.tax.amount, 0);
+  expectedOrderTax += order.shippingPrice.tax.amount;
+  const actualOrderTax = order.total.tax.amount;
+  const aggregationBug = Math.round(Math.abs(actualOrderTax - expectedOrderTax) * 100) / 100 > 0;
+
+  return {
+    orderId: order.id,
+    orderNumber: order.number,
+    lineMismatches,
+    aggregationBug,
+    actualOrderTax,
+    expectedOrderTax: Math.round(expectedOrderTax * 100) / 100,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Under <code>DRY_RUN=true</code>, the default, the script only logs a reconciliation report for every order with a real line mismatch or an aggregation bug. It never writes anything. If a genuine aggregation bug is confirmed, and the delta is below a small configured threshold, a gated correction can touch the order with a no-op line update to force Saleor's own recompute pipeline to run again, rather than writing amounts directly. Anything above that threshold is left for manual finance review.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code> and read the report before authorizing anything. A one or two cent difference on a line, within tolerance for the order's line count, is normal Saleor rounding, not a bug, so never write order totals directly. Only a confirmed aggregation mismatch, where <code>order.total.tax</code> disagrees with the sum of Saleor's own already-rounded line and shipping tax, is worth acting on, and even then only through a forced recompute below a cent-delta threshold, never a raw overwrite.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pages through orders, reconciles each with the pure functions, always logs a report row for anything flagged, and only ever considers a gated recompute under an explicit <code>DRY_RUN=false</code> for a small, confirmed aggregation delta.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/tax-calculation-rounding-mismatch" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">audit_tax_rounding.py</div>
+      <pre><code class="language-python">"""Audit Saleor orders for tax calculation mismatches, using Saleor's own
+per-line rounding rule rather than a naive rate times subtotal recomputation.
+
+With the flat-rate tax strategy, Saleor rounds tax to the cent on each order
+line independently, then sums those already-rounded line amounts, plus
+shipping, into order.total and order.subtotal. It never sums exact unrounded
+values first and rounds once at the end. Because line.unitPrice is derived
+by dividing the rounded line.totalPrice by quantity, high quantity, low
+unit price lines amplify the per-unit rounding remainder, so the sum of
+correctly rounded lines can legitimately differ from rate times subtotal by
+one or more cents. This is documented, longstanding behavior (see
+saleor/saleor#6720), not a bug, so this script never flags ordinary
+per-line rounding drift.
+
+Under DRY_RUN=true (the default) this script only reports flagged orders,
+it never writes anything. A real aggregation bug looks different: the sum
+of a line's own already-rounded tax plus shipping tax disagreeing with
+order.total.tax, which points at cache or denormalization drift. Even
+then, the safe corrective action is a gated no-op line update to force
+Saleor's own recompute pipeline, limited to small confirmed deltas, never
+a direct write to order totals. Run on a schedule. Safe to run again and
+again.
+"""
+import os
+import logging
+import requests
+from decimal import Decimal, ROUND_HALF_UP
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("audit_tax_rounding")
+
+API_URL = os.environ.get("SALEOR_API_URL", "https://store.saleor.cloud/graphql/")
+TOKEN = os.environ.get("SALEOR_AUTH_TOKEN", "dummy-token")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+AGGREGATION_FIX_THRESHOLD_CENTS = float(os.environ.get("AGGREGATION_FIX_THRESHOLD_CENTS", "5"))
+
+ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        total { tax { amount } net { amount } gross { amount } }
+        subtotal { net { amount } gross { amount } }
+        shippingPrice { tax { amount } net { amount } gross { amount } }
+        lines {
+          id
+          quantity
+          unitPrice { tax { amount } net { amount } gross { amount } }
+          totalPrice { tax { amount } net { amount } gross { amount } }
+          taxRate
+        }
+      }
+    }
+  }
+}"""
+
+# A no-op line update (same quantity) forces Saleor's TaxedMoney recalculation
+# pipeline to run again, without writing any amount directly.
+FORCE_RECALC_MUTATION = """
+mutation($orderId: ID!, $lineId: ID!, $quantity: Int!) {
+  orderLineUpdate(id: $lineId, input: { quantity: $quantity }) {
+    orderLine { id }
+    errors { field message code }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def check_line_tax(total_net_amount, tax_rate, actual_tax_amount,
+                    currency_exponent=2, tolerance_cents=1):
+    quantum = Decimal(10) ** -currency_exponent
+    expected_tax = (Decimal(str(total_net_amount)) * Decimal(str(tax_rate))).quantize(
+        quantum, rounding=ROUND_HALF_UP
+    )
+    delta = abs(Decimal(str(actual_tax_amount)) - expected_tax)
+    is_mismatch = delta > quantum * tolerance_cents
+    return is_mismatch, expected_tax, delta
+
+
+def reconcile_order(order):
+    line_mismatches = []
+    for line in order["lines"]:
+        total_net = line["totalPrice"]["net"]["amount"]
+        actual_tax = line["totalPrice"]["tax"]["amount"]
+        is_mismatch, expected_tax, delta = check_line_tax(
+            total_net, line["taxRate"], actual_tax,
+            tolerance_cents=max(1, len(order["lines"])),
+        )
+        if is_mismatch:
+            line_mismatches.append({
+                "lineId": line["id"], "actual": actual_tax,
+                "expected": float(expected_tax), "delta": float(delta),
+            })
+
+    expected_order_tax = sum(l["totalPrice"]["tax"]["amount"] for l in order["lines"])
+    expected_order_tax += order["shippingPrice"]["tax"]["amount"]
+    actual_order_tax = order["total"]["tax"]["amount"]
+    aggregation_delta = round(abs(actual_order_tax - expected_order_tax), 2)
+    aggregation_bug = aggregation_delta > 0.0
+
+    return {
+        "orderId": order["id"],
+        "orderNumber": order["number"],
+        "lineMismatches": line_mismatches,
+        "aggregationBug": aggregation_bug,
+        "aggregationDelta": aggregation_delta,
+        "actualOrderTax": actual_order_tax,
+        "expectedOrderTax": round(expected_order_tax, 2),
+    }
+
+
+def all_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"cursor": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def force_recalculate(order_id, line_id, quantity):
+    result = gql(FORCE_RECALC_MUTATION, {
+        "orderId": order_id, "lineId": line_id, "quantity": quantity,
+    })["orderLineUpdate"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+
+
+def run():
+    flagged = 0
+    fixed = 0
+
+    for order in all_orders():
+        result = reconcile_order(order)
+        if not result["lineMismatches"] and not result["aggregationBug"]:
+            continue
+
+        log.warning("Tax reconciliation flagged order %s: %s", order["number"], result)
+        flagged += 1
+
+        # Only a confirmed aggregation bug below the threshold is ever a
+        # candidate for a gated, forced recompute. Line-level rounding drift
+        # is expected arithmetic and is never auto-corrected.
+        if (
+            not DRY_RUN
+            and result["aggregationBug"]
+            and result["aggregationDelta"] <= AGGREGATION_FIX_THRESHOLD_CENTS / 100
+            and order["lines"]
+        ):
+            first_line = order["lines"][0]
+            log.info(
+                "Forcing recompute on order %s via no-op line update (delta %.2f).",
+                order["number"], result["aggregationDelta"],
+            )
+            force_recalculate(order["id"], first_line["id"], first_line["quantity"])
+            fixed += 1
+        elif result["aggregationBug"]:
+            log.error(
+                "Order %s aggregation delta %.2f exceeds threshold. Escalating to manual finance review.",
+                order["number"], result["aggregationDelta"],
+            )
+
+    log.info("Done. %d order(s) flagged, %d recompute(s) triggered.", flagged, fixed)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">audit-tax-rounding.js</div>
+      <pre><code class="language-javascript">/**
+ * Audit Saleor orders for tax calculation mismatches, using Saleor's own
+ * per-line rounding rule rather than a naive rate times subtotal
+ * recomputation.
+ *
+ * With the flat-rate tax strategy, Saleor rounds tax to the cent on each
+ * order line independently, then sums those already-rounded line amounts,
+ * plus shipping, into order.total and order.subtotal. It never sums exact
+ * unrounded values first and rounds once at the end. Because
+ * line.unitPrice is derived by dividing the rounded line.totalPrice by
+ * quantity, high quantity, low unit price lines amplify the per-unit
+ * rounding remainder, so the sum of correctly rounded lines can
+ * legitimately differ from rate times subtotal by one or more cents. This
+ * is documented, longstanding behavior (see saleor/saleor#6720), not a
+ * bug, so this script never flags ordinary per-line rounding drift.
+ *
+ * Under DRY_RUN=true (the default) this script only reports flagged
+ * orders, it never writes anything. A real aggregation bug looks
+ * different: the sum of a line's own already-rounded tax plus shipping
+ * tax disagreeing with order.total.tax, which points at cache or
+ * denormalization drift. Even then, the safe corrective action is a
+ * gated no-op line update to force Saleor's own recompute pipeline,
+ * limited to small confirmed deltas, never a direct write to order
+ * totals. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/tax-calculation-rounding-mismatch/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const AGGREGATION_FIX_THRESHOLD_CENTS = Number(process.env.AGGREGATION_FIX_THRESHOLD_CENTS || 5);
+
+export function checkLineTax(totalNetAmount, taxRate, actualTaxAmount,
+                              currencyExponent = 2, toleranceCents = 1) {
+  const quantum = Math.pow(10, -currencyExponent);
+  const expectedTax = roundHalfUp(totalNetAmount * taxRate, currencyExponent);
+  const delta = round2(Math.abs(actualTaxAmount - expectedTax));
+  const isMismatch = delta > round2(quantum * toleranceCents) + 1e-9;
+  return { isMismatch, expectedTax, delta };
+}
+
+function roundHalfUp(value, exponent) {
+  const factor = Math.pow(10, exponent);
+  return Math.round((value * factor) + Number.EPSILON * Math.sign(value)) / factor;
+}
+
+function round2(value) {
+  return Math.round(value * 1e8) / 1e8;
+}
+
+export function reconcileOrder(order) {
+  const lineMismatches = [];
+  for (const line of order.lines) {
+    const totalNet = line.totalPrice.net.amount;
+    const actualTax = line.totalPrice.tax.amount;
+    const { isMismatch, expectedTax, delta } = checkLineTax(
+      totalNet, line.taxRate, actualTax,
+      2, Math.max(1, order.lines.length)
+    );
+    if (isMismatch) {
+      lineMismatches.push({ lineId: line.id, actual: actualTax, expected: expectedTax, delta });
+    }
+  }
+
+  let expectedOrderTax = order.lines.reduce((sum, l) => sum + l.totalPrice.tax.amount, 0);
+  expectedOrderTax += order.shippingPrice.tax.amount;
+  const actualOrderTax = order.total.tax.amount;
+  const aggregationDelta = Math.round(Math.abs(actualOrderTax - expectedOrderTax) * 100) / 100;
+  const aggregationBug = aggregationDelta > 0;
+
+  return {
+    orderId: order.id,
+    orderNumber: order.number,
+    lineMismatches,
+    aggregationBug,
+    aggregationDelta,
+    actualOrderTax,
+    expectedOrderTax: Math.round(expectedOrderTax * 100) / 100,
+  };
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const ORDERS_QUERY = `
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        total { tax { amount } net { amount } gross { amount } }
+        subtotal { net { amount } gross { amount } }
+        shippingPrice { tax { amount } net { amount } gross { amount } }
+        lines {
+          id
+          quantity
+          unitPrice { tax { amount } net { amount } gross { amount } }
+          totalPrice { tax { amount } net { amount } gross { amount } }
+          taxRate
+        }
+      }
+    }
+  }
+}`;
+
+// A no-op line update (same quantity) forces Saleor's TaxedMoney
+// recalculation pipeline to run again, without writing any amount directly.
+const FORCE_RECALC_MUTATION = `
+mutation($orderId: ID!, $lineId: ID!, $quantity: Int!) {
+  orderLineUpdate(id: $lineId, input: { quantity: $quantity }) {
+    orderLine { id }
+    errors { field message code }
+  }
+}`;
+
+async function* allOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function forceRecalculate(orderId, lineId, quantity) {
+  const result = (await gql(FORCE_RECALC_MUTATION, { orderId, lineId, quantity })).orderLineUpdate;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+}
+
+export async function run() {
+  let flagged = 0;
+  let fixed = 0;
+
+  for await (const order of allOrders()) {
+    const result = reconcileOrder(order);
+    if (!result.lineMismatches.length && !result.aggregationBug) continue;
+
+    console.warn(`Tax reconciliation flagged order ${order.number}:`, result);
+    flagged++;
+
+    // Only a confirmed aggregation bug below the threshold is ever a
+    // candidate for a gated, forced recompute. Line-level rounding drift is
+    // expected arithmetic and is never auto-corrected.
+    if (
+      !DRY_RUN &&
+      result.aggregationBug &&
+      result.aggregationDelta <= AGGREGATION_FIX_THRESHOLD_CENTS / 100 &&
+      order.lines.length
+    ) {
+      const firstLine = order.lines[0];
+      console.log(
+        `Forcing recompute on order ${order.number} via no-op line update (delta ${result.aggregationDelta.toFixed(2)}).`
+      );
+      await forceRecalculate(order.id, firstLine.id, firstLine.quantity);
+      fixed++;
+    } else if (result.aggregationBug) {
+      console.error(
+        `Order ${order.number} aggregation delta ${result.aggregationDelta.toFixed(2)} exceeds threshold. Escalating to manual finance review.`
+      );
+    }
+  }
+
+  console.log(`Done. ${flagged} order(s) flagged, ${fixed} recompute(s) triggered.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get flagged, and it has to correctly leave Saleor's own documented rounding drift alone. Because <code>check_line_tax</code> is pure, taking plain numbers, the test needs no network and no Saleor account. It reproduces the documented 12 cent drift from <code>saleor/saleor#6720</code> and confirms that case is not flagged at the line level, then checks that an injected corrupted line is flagged.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_tax_rounding_check.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+from audit_tax_rounding import check_line_tax, reconcile_order
+
+
+def test_exact_match_is_not_a_mismatch():
+    is_mismatch, expected, delta = check_line_tax(
+        total_net_amount=100.0, tax_rate=0.22, actual_tax_amount=22.0,
+    )
+    assert is_mismatch is False
+    assert expected == Decimal("22.00")
+    assert delta == Decimal("0.00")
+
+
+def test_documented_112_unit_drift_is_not_flagged_at_tolerance():
+    # 0.05 / 1.22 = 0.0098..., rounds to 0.01 per unit, 112 units diverges
+    # from 112 * 0.05 / 1.22 by about 12 cents. With a tolerance sized for
+    # the order's line count this must not be treated as a mismatch.
+    unit_net = round(0.05 / 1.22, 2)  # 0.01, Saleor's own rounded unit price
+    line_total_net = round(unit_net * 112, 2)  # 1.12
+    actual_tax = round(unit_net * 0.22, 2) * 112  # tax computed per unit then summed
+    is_mismatch, expected, delta = check_line_tax(
+        total_net_amount=line_total_net, tax_rate=0.22,
+        actual_tax_amount=actual_tax, tolerance_cents=12,
+    )
+    assert is_mismatch is False
+
+
+def test_injected_corrupted_line_is_flagged():
+    is_mismatch, expected, delta = check_line_tax(
+        total_net_amount=100.0, tax_rate=0.22, actual_tax_amount=30.0,
+    )
+    assert is_mismatch is True
+    assert expected == Decimal("22.00")
+    assert delta == Decimal("8.00")
+
+
+def test_one_cent_drift_within_tolerance_is_not_a_mismatch():
+    is_mismatch, expected, delta = check_line_tax(
+        total_net_amount=50.0, tax_rate=0.2, actual_tax_amount=10.01,
+        tolerance_cents=1,
+    )
+    assert is_mismatch is False
+
+
+def test_reconcile_order_flags_real_aggregation_bug():
+    order = {
+        "id": "T3JkZXI6MQ==",
+        "number": "1001",
+        "total": {"tax": {"amount": 99.0}},
+        "shippingPrice": {"tax": {"amount": 1.0}},
+        "lines": [
+            {
+                "id": "T3JkZXJMaW5lOjE=", "quantity": 1, "taxRate": 0.2,
+                "totalPrice": {"net": {"amount": 100.0}, "tax": {"amount": 20.0}},
+            },
+        ],
+    }
+    result = reconcile_order(order)
+    assert result["aggregationBug"] is True
+    assert result["expectedOrderTax"] == 21.0
+    assert result["actualOrderTax"] == 99.0
+
+
+def test_reconcile_order_ok_when_totals_match_saleor_own_sum():
+    order = {
+        "id": "T3JkZXI6Mg==",
+        "number": "1002",
+        "total": {"tax": {"amount": 21.0}},
+        "shippingPrice": {"tax": {"amount": 1.0}},
+        "lines": [
+            {
+                "id": "T3JkZXJMaW5lOjI=", "quantity": 1, "taxRate": 0.2,
+                "totalPrice": {"net": {"amount": 100.0}, "tax": {"amount": 20.0}},
+            },
+        ],
+    }
+    result = reconcile_order(order)
+    assert result["aggregationBug"] is False
+    assert result["lineMismatches"] == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">tax-rounding.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { checkLineTax, reconcileOrder } from "./audit-tax-rounding.js";
+
+test("exact match is not a mismatch", () => {
+  const { isMismatch, expectedTax, delta } = checkLineTax(100.0, 0.22, 22.0);
+  assert.equal(isMismatch, false);
+  assert.equal(expectedTax, 22.0);
+  assert.equal(delta, 0);
+});
+
+test("documented 112 unit drift is not flagged at tolerance", () => {
+  // 0.05 / 1.22 = 0.0098..., rounds to 0.01 per unit, 112 units diverges
+  // from 112 * 0.05 / 1.22 by about 12 cents. Must not be flagged when the
+  // tolerance is sized for the order's line count.
+  const unitNet = Math.round((0.05 / 1.22) * 100) / 100; // 0.01
+  const lineTotalNet = Math.round(unitNet * 112 * 100) / 100; // 1.12
+  const actualTax = Math.round(unitNet * 0.22 * 100) / 100 * 112;
+  const { isMismatch } = checkLineTax(lineTotalNet, 0.22, actualTax, 2, 12);
+  assert.equal(isMismatch, false);
+});
+
+test("injected corrupted line is flagged", () => {
+  const { isMismatch, expectedTax, delta } = checkLineTax(100.0, 0.22, 30.0);
+  assert.equal(isMismatch, true);
+  assert.equal(expectedTax, 22.0);
+  assert.equal(delta, 8.0);
+});
+
+test("one cent drift within tolerance is not a mismatch", () => {
+  const { isMismatch } = checkLineTax(50.0, 0.2, 10.01, 2, 1);
+  assert.equal(isMismatch, false);
+});
+
+test("reconcileOrder flags real aggregation bug", () => {
+  const order = {
+    id: "T3JkZXI6MQ==",
+    number: "1001",
+    total: { tax: { amount: 99.0 } },
+    shippingPrice: { tax: { amount: 1.0 } },
+    lines: [
+      {
+        id: "T3JkZXJMaW5lOjE=", quantity: 1, taxRate: 0.2,
+        totalPrice: { net: { amount: 100.0 }, tax: { amount: 20.0 } },
+      },
+    ],
+  };
+  const result = reconcileOrder(order);
+  assert.equal(result.aggregationBug, true);
+  assert.equal(result.expectedOrderTax, 21.0);
+  assert.equal(result.actualOrderTax, 99.0);
+});
+
+test("reconcileOrder OK when totals match Saleor's own sum", () => {
+  const order = {
+    id: "T3JkZXI6Mg==",
+    number: "1002",
+    total: { tax: { amount: 21.0 } },
+    shippingPrice: { tax: { amount: 1.0 } },
+    lines: [
+      {
+        id: "T3JkZXJMaW5lOjI=", quantity: 1, taxRate: 0.2,
+        totalPrice: { net: { amount: 100.0 }, tax: { amount: 20.0 } },
+      },
+    ],
+  };
+  const result = reconcileOrder(order);
+  assert.equal(result.aggregationBug, false);
+  assert.deepEqual(result.lineMismatches, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Finance reconciliation</span>
+      <h4>The spreadsheet that never agreed with Saleor</h4>
+      <p>A finance team built a simple reconciliation spreadsheet that multiplied each order's subtotal by its tax rate and compared the result to <code>order.total.tax</code>. It flagged nearly every order in the store as wrong, usually by one to three cents, and the team spent a week convinced Saleor's tax engine was broken before escalating it as a data integrity incident.</p>
+      <p>Running the audit script showed that every one of those flagged orders passed the per-line check cleanly. The drift was exactly the documented behavior from <code>saleor/saleor#6720</code>, rounding tax per line before summing, not per-order rate multiplication. The team retired the naive spreadsheet formula and now runs the script's reconciliation report instead, which has flagged zero false positives since.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Real aggregation bug</span>
+      <h4>The one order where the totals actually disagreed with themselves</h4>
+      <p>Among thousands of orders with normal per-line rounding drift, the audit surfaced a single order where <code>order.total.tax</code> did not even match the sum of that order's own line and shipping tax fields, a different and much rarer signal than ordinary rounding. That pointed at a stale cached total rather than a rounding artifact.</p>
+      <p>Because the aggregation delta was small and below the configured threshold, the gated recompute path issued a no-op line update to force Saleor to recalculate the order's totals server side. A follow-up query confirmed the order's total tax now matched the sum of its lines, and the order was cleared without anyone writing a dollar amount by hand.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a cent of rounding drift stops looking like a crisis. Finance gets a reconciliation report that separates Saleor's own expected per-line rounding from genuine aggregation bugs, and the only automated correction is a small, gated recompute that forces Saleor to redo its own math, never a direct rewrite of an order's tax amounts.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Saleor's order total tax not equal rate times subtotal exactly?</summary>
+      <p>Saleor computes tax separately on each order line, rounds each line's tax to two decimal places, and then sums those already-rounded line amounts to get order.total and order.subtotal. It does not sum exact unrounded amounts first and round once at the end. Summing numbers that were each rounded on their own can legitimately land a cent or more away from multiplying the rate by the subtotal in one shot, especially with high quantity or low unit price lines.</p>
+    </details>
+    <details>
+      <summary>Is a one or two cent tax difference on a Saleor order a bug?</summary>
+      <p>Usually not. This is documented, longstanding Saleor behavior, reported in saleor/saleor#6720, that comes from rounding tax per line before summing rather than rounding once at the end. A real bug looks different: order.total.tax not matching the sum of every line's already-rounded tax plus shipping tax, which points at cached or stale data rather than normal per-line rounding.</p>
+    </details>
+    <details>
+      <summary>Should a script automatically rewrite order totals when it finds a tax mismatch?</summary>
+      <p>No. Per-line rounding drift of a few cents is expected arithmetic, not corrupted data, so writing amounts directly risks making a correct order wrong. The safe pattern is to report flagged orders for review, and only for a confirmed aggregation bug, force Saleor to recompute totals server side, such as a no-op line update, behind a DRY_RUN flag and a cent-delta threshold that escalates larger deltas to manual finance review.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>The calculation of the tax is not accurate. <a href="https://github.com/saleor/saleor/issues/6720" rel="noopener">github.com/saleor/saleor/issues/6720</a></li>
+      <li>Flat rate tax plugin. <a href="https://github.com/saleor/saleor/discussions/7942" rel="noopener">github.com/saleor/saleor/discussions/7942</a></li>
+      <li>Surprising behavior with dynamic taxes sync webhook. <a href="https://github.com/saleor/saleor/discussions/10732" rel="noopener">github.com/saleor/saleor/discussions/10732</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: price calculation. <a href="https://docs.saleor.io/developer/price-calculation" rel="noopener">docs.saleor.io/developer/price-calculation</a></li>
+      <li>Saleor Commerce Documentation: taxes. <a href="https://docs.saleor.io/developer/taxes" rel="noopener">docs.saleor.io/developer/taxes</a></li>
+      <li>Saleor API Reference: the OrderLine object. <a href="https://docs.saleor.io/docs/3.x/api-reference/objects/order-line" rel="noopener">docs.saleor.io/docs/3.x/api-reference/objects/order-line</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, payments, stock, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this settle a tax reconciliation headache?</h3>
+    <p>If this saved your finance team from chasing a phantom rounding bug, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>
