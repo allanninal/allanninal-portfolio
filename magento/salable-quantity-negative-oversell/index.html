@@ -1,0 +1,1013 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Magento 2 Salable Quantity Going Negative or Allowing Oversell</title>
+<meta name="description" content="Magento 2 MSI computes salable quantity as physical stock minus reservations, and a lost compensating reservation or a misread backorder config can drive it negative or let a SKU oversell. Learn why and build a Python or Node.js script that detects it safely over REST.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/salable-quantity-negative-oversell/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Magento 2 Salable Quantity Going Negative or Allowing Oversell">
+<meta property="og:description" content="Why MSI reservations can drift the computed salable quantity below zero, and a safe Python or Node.js script that detects the broken invariant and reports it before it becomes a true oversell.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/salable-quantity-negative-oversell/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/salable-quantity-negative-oversell/#article","headline":"Fix Magento 2 Salable Quantity Going Negative or Allowing Oversell","description":"Why MSI reservations can drift the computed salable quantity below zero, and a safe Python or Node.js script that detects the broken invariant and reports it before it becomes a true oversell.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/salable-quantity-negative-oversell/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory (MSI)","keywords":"Magento salable quantity negative, MSI oversell, inventory reservations, source_items, backorders, get-product-salable-quantity, list-inconsistencies, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Salable quantity goes negative or allows oversell","item":"https://www.allanninal.dev/magento/salable-quantity-negative-oversell/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Magento show a negative salable quantity?","acceptedAnswer":{"@type":"Answer","text":"MSI computes salable quantity as the sum of in-stock source_items quantities minus the sum of outstanding reservations, which are an append-only ledger rather than a live decrement of one qty column. If a compensating reservation for a cancelled or failed order is never written, the ledger keeps an orphaned negative entry forever, so the computed salable quantity drifts below zero even though the physical stock is fine. Backorders set to allow qty below zero can also make salable quantity negative on purpose, which is expected rather than broken."}},{"@type":"Question","name":"Is a negative salable quantity always a bug?","acceptedAnswer":{"@type":"Answer","text":"No. If Backorders is set to allow qty below zero, a negative salable quantity is the intended behavior, since the product is meant to keep selling while it is backordered. It only signals a broken invariant when backorders are disabled, or when the negative amount is larger than the open order demand can explain, which points to orphaned or duplicated reservations instead."}},{"@type":"Question","name":"Can a script fix the reservation ledger over the REST API?","acceptedAnswer":{"@type":"Answer","text":"Not safely. Reservations are an append-only event log, and editing or deleting entries directly can corrupt the ledger or double-correct it. The REST-safe action is to stop further sales on a genuinely oversold SKU by setting is_in_stock to false or tightening the out of stock threshold. The actual ledger repair, bin/magento inventory:reservation:list-inconsistencies followed by inventory:reservation:create-compensations, is a CLI-only operation for an admin to run."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Inventory (MSI)</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Inventory (MSI)</p>
+    <h1>Magento 2 salable quantity goes negative or allows oversell</h1>
+    <p class="lead">A product page shows the item in stock, checkout lets a customer buy it, and yet the salable quantity Magento reports for that SKU is a negative number. Physical stock in the warehouse is fine. Nobody touched the qty column directly. What actually moved is the reservation ledger, a separate append-only log that MSI subtracts from physical stock to compute what is left to sell, and when a compensating entry on that ledger goes missing, the computed number can drift below zero forever. Here is why that invariant breaks and a small script that catches it before it turns into a real oversold order.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">REST API cross-check</span>
+      <span class="chip">Safe by default (report first)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>MSI never edits one stock number in place. It computes salable quantity as <code>sum(in-stock source_items quantities) - sum(outstanding reservations)</code>, and reservations are an append-only ledger. If the compensating reservation for a cancelled or failed order is lost, which is common during 2.3.x upgrades, custom checkout flows, direct database edits, or third-party extensions that bypass the ReservationBuilder, the ledger keeps an orphaned entry that never clears, and the computed salable quantity drifts below zero even though the warehouse is fine. Separately, Backorders set to allow qty below zero can make salable quantity negative on purpose, which is expected, not broken, unless the negative amount no longer matches real open order demand. A script cannot safely rewrite the reservation ledger over REST, so it cross-checks three endpoints, flags the exact SKUs that need attention, and only ever takes the reversible step of pausing sales on a genuinely oversold SKU. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Before MSI, Magento kept a single <code>qty</code> column per stock item, and every order decremented it directly. MSI replaced that with two separate ideas: physical quantity, the sum of what your <code>source_items</code> actually hold, and reservations, a running log of demand against that stock. Salable quantity is the difference between the two, computed on the fly, not stored as one editable number.</p>
+  <p>That append-only design is deliberate. Reservations are meant to be auditable and safe under concurrent checkout, since two shoppers buying the last unit at the same instant both get a reservation row instead of racing to update the same integer. But it only stays correct if every reservation that increases demand is eventually matched by a compensating reservation when that demand goes away, for example when an order is cancelled or a payment fails. If that compensating write never happens, the ledger keeps a phantom negative entry forever, and every future read of salable quantity is wrong by exactly that amount, even though the shelves have the stock.</p>
+  <p>Separately, the Backorders setting can make salable quantity negative on purpose. With Allow Qty Below 0 turned on, Magento is designed to keep selling past zero, and a negative number there is expected. The real bug is when reservations do not reconcile with real open orders on top of that, or when backorders are off and salable quantity is negative anyway, which should be impossible.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. An order reserves stock, the order is cancelled, but the compensating reservation is never written, so the ledger keeps an orphaned negative entry and salable quantity drifts below zero forever.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="65" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="90" y="93" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Order placed</text>
+      <text x="90" y="111" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">reservation: -1 qty</text>
+      <line x1="173" y1="98" x2="215" y2="98" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="65" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="298" y="93" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Order cancelled</text>
+      <text x="298" y="111" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">or checkout fails</text>
+      <line x1="381" y1="98" x2="440" y2="98" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="55" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="140" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">compensating +1 never written</text>
+      <rect x="443" y="65" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="93" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Ledger orphaned</text>
+      <text x="523" y="111" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">-1 stays forever</text>
+      <rect x="628" y="65" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="89" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Salable qty</text>
+      <text x="689" y="107" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">drifts negative</text>
+      <line x1="606" y1="98" x2="625" y2="98" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="689" y1="131" x2="689" y2="163" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="5 4"></line>
+      <rect x="565" y="165" width="185" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="657" y="188" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Physical stock is fine,</text>
+      <text x="657" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">number is not</text>
+    </svg>
+    <figcaption>Physical stock never moved. The reservation ledger kept a phantom negative entry because the cancel path never wrote the offsetting reservation.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>A 2.3.x upgrade path where an older cancel or refund flow does not fully wire into the newer <code>ReservationBuilder</code>, so the compensating reservation is silently skipped.</li>
+    <li>A custom checkout flow, a headless storefront, or a third-party extension that writes its own order state changes and bypasses the reservation service entirely.</li>
+    <li>Direct database edits, such as manually cancelling an order in the <code>sales_order</code> table without running it through Magento's own cancellation service.</li>
+    <li>Backorders set to Allow Qty Below 0 combined with <code>manage_stock</code> enabled, which lets salable quantity go negative by design, but which can mask a true reservation mismatch if nobody is also checking it against real open order demand.</li>
+  </ul>
+  <p>This exact pattern shows up repeatedly in Magento's own issue tracker and community forum, negative salable quantities with no setting that stops them, and reservations that stop reconciling with real inventory after normal store operation. See the citations at the end for the specific threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Reservations are an event log, not a value you can safely rewrite. Deleting or editing a reservation row to force salable quantity back to a number you expect can corrupt the ledger or double-correct it, since Magento's own reconciliation tooling assumes every reservation it has ever written is still there. So the right move from the outside, over REST, is never to touch the ledger. It is to detect where the invariant <code>salable = physical - reservations</code> has broken, using the same three data points <code>bin/magento inventory:reservation:list-inconsistencies</code> checks internally, and report exactly which SKUs need the real CLI-only compensation run by an admin.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the reservation ledger. We add a job that reads the computed salable quantity, the physical stock from source_items, the open order demand, and the backorder configuration for each SKU, decides whether the numbers reconcile, and either reports it as fine, flags it for CLI-based ledger repair, or, only for a confirmed critical oversell, pauses further sales on that one SKU.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job reads salable quantity, physical stock, open order demand, and backorder config for a SKU, checks whether the numbers reconcile, and either reports ok, flags it as needing CLI reservation repair, or pauses sales on a confirmed oversell.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read salable qty,</text>
+      <text x="117" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">physical qty, open orders</text>
+      <text x="117" y="161" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">per SKU over REST</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Check backorders</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">and reconcile numbers</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Invariant</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">broken?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report ok</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="623" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="689" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Flag for CLI repair,</text>
+      <text x="689" y="221" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">pause sales if critical</text>
+      <path d="M695,138 C715,138 689,150 689,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only flags or pauses a SKU once the invariant is confirmed broken. Expected backorder behavior and healthy SKUs are left alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>The script authenticates like any other Magento REST client. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export STOCK_ID="1"
+export DRY_RUN="true"   # start safe, change to false to allow the pause-sales path</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export STOCK_ID="1"
+export DRY_RUN="true"   // start safe, change to false to allow the pause-sales path</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the three data points that must agree</h3>
+      <p>For each SKU, pull the computed salable quantity, the physical quantity from in-stock source_items, the stock item config, and the open order demand. <code>GET /rest/V1/inventory/get-product-salable-quantity/{sku}/{stockId}</code> gives the number MSI actually returns to checkout. <code>GET /rest/V1/inventory/source-items</code> filtered by SKU, summed for status 1 rows, gives physical quantity. <code>GET /rest/V1/products/{sku}</code> gives <code>extension_attributes.stock_item.manage_stock</code> and <code>backorders</code>. Open order demand comes from summing <code>qty_ordered</code> on <code>GET /rest/V1/orders</code> filtered to statuses that are not complete, closed, or cancelled.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def get_salable_qty(sku, stock_id):
+    data = magento_get(f"/inventory/get-product-salable-quantity/{sku}/{stock_id}")
+    return float(data)
+
+
+def get_physical_qty(sku):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+        "searchCriteria[filterGroups][0][filters][0][value]": sku,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    items = magento_get("/inventory/source-items", params)["items"]
+    return sum(i["quantity"] for i in items if i.get("status") == 1)
+
+
+def get_stock_item_config(sku):
+    product = magento_get(f"/products/{sku}")
+    stock_item = product["extension_attributes"]["stock_item"]
+    return {
+        "manageStock": bool(stock_item.get("manage_stock")),
+        "backorders": int(stock_item.get("backorders", 0)),
+    }
+
+
+def get_open_order_qty_total(sku):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": "complete,closed,canceled",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "nin",
+    }
+    orders = magento_get("/orders", params)["items"]
+    total = 0.0
+    for order in orders:
+        for item in order.get("items", []):
+            if item.get("sku") == sku:
+                total += float(item.get("qty_ordered", 0))
+    return total</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function getSalableQty(sku, stockId) {
+  const data = await magentoGet(`/inventory/get-product-salable-quantity/${sku}/${stockId}`);
+  return Number(data);
+}
+
+async function getPhysicalQty(sku) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+    "searchCriteria[filterGroups][0][filters][0][value]": sku,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  };
+  const data = await magentoGet("/inventory/source-items", params);
+  return data.items.filter((i) =&gt; i.status === 1).reduce((sum, i) =&gt; sum + i.quantity, 0);
+}
+
+async function getStockItemConfig(sku) {
+  const product = await magentoGet(`/products/${sku}`);
+  const stockItem = product.extension_attributes.stock_item;
+  return {
+    manageStock: Boolean(stockItem.manage_stock),
+    backorders: Number(stockItem.backorders || 0),
+  };
+}
+
+async function getOpenOrderQtyTotal(sku) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "status",
+    "searchCriteria[filterGroups][0][filters][0][value]": "complete,closed,canceled",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "nin",
+  };
+  const data = await magentoGet("/orders", params);
+  let total = 0;
+  for (const order of data.items) {
+    for (const item of order.items || []) {
+      if (item.sku === sku) total += Number(item.qty_ordered || 0);
+    }
+  }
+  return total;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the four numbers and returns a flag, a severity, and a reason. A pure function like this is easy to read and easy to test, which we do later. Manage stock disabled is a warning, since oversell is not tracked at all. Negative salable quantity with backorders disabled is critical, the impossible state. Negative salable quantity with backorders enabled is expected, unless the magnitude exceeds real open order demand by more than physical stock, which points to phantom reservations. Any mismatch between salable quantity and physical minus open orders is a reconciliation warning regardless of sign.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_salable_qty_action(sku, salable_qty, physical_qty, open_order_qty_total, stock_item_config, tolerance_units=0):
+    if not stock_item_config.get("manageStock"):
+        return {
+            "flag": True,
+            "severity": "warning",
+            "reason": "manage_stock disabled: product always shows in-stock, oversell not tracked",
+        }
+
+    backorders = stock_item_config.get("backorders", 0)
+
+    if salable_qty &lt; 0 and backorders == 0:
+        return {
+            "flag": True,
+            "severity": "critical",
+            "reason": "negative salable qty with backorders disabled: true oversell, invariant broken",
+        }
+
+    if salable_qty &lt; 0 and backorders != 0:
+        if abs(salable_qty) &gt; open_order_qty_total + physical_qty:
+            return {
+                "flag": True,
+                "severity": "critical",
+                "reason": "reservation total exceeds open order demand: phantom/duplicate reservations",
+            }
+        return {"flag": False, "severity": "ok", "reason": "negative salable qty is expected backorder behavior"}
+
+    expected_salable = physical_qty - open_order_qty_total
+    if abs(salable_qty - expected_salable) &gt; tolerance_units:
+        return {
+            "flag": True,
+            "severity": "warning",
+            "reason": "salable qty does not reconcile with source_items minus open reservations: stale index or lost/duplicated reservation",
+        }
+
+    return {"flag": False, "severity": "ok", "reason": "consistent"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideSalableQtyAction(sku, salableQty, physicalQty, openOrderQtyTotal, stockItemConfig, toleranceUnits = 0) {
+  if (!stockItemConfig.manageStock) {
+    return {
+      flag: true,
+      severity: "warning",
+      reason: "manage_stock disabled: product always shows in-stock, oversell not tracked",
+    };
+  }
+
+  const backorders = stockItemConfig.backorders || 0;
+
+  if (salableQty &lt; 0 &amp;&amp; backorders === 0) {
+    return {
+      flag: true,
+      severity: "critical",
+      reason: "negative salable qty with backorders disabled: true oversell, invariant broken",
+    };
+  }
+
+  if (salableQty &lt; 0 &amp;&amp; backorders !== 0) {
+    if (Math.abs(salableQty) &gt; openOrderQtyTotal + physicalQty) {
+      return {
+        flag: true,
+        severity: "critical",
+        reason: "reservation total exceeds open order demand: phantom/duplicate reservations",
+      };
+    }
+    return { flag: false, severity: "ok", reason: "negative salable qty is expected backorder behavior" };
+  }
+
+  const expectedSalable = physicalQty - openOrderQtyTotal;
+  if (Math.abs(salableQty - expectedSalable) &gt; toleranceUnits) {
+    return {
+      flag: true,
+      severity: "warning",
+      reason: "salable qty does not reconcile with source_items minus open reservations: stale index or lost/duplicated reservation",
+    };
+  }
+
+  return { flag: false, severity: "ok", reason: "consistent" };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report by default, pause sales only when confirmed critical</h3>
+      <p>The default output is a structured record per flagged SKU: <code>{sku, stockId, salableQty, physicalQty, openOrderQtyTotal, severity, reason}</code>, for an operator to review. When a SKU is critical and the reason points to a genuine oversell, the only REST-safe corrective step is to stop further sales, not to rewrite history. That means <code>PUT /rest/V1/products/{sku}</code> with <code>extension_attributes.stock_item.is_in_stock=false</code>, which is reversible the moment an admin reconciles the inventory. The actual reservation-ledger fix always stays a CLI operation, <code>bin/magento inventory:reservation:list-inconsistencies -r</code> piped into <code>inventory:reservation:create-compensations</code>, and the script only ever names the SKUs and stock ids that need it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def pause_sales(sku):
+    payload = {"product": {"sku": sku, "extension_attributes": {"stock_item": {"is_in_stock": False}}}}
+    if DRY_RUN:
+        log.info("DRY_RUN: would PUT /products/%s with %s", sku, payload)
+        return
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/products/{sku}",
+        json=payload,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function pauseSales(sku) {
+  const payload = { product: { sku, extension_attributes: { stock_item: { is_in_stock: false } } } };
+  if (DRY_RUN) {
+    console.log(`DRY_RUN: would PUT /products/${sku} with`, JSON.stringify(payload));
+    return;
+  }
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/products/${sku}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never attempt to create, edit, or delete reservation rows over REST, since that ledger is append-only and a direct edit can corrupt or double-correct it. Report critical and warning SKUs, and only ever pause sales, never rewrite inventory history, and always leave the actual reservation compensation to <code>bin/magento inventory:reservation:list-inconsistencies</code> and <code>inventory:reservation:create-compensations</code> run by an admin.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, cross-checks the three REST data sources per SKU, runs the pure decision function, respects the dry run flag, and is safe to run again and again because by default it only reports.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/salable-quantity-negative-oversell" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_salable_qty_oversell.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 SKUs where salable quantity has gone negative or oversold, safely.
+
+MSI computes salable quantity as sum(in-stock source_items quantities) minus sum
+of outstanding reservations, an append-only ledger. If a compensating reservation
+for a cancelled or failed order is lost, the ledger keeps an orphaned entry and
+salable quantity drifts below zero forever, even though physical stock is fine.
+Backorders set to allow qty below zero can make a negative number expected
+instead of broken. Reservations are never rewritten here; the only write this
+script performs is pausing further sales (is_in_stock=false) on a confirmed
+critical oversell. The actual ledger repair stays a CLI-only operation for an
+admin to run. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_salable_qty_oversell")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+STOCK_ID = os.environ.get("STOCK_ID", "1")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_salable_qty(sku, stock_id):
+    data = magento_get(f"/inventory/get-product-salable-quantity/{sku}/{stock_id}")
+    return float(data)
+
+
+def get_physical_qty(sku):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+        "searchCriteria[filterGroups][0][filters][0][value]": sku,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    items = magento_get("/inventory/source-items", params)["items"]
+    return sum(i["quantity"] for i in items if i.get("status") == 1)
+
+
+def get_stock_item_config(sku):
+    product = magento_get(f"/products/{sku}")
+    stock_item = product["extension_attributes"]["stock_item"]
+    return {
+        "manageStock": bool(stock_item.get("manage_stock")),
+        "backorders": int(stock_item.get("backorders", 0)),
+    }
+
+
+def get_open_order_qty_total(sku):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": "complete,closed,canceled",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "nin",
+    }
+    orders = magento_get("/orders", params)["items"]
+    total = 0.0
+    for order in orders:
+        for item in order.get("items", []):
+            if item.get("sku") == sku:
+                total += float(item.get("qty_ordered", 0))
+    return total
+
+
+def decide_salable_qty_action(sku, salable_qty, physical_qty, open_order_qty_total, stock_item_config, tolerance_units=0):
+    if not stock_item_config.get("manageStock"):
+        return {
+            "flag": True,
+            "severity": "warning",
+            "reason": "manage_stock disabled: product always shows in-stock, oversell not tracked",
+        }
+
+    backorders = stock_item_config.get("backorders", 0)
+
+    if salable_qty &lt; 0 and backorders == 0:
+        return {
+            "flag": True,
+            "severity": "critical",
+            "reason": "negative salable qty with backorders disabled: true oversell, invariant broken",
+        }
+
+    if salable_qty &lt; 0 and backorders != 0:
+        if abs(salable_qty) &gt; open_order_qty_total + physical_qty:
+            return {
+                "flag": True,
+                "severity": "critical",
+                "reason": "reservation total exceeds open order demand: phantom/duplicate reservations",
+            }
+        return {"flag": False, "severity": "ok", "reason": "negative salable qty is expected backorder behavior"}
+
+    expected_salable = physical_qty - open_order_qty_total
+    if abs(salable_qty - expected_salable) &gt; tolerance_units:
+        return {
+            "flag": True,
+            "severity": "warning",
+            "reason": "salable qty does not reconcile with source_items minus open reservations: stale index or lost/duplicated reservation",
+        }
+
+    return {"flag": False, "severity": "ok", "reason": "consistent"}
+
+
+def pause_sales(sku):
+    payload = {"product": {"sku": sku, "extension_attributes": {"stock_item": {"is_in_stock": False}}}}
+    if DRY_RUN:
+        log.info("DRY_RUN: would PUT /products/%s with %s", sku, payload)
+        return
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/products/{sku}",
+        json=payload,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def run(skus=None):
+    skus = skus or []
+    flagged = 0
+    for sku in skus:
+        salable_qty = get_salable_qty(sku, STOCK_ID)
+        physical_qty = get_physical_qty(sku)
+        open_order_qty_total = get_open_order_qty_total(sku)
+        stock_item_config = get_stock_item_config(sku)
+
+        result = decide_salable_qty_action(sku, salable_qty, physical_qty, open_order_qty_total, stock_item_config)
+
+        if not result["flag"]:
+            continue
+
+        log.warning(
+            "SKU %s: %s (salable=%s, physical=%s, openOrders=%s). %s",
+            sku, result["severity"], salable_qty, physical_qty, open_order_qty_total, result["reason"],
+        )
+
+        if result["severity"] == "critical" and "oversell" in result["reason"]:
+            pause_sales(sku)
+
+        flagged += 1
+
+    log.info("Done. %d SKU(s) flagged.", flagged)
+
+
+if __name__ == "__main__":
+    run(skus=os.environ.get("CHECK_SKUS", "").split(",") if os.environ.get("CHECK_SKUS") else [])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-salable-qty-oversell.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 SKUs where salable quantity has gone negative or oversold, safely.
+ *
+ * MSI computes salable quantity as sum(in-stock source_items quantities) minus
+ * sum of outstanding reservations, an append-only ledger. If a compensating
+ * reservation for a cancelled or failed order is lost, the ledger keeps an
+ * orphaned entry and salable quantity drifts below zero forever, even though
+ * physical stock is fine. Backorders set to allow qty below zero can make a
+ * negative number expected instead of broken. Reservations are never rewritten
+ * here; the only write this script performs is pausing further sales
+ * (is_in_stock=false) on a confirmed critical oversell. The actual ledger
+ * repair stays a CLI-only operation for an admin to run. Safe to run again
+ * and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/salable-quantity-negative-oversell/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const STOCK_ID = process.env.STOCK_ID || "1";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decideSalableQtyAction(sku, salableQty, physicalQty, openOrderQtyTotal, stockItemConfig, toleranceUnits = 0) {
+  if (!stockItemConfig.manageStock) {
+    return {
+      flag: true,
+      severity: "warning",
+      reason: "manage_stock disabled: product always shows in-stock, oversell not tracked",
+    };
+  }
+
+  const backorders = stockItemConfig.backorders || 0;
+
+  if (salableQty &lt; 0 &amp;&amp; backorders === 0) {
+    return {
+      flag: true,
+      severity: "critical",
+      reason: "negative salable qty with backorders disabled: true oversell, invariant broken",
+    };
+  }
+
+  if (salableQty &lt; 0 &amp;&amp; backorders !== 0) {
+    if (Math.abs(salableQty) &gt; openOrderQtyTotal + physicalQty) {
+      return {
+        flag: true,
+        severity: "critical",
+        reason: "reservation total exceeds open order demand: phantom/duplicate reservations",
+      };
+    }
+    return { flag: false, severity: "ok", reason: "negative salable qty is expected backorder behavior" };
+  }
+
+  const expectedSalable = physicalQty - openOrderQtyTotal;
+  if (Math.abs(salableQty - expectedSalable) &gt; toleranceUnits) {
+    return {
+      flag: true,
+      severity: "warning",
+      reason: "salable qty does not reconcile with source_items minus open reservations: stale index or lost/duplicated reservation",
+    };
+  }
+
+  return { flag: false, severity: "ok", reason: "consistent" };
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function getSalableQty(sku, stockId) {
+  const data = await magentoGet(`/inventory/get-product-salable-quantity/${sku}/${stockId}`);
+  return Number(data);
+}
+
+async function getPhysicalQty(sku) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+    "searchCriteria[filterGroups][0][filters][0][value]": sku,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  };
+  const data = await magentoGet("/inventory/source-items", params);
+  return data.items.filter((i) =&gt; i.status === 1).reduce((sum, i) =&gt; sum + i.quantity, 0);
+}
+
+async function getStockItemConfig(sku) {
+  const product = await magentoGet(`/products/${sku}`);
+  const stockItem = product.extension_attributes.stock_item;
+  return {
+    manageStock: Boolean(stockItem.manage_stock),
+    backorders: Number(stockItem.backorders || 0),
+  };
+}
+
+async function getOpenOrderQtyTotal(sku) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "status",
+    "searchCriteria[filterGroups][0][filters][0][value]": "complete,closed,canceled",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "nin",
+  };
+  const data = await magentoGet("/orders", params);
+  let total = 0;
+  for (const order of data.items) {
+    for (const item of order.items || []) {
+      if (item.sku === sku) total += Number(item.qty_ordered || 0);
+    }
+  }
+  return total;
+}
+
+async function pauseSales(sku) {
+  const payload = { product: { sku, extension_attributes: { stock_item: { is_in_stock: false } } } };
+  if (DRY_RUN) {
+    console.log(`DRY_RUN: would PUT /products/${sku} with`, JSON.stringify(payload));
+    return;
+  }
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/products/${sku}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+}
+
+export async function run(skus = []) {
+  let flagged = 0;
+  for (const sku of skus) {
+    const salableQty = await getSalableQty(sku, STOCK_ID);
+    const physicalQty = await getPhysicalQty(sku);
+    const openOrderQtyTotal = await getOpenOrderQtyTotal(sku);
+    const stockItemConfig = await getStockItemConfig(sku);
+
+    const result = decideSalableQtyAction(sku, salableQty, physicalQty, openOrderQtyTotal, stockItemConfig);
+
+    if (!result.flag) continue;
+
+    console.warn(
+      `SKU ${sku}: ${result.severity} (salable=${salableQty}, physical=${physicalQty}, openOrders=${openOrderQtyTotal}). ${result.reason}`
+    );
+
+    if (result.severity === "critical" && result.reason.includes("oversell")) {
+      await pauseSales(sku);
+    }
+
+    flagged++;
+  }
+  console.log(`Done. ${flagged} SKU(s) flagged.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const skus = (process.env.CHECK_SKUS || "").split(",").filter(Boolean);
+  run(skus).catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a SKU is left alone, flagged for CLI reservation repair, or paused from further sales. Because we kept <code>decide_salable_qty_action</code> pure, the test needs no network, no database, and no Magento store. It just feeds in the four numbers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_salable_qty_decide.py</div>
+      <pre><code class="language-python">from flag_salable_qty_oversell import decide_salable_qty_action
+
+CONFIG_NO_BACKORDERS = {"manageStock": True, "backorders": 0}
+CONFIG_BACKORDERS = {"manageStock": True, "backorders": 1}
+
+
+def test_ok_when_consistent():
+    result = decide_salable_qty_action("SKU-1", 5, 10, 5, CONFIG_NO_BACKORDERS)
+    assert result["flag"] is False
+    assert result["severity"] == "ok"
+
+
+def test_warning_when_manage_stock_disabled():
+    config = {"manageStock": False, "backorders": 0}
+    result = decide_salable_qty_action("SKU-1", 5, 10, 5, config)
+    assert result["flag"] is True
+    assert result["severity"] == "warning"
+
+
+def test_critical_when_negative_and_backorders_disabled():
+    result = decide_salable_qty_action("SKU-1", -2, 10, 12, CONFIG_NO_BACKORDERS)
+    assert result["flag"] is True
+    assert result["severity"] == "critical"
+    assert "backorders disabled" in result["reason"]
+
+
+def test_ok_when_negative_and_backorders_enabled_matching_demand():
+    result = decide_salable_qty_action("SKU-1", -3, 10, 13, CONFIG_BACKORDERS)
+    assert result["flag"] is False
+    assert result["severity"] == "ok"
+
+
+def test_critical_when_negative_backorders_enabled_but_exceeds_demand():
+    result = decide_salable_qty_action("SKU-1", -50, 10, 5, CONFIG_BACKORDERS)
+    assert result["flag"] is True
+    assert result["severity"] == "critical"
+    assert "phantom" in result["reason"]
+
+
+def test_warning_when_salable_does_not_reconcile():
+    result = decide_salable_qty_action("SKU-1", 8, 10, 5, CONFIG_NO_BACKORDERS)
+    assert result["flag"] is True
+    assert result["severity"] == "warning"
+    assert "does not reconcile" in result["reason"]
+
+
+def test_ok_when_reconciles_within_tolerance():
+    result = decide_salable_qty_action("SKU-1", 5, 10, 5, CONFIG_NO_BACKORDERS, tolerance_units=0)
+    assert result["flag"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">salable-qty-decide.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideSalableQtyAction } from "./flag-salable-qty-oversell.js";
+
+const CONFIG_NO_BACKORDERS = { manageStock: true, backorders: 0 };
+const CONFIG_BACKORDERS = { manageStock: true, backorders: 1 };
+
+test("ok when consistent", () =&gt; {
+  const result = decideSalableQtyAction("SKU-1", 5, 10, 5, CONFIG_NO_BACKORDERS);
+  assert.equal(result.flag, false);
+  assert.equal(result.severity, "ok");
+});
+
+test("warning when manage_stock disabled", () =&gt; {
+  const config = { manageStock: false, backorders: 0 };
+  const result = decideSalableQtyAction("SKU-1", 5, 10, 5, config);
+  assert.equal(result.flag, true);
+  assert.equal(result.severity, "warning");
+});
+
+test("critical when negative and backorders disabled", () =&gt; {
+  const result = decideSalableQtyAction("SKU-1", -2, 10, 12, CONFIG_NO_BACKORDERS);
+  assert.equal(result.flag, true);
+  assert.equal(result.severity, "critical");
+  assert.match(result.reason, /backorders disabled/);
+});
+
+test("ok when negative and backorders enabled matching demand", () =&gt; {
+  const result = decideSalableQtyAction("SKU-1", -3, 10, 13, CONFIG_BACKORDERS);
+  assert.equal(result.flag, false);
+  assert.equal(result.severity, "ok");
+});
+
+test("critical when negative backorders enabled but exceeds demand", () =&gt; {
+  const result = decideSalableQtyAction("SKU-1", -50, 10, 5, CONFIG_BACKORDERS);
+  assert.equal(result.flag, true);
+  assert.equal(result.severity, "critical");
+  assert.match(result.reason, /phantom/);
+});
+
+test("warning when salable does not reconcile", () =&gt; {
+  const result = decideSalableQtyAction("SKU-1", 8, 10, 5, CONFIG_NO_BACKORDERS);
+  assert.equal(result.flag, true);
+  assert.equal(result.severity, "warning");
+  assert.match(result.reason, /does not reconcile/);
+});
+
+test("ok when reconciles within tolerance", () =&gt; {
+  const result = decideSalableQtyAction("SKU-1", 5, 10, 5, CONFIG_NO_BACKORDERS, 0);
+  assert.equal(result.flag, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">2.3.x upgrade</span>
+      <h4>The store where cancellations stopped compensating</h4>
+      <p>A catalog upgraded through several 2.3.x releases kept a customized order cancellation flow written years earlier, before <code>ReservationBuilder</code> was the standard path. Every cancelled order still updated <code>sales_order</code> correctly, but the compensating reservation was never written, so every cancellation quietly left the ledger a little more negative.</p>
+      <p>Nobody noticed until a top seller's salable quantity read minus 40 with backorders off, an impossible state. The detection job flagged it as critical within the first run, giving the team the exact SKU to hand to <code>bin/magento inventory:reservation:list-inconsistencies</code> instead of guessing which of thousands of orders were the culprit.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Backorders confusion</span>
+      <h4>The SKU that looked broken but was not</h4>
+      <p>A wholesale SKU had Allow Qty Below 0 turned on deliberately, so staff expected to see it go negative while restock was in transit. A monitoring alert kept firing anyway, every time the number dropped, because nobody had distinguished expected backorder drift from an actual problem.</p>
+      <p>Once the checks compared the negative salable quantity against real open order demand, the noise stopped. Only when the negative magnitude no longer matched the orders actually in flight did the job flag it, and that happened exactly once, catching a real duplicate reservation the team would have otherwise missed.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a broken reservation ledger is caught within one detection cycle instead of surviving silently until a customer complains about an oversold order. The alert carries the exact salable, physical, and open order numbers, so whoever responds knows immediately whether it needs the CLI reservation repair or is just expected backorder behavior. Keep the pause-sales step limited to confirmed critical oversells, since that is what keeps the script from fighting a SKU that is backordered on purpose.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Magento show a negative salable quantity?</summary>
+      <p>MSI computes salable quantity as the sum of in-stock source_items quantities minus the sum of outstanding reservations, which are an append-only ledger rather than a live decrement of one qty column. If a compensating reservation for a cancelled or failed order is never written, the ledger keeps an orphaned negative entry forever, so the computed salable quantity drifts below zero even though the physical stock is fine. Backorders set to allow qty below zero can also make salable quantity negative on purpose, which is expected rather than broken.</p>
+    </details>
+    <details>
+      <summary>Is a negative salable quantity always a bug?</summary>
+      <p>No. If Backorders is set to allow qty below zero, a negative salable quantity is the intended behavior, since the product is meant to keep selling while it is backordered. It only signals a broken invariant when backorders are disabled, or when the negative amount is larger than the open order demand can explain, which points to orphaned or duplicated reservations instead.</p>
+    </details>
+    <details>
+      <summary>Can a script fix the reservation ledger over the REST API?</summary>
+      <p>Not safely. Reservations are an append-only event log, and editing or deleting entries directly can corrupt the ledger or double-correct it. The REST-safe action is to stop further sales on a genuinely oversold SKU by setting is_in_stock to false or tightening the out of stock threshold. The actual ledger repair, bin/magento inventory:reservation:list-inconsistencies followed by inventory:reservation:create-compensations, is a CLI-only operation for an admin to run.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: MSI setting that prevents negative salable qtys, or some kind of correction process. <a href="https://github.com/magento/inventory/issues/3165" rel="noopener">github.com/magento/inventory/issues/3165</a></li>
+      <li>GitHub Issue: MSI modules allow oversell leading to negative quantity available. <a href="https://github.com/magento/inventory/issues/2722" rel="noopener">github.com/magento/inventory/issues/2722</a></li>
+      <li>Magento Community Forum: inconsistency in product salable quantity, inventory reservations not working properly. <a href="https://community.magento.com/t5/Magento-2-x-Technical-Issues/Inconsistency-in-product-salable-quantity-Magento-2-Inventory/td-p/141876" rel="noopener">community.magento.com inconsistency in product salable quantity</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce PHP Extensions: Inventory Management API reference. <a href="https://developer.adobe.com/commerce/php/development/components/web-api/inventory-management" rel="noopener">developer.adobe.com/commerce/php/development/components/web-api/inventory-management</a></li>
+      <li>Adobe Commerce Web APIs: manage source items. <a href="https://developer.adobe.com/commerce/webapi/rest/inventory/manage-source-items" rel="noopener">developer.adobe.com/commerce/webapi/rest/inventory/manage-source-items</a></li>
+      <li>magento/inventory Wiki: configure MSI backorders. <a href="https://github.com/magento/inventory/wiki/Configure-MSI-backorders" rel="noopener">github.com/magento/inventory/wiki/Configure-MSI-backorders</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce inventory, orders, catalog data, or indexing that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a bad SKU?</h3>
+    <p>If this saved you an oversold order or a confusing negative quantity, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

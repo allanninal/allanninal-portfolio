@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magento Order Status Wrong After a Partial or Zero Total Refund</title>
+<meta name="description" content="A Magento 2 credit memo with a zero or partial total can leave an order stuck on Processing instead of Closed, or force it to Closed after only a partial refund. Learn why the core refund logic misreads these totals and how to detect it safely over the REST API.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/order-status-wrong-after-refund/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Magento Order Status Wrong After a Partial or Zero Total Refund">
+<meta property="og:description" content="Why Magento's credit memo save logic can leave an order on the wrong status after a zero-total or partial refund, and a safe Python or Node.js script that flags it over REST.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/order-status-wrong-after-refund/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/order-status-wrong-after-refund/#article","headline":"Magento Order Status Wrong After a Partial or Zero Total Refund","description":"Why Magento's credit memo save logic can leave an order on the wrong status after a zero-total or partial refund, and a safe Python or Node.js script that flags it over REST.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/order-status-wrong-after-refund/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Credit Memos and Refunds","keywords":"Magento order status wrong after refund, zero total credit memo, partial refund closed, Order::setState, total_refunded, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Order status wrong after partial or zero total refund","item":"https://www.allanninal.dev/magento/order-status-wrong-after-refund/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Magento order stay Processing after it was fully refunded?","acceptedAnswer":{"@type":"Answer","text":"Magento derives order state from totals such as total_refunded and total_paid rather than recomputing it from a single authoritative rule each time a credit memo posts. When the refund includes a zero-total credit memo, such as a store-credit-only refund or a refund of shipping only, the comparison the core code makes between total_refunded and total_paid can fail to recognize the order as fully refunded, so it never transitions to Closed and is left on Processing or Complete instead."}},{"@type":"Question","name":"How do I find orders with the wrong status after a refund?","acceptedAnswer":{"@type":"Answer","text":"Pull orders in status processing or complete from the REST API, then for each one fetch its credit memos filtered by order_id. Compare the sum of credit memo totals and the order's own total_refunded, total_paid, and total_invoiced fields against a simple rule: if the order is fully refunded but not marked closed, or if it was only partially refunded but was forced to closed, the status disagrees with the totals and the order should be flagged."}},{"@type":"Question","name":"Can I fix the order status directly over the Magento REST API?","acceptedAnswer":{"@type":"Answer","text":"Not safely. Order state and status are gated by Magento's internal state machine defined in sales.xml and Order::setState, and there is no supported public REST write for status alone. POSTing an arbitrary status back through /rest/V1/orders can desync order state and status. The safe path is to report the mismatch, optionally add a status history comment through PUT /rest/V1/orders/{id}, and let a human trigger the correct transition from the Credit Memos grid or the order view in Admin."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Credit Memos and Refunds</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Credit Memos and Refunds</p>
+    <h1>Order status wrong after partial or zero total refund</h1>
+    <p class="lead">A customer got a store-credit-only refund, or you refunded just the shipping, or a bundle item was partially credited back. The credit memo saved fine. But the order still says Processing days later, even though nothing is left to pay back. Or the opposite happens, one partial refund and the order jumps straight to Closed while most of the balance is still owed. Here is why Magento's own refund logic misreads these totals and a small script that finds every order it happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Magento REST API</span>
+      <span class="chip">Safe by default (report first)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento 2 derives order state and status largely from invoiced, shipped, and refunded totals through <code>Magento\Sales\Model\Order::getIsInProcess()</code>, <code>Order::setState()</code>, and the logic that runs on the <code>sales_order_creditmemo_save_after</code> event, rather than recomputing the status from a single authoritative rule every time a credit memo posts. A zero-total credit memo, a shipping-only refund, or a partial refund on a bundle or configurable item can make the check that compares <code>total_refunded</code> against <code>total_paid</code> come out wrong, leaving a fully refunded order on Processing or Complete, or, per the inverse Adobe Commerce bug, forcing an order to Closed after only a partial refund. There is no safe REST write for order state or status, so the fix here is to detect every affected order through <code>/rest/V1/orders</code> and <code>/rest/V1/creditmemo</code>, report it for review, and let a human trigger the correct transition in Admin. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Magento does not have one place that says "here is this order's correct status, recompute it now." Instead the status falls out of a handful of totals the order carries around: how much was invoiced, how much was shipped, how much was refunded, how much was paid. Various pieces of core code, from <code>Order::getIsInProcess()</code> to the creditmemo total collectors under <code>Magento\Sales\Model\Order\Creditmemo\Total\*</code>, each look at a slice of those totals and nudge the state one way or another.</p>
+  <p>That works for the common case, refund the whole order in one credit memo and it closes cleanly. It falls apart at the edges. A credit memo can legitimately have a zero grand total, for example when a refund is issued entirely as store credit rather than back to the original payment method. A refund can cover only shipping, leaving every line item's refunded amount at zero even though the customer got money back. A bundle or configurable product can be partially refunded on some of its sub items but not others, which muddies what "fully refunded" even means for that line. In each of these cases the comparison between <code>total_refunded</code> and <code>total_paid</code> that core code relies on does not line up cleanly, and the order status stops matching reality.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A zero total or partial credit memo saves, Order colon colon setState runs its total comparison, the comparison misreads the zero or partial total, and the order status is left wrong, either stuck on Processing or forced to Closed.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="165" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="92" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Credit memo saves</text>
+      <text x="92" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">zero total or partial</text>
+      <line x1="178" y1="103" x2="220" y2="103" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="223" y="70" width="165" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="305" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Order::setState() runs</text>
+      <text x="305" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">compares totals</text>
+      <line x1="391" y1="103" x2="450" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="420" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="420" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">comparison misreads the total</text>
+      <rect x="453" y="70" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">total_refunded vs</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">total_paid disagree</text>
+      <rect x="628" y="70" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Status wrong</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stuck or forced</text>
+      <line x1="606" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="689" y1="136" x2="689" y2="168" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="5 4"></line>
+      <rect x="565" y="170" width="185" height="50" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="657" y="191" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Fully refunded stays</text>
+      <text x="657" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Processing, or one partial closes</text>
+    </svg>
+    <figcaption>Order::setState() compares refunded and paid totals as a proxy for the order's real state. A zero-total or partial credit memo can make that comparison come out wrong in either direction.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>A refund issued entirely as store credit, so the credit memo's <code>grand_total</code> and <code>base_grand_total</code> are zero even though the customer's balance is settled.</li>
+    <li>A refund of shipping only, or of a small fee, which does not move <code>total_refunded</code> anywhere close to <code>total_paid</code> yet is, in context, the entire refund the order was ever going to get.</li>
+    <li>A partial refund on a bundle or configurable product's sub items, where some child line items are credited and others are not, so what counts as "fully refunded" for that parent line is ambiguous to the totals-based check.</li>
+    <li>The reverse defect, tracked by Adobe as ACSD-49392, where a genuinely partial refund on an order gets the order forced to Closed anyway, when a partial refund alone should never close an order on its own.</li>
+  </ul>
+  <p>This is a long-standing, repeatedly reported core bug rather than a merchant configuration mistake. It shows up across several separate GitHub issues describing the same family of symptom: a credit memo posts, the totals look fine in the credit memo itself, and the order's status simply does not follow. See the citations at the end for the specific threads and the Adobe Commerce patch notes.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no single rule engine in Magento that says "a credit memo just posted, here is what the order's status should be, set it." Instead the status is an emergent property of several totals-based checks scattered across <code>Order::setState()</code>, <code>Order::getIsInProcess()</code>, and the creditmemo total collectors, and those checks were written assuming a normal, full-value refund. Detecting the defect means comparing the same totals Magento already exposes over REST, <code>total_refunded</code>, <code>total_paid</code>, <code>total_invoiced</code>, against the order's actual status, and also checking whether any of the order's credit memos has a zero <code>grand_total</code>, since that is the shape that most often confuses the core logic.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch <code>order.state</code> or <code>order.status</code> directly. Order state transitions are core business logic gated by Magento's internal state machine, configured in <code>sales.xml</code> under <code>&lt;order&gt;&lt;states&gt;</code>, and there is no supported, documented REST write for status alone. Instead we add a job that lists candidate orders, pulls each one's credit memos, runs the same totals comparison a human would, and reports every mismatch in either direction so an admin can correct it from the Credit Memos grid or the order view.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists processing and complete orders, reads each order's credit memos and totals, checks whether the expected status based on total refunded and total paid matches the current status, and either reports the mismatch for a human to correct in Admin or leaves the order alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">List candidate orders</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">status in processing, complete</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read credit memos</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">and order totals</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Expected status</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">differs?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report ok</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="623" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="689" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag for review</text>
+      <text x="689" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">human corrects status in Admin</text>
+      <path d="M695,138 C715,138 689,150 689,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only flags orders where the expected status, computed from totals, disagrees with the current status. Everything already correct is left alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>The script authenticates like any other Magento REST client. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export DRY_RUN="true"   # start safe, change to false to allow the status history comment</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export DRY_RUN="true"   // start safe, change to false to allow the status history comment</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List candidate orders, then read credit memos for each one</h3>
+      <p>Filter <code>/rest/V1/orders</code> with a <code>searchCriteria</code> filter on <code>status in (processing, complete)</code>, paging with <code>pageSize</code> and <code>currentPage</code>. For every hit, fetch its credit memos from <code>/rest/V1/creditmemo</code> filtered by <code>order_id</code>, reading back <code>grand_total</code>, <code>base_grand_total</code>, and <code>state</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def candidate_orders(page_size=200):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": "processing,complete",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": 1,
+    }
+    return magento_get("/orders", params)["items"]
+
+
+def creditmemos_for_order(order_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": order_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    return magento_get("/creditmemo", params)["items"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function candidateOrders(pageSize = 200) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "status",
+    "searchCriteria[filterGroups][0][filters][0][value]": "processing,complete",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": 1,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items;
+}
+
+async function creditmemosForOrder(orderId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": orderId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  };
+  const data = await magentoGet("/creditmemo", params);
+  return data.items;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the order's totals, its credit memos, and its current status, and returns the expected status plus whether that disagrees with reality. A pure function like this is easy to read and easy to test, which we do later. Nothing invoiced yet means no refund-driven transition applies at all, so we leave the status alone in that case. Money math uses a small epsilon since floats never compare exactly.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">EPSILON = 0.01
+
+def expected_order_status(order_totals, credit_memos, current_status):
+    total_invoiced = order_totals.get("totalInvoiced", 0) or 0
+    total_paid = order_totals.get("totalPaid", 0) or 0
+    total_refunded = order_totals.get("totalRefunded", 0) or 0
+
+    if total_invoiced &lt;= 0:
+        return {"expected": current_status, "isMismatch": False}
+
+    is_fully_refunded = total_refunded &gt;= total_paid - EPSILON
+    has_zero_total_memo = any(cm.get("grandTotal") == 0 for cm in credit_memos)
+    if credit_memos and has_zero_total_memo and total_refunded &gt;= total_paid - EPSILON:
+        is_fully_refunded = True
+
+    if is_fully_refunded:
+        expected = "closed"
+    elif 0 &lt; total_refunded &lt; total_paid - EPSILON:
+        expected = "processing" if current_status == "closed" else current_status
+    else:
+        expected = current_status
+
+    return {"expected": expected, "isMismatch": expected != current_status}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const EPSILON = 0.01;
+
+export function expectedOrderStatus(orderTotals, creditMemos, currentStatus) {
+  const totalInvoiced = orderTotals.totalInvoiced || 0;
+  const totalPaid = orderTotals.totalPaid || 0;
+  const totalRefunded = orderTotals.totalRefunded || 0;
+
+  if (totalInvoiced &lt;= 0) {
+    return { expected: currentStatus, isMismatch: false };
+  }
+
+  let isFullyRefunded = totalRefunded &gt;= totalPaid - EPSILON;
+  const hasZeroTotalMemo = creditMemos.some((cm) =&gt; cm.grandTotal === 0);
+  if (creditMemos.length &gt; 0 &amp;&amp; hasZeroTotalMemo &amp;&amp; totalRefunded &gt;= totalPaid - EPSILON) {
+    isFullyRefunded = true;
+  }
+
+  let expected;
+  if (isFullyRefunded) {
+    expected = "closed";
+  } else if (totalRefunded &gt; 0 &amp;&amp; totalRefunded &lt; totalPaid - EPSILON) {
+    expected = currentStatus === "closed" ? "processing" : currentStatus;
+  } else {
+    expected = currentStatus;
+  }
+
+  return { expected, isMismatch: expected !== currentStatus };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report by default, leave the transition to Admin</h3>
+      <p>The default output is one report row per mismatched order: <code>increment_id</code>, <code>entity_id</code>, current status, expected status, and the totals that drove the decision. There is no safe REST write for order status alone, so this job never sets it directly. If a human confirms the mismatch, the only optional write, and only outside dry run, is a status history comment added through <code>PUT /rest/V1/orders/{id}</code> with a <code>status_histories</code> entry, so the note shows up on the order for whoever triggers the real transition from the Credit Memos grid or the order view's Close order action.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def add_status_history_comment(order_id, comment):
+    payload = {
+        "entity": {
+            "entity_id": order_id,
+            "status_histories": [
+                {"comment": comment, "is_customer_notified": 0, "is_visible_on_front": 0}
+            ],
+        }
+    }
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/orders/{order_id}",
+        json=payload,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function addStatusHistoryComment(orderId, comment) {
+  const payload = {
+    entity: {
+      entity_id: orderId,
+      status_histories: [
+        { comment, is_customer_notified: 0, is_visible_on_front: 0 },
+      ],
+    },
+  };
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/orders/${orderId}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Treat every flagged order as a report for a human to review first. Never attempt to set <code>order.status</code> or <code>order.state</code> directly through a public REST write, Magento does not expose a supported one for status alone and forcing it can desync the order's state from its status. The only optional write this job makes is a visible-to-staff status history comment, never a status change, and only once a human is ready to act on it.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, lists processing and complete orders, cross checks each one's credit memos and totals, reports every status mismatch, and only adds a status history comment when <code>DRY_RUN</code> is false.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/order-status-wrong-after-refund" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_status_after_refund.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 orders whose status disagrees with their refund totals.
+
+Magento derives order state and status largely from totals such as
+total_refunded and total_paid, via Order::getIsInProcess(), Order::setState(),
+and the creditmemo save observers, rather than recomputing status from a
+single authoritative rule each time a credit memo posts. A zero-total credit
+memo (store-credit-only refunds), a shipping-only refund, or a partial refund
+on a bundle/configurable item can make the totals comparison come out wrong,
+leaving a fully refunded order on Processing or Complete, or forcing an
+order to Closed after only a partial refund.
+
+There is no safe REST write for order.status alone, so this reports by
+default. The only optional write is a status history comment, and only when
+DRY_RUN is false. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_status_after_refund")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+EPSILON = 0.01
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def expected_order_status(order_totals, credit_memos, current_status):
+    total_invoiced = order_totals.get("totalInvoiced", 0) or 0
+    total_paid = order_totals.get("totalPaid", 0) or 0
+    total_refunded = order_totals.get("totalRefunded", 0) or 0
+
+    if total_invoiced &lt;= 0:
+        return {"expected": current_status, "isMismatch": False}
+
+    is_fully_refunded = total_refunded &gt;= total_paid - EPSILON
+    has_zero_total_memo = any(cm.get("grandTotal") == 0 for cm in credit_memos)
+    if credit_memos and has_zero_total_memo and total_refunded &gt;= total_paid - EPSILON:
+        is_fully_refunded = True
+
+    if is_fully_refunded:
+        expected = "closed"
+    elif 0 &lt; total_refunded &lt; total_paid - EPSILON:
+        expected = "processing" if current_status == "closed" else current_status
+    else:
+        expected = current_status
+
+    return {"expected": expected, "isMismatch": expected != current_status}
+
+
+def candidate_orders(page_size=200):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": "processing,complete",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": 1,
+    }
+    return magento_get("/orders", params)["items"]
+
+
+def creditmemos_for_order(order_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": order_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    return magento_get("/creditmemo", params)["items"]
+
+
+def add_status_history_comment(order_id, comment):
+    payload = {
+        "entity": {
+            "entity_id": order_id,
+            "status_histories": [
+                {"comment": comment, "is_customer_notified": 0, "is_visible_on_front": 0}
+            ],
+        }
+    }
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/orders/{order_id}",
+        json=payload,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    flagged = 0
+    for order in candidate_orders():
+        order_id = order.get("entity_id")
+        current_status = order.get("status")
+        memos = creditmemos_for_order(order_id)
+
+        credit_memos = [{"grandTotal": m.get("grand_total"), "state": m.get("state")} for m in memos]
+        order_totals = {
+            "totalInvoiced": order.get("total_invoiced"),
+            "totalPaid": order.get("total_paid"),
+            "totalRefunded": order.get("total_refunded"),
+        }
+
+        result = expected_order_status(order_totals, credit_memos, current_status)
+        if not result["isMismatch"]:
+            continue
+
+        comment = (
+            f"Flagged: total_refunded={order_totals['totalRefunded']} "
+            f"total_paid={order_totals['totalPaid']} status={current_status} "
+            f"expected={result['expected']}"
+        )
+        log.warning(
+            "Order %s (id=%s) status mismatch: current=%s expected=%s total_refunded=%s total_paid=%s. %s",
+            order.get("increment_id"), order_id, current_status, result["expected"],
+            order_totals["totalRefunded"], order_totals["totalPaid"],
+            "would add status history comment" if DRY_RUN else "adding status history comment",
+        )
+        if not DRY_RUN:
+            add_status_history_comment(order_id, comment)
+        flagged += 1
+
+    log.info("Done. %d order(s) flagged with a status mismatch after refund.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-status-after-refund.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 orders whose status disagrees with their refund totals.
+ *
+ * Magento derives order state and status largely from totals such as
+ * total_refunded and total_paid, via Order::getIsInProcess(), Order::setState(),
+ * and the creditmemo save observers, rather than recomputing status from a
+ * single authoritative rule each time a credit memo posts. A zero-total credit
+ * memo (store-credit-only refunds), a shipping-only refund, or a partial
+ * refund on a bundle/configurable item can make the totals comparison come
+ * out wrong, leaving a fully refunded order on Processing or Complete, or
+ * forcing an order to Closed after only a partial refund.
+ *
+ * There is no safe REST write for order.status alone, so this reports by
+ * default. The only optional write is a status history comment, and only
+ * when DRY_RUN is false. Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/order-status-wrong-after-refund/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const EPSILON = 0.01;
+
+export function expectedOrderStatus(orderTotals, creditMemos, currentStatus) {
+  const totalInvoiced = orderTotals.totalInvoiced || 0;
+  const totalPaid = orderTotals.totalPaid || 0;
+  const totalRefunded = orderTotals.totalRefunded || 0;
+
+  if (totalInvoiced &lt;= 0) {
+    return { expected: currentStatus, isMismatch: false };
+  }
+
+  let isFullyRefunded = totalRefunded &gt;= totalPaid - EPSILON;
+  const hasZeroTotalMemo = creditMemos.some((cm) =&gt; cm.grandTotal === 0);
+  if (creditMemos.length &gt; 0 &amp;&amp; hasZeroTotalMemo &amp;&amp; totalRefunded &gt;= totalPaid - EPSILON) {
+    isFullyRefunded = true;
+  }
+
+  let expected;
+  if (isFullyRefunded) {
+    expected = "closed";
+  } else if (totalRefunded &gt; 0 &amp;&amp; totalRefunded &lt; totalPaid - EPSILON) {
+    expected = currentStatus === "closed" ? "processing" : currentStatus;
+  } else {
+    expected = currentStatus;
+  }
+
+  return { expected, isMismatch: expected !== currentStatus };
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function candidateOrders(pageSize = 200) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "status",
+    "searchCriteria[filterGroups][0][filters][0][value]": "processing,complete",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": 1,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items;
+}
+
+async function creditmemosForOrder(orderId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": orderId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  };
+  const data = await magentoGet("/creditmemo", params);
+  return data.items;
+}
+
+async function addStatusHistoryComment(orderId, comment) {
+  const payload = {
+    entity: {
+      entity_id: orderId,
+      status_histories: [
+        { comment, is_customer_notified: 0, is_visible_on_front: 0 },
+      ],
+    },
+  };
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/orders/${orderId}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+export async function run() {
+  let flagged = 0;
+  const orders = await candidateOrders();
+  for (const order of orders) {
+    const orderId = order.entity_id;
+    const currentStatus = order.status;
+    const memos = await creditmemosForOrder(orderId);
+
+    const creditMemos = memos.map((m) =&gt; ({ grandTotal: m.grand_total, state: m.state }));
+    const orderTotals = {
+      totalInvoiced: order.total_invoiced,
+      totalPaid: order.total_paid,
+      totalRefunded: order.total_refunded,
+    };
+
+    const result = expectedOrderStatus(orderTotals, creditMemos, currentStatus);
+    if (!result.isMismatch) continue;
+
+    const comment = `Flagged: total_refunded=${orderTotals.totalRefunded} total_paid=${orderTotals.totalPaid} status=${currentStatus} expected=${result.expected}`;
+    console.warn(
+      `Order ${order.increment_id} (id=${orderId}) status mismatch: current=${currentStatus} expected=${result.expected} total_refunded=${orderTotals.totalRefunded} total_paid=${orderTotals.totalPaid}. ${
+        DRY_RUN ? "would add status history comment" : "adding status history comment"
+      }`
+    );
+    if (!DRY_RUN) await addStatusHistoryComment(orderId, comment);
+    flagged++;
+  }
+
+  console.log(`Done. ${flagged} order(s) flagged with a status mismatch after refund.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get surfaced as a defect. Because we kept <code>expected_order_status</code> pure, the test needs no network and no Magento store. It just feeds in plain fixtures and checks the answer, matching the reported GitHub scenarios directly: a zero-total memo, a partial bundle-item memo, and a fully-refunded order still stuck on Processing.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_refund_status.py</div>
+      <pre><code class="language-python">from flag_status_after_refund import expected_order_status
+
+
+def totals(**over):
+    base = {"totalInvoiced": 100.0, "totalPaid": 100.0, "totalRefunded": 0.0}
+    base.update(over)
+    return base
+
+
+def test_nothing_invoiced_yet_is_never_a_mismatch():
+    result = expected_order_status(totals(totalInvoiced=0, totalPaid=0), [], "pending")
+    assert result["isMismatch"] is False
+    assert result["expected"] == "pending"
+
+
+def test_fully_refunded_but_still_processing_is_a_mismatch():
+    result = expected_order_status(totals(totalRefunded=100.0), [{"grandTotal": 100.0}], "processing")
+    assert result["expected"] == "closed"
+    assert result["isMismatch"] is True
+
+
+def test_zero_total_memo_covering_full_balance_is_treated_as_fully_refunded():
+    result = expected_order_status(totals(totalRefunded=100.0), [{"grandTotal": 0.0}], "complete")
+    assert result["expected"] == "closed"
+    assert result["isMismatch"] is True
+
+
+def test_partial_refund_never_forces_closed_on_its_own():
+    result = expected_order_status(totals(totalRefunded=40.0), [{"grandTotal": 40.0}], "closed")
+    assert result["expected"] == "processing"
+    assert result["isMismatch"] is True
+
+
+def test_partial_refund_leaves_processing_alone():
+    result = expected_order_status(totals(totalRefunded=40.0), [{"grandTotal": 40.0}], "processing")
+    assert result["expected"] == "processing"
+    assert result["isMismatch"] is False
+
+
+def test_already_closed_and_fully_refunded_is_not_a_mismatch():
+    result = expected_order_status(totals(totalRefunded=100.0), [{"grandTotal": 100.0}], "closed")
+    assert result["isMismatch"] is False
+
+
+def test_no_refund_at_all_is_not_a_mismatch():
+    result = expected_order_status(totals(), [], "processing")
+    assert result["isMismatch"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">refund-status.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { expectedOrderStatus } from "./flag-status-after-refund.js";
+
+const totals = (over = {}) =&gt; ({ totalInvoiced: 100.0, totalPaid: 100.0, totalRefunded: 0.0, ...over });
+
+test("nothing invoiced yet is never a mismatch", () =&gt; {
+  const result = expectedOrderStatus(totals({ totalInvoiced: 0, totalPaid: 0 }), [], "pending");
+  assert.equal(result.isMismatch, false);
+  assert.equal(result.expected, "pending");
+});
+
+test("fully refunded but still processing is a mismatch", () =&gt; {
+  const result = expectedOrderStatus(totals({ totalRefunded: 100.0 }), [{ grandTotal: 100.0 }], "processing");
+  assert.equal(result.expected, "closed");
+  assert.equal(result.isMismatch, true);
+});
+
+test("zero total memo covering full balance is treated as fully refunded", () =&gt; {
+  const result = expectedOrderStatus(totals({ totalRefunded: 100.0 }), [{ grandTotal: 0.0 }], "complete");
+  assert.equal(result.expected, "closed");
+  assert.equal(result.isMismatch, true);
+});
+
+test("partial refund never forces closed on its own", () =&gt; {
+  const result = expectedOrderStatus(totals({ totalRefunded: 40.0 }), [{ grandTotal: 40.0 }], "closed");
+  assert.equal(result.expected, "processing");
+  assert.equal(result.isMismatch, true);
+});
+
+test("partial refund leaves processing alone", () =&gt; {
+  const result = expectedOrderStatus(totals({ totalRefunded: 40.0 }), [{ grandTotal: 40.0 }], "processing");
+  assert.equal(result.expected, "processing");
+  assert.equal(result.isMismatch, false);
+});
+
+test("already closed and fully refunded is not a mismatch", () =&gt; {
+  const result = expectedOrderStatus(totals({ totalRefunded: 100.0 }), [{ grandTotal: 100.0 }], "closed");
+  assert.equal(result.isMismatch, false);
+});
+
+test("no refund at all is not a mismatch", () =&gt; {
+  const result = expectedOrderStatus(totals(), [], "processing");
+  assert.equal(result.isMismatch, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Store credit refund</span>
+      <h4>The store that refunded entirely to store credit</h4>
+      <p>A fashion retailer let customer service issue refunds as store credit instead of back to the card, mainly to keep the sale on the books and encourage a repeat purchase. Each of those credit memos had a <code>grand_total</code> of zero, since no money moved back to the original payment method. The orders behind them stayed on Processing indefinitely, even though customer service considered the case fully resolved.</p>
+      <p>Running the detection job weekly surfaced every one of these orders as a mismatch, expected status closed, current status processing. Support used the report to close them out from the order view in one pass, and stopped seeing them resurface in the "orders needing attention" filter every week.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Bundle sub item refund</span>
+      <h4>The bundle where only one component was refunded</h4>
+      <p>A furniture store sold bundles where a customer could return one accessory from a multi-item bundle without returning the whole set. The credit memo against that sub item was small relative to the order's grand total, and the core totals comparison never recognized the refund as complete for the order as a whole, even though the customer's specific complaint was closed.</p>
+      <p>The team ran the script in dry run first, reviewed the small number of orders it flagged as still Processing with a partial refund on record, and used the report to decide case by case whether the order should move to Closed or stay open pending further action, rather than guessing from the credit memo total alone.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a refund that leaves the order status wrong, in either direction, gets caught within one detection cycle instead of sitting quietly in the order grid. The report carries the increment id, the current and expected status, and the totals that drove the decision, so whoever reviews it can act fast. The order's status itself is never touched directly, only a note is added for staff, which keeps the real transition in the hands of a human using the same Credit Memos grid and Close order action Magento already provides.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Magento order stay Processing after it was fully refunded?</summary>
+      <p>Magento derives order state from totals such as total_refunded and total_paid rather than recomputing it from a single authoritative rule each time a credit memo posts. When the refund includes a zero-total credit memo, such as a store-credit-only refund or a refund of shipping only, the comparison the core code makes between total_refunded and total_paid can fail to recognize the order as fully refunded, so it never transitions to Closed and is left on Processing or Complete instead.</p>
+    </details>
+    <details>
+      <summary>How do I find orders with the wrong status after a refund?</summary>
+      <p>Pull orders in status processing or complete from the REST API, then for each one fetch its credit memos filtered by order_id. Compare the sum of credit memo totals and the order's own total_refunded, total_paid, and total_invoiced fields against a simple rule: if the order is fully refunded but not marked closed, or if it was only partially refunded but was forced to closed, the status disagrees with the totals and the order should be flagged.</p>
+    </details>
+    <details>
+      <summary>Can I fix the order status directly over the Magento REST API?</summary>
+      <p>Not safely. Order state and status are gated by Magento's internal state machine defined in sales.xml and Order::setState, and there is no supported public REST write for status alone. POSTing an arbitrary status back through /rest/V1/orders can desync order state and status. The safe path is to report the mismatch, optionally add a status history comment through PUT /rest/V1/orders/{id}, and let a human trigger the correct transition from the Credit Memos grid or the order view in Admin.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: Credit Memo with Zero Total, order status Complete and not Closed. <a href="https://github.com/magento/magento2/issues/22762" rel="noopener">github.com/magento/magento2/issues/22762</a></li>
+      <li>GitHub Issue: order remains in status processing after shipping, if items get partially refunded. <a href="https://github.com/magento/magento2/issues/35528" rel="noopener">github.com/magento/magento2/issues/35528</a></li>
+      <li>Adobe Commerce: ACSD-49392, order status changes to closed after partial refund. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/tools/quality-patches-tool/patches-available-in-qpt/v1-1-31/acsd-49392-order-status-changes-to-closed-after-partial-refund" rel="noopener">experienceleague.adobe.com ACSD-49392</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce: Credit memos in the Admin. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/stores-sales/order-management/credit-memos/credit-memos" rel="noopener">experienceleague.adobe.com credit memos</a></li>
+      <li>Adobe Commerce: order status reference. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/stores-sales/order-management/orders/order-status" rel="noopener">experienceleague.adobe.com order status</a></li>
+      <li>Adobe Commerce: order workflow and processing. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/stores-sales/order-management/orders/order-processing" rel="noopener">experienceleague.adobe.com order processing</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce orders, payments, catalog data, or inventory that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a status that never matched the refund?</h3>
+    <p>If this saved you from chasing a report that never reconciled, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

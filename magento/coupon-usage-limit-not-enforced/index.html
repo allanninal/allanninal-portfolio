@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coupon Usage Limit Not Enforced, Allowing Unlimited Reuse in Magento 2</title>
+<meta name="description" content="A Magento 2 or Adobe Commerce coupon with uses_per_coupon or uses_per_customer set keeps getting reused past its limit. Learn why the async usage queue consumer silently breaks enforcement, and build a Python or Node.js script that detects and reports the real usage drift.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/coupon-usage-limit-not-enforced/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Coupon Usage Limit Not Enforced, Allowing Unlimited Reuse in Magento 2">
+<meta property="og:description" content="Why uses_per_coupon and uses_per_customer silently stop being enforced since Magento 2.4.3, and a safe Python or Node.js script that cross-checks real order counts against times_used over the REST API.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/coupon-usage-limit-not-enforced/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/coupon-usage-limit-not-enforced/#article","headline":"Coupon Usage Limit Not Enforced, Allowing Unlimited Reuse in Magento 2","description":"Why uses_per_coupon and uses_per_customer silently stop being enforced since Magento 2.4.3, and a safe Python or Node.js script that cross-checks real order counts against times_used over the REST API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/coupon-usage-limit-not-enforced/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Cart Price Rules and Coupons","keywords":"Magento coupon usage limit not working, uses_per_coupon, uses_per_customer, salesrule_coupon times_used, sales.rule.update.coupon.usage, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Coupon usage limit not enforced, allowing unlimited reuse","item":"https://www.allanninal.dev/magento/coupon-usage-limit-not-enforced/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Magento coupon keep working after it should have hit its usage limit?","acceptedAnswer":{"@type":"Answer","text":"Since Magento 2.4.3, the counters that enforce uses_per_coupon and uses_per_customer, such as salesrule_coupon.times_used, salesrule_customer.times_used, and the salesrule_coupon_usage rows, are updated asynchronously by the sales.rule.update.coupon.usage message queue consumer instead of during order placement. If that consumer is not running, falls behind under load, or the order placement fails after the coupon is applied but before the queue message is processed, times_used never increments even though the coupon was used on a real order, so the limit silently stops being enforced."}},{"@type":"Question","name":"How do I detect coupons that are being reused past their limit?","acceptedAnswer":{"@type":"Answer","text":"Pull active coupon rules through GET /rest/V1/salesRules filtered on coupon_type and is_active, then list each rule's coupons through GET /rest/V1/coupons to read the API's reported times_used. Independently count the real usage from GET /rest/V1/orders filtered by coupon_code and a non-cancelled state, grouped by coupon_code and by customer_id. A coupon is flagged when the real order count exceeds uses_per_coupon, any customer's real count exceeds uses_per_customer, or the reported times_used is lower than the real count, which is the direct evidence the async consumer under-counted."}},{"@type":"Question","name":"Is it safe for a script to automatically cancel or block the extra orders?","acceptedAnswer":{"@type":"Answer","text":"No. Those orders already shipped or are being processed, so cancelling or refunding them is a business and legal decision, not something a script should decide on its own. The script only reports the discrepancy, the rule, the coupon, and the offending order increment ids for a human to review. The one safe corrective action, gated behind an explicit --apply flag, is recomputing and correcting the times_used counters to match the true order count and confirming the sales.rule.update.coupon.usage consumer is actually running."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Cart Price Rules and Coupons</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Cart Price Rules and Coupons</p>
+    <h1>Coupon usage limit not enforced, allowing unlimited reuse</h1>
+    <p class="lead">You set <code>Uses per Coupon</code> to one, or <code>Uses per Customer</code> to one, and the storefront still accepts the same code on the tenth order. Nothing looks wrong in the rule configuration. But the counters Magento uses to enforce that limit are updated after the fact, on a queue, and when that queue lags or the consumer is not running, the limit simply stops being checked. Here is why that happens and a small script that finds every coupon being reused past its real limit without touching a single order.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">REST API, read only detection</span>
+      <span class="chip">Safe by default (report first)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Since Magento 2.4.3, coupon and customer usage bookkeeping, <code>salesrule_coupon.times_used</code>, <code>salesrule_customer.times_used</code>, and the <code>salesrule_coupon_usage</code> rows, is incremented asynchronously by the <code>sales.rule.update.coupon.usage</code> message queue consumer instead of synchronously at order placement. If the consumer is not running, lags under load, or the order crashes after the coupon is applied but before the queue message is consumed, <code>times_used</code> never moves even though the coupon was used on a real order, so <code>uses_per_coupon</code> and <code>uses_per_customer</code> silently stop being enforced. A script can pull each rule's configured limits over <code>GET /rest/V1/salesRules</code>, the API's reported <code>times_used</code> over <code>GET /rest/V1/coupons</code>, and the real, authoritative usage from <code>GET /rest/V1/orders</code> filtered by <code>coupon_code</code>, then flag any coupon where the real order count disagrees with the configured limit or the reported counter. It should not cancel or refund those orders on its own, since that is a business decision. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A cart price rule with a coupon code carries two limits merchants rely on: <code>uses_per_coupon</code>, how many times the code overall can be redeemed, and <code>uses_per_customer</code>, how many times one customer can redeem it. Both are meant to be checked and incremented the moment an order is placed with that coupon attached, the same way inventory is reserved the moment a cart becomes an order.</p>
+  <p>That used to be true. But since Magento 2.4.3, the increment side of that bookkeeping moved off the request thread and onto a message queue. <code>Magento\SalesRule\Model\Plugin\Quote</code> and the <code>CouponUsageProcessor</code> now publish a message to <code>sales.rule.update.coupon.usage</code> when an order is placed, and a separate consumer process is responsible for actually writing the updated <code>times_used</code> values back to <code>salesrule_coupon</code>, <code>salesrule_customer</code>, and <code>salesrule_coupon_usage</code>. The order itself succeeds and ships regardless of whether that consumer ever runs. If it is not running, falls behind under load, or the request crashes after the coupon was applied to the quote but before the queue message is consumed, the counters simply never catch up, and the coupon keeps validating as if it had never been used.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A customer places an order with a coupon, the order succeeds and ships, a queue message is published to update the usage counter, but if the consumer is not running or lags, times_used is never incremented, so the coupon still validates for the next order.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Order placed</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">coupon applied, ships fine</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="298" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Queue message sent</text>
+      <text x="298" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">sales.rule.update.coupon.usage</text>
+      <line x1="381" y1="103" x2="440" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">consumer down or lagging</text>
+      <rect x="443" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">times_used stuck</text>
+      <text x="523" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">counter never increments</text>
+      <rect x="628" y="70" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Coupon still</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">validates</text>
+      <line x1="606" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="689" y1="136" x2="689" y2="168" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="5 4"></line>
+      <rect x="565" y="170" width="185" height="50" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="657" y="191" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">real order count exceeds</text>
+      <text x="657" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">uses_per_coupon or per_customer</text>
+    </svg>
+    <figcaption>Order placement and coupon usage bookkeeping are two separate paths. When only the order half completes, the code looks unused and keeps validating past its real limit.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>The <code>sales.rule.update.coupon.usage</code> consumer is not started at all, common right after a fresh deployment or a server migration where <code>bin/magento queue:consumers:start</code> was never added to the process manager.</li>
+    <li>The consumer is running but falls behind during a sale or a flash promotion, so a burst of orders using the same coupon all place successfully before any of their usage messages are processed.</li>
+    <li>The order placement request crashes, times out, or is killed after the coupon has been applied to the quote and the order has been created, but before the queue message for that order is published or consumed.</li>
+    <li>A related variant leaves the opposite symptom: a cancelled or failed order's usage row in <code>salesrule_coupon_usage</code> is never decremented, so <code>times_used</code> stays artificially high and blocks a valid customer from reusing a coupon they never successfully redeemed. Both symptoms trace back to the same root cause, usage tracking that is decoupled from the authoritative order record.</li>
+  </ul>
+  <p>This is a documented, recurring gap reported directly against Magento 2.4.3 and later, both in the core issue tracker and in Adobe's own knowledge base. See the citations at the end for the exact threads and articles.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>salesrule_coupon.times_used</code> is not the source of truth, it is a cache that is supposed to track the source of truth. The actual record of whether a coupon was used is the order itself, specifically its <code>coupon_code</code> field and its state. So a detection script should never trust <code>times_used</code> on its own. It should count real, non-cancelled orders carrying that coupon code and compare that count against the configured limit, then treat any gap between the real count and the reported counter as direct evidence the queue consumer fell behind.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live checkout or the queue consumer's code. We add a job that pulls every active coupon rule and its configured limits, pulls the coupon codes under each rule, independently counts real usage from actual orders, and reports any coupon where the real count breaks the configured limit or disagrees with the reported counter. Nothing about placing, cancelling, or refunding an order is touched by this job.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists active coupon rules and their limits, lists coupons per rule, counts real non-cancelled orders per coupon code and per customer, checks whether the real count exceeds the configured limit or disagrees with times_used, and either reports the coupon as fine or flags it with the offending order ids for human review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="128" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">List active rules,</text>
+      <text x="117" y="145" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">coupons per rule</text>
+      <text x="117" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">salesRules, coupons</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Count real orders</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">by coupon_code, by customer</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="580" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b1a10">Exceeds limit or</text>
+      <text x="580" y="143" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b1a10">times_used drifts?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report ok</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="623" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="689" y="205" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag for review</text>
+      <text x="689" y="221" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">offending order ids listed</text>
+      <path d="M695,138 C715,138 689,150 689,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only reports a discrepancy. Recomputing the counters or contacting a customer about an over-redeemed coupon stays a human decision.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>Authenticate the way any Magento REST client does. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export DRY_RUN="true"   # start safe, change to false only with --apply to recompute counters</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export DRY_RUN="true"   // start safe, change to false only with --apply to recompute counters</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List active coupon rules and their coupons</h3>
+      <p>Search <code>/salesRules</code> for rules that are active and carry a coupon type of specific or auto-generated, and read back <code>rule_id</code>, <code>uses_per_coupon</code>, and <code>uses_per_customer</code>. For each rule, search <code>/coupons</code> filtered by <code>rule_id</code> to get every coupon's <code>coupon_id</code>, <code>code</code>, and the API's reported <code>times_used</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def active_coupon_rules(page_size=100):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "coupon_type",
+        "searchCriteria[filterGroups][0][filters][0][value]": "2,3",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+        "searchCriteria[filterGroups][1][filters][0][field]": "is_active",
+        "searchCriteria[filterGroups][1][filters][0][value]": 1,
+        "searchCriteria[pageSize]": page_size,
+    }
+    return magento_get("/salesRules", params)["items"]
+
+
+def coupons_for_rule(rule_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "rule_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": rule_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    return magento_get("/coupons", params)["items"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function activeCouponRules(pageSize = 100) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "coupon_type",
+    "searchCriteria[filterGroups][0][filters][0][value]": "2,3",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+    "searchCriteria[filterGroups][1][filters][0][field]": "is_active",
+    "searchCriteria[filterGroups][1][filters][0][value]": 1,
+    "searchCriteria[pageSize]": pageSize,
+  };
+  const data = await magentoGet("/salesRules", params);
+  return data.items;
+}
+
+async function couponsForRule(ruleId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "rule_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": ruleId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  };
+  const data = await magentoGet("/coupons", params);
+  return data.items;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Count the real usage from orders</h3>
+      <p>For each coupon code, search <code>/orders</code> filtered by <code>coupon_code</code> equal to that code, excluding cancelled orders. Read <code>entity_id</code>, <code>increment_id</code>, <code>customer_id</code>, and <code>state</code>, since orders, not the cached counter, are the authoritative record of whether a coupon was really used. Page through with <code>currentPage</code> so a heavily used coupon does not get truncated.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def orders_for_coupon(code, page_size=100):
+    page = 1
+    while True:
+        params = {
+            "searchCriteria[filterGroups][0][filters][0][field]": "coupon_code",
+            "searchCriteria[filterGroups][0][filters][0][value]": code,
+            "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+            "searchCriteria[pageSize]": page_size,
+            "searchCriteria[currentPage]": page,
+        }
+        items = magento_get("/orders", params)["items"]
+        if not items:
+            return
+        for item in items:
+            yield item
+        if len(items) < page_size:
+            return
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function* ordersForCoupon(code, pageSize = 100) {
+  let page = 1;
+  while (true) {
+    const params = {
+      "searchCriteria[filterGroups][0][filters][0][field]": "coupon_code",
+      "searchCriteria[filterGroups][0][filters][0][value]": code,
+      "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+      "searchCriteria[pageSize]": pageSize,
+      "searchCriteria[currentPage]": page,
+    };
+    const data = await magentoGet("/orders", params);
+    const items = data.items || [];
+    if (items.length === 0) return;
+    for (const item of items) yield item;
+    if (items.length < pageSize) return;
+    page++;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the rule's configured limits, the coupon record, and the real orders, and returns a plain verdict. A pure function like this is easy to read and easy to test, which we do later. It filters out cancelled orders, counts the real total and the count per customer, and flags a violation when the real total exceeds <code>uses_per_coupon</code>, any customer's real count exceeds <code>uses_per_customer</code>, or the reported <code>times_used</code> is lower than the real total, which is direct evidence the queue consumer under-counted.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def evaluate_coupon_usage(rule, coupon_record, real_orders):
+    active = [o for o in real_orders if o.get("state") != "canceled"]
+    real_total_count = len(active)
+
+    per_customer_counts = {}
+    for o in active:
+        key = str(o.get("customerId")) if o.get("customerId") is not None else "guest"
+        per_customer_counts[key] = per_customer_counts.get(key, 0) + 1
+
+    uses_per_coupon = rule.get("usesPerCoupon")
+    uses_per_customer = rule.get("usesPerCustomer")
+    reported_times_used = coupon_record.get("reportedTimesUsed", 0)
+
+    reason = None
+    if uses_per_coupon and real_total_count > uses_per_coupon:
+        reason = "per_coupon_exceeded"
+    elif uses_per_customer and any(c > uses_per_customer for c in per_customer_counts.values()):
+        reason = "per_customer_exceeded"
+    elif reported_times_used < real_total_count:
+        reason = "times_used_drift"
+
+    allowed = 0
+    if reason == "per_coupon_exceeded":
+        allowed = uses_per_coupon
+    offending = [o["incrementId"] for o in active[allowed:]] if reason == "per_coupon_exceeded" else (
+        [o["incrementId"] for o in active] if reason else []
+    )
+
+    return {
+        "isViolation": reason is not None,
+        "reason": reason,
+        "realTotalCount": real_total_count,
+        "perCustomerCounts": per_customer_counts,
+        "offendingOrderIncrementIds": offending,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function evaluateCouponUsage(rule, couponRecord, realOrders) {
+  const active = realOrders.filter((o) => o.state !== "canceled");
+  const realTotalCount = active.length;
+
+  const perCustomerCounts = {};
+  for (const o of active) {
+    const key = o.customerId != null ? String(o.customerId) : "guest";
+    perCustomerCounts[key] = (perCustomerCounts[key] || 0) + 1;
+  }
+
+  const { usesPerCoupon, usesPerCustomer } = rule;
+  const reportedTimesUsed = couponRecord.reportedTimesUsed || 0;
+
+  let reason = null;
+  if (usesPerCoupon && realTotalCount > usesPerCoupon) {
+    reason = "per_coupon_exceeded";
+  } else if (usesPerCustomer && Object.values(perCustomerCounts).some((c) => c > usesPerCustomer)) {
+    reason = "per_customer_exceeded";
+  } else if (reportedTimesUsed < realTotalCount) {
+    reason = "times_used_drift";
+  }
+
+  const offendingOrderIncrementIds =
+    reason === "per_coupon_exceeded"
+      ? active.slice(usesPerCoupon).map((o) => o.incrementId)
+      : reason
+      ? active.map((o) => o.incrementId)
+      : [];
+
+  return {
+    isViolation: reason !== null,
+    reason,
+    realTotalCount,
+    perCustomerCounts,
+    offendingOrderIncrementIds,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report by default, repair only when gated</h3>
+      <p>The default output is a structured record per flagged coupon: its <code>rule_id</code>, <code>coupon_id</code> and <code>code</code>, the configured <code>uses_per_coupon</code> and <code>uses_per_customer</code>, the real order count, the reported <code>times_used</code>, and the offending order increment ids, for an operator to review. Placing holds, cancelling, or refunding those orders is never something this script does, since orders that already shipped carry business and legal consequences no script should decide unilaterally. Only when <code>DRY_RUN</code> is false and the script is run with an explicit <code>--apply</code> flag does it recompute and correct the <code>times_used</code> counters to match the true order count, and it prints a reminder to run <code>bin/magento queue:consumers:start sales.rule.update.coupon.usage</code> or otherwise verify the consumer is running.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code> and without <code>--apply</code>. Even the one safe corrective action, recomputing <code>times_used</code>, should be reviewed against the printed order list first, and the offending orders themselves are never touched by this script.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, lists active coupon rules and their coupons, counts real usage from orders, respects the dry run flag, and is safe to run again and again because by default it only reports.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/coupon-usage-limit-not-enforced" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">evaluate_coupon_usage.py</div>
+      <pre><code class="language-python">"""Detect Magento 2 and Adobe Commerce coupons that are being reused past their
+configured limit, safely.
+
+Since Magento 2.4.3, coupon usage bookkeeping (salesrule_coupon.times_used,
+salesrule_customer.times_used, and salesrule_coupon_usage rows) is
+incremented asynchronously by the sales.rule.update.coupon.usage message
+queue consumer instead of during order placement. If that consumer is not
+running, lags under load, or the order crashes after the coupon is applied
+but before the message is consumed, times_used never increments even though
+the coupon was used on a real order, so uses_per_coupon and
+uses_per_customer silently stop being enforced.
+
+This reports every discrepancy by default. It never cancels, refunds, or
+holds an order. The only gated corrective action, behind DRY_RUN=false and
+--apply, recomputes times_used to match the real order count. Run on a
+schedule. Safe to run again and again.
+"""
+import os
+import sys
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("evaluate_coupon_usage")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+APPLY = "--apply" in sys.argv
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def magento_put_coupon_times_used(coupon_id, times_used):
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/coupons",
+        json={"entity": {"coupon_id": coupon_id, "times_used": times_used}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def active_coupon_rules(page_size=100):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "coupon_type",
+        "searchCriteria[filterGroups][0][filters][0][value]": "2,3",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+        "searchCriteria[filterGroups][1][filters][0][field]": "is_active",
+        "searchCriteria[filterGroups][1][filters][0][value]": 1,
+        "searchCriteria[pageSize]": page_size,
+    }
+    return magento_get("/salesRules", params)["items"]
+
+
+def coupons_for_rule(rule_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "rule_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": rule_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    return magento_get("/coupons", params)["items"]
+
+
+def orders_for_coupon(code, page_size=100):
+    page = 1
+    while True:
+        params = {
+            "searchCriteria[filterGroups][0][filters][0][field]": "coupon_code",
+            "searchCriteria[filterGroups][0][filters][0][value]": code,
+            "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+            "searchCriteria[pageSize]": page_size,
+            "searchCriteria[currentPage]": page,
+        }
+        items = magento_get("/orders", params)["items"]
+        if not items:
+            return
+        for item in items:
+            yield item
+        if len(items) < page_size:
+            return
+        page += 1
+
+
+def evaluate_coupon_usage(rule, coupon_record, real_orders):
+    active = [o for o in real_orders if o.get("state") != "canceled"]
+    real_total_count = len(active)
+
+    per_customer_counts = {}
+    for o in active:
+        key = str(o.get("customerId")) if o.get("customerId") is not None else "guest"
+        per_customer_counts[key] = per_customer_counts.get(key, 0) + 1
+
+    uses_per_coupon = rule.get("usesPerCoupon")
+    uses_per_customer = rule.get("usesPerCustomer")
+    reported_times_used = coupon_record.get("reportedTimesUsed", 0)
+
+    reason = None
+    if uses_per_coupon and real_total_count > uses_per_coupon:
+        reason = "per_coupon_exceeded"
+    elif uses_per_customer and any(c > uses_per_customer for c in per_customer_counts.values()):
+        reason = "per_customer_exceeded"
+    elif reported_times_used < real_total_count:
+        reason = "times_used_drift"
+
+    allowed = uses_per_coupon if reason == "per_coupon_exceeded" else 0
+    offending = [o["incrementId"] for o in active[allowed:]] if reason == "per_coupon_exceeded" else (
+        [o["incrementId"] for o in active] if reason else []
+    )
+
+    return {
+        "isViolation": reason is not None,
+        "reason": reason,
+        "realTotalCount": real_total_count,
+        "perCustomerCounts": per_customer_counts,
+        "offendingOrderIncrementIds": offending,
+    }
+
+
+def to_plain_rule(raw):
+    return {
+        "ruleId": raw["rule_id"],
+        "usesPerCoupon": raw.get("uses_per_coupon") or None,
+        "usesPerCustomer": raw.get("uses_per_customer") or None,
+    }
+
+
+def to_plain_coupon(raw):
+    return {
+        "couponId": raw["coupon_id"],
+        "code": raw["code"],
+        "reportedTimesUsed": raw.get("times_used") or 0,
+    }
+
+
+def to_plain_orders(raw_items):
+    return [
+        {
+            "orderId": str(item["entity_id"]),
+            "incrementId": item.get("increment_id", ""),
+            "customerId": item.get("customer_id"),
+            "state": item.get("state", ""),
+        }
+        for item in raw_items
+    ]
+
+
+def run():
+    flagged = 0
+    for raw_rule in active_coupon_rules():
+        rule = to_plain_rule(raw_rule)
+        for raw_coupon in coupons_for_rule(rule["ruleId"]):
+            coupon_record = to_plain_coupon(raw_coupon)
+            real_orders = to_plain_orders(list(orders_for_coupon(coupon_record["code"])))
+
+            result = evaluate_coupon_usage(rule, coupon_record, real_orders)
+            if not result["isViolation"]:
+                continue
+
+            flagged += 1
+            log.warning(
+                "Rule %s coupon %s (%s): reason=%s real_count=%s reported_times_used=%s "
+                "uses_per_coupon=%s uses_per_customer=%s offending_orders=%s",
+                rule["ruleId"], coupon_record["couponId"], coupon_record["code"],
+                result["reason"], result["realTotalCount"], coupon_record["reportedTimesUsed"],
+                rule["usesPerCoupon"], rule["usesPerCustomer"], result["offendingOrderIncrementIds"],
+            )
+
+            if not DRY_RUN and APPLY:
+                log.warning(
+                    "DRY_RUN is false and --apply is set: recomputing times_used for coupon %s "
+                    "from %s to %s. Confirm sales.rule.update.coupon.usage is running so this "
+                    "does not drift again.",
+                    coupon_record["code"], coupon_record["reportedTimesUsed"], result["realTotalCount"],
+                )
+                magento_put_coupon_times_used(coupon_record["couponId"], result["realTotalCount"])
+
+    log.info("Done. %d coupon(s) flagged.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">evaluate-coupon-usage.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect Magento 2 and Adobe Commerce coupons that are being reused past
+ * their configured limit, safely.
+ *
+ * Since Magento 2.4.3, coupon usage bookkeeping (salesrule_coupon.times_used,
+ * salesrule_customer.times_used, and salesrule_coupon_usage rows) is
+ * incremented asynchronously by the sales.rule.update.coupon.usage message
+ * queue consumer instead of during order placement. If that consumer is not
+ * running, lags under load, or the order crashes after the coupon is
+ * applied but before the message is consumed, times_used never increments
+ * even though the coupon was used on a real order, so uses_per_coupon and
+ * uses_per_customer silently stop being enforced.
+ *
+ * This reports every discrepancy by default. It never cancels, refunds, or
+ * holds an order. The only gated corrective action, behind DRY_RUN=false
+ * and --apply, recomputes times_used to match the real order count. Run on
+ * a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/coupon-usage-limit-not-enforced/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const APPLY = process.argv.includes("--apply");
+
+export function evaluateCouponUsage(rule, couponRecord, realOrders) {
+  const active = realOrders.filter((o) => o.state !== "canceled");
+  const realTotalCount = active.length;
+
+  const perCustomerCounts = {};
+  for (const o of active) {
+    const key = o.customerId != null ? String(o.customerId) : "guest";
+    perCustomerCounts[key] = (perCustomerCounts[key] || 0) + 1;
+  }
+
+  const { usesPerCoupon, usesPerCustomer } = rule;
+  const reportedTimesUsed = couponRecord.reportedTimesUsed || 0;
+
+  let reason = null;
+  if (usesPerCoupon && realTotalCount > usesPerCoupon) {
+    reason = "per_coupon_exceeded";
+  } else if (usesPerCustomer && Object.values(perCustomerCounts).some((c) => c > usesPerCustomer)) {
+    reason = "per_customer_exceeded";
+  } else if (reportedTimesUsed < realTotalCount) {
+    reason = "times_used_drift";
+  }
+
+  const offendingOrderIncrementIds =
+    reason === "per_coupon_exceeded"
+      ? active.slice(usesPerCoupon).map((o) => o.incrementId)
+      : reason
+      ? active.map((o) => o.incrementId)
+      : [];
+
+  return {
+    isViolation: reason !== null,
+    reason,
+    realTotalCount,
+    perCustomerCounts,
+    offendingOrderIncrementIds,
+  };
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function magentoPutCouponTimesUsed(couponId, timesUsed) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/coupons`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ entity: { coupon_id: couponId, times_used: timesUsed } }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function activeCouponRules(pageSize = 100) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "coupon_type",
+    "searchCriteria[filterGroups][0][filters][0][value]": "2,3",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "in",
+    "searchCriteria[filterGroups][1][filters][0][field]": "is_active",
+    "searchCriteria[filterGroups][1][filters][0][value]": 1,
+    "searchCriteria[pageSize]": pageSize,
+  };
+  const data = await magentoGet("/salesRules", params);
+  return data.items;
+}
+
+async function couponsForRule(ruleId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "rule_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": ruleId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  };
+  const data = await magentoGet("/coupons", params);
+  return data.items;
+}
+
+async function* ordersForCoupon(code, pageSize = 100) {
+  let page = 1;
+  while (true) {
+    const params = {
+      "searchCriteria[filterGroups][0][filters][0][field]": "coupon_code",
+      "searchCriteria[filterGroups][0][filters][0][value]": code,
+      "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+      "searchCriteria[pageSize]": pageSize,
+      "searchCriteria[currentPage]": page,
+    };
+    const data = await magentoGet("/orders", params);
+    const items = data.items || [];
+    if (items.length === 0) return;
+    for (const item of items) yield item;
+    if (items.length < pageSize) return;
+    page++;
+  }
+}
+
+function toPlainRule(raw) {
+  return {
+    ruleId: raw.rule_id,
+    usesPerCoupon: raw.uses_per_coupon || null,
+    usesPerCustomer: raw.uses_per_customer || null,
+  };
+}
+
+function toPlainCoupon(raw) {
+  return {
+    couponId: raw.coupon_id,
+    code: raw.code,
+    reportedTimesUsed: raw.times_used || 0,
+  };
+}
+
+function toPlainOrder(item) {
+  return {
+    orderId: String(item.entity_id),
+    incrementId: item.increment_id || "",
+    customerId: item.customer_id ?? null,
+    state: item.state || "",
+  };
+}
+
+export async function run() {
+  let flagged = 0;
+  const rawRules = await activeCouponRules();
+
+  for (const rawRule of rawRules) {
+    const rule = toPlainRule(rawRule);
+    const rawCoupons = await couponsForRule(rule.ruleId);
+
+    for (const rawCoupon of rawCoupons) {
+      const couponRecord = toPlainCoupon(rawCoupon);
+      const realOrders = [];
+      for await (const item of ordersForCoupon(couponRecord.code)) {
+        realOrders.push(toPlainOrder(item));
+      }
+
+      const result = evaluateCouponUsage(rule, couponRecord, realOrders);
+      if (!result.isViolation) continue;
+
+      flagged++;
+      console.warn(
+        `Rule ${rule.ruleId} coupon ${couponRecord.couponId} (${couponRecord.code}): ` +
+        `reason=${result.reason} real_count=${result.realTotalCount} reported_times_used=${couponRecord.reportedTimesUsed} ` +
+        `uses_per_coupon=${rule.usesPerCoupon} uses_per_customer=${rule.usesPerCustomer} ` +
+        `offending_orders=${JSON.stringify(result.offendingOrderIncrementIds)}`
+      );
+
+      if (!DRY_RUN && APPLY) {
+        console.warn(
+          `DRY_RUN is false and --apply is set: recomputing times_used for coupon ${couponRecord.code} ` +
+          `from ${couponRecord.reportedTimesUsed} to ${result.realTotalCount}. Confirm ` +
+          `sales.rule.update.coupon.usage is running so this does not drift again.`
+        );
+        await magentoPutCouponTimesUsed(couponRecord.couponId, result.realTotalCount);
+      }
+    }
+  }
+
+  console.log(`Done. ${flagged} coupon(s) flagged.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a coupon gets flagged as reused past its limit. Because we kept <code>evaluate_coupon_usage</code> pure, the test needs no network, no Magento store, and no admin token. It just feeds in plain fixture objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_coupon_usage.py</div>
+      <pre><code class="language-python">from evaluate_coupon_usage import evaluate_coupon_usage
+
+
+def rule(**over):
+    base = {"ruleId": 12, "usesPerCoupon": 1, "usesPerCustomer": 1}
+    base.update(over)
+    return base
+
+
+def coupon(**over):
+    base = {"couponId": 55, "code": "SAVE10", "reportedTimesUsed": 1}
+    base.update(over)
+    return base
+
+
+def order(**over):
+    base = {"orderId": "1", "incrementId": "000000001", "customerId": 7, "state": "complete"}
+    base.update(over)
+    return base
+
+
+def test_no_violation_when_within_limits_and_counter_matches():
+    result = evaluate_coupon_usage(rule(), coupon(), [order()])
+    assert result["isViolation"] is False
+    assert result["realTotalCount"] == 1
+
+
+def test_per_coupon_exceeded_when_real_count_over_limit():
+    orders = [order(orderId="1", incrementId="000000001"), order(orderId="2", incrementId="000000002", customerId=9)]
+    result = evaluate_coupon_usage(rule(usesPerCoupon=1, usesPerCustomer=None), coupon(reportedTimesUsed=2), orders)
+    assert result["isViolation"] is True
+    assert result["reason"] == "per_coupon_exceeded"
+    assert result["offendingOrderIncrementIds"] == ["000000002"]
+
+
+def test_per_customer_exceeded_when_same_customer_reuses_coupon():
+    orders = [order(orderId="1", incrementId="000000001"), order(orderId="2", incrementId="000000002")]
+    result = evaluate_coupon_usage(rule(usesPerCoupon=None, usesPerCustomer=1), coupon(reportedTimesUsed=2), orders)
+    assert result["isViolation"] is True
+    assert result["reason"] == "per_customer_exceeded"
+    assert result["perCustomerCounts"]["7"] == 2
+
+
+def test_times_used_drift_when_counter_lags_real_orders():
+    orders = [order()]
+    result = evaluate_coupon_usage(rule(usesPerCoupon=None, usesPerCustomer=None), coupon(reportedTimesUsed=0), orders)
+    assert result["isViolation"] is True
+    assert result["reason"] == "times_used_drift"
+
+
+def test_cancelled_orders_are_excluded_from_the_real_count():
+    orders = [order(), order(orderId="2", incrementId="000000002", state="canceled")]
+    result = evaluate_coupon_usage(rule(usesPerCoupon=1), coupon(reportedTimesUsed=1), orders)
+    assert result["isViolation"] is False
+    assert result["realTotalCount"] == 1
+
+
+def test_guest_orders_are_grouped_under_guest_key():
+    orders = [order(customerId=None)]
+    result = evaluate_coupon_usage(rule(usesPerCoupon=None, usesPerCustomer=None), coupon(reportedTimesUsed=1), orders)
+    assert result["perCustomerCounts"]["guest"] == 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">coupon-usage.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { evaluateCouponUsage } from "./evaluate-coupon-usage.js";
+
+const rule = (over = {}) => ({ ruleId: 12, usesPerCoupon: 1, usesPerCustomer: 1, ...over });
+const coupon = (over = {}) => ({ couponId: 55, code: "SAVE10", reportedTimesUsed: 1, ...over });
+const order = (over = {}) => ({ orderId: "1", incrementId: "000000001", customerId: 7, state: "complete", ...over });
+
+test("no violation when within limits and counter matches", () => {
+  const result = evaluateCouponUsage(rule(), coupon(), [order()]);
+  assert.equal(result.isViolation, false);
+  assert.equal(result.realTotalCount, 1);
+});
+
+test("per_coupon_exceeded when real count over limit", () => {
+  const orders = [order({ orderId: "1", incrementId: "000000001" }), order({ orderId: "2", incrementId: "000000002", customerId: 9 })];
+  const result = evaluateCouponUsage(rule({ usesPerCoupon: 1, usesPerCustomer: null }), coupon({ reportedTimesUsed: 2 }), orders);
+  assert.equal(result.isViolation, true);
+  assert.equal(result.reason, "per_coupon_exceeded");
+  assert.deepEqual(result.offendingOrderIncrementIds, ["000000002"]);
+});
+
+test("per_customer_exceeded when same customer reuses coupon", () => {
+  const orders = [order({ orderId: "1", incrementId: "000000001" }), order({ orderId: "2", incrementId: "000000002" })];
+  const result = evaluateCouponUsage(rule({ usesPerCoupon: null, usesPerCustomer: 1 }), coupon({ reportedTimesUsed: 2 }), orders);
+  assert.equal(result.isViolation, true);
+  assert.equal(result.reason, "per_customer_exceeded");
+  assert.equal(result.perCustomerCounts["7"], 2);
+});
+
+test("times_used_drift when counter lags real orders", () => {
+  const result = evaluateCouponUsage(rule({ usesPerCoupon: null, usesPerCustomer: null }), coupon({ reportedTimesUsed: 0 }), [order()]);
+  assert.equal(result.isViolation, true);
+  assert.equal(result.reason, "times_used_drift");
+});
+
+test("cancelled orders are excluded from the real count", () => {
+  const orders = [order(), order({ orderId: "2", incrementId: "000000002", state: "canceled" })];
+  const result = evaluateCouponUsage(rule({ usesPerCoupon: 1 }), coupon({ reportedTimesUsed: 1 }), orders);
+  assert.equal(result.isViolation, false);
+  assert.equal(result.realTotalCount, 1);
+});
+
+test("guest orders are grouped under guest key", () => {
+  const orders = [order({ customerId: null })];
+  const result = evaluateCouponUsage(rule({ usesPerCoupon: null, usesPerCustomer: null }), coupon({ reportedTimesUsed: 1 }), orders);
+  assert.equal(result.perCustomerCounts.guest, 1);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash sale burst</span>
+      <h4>The one-time code that redeemed forty times</h4>
+      <p>A DTC brand launched a first-order discount capped at <code>uses_per_customer</code> equal to one, expecting it as a one-shot welcome offer. During a traffic spike from a newsletter blast, the same code was reused by several repeat customers dozens of times over a weekend. The rule configuration in the admin looked completely normal.</p>
+      <p>The detection job counted real orders per <code>coupon_code</code> and per <code>customer_id</code> straight from the orders API and found the queue consumer had been quietly falling behind since the traffic spike started. The report gave finance the exact list of offending increment ids to review, and the operations team restarted and monitored the <code>sales.rule.update.coupon.usage</code> consumer so it stopped happening.</p>
+    </div>
+    <div class="case">
+      <span class="tag">False positive from stale rows</span>
+      <h4>The loyal customer who got blocked by their own old order</h4>
+      <p>A subscription add-on store had a repeat customer complain that a single-use coupon they had never successfully redeemed refused to apply. Support assumed it was user error until someone pulled the coupon's usage rows and found a cancelled order still counted toward <code>times_used</code>, since the decrement never ran when that earlier order was cancelled.</p>
+      <p>Running the script surfaced the mismatch immediately: the real, non-cancelled order count for that customer was zero, but the reported counter said one. The team corrected the counter through the gated <code>--apply</code> path after confirming the cancelled order in the admin, and the customer could use the code as intended.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a coupon quietly bypassing its own limit gets caught within one detection cycle instead of surviving for weeks in a discount report nobody double-checks. The report carries the rule's configured limits, the real order count, the reported counter, and the exact offending increment ids, so finance and support can decide what to do about the extra orders with full information. Keep the actual counter correction gated behind <code>--apply</code> and a human review, since that is what keeps the script from making a business call it has no business making.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Magento coupon keep working after it should have hit its usage limit?</summary>
+      <p>Since Magento 2.4.3, the counters that enforce uses_per_coupon and uses_per_customer, such as salesrule_coupon.times_used, salesrule_customer.times_used, and the salesrule_coupon_usage rows, are updated asynchronously by the sales.rule.update.coupon.usage message queue consumer instead of during order placement. If that consumer is not running, falls behind under load, or the order placement fails after the coupon is applied but before the queue message is processed, times_used never increments even though the coupon was used on a real order, so the limit silently stops being enforced.</p>
+    </details>
+    <details>
+      <summary>How do I detect coupons that are being reused past their limit?</summary>
+      <p>Pull active coupon rules through GET /rest/V1/salesRules filtered on coupon_type and is_active, then list each rule's coupons through GET /rest/V1/coupons to read the API's reported times_used. Independently count the real usage from GET /rest/V1/orders filtered by coupon_code and a non-cancelled state, grouped by coupon_code and by customer_id. A coupon is flagged when the real order count exceeds uses_per_coupon, any customer's real count exceeds uses_per_customer, or the reported times_used is lower than the real count, which is the direct evidence the async consumer under-counted.</p>
+    </details>
+    <details>
+      <summary>Is it safe for a script to automatically cancel or block the extra orders?</summary>
+      <p>No. Those orders already shipped or are being processed, so cancelling or refunding them is a business and legal decision, not something a script should decide on its own. The script only reports the discrepancy, the rule, the coupon, and the offending order increment ids for a human to review. The one safe corrective action, gated behind an explicit --apply flag, is recomputing and correcting the times_used counters to match the true order count and confirming the sales.rule.update.coupon.usage consumer is actually running.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: Cart Price Rules, Uses per Coupon and Uses per Customer not working. <a href="https://github.com/magento/magento2/issues/34065" rel="noopener">github.com/magento/magento2/issues/34065</a></li>
+      <li>GitHub Issue: Magento CE 2.4.3, a coupon set to Uses per Customer = 1 can be used in multiple orders by the same customer. <a href="https://github.com/magento/magento2/issues/35077" rel="noopener">github.com/magento/magento2/issues/35077</a></li>
+      <li>Adobe Commerce Knowledge Base: coupon code tracking discrepancy in Adobe Commerce. <a href="https://experienceleague.adobe.com/en/docs/experience-cloud-kcs/kbarticles/ka-25898" rel="noopener">experienceleague.adobe.com coupon code tracking discrepancy</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce: How many coupons can a customer use in Adobe Commerce. <a href="https://experienceleague.adobe.com/en/docs/commerce-knowledge-base/kb/faq/how-many-coupons-can-a-customer-use-in-magento-2" rel="noopener">experienceleague.adobe.com how many coupons can a customer use</a></li>
+      <li>Adobe Commerce: Coupon codes, cart price rules documentation. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/marketing/promotions/cart-rules/price-rules-cart-coupon" rel="noopener">experienceleague.adobe.com price rules cart coupon</a></li>
+      <li>Adobe Commerce: ACSD-54966, fix for limited-use coupon code after failed orders. <a href="https://experienceleague.adobe.com/en/docs/commerce-knowledge-base/kb/support-tools/patches/v1-1-42/acsd-54966-fix-for-limited-use-coupon-code-after-failed-orders" rel="noopener">experienceleague.adobe.com ACSD-54966 patch notes</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce orders, payments, catalog data, or inventory that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a coupon slipping past its limit?</h3>
+    <p>If this saved you from an unlimited discount code or a customer wrongly blocked by a stale usage row, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Catalog Price Rule Cron Failure Blocks Downstream Indexers in Magento 2</title>
+<meta name="description" content="The catalogrule_apply_all cron throws on a new store view and never releases its lock, so indexer_reindex_all_invalid and indexer_update_all_views stop running for every store. Learn why it happens and build a Python or Node.js script that detects the stuck rule pricing and reports it.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/catalog-price-rule-cron-blocks-indexers/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Catalog Price Rule Cron Failure Blocks Downstream Indexers in Magento 2">
+<meta property="og:description" content="Why a failing catalogrule_apply_all cron leaves a stuck lock that stops indexer_reindex_all_invalid and indexer_update_all_views for every store, and a safe Python or Node.js script that detects it and reports.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/catalog-price-rule-cron-blocks-indexers/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/catalog-price-rule-cron-blocks-indexers/#article","headline":"Catalog Price Rule Cron Failure Blocks Downstream Indexers in Magento 2","description":"Why a failing catalogrule_apply_all cron leaves a stuck lock that stops indexer_reindex_all_invalid and indexer_update_all_views for every store, and a safe Python or Node.js script that detects the stuck rule pricing and reports it.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/catalog-price-rule-cron-blocks-indexers/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Indexing","keywords":"Magento 2 catalogrule_apply_all, catalog price rule cron, indexer_reindex_all_invalid, cron_schedule stuck lock, Adobe Commerce REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Catalog price rule cron failure blocks downstream indexers","item":"https://www.allanninal.dev/magento/catalog-price-rule-cron-blocks-indexers/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did all my scheduled indexers stop running after I added a store view?","acceptedAnswer":{"@type":"Answer","text":"The daily catalogrule_apply_all cron recalculates rule prices for every store view. A newly created store view with an incomplete locale or timezone setup, or a catalog price rule whose catalogrule_product table has not been built yet, can make that job throw an exception and exit non zero. Magento's scheduler treats the failed run as still holding its lock, so indexer_reindex_all_invalid and indexer_update_all_views cannot acquire it on the next run and stop executing for every store, not only the new one."}},{"@type":"Question","name":"Can a script safely fix a stuck catalogrule_apply_all lock through the REST API?","acceptedAnswer":{"@type":"Answer","text":"Not directly, and it should not try to. Forcing catalogrule_apply_all, running bin/magento indexer:reindex, and resetting a stuck cron_schedule row are CLI and database level operations with no public REST endpoint. A script can detect the stuck state by comparing expected rule pricing to the live storefront price and by reading cron_schedule for error or stale running rows, then report it. Only with DRY_RUN turned off and an operator's explicit confirmation should it reset the specific stuck cron_schedule rows to missed, and it should never force the price recalculation itself."}},{"@type":"Question","name":"How do I tell a stuck catalog price rule apart from a rule that legitimately has not started yet?","acceptedAnswer":{"@type":"Answer","text":"Check both signals together. A rule counts as stuck only when the storefront price for a targeted SKU still disagrees with the expected discounted price and the cron_schedule rows for catalogrule_apply_all, indexer_reindex_all_invalid, or indexer_update_all_views show a status of error, or running past the lock timeout. If the rule's from_date has not arrived yet, or the cron rows show a normal success, the price difference is expected and is not a stuck job."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Indexing</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Indexing</p>
+    <h1>Catalog price rule cron failure blocks downstream indexers</h1>
+    <p class="lead">You added a store view, or a new catalog price rule went live, and now nothing seems to reindex. Prices are wrong, search results feel stale, and it is not just that one store, it is every store on the install. Here is why a single failing catalogrule_apply_all run can hold a lock that stops indexer_reindex_all_invalid and indexer_update_all_views cold, and a small script that finds the SKUs and cron rows that prove it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Adobe Commerce REST API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>The <code>catalogrule_apply_all</code> cron (module-catalog-rule, runs daily by default) recalculates catalog price rule prices and invalidates the <code>catalog_product_price</code> and <code>catalogsearch_fulltext</code> indexers for every store view. When a new store view has an incomplete locale or timezone setup, or a rule's <code>catalogrule_product</code> relationship has not been built yet, the job throws and exits non zero. Magento's scheduler treats that failed run as still holding its lock, so the next <code>indexer_reindex_all_invalid</code> or <code>indexer_update_all_views</code> run cannot acquire it and never executes, leaving rule prices unapplied and every scheduled indexer stale across every store. Run a small Python or Node.js script that computes the expected rule discounted price for representative SKUs, compares it to the live storefront price per store, and separately checks whether the relevant cron_schedule rows are in an error or stuck running state. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Catalog price rules do not compute their discount at storefront read time. Magento precomputes the ruled price once a day through <code>catalogrule_apply_all</code>, which walks every active rule, every website it targets, and every store view under that website, and writes the resulting price into the index tables that the storefront actually reads. That same cron job also invalidates the dependent indexers, <code>catalog_product_price</code> and <code>catalogsearch_fulltext</code>, so they know they have work to do.</p>
+  <p>The trouble starts when that daily job cannot finish cleanly for one store view. A brand new store view with an incomplete locale or timezone configuration can make the timezone lookup inside <code>Magento\Framework\Stdlib\DateTime\Timezone</code> throw. A rule whose <code>catalogrule_product</code> relationship table has not been populated yet, which only happens when a rule is saved or applied in the Admin or a product is saved, and never by the daily cron itself, can leave the job trying to call a method on something that is not there, producing errors like "Call to a member function setData() on boolean." Either way the cron process exits non zero mid run.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. The catalogrule_apply_all cron throws on a new store view, cron_schedule keeps its status as running, and the next indexer_reindex_all_invalid run cannot acquire the lock, so all scheduled indexers stay stale across every store.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a8078"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">catalogrule_apply_all</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">runs daily on cron</text>
+      <line x1="163" y1="103" x2="203" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="183" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="183" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">throws, exits non zero</text>
+      <rect x="206" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="286" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">cron_schedule</text>
+      <text x="286" y="110" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">stays "running"</text>
+      <text x="286" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">lock never released</text>
+      <line x1="369" y1="103" x2="428" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="431" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="511" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">indexer_reindex</text>
+      <text x="511" y="110" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">_all_invalid</text>
+      <text x="511" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">cannot acquire lock</text>
+      <line x1="594" y1="103" x2="613" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="616" y="70" width="134" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="683" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Every store</text>
+      <text x="683" y="110" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">stays stale</text>
+      <text x="683" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">not just the new view</text>
+      <text x="380" y="175" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">One store view's bad config blocks the indexer lock for the whole install.</text>
+    </svg>
+    <figcaption>A single failed run of catalogrule_apply_all leaves its lock looking held, so the next scheduled reindex for every store never starts.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>None of this is a bug in one specific rule. It is a property of how a single shared cron job covers every store view and how Magento's cron scheduler treats a lock. A few concrete ways it shows up on real stores:</p>
+  <ul>
+    <li>A newly created store view is missing or has an inconsistent locale or timezone configuration, and the timezone lookup in <code>Magento\Framework\Stdlib\DateTime\Timezone</code> throws while <code>catalogrule_apply_all</code> is iterating that view.</li>
+    <li>A catalog price rule was just created or edited, but its <code>catalogrule_product</code> relationship table has not been rebuilt yet, since that table only populates when a rule is saved or applied in the Admin or a product is saved, not by the daily cron itself, and the job hits a null it did not expect.</li>
+    <li>Magento's cron scheduler treats a job that exited without recording success as still "running" or in an error state that holds its lock, so <code>indexer_reindex_all_invalid</code> and <code>indexer_update_all_views</code> log "Could not acquire lock for cron job" and simply do not run.</li>
+    <li>Because the lock is shared across the whole install rather than scoped to one store, the failure on a brand new store view stalls scheduled indexing for every store, including ones that were working fine.</li>
+  </ul>
+  <p>Nothing about this raises a storefront error a shopper would see. Rule prices just quietly stop updating, and catalog search results drift further from the catalog every day the lock stays stuck. See the citations at the end for the exact issue threads and forum reports that describe this behavior.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Clearing a stuck cron lock and forcing <code>catalogrule_apply_all</code> are CLI and database level operations, not something safe to trigger blindly over REST. Resetting locks without understanding why the job failed can mask a real configuration error, and forcing a full reindex during business hours can be expensive. So the honest move is to detect the stuck state precisely, from both the pricing side and the cron side, and report it, leaving the actual fix to an operator with shell access.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not call <code>catalogrule_apply_all</code> or touch cron locks directly. We enumerate active catalog price rules, compute the discounted price each one should produce for representative SKUs, and compare that to the live per store price returned by the Products REST endpoint. We separately read <code>cron_schedule</code> for the relevant job codes to see if any are stuck in error or a stale running state. Only when both signals agree, a real price mismatch and a stuck cron row, do we call the situation stuck, and only with an operator's explicit opt in do we perform the one narrow, reversible repair: resetting the specific stuck row to missed.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A script lists active catalog price rules and computes expected prices, reads live storefront prices per store, reads cron_schedule for stuck rows, and if both a price mismatch and a stuck cron job are found it reports the stuck rule and store, otherwise nothing is stuck.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="180" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="100" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">List active rules</text>
+      <text x="100" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">compute expected price</text>
+      <line x1="100" y1="80" x2="100" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read live price</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">per store, per SKU</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="150" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="345" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read cron_schedule</text>
+      <text x="345" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">error or stale running</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="555,106 662,138 555,170 448,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="555" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Mismatch and</text>
+      <text x="555" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">stale cron?</text>
+      <text x="665" y="118" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="695" y2="118" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="60" width="132" height="50" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="80" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">report stuck</text>
+      <text x="684" y="96" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">rule, SKUs, jobs</text>
+      <text x="665" y="200" font-family="sans-serif" font-size="10.5" fill="#8a8078" font-weight="700">no</text>
+      <line x1="662" y1="138" x2="695" y2="185" stroke="#8a8078" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="188" width="132" height="50" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">nothing stuck</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">no action needed</text>
+    </svg>
+    <figcaption>The script only ever reports by default. It calls a rule stuck only when the pricing mismatch and the stuck cron row both show up together.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin token</h3>
+      <p>Authenticate against the admin token endpoint with an admin username and password, or use an integration access token if you already have one. Keep the base URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_USERNAME="admin"
+export MAGENTO_ADMIN_PASSWORD="change-me"
+export STORE_CODES="default,eu_de"
+export LOCK_TIMEOUT_MINUTES="15"
+export DRY_RUN="true"   # start safe, change to false only to reset a stuck cron_schedule row</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_USERNAME="admin"
+export MAGENTO_ADMIN_PASSWORD="change-me"
+export STORE_CODES="default,eu_de"
+export LOCK_TIMEOUT_MINUTES="15"
+export DRY_RUN="true"   // start safe, change to false only to reset a stuck cron_schedule row</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Enumerate active catalog price rules and target SKUs</h3>
+      <p>There is no public <code>/V1/catalogRule</code> REST endpoint, so this script works from a list of rules you already know about, their <code>rule_id</code>, <code>website_ids</code>, discount type, and amount, alongside representative SKUs each rule targets. Read each SKU's base admin price with <code>GET /rest/V1/products/{sku}</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+
+def get_token(username, password):
+    r = requests.post(
+        f"{MAGENTO_URL}/rest/V1/integration/admin/token",
+        json={"username": username, "password": password},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def base_price(token, sku):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/products/{sku}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["price"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+
+async function getToken(username, password) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/integration/admin/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function basePrice(token, sku) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/products/${encodeURIComponent(sku)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.price;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the live per store price</h3>
+      <p>For each store view a rule's website targets, fetch the store scoped product with <code>GET /rest/{storeCode}/V1/products/{sku}</code>. That is the price the storefront is actually serving, computed with whatever the price index currently holds, rule applied or not.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def live_price(token, store_code, sku):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/{store_code}/V1/products/{sku}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["price"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function livePrice(token, storeCode, sku) {
+  const res = await fetch(`${MAGENTO_URL}/rest/${storeCode}/V1/products/${encodeURIComponent(sku)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.price;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes only already fetched values: the active rules, the base and live prices per SKU and store, and the <code>cron_schedule</code> rows for the three job codes that matter. It computes the expected discounted price from each applicable rule, flags SKUs where that expected price disagrees with the live price by more than a cent, separately scans the cron rows for an error status or a running status stuck past the lock timeout, and only calls the whole thing stuck when both a price mismatch and a stale cron job are present.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from datetime import datetime
+
+STUCK_JOB_CODES = {"catalogrule_apply_all", "indexer_reindex_all_invalid", "indexer_update_all_views"}
+
+
+def detect_stuck_catalog_rule_pricing(rules, product_prices, cron_rows, now_iso, lock_timeout_minutes=15):
+    now = _parse(now_iso)
+
+    affected_skus = []
+    affected_rule_ids = set()
+    for pp in product_prices:
+        for rule in rules:
+            if pp["storeId"] not in _store_ids_for_rule(rule):
+                continue
+            if not _rule_active(rule, now_iso):
+                continue
+            expected = _expected_price(pp["basePrice"], rule)
+            if abs(expected - pp["livePrice"]) > 0.01:
+                affected_skus.append(pp["sku"])
+                affected_rule_ids.add(rule["ruleId"])
+
+    stale_cron_jobs = []
+    for row in cron_rows:
+        if row["jobCode"] not in STUCK_JOB_CODES:
+            continue
+        if row["status"] == "error":
+            stale_cron_jobs.append(row["jobCode"])
+        elif row["status"] == "running":
+            age_minutes = (now - _parse(row["scheduledAt"])).total_seconds() / 60
+            if age_minutes > lock_timeout_minutes:
+                stale_cron_jobs.append(row["jobCode"])
+
+    stuck = len(affected_skus) > 0 and len(stale_cron_jobs) > 0
+    return {
+        "stuck": stuck,
+        "affectedSkus": sorted(set(affected_skus)),
+        "affectedRuleIds": sorted(affected_rule_ids),
+        "staleCronJobs": sorted(set(stale_cron_jobs)),
+    }
+
+
+def _expected_price(base_price, rule):
+    if rule["simpleAction"] == "by_percent":
+        return base_price * (1 - rule["discountAmount"] / 100)
+    return base_price - rule["discountAmount"]
+
+
+def _rule_active(rule, now_iso):
+    if rule.get("fromDate") and now_iso < rule["fromDate"]:
+        return False
+    if rule.get("toDate") and now_iso > rule["toDate"]:
+        return False
+    return True
+
+
+def _store_ids_for_rule(rule):
+    # websiteIds stand in for the stores they own for this comparison;
+    # callers pass storeId values already scoped to a rule's websites.
+    return set(rule["websiteIds"])
+
+
+def _parse(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const STUCK_JOB_CODES = new Set(["catalogrule_apply_all", "indexer_reindex_all_invalid", "indexer_update_all_views"]);
+
+function expectedPrice(basePrice, rule) {
+  if (rule.simpleAction === "by_percent") return basePrice * (1 - rule.discountAmount / 100);
+  return basePrice - rule.discountAmount;
+}
+
+function ruleActive(rule, nowIso) {
+  if (rule.fromDate &amp;&amp; nowIso < rule.fromDate) return false;
+  if (rule.toDate &amp;&amp; nowIso > rule.toDate) return false;
+  return true;
+}
+
+export function detectStuckCatalogRulePricing(rules, productPrices, cronRows, nowIso, lockTimeoutMinutes = 15) {
+  const now = new Date(nowIso);
+
+  const affectedSkus = new Set();
+  const affectedRuleIds = new Set();
+  for (const pp of productPrices) {
+    for (const rule of rules) {
+      if (!rule.websiteIds.includes(pp.storeId)) continue;
+      if (!ruleActive(rule, nowIso)) continue;
+      const expected = expectedPrice(pp.basePrice, rule);
+      if (Math.abs(expected - pp.livePrice) > 0.01) {
+        affectedSkus.add(pp.sku);
+        affectedRuleIds.add(rule.ruleId);
+      }
+    }
+  }
+
+  const staleCronJobs = new Set();
+  for (const row of cronRows) {
+    if (!STUCK_JOB_CODES.has(row.jobCode)) continue;
+    if (row.status === "error") {
+      staleCronJobs.add(row.jobCode);
+    } else if (row.status === "running") {
+      const ageMinutes = (now - new Date(row.scheduledAt)) / 60000;
+      if (ageMinutes > lockTimeoutMinutes) staleCronJobs.add(row.jobCode);
+    }
+  }
+
+  const stuck = affectedSkus.size > 0 &amp;&amp; staleCronJobs.size > 0;
+  return {
+    stuck,
+    affectedSkus: [...affectedSkus].sort(),
+    affectedRuleIds: [...affectedRuleIds].sort((a, b) => a - b),
+    staleCronJobs: [...staleCronJobs].sort(),
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>The only narrow, reversible repair</h3>
+      <p>The script never forces <code>catalogrule_apply_all</code> or a full reindex. When <code>DRY_RUN</code> is off and an operator has explicitly confirmed, the one narrow repair is resetting the specific stuck <code>cron_schedule</code> rows back to <code>missed</code>, so the scheduler can re-acquire the lock on its next natural run. This is a database level operation, so it needs a direct connection with write access, not the REST API.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reset_lock.sql</div>
+      <pre><code class="language-python"># Narrowly scoped and reversible: only touches the exact stuck job codes,
+# only rows still marked running, and only ones past the lock timeout.
+# Run manually by an operator with DB access, never from this script itself.
+
+UPDATE cron_schedule
+SET status = 'missed'
+WHERE job_code IN ('catalogrule_apply_all', 'indexer_reindex_all_invalid', 'indexer_update_all_views')
+  AND status = 'running'
+  AND scheduled_at < NOW() - INTERVAL 15 MINUTE;</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reset_lock.sql</div>
+      <pre><code class="language-javascript">// Narrowly scoped and reversible: only touches the exact stuck job codes,
+// only rows still marked running, and only ones past the lock timeout.
+// Run manually by an operator with DB access, never from this script itself.
+
+UPDATE cron_schedule
+SET status = 'missed'
+WHERE job_code IN ('catalogrule_apply_all', 'indexer_reindex_all_invalid', 'indexer_update_all_views')
+  AND status = 'running'
+  AND scheduled_at &lt; NOW() - INTERVAL 15 MINUTE;</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop authenticates once, reads base and live prices for your configured SKUs across your configured stores, calls the pure detection function, and reports. Notice the dry run guard. This script only ever reports, by design, since resetting the lock or forcing a reindex is CLI and database territory that belongs to an operator, not to a scheduled job running against production.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never calls <code>catalogrule_apply_all</code>, never runs <code>bin/magento indexer:reindex</code>, and never writes to <code>cron_schedule</code> itself. It only reports the affected rule ids, SKUs, price deltas, and the stale cron job codes. Resetting the lock is a manual, narrowly scoped SQL statement an operator runs after reading the report, not an automatic action.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and never performs the database level lock reset itself, it only tells you the exact rows to look at.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/catalog-price-rule-cron-blocks-indexers" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_stuck_catalog_rule.py</div>
+      <pre><code class="language-python">"""Detect a stuck Magento 2 or Adobe Commerce catalogrule_apply_all lock.
+
+catalogrule_apply_all recalculates catalog price rule prices and invalidates
+catalog_product_price and catalogsearch_fulltext for every store view. A new
+store view with an incomplete locale or timezone setup, or a rule whose
+catalogrule_product relationship has not been built yet, can make the job
+throw and exit non zero. Magento's scheduler then treats the lock as still
+held, so indexer_reindex_all_invalid and indexer_update_all_views cannot
+acquire it and stop running for every store. This script compares the
+expected rule discounted price to the live storefront price, and separately
+checks cron_schedule for error or stale running rows on the relevant job
+codes. It never forces catalogrule_apply_all, a reindex, or a cron_schedule
+write itself: that is CLI and database operator territory. Safe to run
+again and again.
+"""
+import os
+import json
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_stuck_catalog_rule")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+ADMIN_USERNAME = os.environ.get("MAGENTO_ADMIN_USERNAME")
+ADMIN_PASSWORD = os.environ.get("MAGENTO_ADMIN_PASSWORD")
+ADMIN_TOKEN = os.environ.get("MAGENTO_ADMIN_TOKEN")
+STORE_CODES = [s.strip() for s in os.environ.get("STORE_CODES", "default").split(",") if s.strip()]
+LOCK_TIMEOUT_MINUTES = float(os.environ.get("LOCK_TIMEOUT_MINUTES", "15"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+OUTPUT_JSON = os.environ.get("OUTPUT_JSON", "stuck_catalog_rule_report.json")
+
+# Rules and cron rows are supplied by the operator: there is no public
+# /V1/catalogRule REST endpoint, and cron_schedule is a database table with
+# no REST route. Populate these from your own Admin/DB access, or wire in
+# your own fetchers where noted below.
+RULES = json.loads(os.environ.get("RULES_JSON", "[]"))
+CRON_ROWS = json.loads(os.environ.get("CRON_ROWS_JSON", "[]"))
+SKUS = [s.strip() for s in os.environ.get("SKUS", "").split(",") if s.strip()]
+
+STUCK_JOB_CODES = {"catalogrule_apply_all", "indexer_reindex_all_invalid", "indexer_update_all_views"}
+
+
+def get_token():
+    if ADMIN_TOKEN:
+        return ADMIN_TOKEN
+    r = requests.post(
+        f"{MAGENTO_URL}/rest/V1/integration/admin/token",
+        json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def base_price(token, sku):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/products/{sku}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["price"]
+
+
+def live_price(token, store_code, sku):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/{store_code}/V1/products/{sku}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["price"]
+
+
+def _expected_price(base, rule):
+    if rule["simpleAction"] == "by_percent":
+        return base * (1 - rule["discountAmount"] / 100)
+    return base - rule["discountAmount"]
+
+
+def _rule_active(rule, now_iso):
+    if rule.get("fromDate") and now_iso < rule["fromDate"]:
+        return False
+    if rule.get("toDate") and now_iso > rule["toDate"]:
+        return False
+    return True
+
+
+def _parse(value):
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def detect_stuck_catalog_rule_pricing(rules, product_prices, cron_rows, now_iso, lock_timeout_minutes=LOCK_TIMEOUT_MINUTES):
+    now = _parse(now_iso)
+
+    affected_skus = []
+    affected_rule_ids = set()
+    for pp in product_prices:
+        for rule in rules:
+            if pp["storeId"] not in set(rule["websiteIds"]):
+                continue
+            if not _rule_active(rule, now_iso):
+                continue
+            expected = _expected_price(pp["basePrice"], rule)
+            if abs(expected - pp["livePrice"]) > 0.01:
+                affected_skus.append(pp["sku"])
+                affected_rule_ids.add(rule["ruleId"])
+
+    stale_cron_jobs = []
+    for row in cron_rows:
+        if row["jobCode"] not in STUCK_JOB_CODES:
+            continue
+        if row["status"] == "error":
+            stale_cron_jobs.append(row["jobCode"])
+        elif row["status"] == "running":
+            age_minutes = (now - _parse(row["scheduledAt"])).total_seconds() / 60
+            if age_minutes > lock_timeout_minutes:
+                stale_cron_jobs.append(row["jobCode"])
+
+    stuck = len(affected_skus) > 0 and len(stale_cron_jobs) > 0
+    return {
+        "stuck": stuck,
+        "affectedSkus": sorted(set(affected_skus)),
+        "affectedRuleIds": sorted(affected_rule_ids),
+        "staleCronJobs": sorted(set(stale_cron_jobs)),
+    }
+
+
+def run():
+    token = get_token()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    product_prices = []
+    for sku in SKUS:
+        base = base_price(token, sku)
+        for store_code, store_id in _store_ids(STORE_CODES).items():
+            try:
+                live = live_price(token, store_code, sku)
+            except requests.HTTPError as exc:
+                log.warning("Could not read live price for %s in %s: %s", sku, store_code, exc)
+                continue
+            product_prices.append({"sku": sku, "storeId": store_id, "basePrice": base, "livePrice": live})
+
+    result = detect_stuck_catalog_rule_pricing(RULES, product_prices, CRON_ROWS, now_iso)
+
+    log.info(
+        "stuck=%s affectedSkus=%s affectedRuleIds=%s staleCronJobs=%s",
+        result["stuck"], result["affectedSkus"], result["affectedRuleIds"], result["staleCronJobs"],
+    )
+
+    with open(OUTPUT_JSON, "w") as fh:
+        json.dump(result, fh, indent=2)
+
+    if result["stuck"] and not DRY_RUN:
+        log.warning(
+            "DRY_RUN is false, but this script never resets cron_schedule or forces "
+            "catalogrule_apply_all itself. Review %s and, if confirmed, run the "
+            "reset SQL manually with DB access.",
+            OUTPUT_JSON,
+        )
+
+    log.info("Done. Report written to %s.", OUTPUT_JSON)
+
+
+def _store_ids(store_codes):
+    # Maps configured store codes to numeric store ids for comparison against
+    # rule websiteIds. Wire this to your own store code -> store id lookup,
+    # for example GET /rest/V1/store/storeViews, if the codes are not the ids.
+    return {code: idx + 1 for idx, code in enumerate(store_codes)}
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-stuck-catalog-rule.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect a stuck Magento 2 or Adobe Commerce catalogrule_apply_all lock.
+ *
+ * catalogrule_apply_all recalculates catalog price rule prices and invalidates
+ * catalog_product_price and catalogsearch_fulltext for every store view. A new
+ * store view with an incomplete locale or timezone setup, or a rule whose
+ * catalogrule_product relationship has not been built yet, can make the job
+ * throw and exit non zero. Magento's scheduler then treats the lock as still
+ * held, so indexer_reindex_all_invalid and indexer_update_all_views cannot
+ * acquire it and stop running for every store. This script compares the
+ * expected rule discounted price to the live storefront price, and separately
+ * checks cron_schedule for error or stale running rows on the relevant job
+ * codes. It never forces catalogrule_apply_all, a reindex, or a cron_schedule
+ * write itself: that is CLI and database operator territory. Safe to run
+ * again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/catalog-price-rule-cron-blocks-indexers/
+ */
+import { pathToFileURL } from "node:url";
+import { writeFileSync } from "node:fs";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://example.test").replace(/\/$/, "");
+const ADMIN_USERNAME = process.env.MAGENTO_ADMIN_USERNAME || "admin";
+const ADMIN_PASSWORD = process.env.MAGENTO_ADMIN_PASSWORD || "change-me";
+const ADMIN_TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "";
+const STORE_CODES = (process.env.STORE_CODES || "default").split(",").map((s) => s.trim()).filter(Boolean);
+const LOCK_TIMEOUT_MINUTES = Number(process.env.LOCK_TIMEOUT_MINUTES || 15);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const OUTPUT_JSON = process.env.OUTPUT_JSON || "stuck_catalog_rule_report.json";
+
+const RULES = JSON.parse(process.env.RULES_JSON || "[]");
+const CRON_ROWS = JSON.parse(process.env.CRON_ROWS_JSON || "[]");
+const SKUS = (process.env.SKUS || "").split(",").map((s) => s.trim()).filter(Boolean);
+
+const STUCK_JOB_CODES = new Set(["catalogrule_apply_all", "indexer_reindex_all_invalid", "indexer_update_all_views"]);
+
+function expectedPrice(base, rule) {
+  if (rule.simpleAction === "by_percent") return base * (1 - rule.discountAmount / 100);
+  return base - rule.discountAmount;
+}
+
+function ruleActive(rule, nowIso) {
+  if (rule.fromDate &amp;&amp; nowIso < rule.fromDate) return false;
+  if (rule.toDate &amp;&amp; nowIso > rule.toDate) return false;
+  return true;
+}
+
+export function detectStuckCatalogRulePricing(rules, productPrices, cronRows, nowIso, lockTimeoutMinutes = LOCK_TIMEOUT_MINUTES) {
+  const now = new Date(nowIso);
+
+  const affectedSkus = new Set();
+  const affectedRuleIds = new Set();
+  for (const pp of productPrices) {
+    for (const rule of rules) {
+      if (!rule.websiteIds.includes(pp.storeId)) continue;
+      if (!ruleActive(rule, nowIso)) continue;
+      const expected = expectedPrice(pp.basePrice, rule);
+      if (Math.abs(expected - pp.livePrice) > 0.01) {
+        affectedSkus.add(pp.sku);
+        affectedRuleIds.add(rule.ruleId);
+      }
+    }
+  }
+
+  const staleCronJobs = new Set();
+  for (const row of cronRows) {
+    if (!STUCK_JOB_CODES.has(row.jobCode)) continue;
+    if (row.status === "error") {
+      staleCronJobs.add(row.jobCode);
+    } else if (row.status === "running") {
+      const ageMinutes = (now - new Date(row.scheduledAt)) / 60000;
+      if (ageMinutes > lockTimeoutMinutes) staleCronJobs.add(row.jobCode);
+    }
+  }
+
+  const stuck = affectedSkus.size > 0 &amp;&amp; staleCronJobs.size > 0;
+  return {
+    stuck,
+    affectedSkus: [...affectedSkus].sort(),
+    affectedRuleIds: [...affectedRuleIds].sort((a, b) => a - b),
+    staleCronJobs: [...staleCronJobs].sort(),
+  };
+}
+
+async function getToken() {
+  if (ADMIN_TOKEN) return ADMIN_TOKEN;
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/integration/admin/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function basePrice(token, sku) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/products/${encodeURIComponent(sku)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.price;
+}
+
+async function livePrice(token, storeCode, sku) {
+  const res = await fetch(`${MAGENTO_URL}/rest/${storeCode}/V1/products/${encodeURIComponent(sku)}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.price;
+}
+
+function storeIds(storeCodes) {
+  // Maps configured store codes to numeric store ids for comparison against
+  // rule websiteIds. Wire this to your own store code -> store id lookup,
+  // for example GET /rest/V1/store/storeViews, if the codes are not the ids.
+  const map = {};
+  storeCodes.forEach((code, idx) => { map[code] = idx + 1; });
+  return map;
+}
+
+export async function run() {
+  const token = await getToken();
+  const nowIso = new Date().toISOString();
+
+  const productPrices = [];
+  const codeToId = storeIds(STORE_CODES);
+  for (const sku of SKUS) {
+    const base = await basePrice(token, sku);
+    for (const [storeCode, storeId] of Object.entries(codeToId)) {
+      let live;
+      try {
+        live = await livePrice(token, storeCode, sku);
+      } catch (err) {
+        console.warn(`Could not read live price for ${sku} in ${storeCode}: ${err.message}`);
+        continue;
+      }
+      productPrices.push({ sku, storeId, basePrice: base, livePrice: live });
+    }
+  }
+
+  const result = detectStuckCatalogRulePricing(RULES, productPrices, CRON_ROWS, nowIso);
+
+  console.log(
+    `stuck=${result.stuck} affectedSkus=${JSON.stringify(result.affectedSkus)} affectedRuleIds=${JSON.stringify(result.affectedRuleIds)} staleCronJobs=${JSON.stringify(result.staleCronJobs)}`,
+  );
+
+  writeFileSync(OUTPUT_JSON, JSON.stringify(result, null, 2));
+
+  if (result.stuck &amp;&amp; !DRY_RUN) {
+    console.warn(
+      `DRY_RUN is false, but this script never resets cron_schedule or forces catalogrule_apply_all itself. Review ${OUTPUT_JSON} and, if confirmed, run the reset SQL manually with DB access.`,
+    );
+  }
+
+  console.log(`Done. Report written to ${OUTPUT_JSON}.`);
+  return result;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether the situation is actually stuck versus just a rule that has not started yet or a cron job doing fine. Since <code>detect_stuck_catalog_rule_pricing</code> and <code>detectStuckCatalogRulePricing</code> are pure, the tests need no network and no Magento instance. They just feed in plain rule, price, and cron row objects and check the verdict.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_catalog_rule_lock.py</div>
+      <pre><code class="language-python">from detect_stuck_catalog_rule import detect_stuck_catalog_rule_pricing
+
+NOW = "2026-07-10T12:00:00Z"
+
+
+def rule(**over):
+    base = {
+        "ruleId": 7,
+        "websiteIds": [1],
+        "discountAmount": 20,
+        "simpleAction": "by_percent",
+        "fromDate": None,
+        "toDate": None,
+    }
+    base.update(over)
+    return base
+
+
+def price(**over):
+    base = {"sku": "SKU-1", "storeId": 1, "basePrice": 100.0, "livePrice": 80.0}
+    base.update(over)
+    return base
+
+
+def cron_row(**over):
+    base = {"jobCode": "catalogrule_apply_all", "status": "error", "scheduledAt": "2026-07-10T00:00:00Z"}
+    base.update(over)
+    return base
+
+
+def test_stuck_when_mismatch_and_error_cron():
+    result = detect_stuck_catalog_rule_pricing([rule()], [price(livePrice=100.0)], [cron_row()], NOW)
+    assert result["stuck"] is True
+    assert result["affectedSkus"] == ["SKU-1"]
+    assert result["affectedRuleIds"] == [7]
+    assert result["staleCronJobs"] == ["catalogrule_apply_all"]
+
+
+def test_not_stuck_when_price_matches():
+    result = detect_stuck_catalog_rule_pricing([rule()], [price(livePrice=80.0)], [cron_row()], NOW)
+    assert result["stuck"] is False
+    assert result["affectedSkus"] == []
+
+
+def test_not_stuck_when_cron_is_healthy():
+    healthy = cron_row(status="success")
+    result = detect_stuck_catalog_rule_pricing([rule()], [price(livePrice=100.0)], [healthy], NOW)
+    assert result["stuck"] is False
+    assert result["staleCronJobs"] == []
+
+
+def test_running_within_lock_timeout_is_not_stale():
+    row = cron_row(status="running", scheduledAt="2026-07-10T11:50:00Z")
+    result = detect_stuck_catalog_rule_pricing([rule()], [price(livePrice=100.0)], [row], NOW, lock_timeout_minutes=15)
+    assert result["staleCronJobs"] == []
+    assert result["stuck"] is False
+
+
+def test_running_past_lock_timeout_is_stale():
+    row = cron_row(status="running", scheduledAt="2026-07-10T11:30:00Z")
+    result = detect_stuck_catalog_rule_pricing([rule()], [price(livePrice=100.0)], [row], NOW, lock_timeout_minutes=15)
+    assert result["staleCronJobs"] == ["catalogrule_apply_all"]
+    assert result["stuck"] is True
+
+
+def test_rule_not_yet_active_is_ignored():
+    future_rule = rule(fromDate="2026-08-01T00:00:00Z")
+    result = detect_stuck_catalog_rule_pricing([future_rule], [price(livePrice=100.0)], [cron_row()], NOW)
+    assert result["affectedSkus"] == []
+    assert result["stuck"] is False
+
+
+def test_by_fixed_discount_computes_expected_price():
+    fixed_rule = rule(simpleAction="by_fixed", discountAmount=15)
+    result = detect_stuck_catalog_rule_pricing([fixed_rule], [price(livePrice=100.0)], [cron_row()], NOW)
+    assert result["affectedSkus"] == ["SKU-1"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">catalog-rule-lock.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectStuckCatalogRulePricing } from "./detect-stuck-catalog-rule.js";
+
+const NOW = "2026-07-10T12:00:00Z";
+
+const rule = (over = {}) => ({
+  ruleId: 7,
+  websiteIds: [1],
+  discountAmount: 20,
+  simpleAction: "by_percent",
+  fromDate: null,
+  toDate: null,
+  ...over,
+});
+
+const price = (over = {}) => ({ sku: "SKU-1", storeId: 1, basePrice: 100.0, livePrice: 80.0, ...over });
+
+const cronRow = (over = {}) => ({ jobCode: "catalogrule_apply_all", status: "error", scheduledAt: "2026-07-10T00:00:00Z", ...over });
+
+test("stuck when mismatch and error cron", () => {
+  const result = detectStuckCatalogRulePricing([rule()], [price({ livePrice: 100.0 })], [cronRow()], NOW);
+  assert.equal(result.stuck, true);
+  assert.deepEqual(result.affectedSkus, ["SKU-1"]);
+  assert.deepEqual(result.affectedRuleIds, [7]);
+  assert.deepEqual(result.staleCronJobs, ["catalogrule_apply_all"]);
+});
+
+test("not stuck when price matches", () => {
+  const result = detectStuckCatalogRulePricing([rule()], [price({ livePrice: 80.0 })], [cronRow()], NOW);
+  assert.equal(result.stuck, false);
+  assert.deepEqual(result.affectedSkus, []);
+});
+
+test("not stuck when cron is healthy", () => {
+  const healthy = cronRow({ status: "success" });
+  const result = detectStuckCatalogRulePricing([rule()], [price({ livePrice: 100.0 })], [healthy], NOW);
+  assert.equal(result.stuck, false);
+  assert.deepEqual(result.staleCronJobs, []);
+});
+
+test("running within lock timeout is not stale", () => {
+  const row = cronRow({ status: "running", scheduledAt: "2026-07-10T11:50:00Z" });
+  const result = detectStuckCatalogRulePricing([rule()], [price({ livePrice: 100.0 })], [row], NOW, 15);
+  assert.deepEqual(result.staleCronJobs, []);
+  assert.equal(result.stuck, false);
+});
+
+test("running past lock timeout is stale", () => {
+  const row = cronRow({ status: "running", scheduledAt: "2026-07-10T11:30:00Z" });
+  const result = detectStuckCatalogRulePricing([rule()], [price({ livePrice: 100.0 })], [row], NOW, 15);
+  assert.deepEqual(result.staleCronJobs, ["catalogrule_apply_all"]);
+  assert.equal(result.stuck, true);
+});
+
+test("rule not yet active is ignored", () => {
+  const futureRule = rule({ fromDate: "2026-08-01T00:00:00Z" });
+  const result = detectStuckCatalogRulePricing([futureRule], [price({ livePrice: 100.0 })], [cronRow()], NOW);
+  assert.deepEqual(result.affectedSkus, []);
+  assert.equal(result.stuck, false);
+});
+
+test("by_fixed discount computes expected price", () => {
+  const fixedRule = rule({ simpleAction: "by_fixed", discountAmount: 15 });
+  const result = detectStuckCatalogRulePricing([fixedRule], [price({ livePrice: 100.0 })], [cronRow()], NOW);
+  assert.deepEqual(result.affectedSkus, ["SKU-1"]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">New store view</span>
+      <h4>A regional launch that quietly stalled every reindex</h4>
+      <p>A retailer added a new eu_de store view ahead of a regional launch, but the store view's timezone setting was left at a default that did not match its locale. The next scheduled run of <code>catalogrule_apply_all</code> threw partway through, and by the next morning, sale prices across the entire site, not just the new store, had stopped updating.</p>
+      <p>Running the script against SKUs on an active site wide clearance rule showed the expected discounted price disagreeing with the live price on every store, and the cron report showed <code>catalogrule_apply_all</code> and <code>indexer_reindex_all_invalid</code> both stuck in a running state well past the lock timeout. The operator fixed the store view's timezone, then manually reset the two stuck rows, and the next scheduled run cleared the backlog.</p>
+    </div>
+    <div class="case">
+      <span class="tag">New rule, unbuilt relation</span>
+      <h4>A flash sale rule saved minutes before cron ran</h4>
+      <p>A merchandiser created a new catalog price rule and saved it just minutes before the daily cron window, without opening it again in the Admin to force <code>catalogrule_product</code> to populate. The daily job hit the incomplete relationship and exited with an unhandled error, leaving its lock looking held for the rest of the day.</p>
+      <p>The script flagged the flash sale SKUs as mismatched and the same three job codes as stale in <code>cron_schedule</code>. Because both signals agreed, the team knew this was not a wait it out situation, and reset the lock so the rule could actually apply before the sale's start time passed.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After running this on a schedule, a stuck catalog price rule lock stops being an invisible, install wide problem. You get a precise report naming the affected rule ids, the SKUs and stores where price is wrong, and the exact cron_schedule job codes holding the lock, so an operator can fix the root cause, whether that is a store view's locale or an unbuilt rule relationship, and clear only the specific stuck rows rather than guessing at a blind full reindex.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did all my scheduled indexers stop running after I added a store view?</summary>
+      <p>The daily catalogrule_apply_all cron recalculates rule prices for every store view. A newly created store view with an incomplete locale or timezone setup, or a catalog price rule whose catalogrule_product table has not been built yet, can make that job throw an exception and exit non zero. Magento's scheduler treats the failed run as still holding its lock, so indexer_reindex_all_invalid and indexer_update_all_views cannot acquire it on the next run and stop executing for every store, not only the new one.</p>
+    </details>
+    <details>
+      <summary>Can a script safely fix a stuck catalogrule_apply_all lock through the REST API?</summary>
+      <p>Not directly, and it should not try to. Forcing catalogrule_apply_all, running bin/magento indexer:reindex, and resetting a stuck cron_schedule row are CLI and database level operations with no public REST endpoint. A script can detect the stuck state by comparing expected rule pricing to the live storefront price and by reading cron_schedule for error or stale running rows, then report it. Only with DRY_RUN turned off and an operator's explicit confirmation should it reset the specific stuck cron_schedule rows to missed, and it should never force the price recalculation itself.</p>
+    </details>
+    <details>
+      <summary>How do I tell a stuck catalog price rule apart from a rule that legitimately has not started yet?</summary>
+      <p>Check both signals together. A rule counts as stuck only when the storefront price for a targeted SKU still disagrees with the expected discounted price and the cron_schedule rows for catalogrule_apply_all, indexer_reindex_all_invalid, or indexer_update_all_views show a status of error, or running past the lock timeout. If the rule's from_date has not arrived yet, or the cron rows show a normal success, the price difference is expected and is not a stuck job.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento and Adobe Commerce field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>catalogrule_apply_all locks indexer_reindex_all_invalid and keeps catalogsearch_fulltext constantly processing, hanging Cron Job. <a href="https://github.com/magento/magento2/issues/29070" rel="noopener">github.com/magento/magento2/issues/29070</a></li>
+      <li>Problem indexing catalog price rules after adding a new storeview. <a href="https://community.magento.com/t5/Magento-2-x-Technical-Issues/Problem-indexing-catalog-price-rules-after-adding-a-new/td-p/454984" rel="noopener">community.magento.com problem indexing catalog price rules after adding a new storeview</a></li>
+      <li>ACSD-51102: Catalog rule applied to large number of products not correctly indexed. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/tools/quality-patches-tool/patches-available-in-qpt/v1-1-33/acsd-51102-catalog-rule-is-not-correctly-indexed" rel="noopener">experienceleague.adobe.com acsd-51102-catalog-rule-is-not-correctly-indexed</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Manage the indexers, Adobe Commerce Operations. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/manage-indexers" rel="noopener">experienceleague.adobe.com commerce-operations manage-indexers</a></li>
+      <li>Configure and run cron jobs, Adobe Commerce Operations. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/configure-cron-jobs" rel="noopener">experienceleague.adobe.com commerce-operations configure-cron-jobs</a></li>
+      <li>Cron job is stuck in running status, Adobe Commerce Knowledge Base. <a href="https://experienceleague.adobe.com/en/docs/commerce-knowledge-base/kb/troubleshooting/miscellaneous/cron-job-is-stuck-in-running-status" rel="noopener">experienceleague.adobe.com cron-job-is-stuck-in-running-status</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento indexing, cron, MSI stock, or order grid that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle your indexer lock?</h3>
+    <p>If this saved you a confusing afternoon chasing a stale indexer, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

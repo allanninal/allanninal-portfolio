@@ -1,0 +1,1071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Sequence Drifts From Auto Increment After Migration</title>
+<meta name="description" content="After a Magento 1 migration or a manual DB restore, new orders collide with old increment_ids or skip huge ranges. Learn why the sequence_order tables fall out of step with sales_order, how to detect it over REST, and how to build a report-only Python or Node.js script for it.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/order-sequence-drift-after-migration/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Order Sequence Drifts From Auto Increment After Migration">
+<meta property="og:description" content="Why data migrations leave sequence_order_&lt;store&gt; tables out of step with sales_order, how to spot the duplicate and gap symptoms over REST, and a safe Python or Node.js script that flags the drift for a DBA to repair.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/order-sequence-drift-after-migration/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/order-sequence-drift-after-migration/#article","headline":"Order Sequence Drifts From Auto Increment After Migration","description":"Why data migrations leave sequence_order_&lt;store&gt; tables out of step with sales_order, how to spot the duplicate and gap symptoms over REST, and a safe Python or Node.js script that flags the drift for a DBA to repair.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/order-sequence-drift-after-migration/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders and Grid Sync","keywords":"Magento order sequence drift, sequence_order table, sales_sequence_meta, sales_sequence_profile, duplicate increment_id, data-migration-tool, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Order sequence drifts from auto increment after migration","item":"https://www.allanninal.dev/magento/order-sequence-drift-after-migration/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do new Magento orders collide with old increment_ids after a migration?","acceptedAnswer":{"@type":"Answer","text":"Magento 2 generates order, invoice, shipment, and credit memo numbers from dedicated sequence_order_<store> tables, tracked through sales_sequence_meta and sales_sequence_profile, which are completely separate from the sales_order table's own entity_id auto increment column. A migration or manual DB restore commonly copies sales_order rows without correctly re-seeding the sequence table's last issued value, so the sequence falls behind the highest increment_id already in sales_order and reissues numbers that already exist."}},{"@type":"Question","name":"Can I fix sequence drift through the Magento REST API?","acceptedAnswer":{"@type":"Answer","text":"No. Magento does not expose a REST endpoint that rewrites sequence state. The documented fix is a manual ALTER TABLE sequence_order_<store>_<entity_type> AUTO_INCREMENT = <value> run directly against the database by a DBA, per Adobe's own Commerce Knowledge Base article on changing the increment ID for a DB entity on a particular store. A script can only detect the drift over REST and report the recommended reset value."}},{"@type":"Question","name":"What is the difference between entity_id and increment_id on a Magento order?","acceptedAnswer":{"@type":"Answer","text":"entity_id is the sales_order table's own internal auto increment primary key, invisible to customers. increment_id is the human facing order number, formatted with a prefix and step by SequenceManager and issued from a separate sequence_order_<store> table. A migration can leave entity_id perfectly intact while increment_id collides or jumps, because the two live in completely different tables with no shared counter."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Orders and Grid Sync</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Orders and Grid Sync</p>
+    <h1>Order sequence drifts from auto increment after migration</h1>
+    <p class="lead">A store just moved off Magento 1, or a DBA restored a backup, and a week later two customers are staring at the same order number, or the numbers jump from 100004521 straight to 100009000 with nothing in between. Nothing about sales_order looks wrong. The rows are all there, entity_id ticks up cleanly. The part that broke lives somewhere the migration script never touched: a separate sequence table that hands out the next human facing order number. Here is why that table falls behind and a small script that finds exactly which stores drifted.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Orders REST API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento 2 does not number orders from the <code>sales_order</code> table's own <code>entity_id</code> auto increment column. It numbers them from dedicated <code>sequence_order_&lt;store&gt;</code> tables, tracked through <code>sales_sequence_meta</code> and <code>sales_sequence_profile</code>, and completely separate from <code>entity_id</code>. A migration from Magento 1 with the data-migration-tool, or a manual DB import or restore, commonly copies <code>sales_order</code> rows correctly but never re-seeds the matching sequence table's last issued value. The sequence then hands out an <code>increment_id</code> that already exists (a collision) or jumps far past the last real order (a gap). There is no REST endpoint that rewrites sequence state, so the safe move is to page through <code>GET /rest/V1/orders</code> sorted by <code>increment_id</code>, group by <code>store_id</code>, and report any duplicates or unexplained numeric jumps, leaving the actual <code>ALTER TABLE ... AUTO_INCREMENT</code> repair to a DBA. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every Magento order has two numbers living in two different places. <code>entity_id</code> is the plain auto increment primary key on <code>sales_order</code>, the internal row id nobody outside the database ever sees. <code>increment_id</code> is the order number a customer actually reads, something like <code>100004521</code>, and it is issued by <code>SequenceManager</code> from a dedicated table named <code>sequence_order_&lt;store&gt;</code>, one per store view, with its own separate <code>AUTO_INCREMENT</code> counter.</p>
+  <p>Those two counters have never been the same thing and were never meant to move together. <code>entity_id</code> just counts rows as they are inserted into <code>sales_order</code>. <code>increment_id</code> comes from a row being inserted into the sequence table purely to mint a new number, which is then formatted with a prefix and a step and stamped onto the order. When a migration copies <code>sales_order</code> rows from Magento 1, or a DBA restores a backup into a fresh database, the rows land with their original <code>increment_id</code> values intact, but nothing tells the sequence table what the highest of those values was. The sequence table starts wherever its own default was, and the very next order minted from it can be a number that already belongs to an order sitting three rows above it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A migration copies sales_order rows with their increment_id values intact, but the separate sequence_order table is never re-seeded, so it stays behind the highest existing increment_id, and the next order it mints collides with or skips past real order numbers.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Migration runs</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">sales_order rows copied</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="170" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="303" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">increment_id kept</text>
+      <text x="303" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">on every copied row</text>
+      <line x1="391" y1="103" x2="440" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">sequence table never re-seeded</text>
+      <rect x="443" y="70" width="165" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="525" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Sequence stale</text>
+      <text x="525" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">behind or ahead</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Collision</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">or gap</text>
+      <line x1="611" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="90" y1="136" x2="90" y2="168" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="10" y="170" width="235" height="50" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="127" y="191" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">entity_id stays correct</text>
+      <text x="127" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">sales_order is never wrong</text>
+    </svg>
+    <figcaption>sales_order itself is never wrong. The counter that mints new order numbers just kept its own state in a table the migration forgot about.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>Magento 2 generates order, invoice, shipment, and credit memo numbers from dedicated <code>sequence_order_&lt;store&gt;</code> tables, tracked via <code>sales_sequence_meta</code> and <code>sales_sequence_profile</code>, which are separate from the <code>sales_order</code> table's own <code>entity_id</code> auto increment column.</li>
+    <li>Data migrations from Magento 1 with the data-migration-tool, or manual DB imports and restores, commonly copy <code>sales_order</code> rows without correctly re-seeding the corresponding sequence table's <code>AUTO_INCREMENT</code> or last issued value.</li>
+    <li>Because <code>SequenceManager</code> pulls the next number purely from the sequence table's own state, inserting into <code>sequence_order_&lt;store&gt;</code> to get a new auto increment value and formatting it with a prefix and step, a stale sequence reissues <code>increment_id</code> values that already exist, or skips a large range if the sequence was seeded too far ahead instead of too far behind.</li>
+    <li>This is exactly the class of bug reported across multiple Magento 1 to Magento 2 migrations, and it shows up per store view, since each store has its own sequence table and its own drift.</li>
+  </ul>
+  <p>Store owners usually notice this the same way: a customer support ticket about an order number that "belongs to someone else," or a finance report where order numbers jump by thousands overnight with no matching spike in sales. See the citations at the end for the exact issue threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>sequence_order_&lt;store&gt;</code> is a database table with no REST endpoint of its own, and there is no public API that reports its <code>AUTO_INCREMENT</code> value. What the REST API does expose is the finished product of that sequence, the <code>increment_id</code> string on every order returned by <code>GET /rest/V1/orders</code>. Sorting those orders per store and scanning for the two failure signatures, the same numeric value on two different <code>entity_id</code> rows, or a numeric jump far larger than the store's normal order volume, is the only way to prove drift from the outside, and it is exactly what a script can do safely without ever touching the database directly.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not try to patch the sequence table over the API, because there is no safe public way to do that. Instead we add a job that pulls every order per store sorted by <code>increment_id</code>, strips each store's known prefix to get the plain numeric value, and runs it through a pure function that finds duplicates and gaps and reports the recommended <code>AUTO_INCREMENT</code> reset value, leaving the actual repair to a DBA.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists orders per store sorted by increment_id, strips the prefix to get a numeric value, checks for duplicate numeric values across entity_ids and for gaps larger than a threshold, and reports the recommended AUTO_INCREMENT reset value for a DBA to apply, otherwise it reports the store as healthy.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">GET /V1/orders</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">per store, sorted by increment_id</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Strip prefix, sort</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">numeric value per order</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Duplicate or</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">big gap?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report OK</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="613" y="185" width="142" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report reset value</text>
+      <text x="684" y="222" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">DBA runs ALTER TABLE</text>
+      <path d="M695,138 C715,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports the drift and the recommended reset value. It never writes to the sequence table itself, because the real fix runs directly against the database.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>Authenticate the same way as any other Magento REST client. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export GAP_THRESHOLD="1000"
+export DRY_RUN="true"   # report-only either way, this only affects log verbosity</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export GAP_THRESHOLD="1000"
+export DRY_RUN="true"   // report-only either way, this only affects log verbosity</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull every order's increment_id, per store</h3>
+      <p>Page through <code>GET /rest/V1/orders</code> with <code>searchCriteria[sortOrders][0][field]=increment_id&amp;searchCriteria[sortOrders][0][direction]=ASC</code>, collecting <code>entity_id</code>, <code>store_id</code>, <code>increment_id</code>, and <code>created_at</code> for every item. This always reads <code>sales_order</code> directly, the same table that stayed correct through the migration. Group the results by <code>store_id</code> once collected, since each store has its own sequence table and its own possible drift.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def orders_sorted_by_increment(page_size=200, current_page=1):
+    params = {
+        "searchCriteria[sortOrders][0][field]": "increment_id",
+        "searchCriteria[sortOrders][0][direction]": "ASC",
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": current_page,
+    }
+    return magento_get("/orders", params)["items"]
+
+
+def all_orders_sorted_by_increment(page_size=200):
+    page = 1
+    while True:
+        items = orders_sorted_by_increment(page_size, page)
+        if not items:
+            return
+        for item in items:
+            yield item
+        if len(items) &lt; page_size:
+            return
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function ordersSortedByIncrement(pageSize = 200, currentPage = 1) {
+  const params = {
+    "searchCriteria[sortOrders][0][field]": "increment_id",
+    "searchCriteria[sortOrders][0][direction]": "ASC",
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": currentPage,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items;
+}
+
+async function* allOrdersSortedByIncrement(pageSize = 200) {
+  let page = 1;
+  while (true) {
+    const items = await ordersSortedByIncrement(pageSize, page);
+    if (!items.length) return;
+    for (const item of items) yield item;
+    if (items.length &lt; pageSize) return;
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the full list of orders and a prefix map, and returns duplicates, gaps, and a recommended reset value per store. A pure function like this is easy to read and easy to test, which we do later. It strips each store's known prefix from <code>increment_id</code> to get the plain numeric value, groups by <code>store_id</code>, sorts ascending, then walks the sorted list once: the same numeric value on more than one distinct <code>entity_id</code> is a collision already in progress, and a jump between consecutive numeric values bigger than the configured threshold is a gap.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def strip_prefix(increment_id, prefix):
+    value = increment_id[len(prefix):] if prefix and increment_id.startswith(prefix) else increment_id
+    return int(value.lstrip("0") or "0")
+
+
+def detect_sequence_drift(orders, prefix_by_store, gap_threshold=1000):
+    by_store = {}
+    for o in orders:
+        by_store.setdefault(o["storeId"], []).append(o)
+
+    duplicates = []
+    gaps = []
+    max_numeric_by_store = {}
+
+    for store_id, store_orders in by_store.items():
+        prefix = prefix_by_store.get(store_id, "")
+        rows = sorted(
+            (
+                {
+                    "entityId": o["entityId"],
+                    "numeric": strip_prefix(o["incrementId"], prefix),
+                    "incrementId": o["incrementId"],
+                }
+                for o in store_orders
+            ),
+            key=lambda r: r["numeric"],
+        )
+
+        seen = {}
+        for r in rows:
+            seen.setdefault(r["numeric"], []).append(r["entityId"])
+        for numeric, entity_ids in seen.items():
+            distinct = sorted(set(entity_ids))
+            if len(distinct) &gt; 1:
+                duplicates.append({
+                    "storeId": store_id,
+                    "incrementId": next(r["incrementId"] for r in rows if r["numeric"] == numeric),
+                    "entityIds": distinct,
+                })
+
+        for prev, curr in zip(rows, rows[1:]):
+            gap_size = curr["numeric"] - prev["numeric"]
+            if gap_size &gt; gap_threshold:
+                gaps.append({
+                    "storeId": store_id,
+                    "fromIncrement": prev["numeric"],
+                    "toIncrement": curr["numeric"],
+                    "gapSize": gap_size,
+                })
+
+        max_numeric_by_store[store_id] = max((r["numeric"] for r in rows), default=0)
+
+    return {
+        "duplicates": duplicates,
+        "gaps": gaps,
+        "maxNumericByStore": max_numeric_by_store,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function stripPrefix(incrementId, prefix) {
+  const value = prefix &amp;&amp; incrementId.startsWith(prefix) ? incrementId.slice(prefix.length) : incrementId;
+  const stripped = value.replace(/^0+/, "");
+  return stripped === "" ? 0 : parseInt(stripped, 10);
+}
+
+export function detectSequenceDrift(orders, prefixByStore, gapThreshold = 1000) {
+  const byStore = new Map();
+  for (const o of orders) {
+    if (!byStore.has(o.storeId)) byStore.set(o.storeId, []);
+    byStore.get(o.storeId).push(o);
+  }
+
+  const duplicates = [];
+  const gaps = [];
+  const maxNumericByStore = {};
+
+  for (const [storeId, storeOrders] of byStore) {
+    const prefix = prefixByStore[storeId] || "";
+    const rows = storeOrders
+      .map((o) => ({
+        entityId: o.entityId,
+        numeric: stripPrefix(o.incrementId, prefix),
+        incrementId: o.incrementId,
+      }))
+      .sort((a, b) => a.numeric - b.numeric);
+
+    const seen = new Map();
+    for (const r of rows) {
+      if (!seen.has(r.numeric)) seen.set(r.numeric, []);
+      seen.get(r.numeric).push(r.entityId);
+    }
+    for (const [numeric, entityIds] of seen) {
+      const distinct = [...new Set(entityIds)].sort((a, b) => a - b);
+      if (distinct.length &gt; 1) {
+        const match = rows.find((r) => r.numeric === numeric);
+        duplicates.push({ storeId, incrementId: match.incrementId, entityIds: distinct });
+      }
+    }
+
+    for (let i = 0; i &lt; rows.length - 1; i++) {
+      const gapSize = rows[i + 1].numeric - rows[i].numeric;
+      if (gapSize &gt; gapThreshold) {
+        gaps.push({ storeId, fromIncrement: rows[i].numeric, toIncrement: rows[i + 1].numeric, gapSize });
+      }
+    }
+
+    maxNumericByStore[storeId] = rows.length ? Math.max(...rows.map((r) => r.numeric)) : 0;
+  }
+
+  return { duplicates, gaps, maxNumericByStore };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report by default, never fake a repair</h3>
+      <p>The output is a structured report per affected <code>store_id</code>: the current max numeric <code>increment_id</code> in <code>sales_order</code>, any duplicate collisions found with the colliding <code>entity_id</code> values, any gaps larger than the threshold, and the recommended <code>AUTO_INCREMENT</code> reset value, which is always the max numeric value plus one. There is no code path in this script that touches <code>sequence_order_&lt;store&gt;</code>, because there is no REST way to do that safely. The recommended repair is always the DBA running <code>ALTER TABLE sequence_order_&lt;store&gt;_&lt;entity_type&gt; AUTO_INCREMENT = &lt;value&gt;</code> against the actual database.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Exit non-zero when drift is found</h3>
+      <p>When any store has duplicates or gaps, the script logs the full report and exits with a non-zero status, so it fails loudly in a cron job or CI check instead of quietly passing. Nothing is written. A human runs the <code>ALTER TABLE</code> or re-seed step, places a real test order to confirm the next <code>increment_id</code> is correct, and only then is the flag considered cleared.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never writes to <code>sequence_order_&lt;store&gt;</code> and never touches an order's status or total. <code>DRY_RUN</code> defaults to true and only report mode ever runs unattended, since Magento has no REST endpoint to rewrite sequence state in the first place. The actual fix is always a manual, DBA-run <code>ALTER TABLE</code>, per Adobe's own documented procedure.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pulls every order sorted by <code>increment_id</code>, groups by store, runs the pure detection function, and prints a structured report. It never writes to the sequence tables, so it is safe to run again and again.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/order-sequence-drift-after-migration" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_sequence_drift.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 order sequence drift after a data migration or DB restore.
+
+Magento 2 numbers orders from dedicated sequence_order_<store> tables, tracked
+via sales_sequence_meta and sales_sequence_profile, completely separate from
+the sales_order table's own entity_id auto increment column. A migration from
+Magento 1, or a manual DB import or restore, commonly copies sales_order rows
+without correctly re-seeding the sequence table's last issued value, so the
+next order minted from it can collide with an existing increment_id or skip a
+huge range. There is no REST endpoint to rewrite sequence state, so this only
+reports the drift and the recommended AUTO_INCREMENT reset value. Run on a
+schedule. Safe to run again and again.
+"""
+import os
+import sys
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_sequence_drift")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+GAP_THRESHOLD = int(os.environ.get("GAP_THRESHOLD", "1000"))
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "200"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def orders_sorted_by_increment(page_size=200, current_page=1):
+    params = {
+        "searchCriteria[sortOrders][0][field]": "increment_id",
+        "searchCriteria[sortOrders][0][direction]": "ASC",
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": current_page,
+    }
+    return magento_get("/orders", params)["items"]
+
+
+def all_orders_sorted_by_increment(page_size=200):
+    page = 1
+    while True:
+        items = orders_sorted_by_increment(page_size, page)
+        if not items:
+            return
+        for item in items:
+            yield item
+        if len(items) &lt; page_size:
+            return
+        page += 1
+
+
+def normalize_order(item):
+    return {
+        "entityId": item.get("entity_id"),
+        "storeId": item.get("store_id"),
+        "incrementId": item.get("increment_id"),
+        "createdAt": item.get("created_at"),
+    }
+
+
+def strip_prefix(increment_id, prefix):
+    value = increment_id[len(prefix):] if prefix and increment_id.startswith(prefix) else increment_id
+    return int(value.lstrip("0") or "0")
+
+
+def detect_sequence_drift(orders, prefix_by_store, gap_threshold=1000):
+    by_store = {}
+    for o in orders:
+        by_store.setdefault(o["storeId"], []).append(o)
+
+    duplicates = []
+    gaps = []
+    max_numeric_by_store = {}
+
+    for store_id, store_orders in by_store.items():
+        prefix = prefix_by_store.get(store_id, "")
+        rows = sorted(
+            (
+                {
+                    "entityId": o["entityId"],
+                    "numeric": strip_prefix(o["incrementId"], prefix),
+                    "incrementId": o["incrementId"],
+                }
+                for o in store_orders
+            ),
+            key=lambda r: r["numeric"],
+        )
+
+        seen = {}
+        for r in rows:
+            seen.setdefault(r["numeric"], []).append(r["entityId"])
+        for numeric, entity_ids in seen.items():
+            distinct = sorted(set(entity_ids))
+            if len(distinct) &gt; 1:
+                duplicates.append({
+                    "storeId": store_id,
+                    "incrementId": next(r["incrementId"] for r in rows if r["numeric"] == numeric),
+                    "entityIds": distinct,
+                })
+
+        for prev, curr in zip(rows, rows[1:]):
+            gap_size = curr["numeric"] - prev["numeric"]
+            if gap_size &gt; gap_threshold:
+                gaps.append({
+                    "storeId": store_id,
+                    "fromIncrement": prev["numeric"],
+                    "toIncrement": curr["numeric"],
+                    "gapSize": gap_size,
+                })
+
+        max_numeric_by_store[store_id] = max((r["numeric"] for r in rows), default=0)
+
+    return {
+        "duplicates": duplicates,
+        "gaps": gaps,
+        "maxNumericByStore": max_numeric_by_store,
+    }
+
+
+def run():
+    raw_orders = list(all_orders_sorted_by_increment(PAGE_SIZE))
+    orders = [normalize_order(item) for item in raw_orders]
+
+    # No REST field exposes a store's increment_id prefix, so an empty prefix
+    # is assumed unless overridden per store via PREFIX_BY_STORE, e.g. "1:ORD-,2:EU-".
+    prefix_by_store = {}
+    for pair in os.environ.get("PREFIX_BY_STORE", "").split(","):
+        if ":" in pair:
+            store_id, prefix = pair.split(":", 1)
+            prefix_by_store[int(store_id.strip())] = prefix.strip()
+
+    result = detect_sequence_drift(orders, prefix_by_store, GAP_THRESHOLD)
+
+    for d in result["duplicates"]:
+        log.warning(
+            "Store %s: increment_id %s is duplicated across entity_id %s.",
+            d["storeId"], d["incrementId"], d["entityIds"],
+        )
+    for g in result["gaps"]:
+        log.warning(
+            "Store %s: gap of %s between increment %s and %s.",
+            g["storeId"], g["gapSize"], g["fromIncrement"], g["toIncrement"],
+        )
+
+    affected_stores = {d["storeId"] for d in result["duplicates"]} | {g["storeId"] for g in result["gaps"]}
+    if affected_stores:
+        for store_id in sorted(affected_stores, key=str):
+            reset_value = result["maxNumericByStore"].get(store_id, 0) + 1
+            log.error(
+                "Store %s sequence drift detected. Recommended repair: "
+                "ALTER TABLE sequence_order_%s AUTO_INCREMENT = %d (run by a DBA, not this script).",
+                store_id, store_id, reset_value,
+            )
+        log.error("%d store(s) affected. Exiting non-zero. No sequence table was written.", len(affected_stores))
+        sys.exit(1)
+    else:
+        log.info("Done. No sequence drift found across %d order(s).", len(orders))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-sequence-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 order sequence drift after a data migration or DB restore.
+ *
+ * Magento 2 numbers orders from dedicated sequence_order_<store> tables, tracked
+ * via sales_sequence_meta and sales_sequence_profile, completely separate from
+ * the sales_order table's own entity_id auto increment column. A migration from
+ * Magento 1, or a manual DB import or restore, commonly copies sales_order rows
+ * without correctly re-seeding the sequence table's last issued value, so the
+ * next order minted from it can collide with an existing increment_id or skip a
+ * huge range. There is no REST endpoint to rewrite sequence state, so this only
+ * reports the drift and the recommended AUTO_INCREMENT reset value. Run on a
+ * schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/order-sequence-drift-after-migration/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const GAP_THRESHOLD = Number(process.env.GAP_THRESHOLD || 1000);
+const PAGE_SIZE = Number(process.env.PAGE_SIZE || 200);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function stripPrefix(incrementId, prefix) {
+  const value = prefix &amp;&amp; incrementId.startsWith(prefix) ? incrementId.slice(prefix.length) : incrementId;
+  const stripped = value.replace(/^0+/, "");
+  return stripped === "" ? 0 : parseInt(stripped, 10);
+}
+
+export function detectSequenceDrift(orders, prefixByStore, gapThreshold = 1000) {
+  const byStore = new Map();
+  for (const o of orders) {
+    if (!byStore.has(o.storeId)) byStore.set(o.storeId, []);
+    byStore.get(o.storeId).push(o);
+  }
+
+  const duplicates = [];
+  const gaps = [];
+  const maxNumericByStore = {};
+
+  for (const [storeId, storeOrders] of byStore) {
+    const prefix = prefixByStore[storeId] || "";
+    const rows = storeOrders
+      .map((o) => ({
+        entityId: o.entityId,
+        numeric: stripPrefix(o.incrementId, prefix),
+        incrementId: o.incrementId,
+      }))
+      .sort((a, b) => a.numeric - b.numeric);
+
+    const seen = new Map();
+    for (const r of rows) {
+      if (!seen.has(r.numeric)) seen.set(r.numeric, []);
+      seen.get(r.numeric).push(r.entityId);
+    }
+    for (const [numeric, entityIds] of seen) {
+      const distinct = [...new Set(entityIds)].sort((a, b) => a - b);
+      if (distinct.length &gt; 1) {
+        const match = rows.find((r) => r.numeric === numeric);
+        duplicates.push({ storeId, incrementId: match.incrementId, entityIds: distinct });
+      }
+    }
+
+    for (let i = 0; i &lt; rows.length - 1; i++) {
+      const gapSize = rows[i + 1].numeric - rows[i].numeric;
+      if (gapSize &gt; gapThreshold) {
+        gaps.push({ storeId, fromIncrement: rows[i].numeric, toIncrement: rows[i + 1].numeric, gapSize });
+      }
+    }
+
+    maxNumericByStore[storeId] = rows.length ? Math.max(...rows.map((r) => r.numeric)) : 0;
+  }
+
+  return { duplicates, gaps, maxNumericByStore };
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function ordersSortedByIncrement(pageSize = 200, currentPage = 1) {
+  const params = {
+    "searchCriteria[sortOrders][0][field]": "increment_id",
+    "searchCriteria[sortOrders][0][direction]": "ASC",
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": currentPage,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items;
+}
+
+async function* allOrdersSortedByIncrement(pageSize = 200) {
+  let page = 1;
+  while (true) {
+    const items = await ordersSortedByIncrement(pageSize, page);
+    if (!items.length) return;
+    for (const item of items) yield item;
+    if (items.length &lt; pageSize) return;
+    page += 1;
+  }
+}
+
+function normalizeOrder(item) {
+  return {
+    entityId: item.entity_id,
+    storeId: item.store_id,
+    incrementId: item.increment_id,
+    createdAt: item.created_at,
+  };
+}
+
+function parsePrefixByStore(raw) {
+  const map = {};
+  for (const pair of (raw || "").split(",")) {
+    if (pair.includes(":")) {
+      const [storeId, prefix] = pair.split(":");
+      map[Number(storeId.trim())] = prefix.trim();
+    }
+  }
+  return map;
+}
+
+export async function run() {
+  const rawOrders = [];
+  for await (const item of allOrdersSortedByIncrement(PAGE_SIZE)) rawOrders.push(item);
+  const orders = rawOrders.map(normalizeOrder);
+
+  const prefixByStore = parsePrefixByStore(process.env.PREFIX_BY_STORE);
+  const result = detectSequenceDrift(orders, prefixByStore, GAP_THRESHOLD);
+
+  for (const d of result.duplicates) {
+    console.warn(`Store ${d.storeId}: increment_id ${d.incrementId} is duplicated across entity_id ${JSON.stringify(d.entityIds)}.`);
+  }
+  for (const g of result.gaps) {
+    console.warn(`Store ${g.storeId}: gap of ${g.gapSize} between increment ${g.fromIncrement} and ${g.toIncrement}.`);
+  }
+
+  const affectedStores = new Set([
+    ...result.duplicates.map((d) => d.storeId),
+    ...result.gaps.map((g) => g.storeId),
+  ]);
+
+  if (affectedStores.size) {
+    for (const storeId of [...affectedStores].sort()) {
+      const resetValue = (result.maxNumericByStore[storeId] || 0) + 1;
+      console.error(
+        `Store ${storeId} sequence drift detected. Recommended repair: ` +
+        `ALTER TABLE sequence_order_${storeId} AUTO_INCREMENT = ${resetValue} (run by a DBA, not this script).`
+      );
+    }
+    console.error(`${affectedStores.size} store(s) affected. Exiting non-zero. No sequence table was written.`);
+    process.exit(1);
+  } else {
+    console.log(`Done. No sequence drift found across ${orders.length} order(s).`);
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The detection rule is the part most worth testing, because it decides which stores get flagged for a DBA repair. Because we kept <code>detect_sequence_drift</code> pure, the test needs no network and no Magento store. It just feeds in plain fixture order arrays and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_order_sequence_drift.py</div>
+      <pre><code class="language-python">from detect_sequence_drift import detect_sequence_drift, strip_prefix
+
+
+def order(**over):
+    base = {"entityId": 1, "storeId": 1, "incrementId": "100000001", "createdAt": "2026-07-01 00:00:00"}
+    base.update(over)
+    return base
+
+
+def test_no_drift_on_clean_sequential_orders():
+    orders = [
+        order(entityId=1, incrementId="100000001"),
+        order(entityId=2, incrementId="100000002"),
+        order(entityId=3, incrementId="100000003"),
+    ]
+    result = detect_sequence_drift(orders, {}, gap_threshold=1000)
+    assert result["duplicates"] == []
+    assert result["gaps"] == []
+    assert result["maxNumericByStore"][1] == 100000003
+
+
+def test_duplicate_increment_id_across_two_entity_ids():
+    orders = [
+        order(entityId=10, incrementId="100000050"),
+        order(entityId=11, incrementId="100000050"),
+        order(entityId=12, incrementId="100000051"),
+    ]
+    result = detect_sequence_drift(orders, {}, gap_threshold=1000)
+    assert len(result["duplicates"]) == 1
+    assert result["duplicates"][0]["entityIds"] == [10, 11]
+    assert result["duplicates"][0]["incrementId"] == "100000050"
+
+
+def test_gap_beyond_threshold_is_flagged():
+    orders = [
+        order(entityId=1, incrementId="100004521"),
+        order(entityId=2, incrementId="100009000"),
+    ]
+    result = detect_sequence_drift(orders, {}, gap_threshold=1000)
+    assert len(result["gaps"]) == 1
+    assert result["gaps"][0]["fromIncrement"] == 100004521
+    assert result["gaps"][0]["toIncrement"] == 100009000
+    assert result["gaps"][0]["gapSize"] == 4479
+
+
+def test_gap_within_threshold_is_not_flagged():
+    orders = [
+        order(entityId=1, incrementId="100000001"),
+        order(entityId=2, incrementId="100000500"),
+    ]
+    result = detect_sequence_drift(orders, {}, gap_threshold=1000)
+    assert result["gaps"] == []
+
+
+def test_stores_are_isolated_from_each_other():
+    orders = [
+        order(entityId=1, storeId=1, incrementId="100000001"),
+        order(entityId=2, storeId=2, incrementId="200000001"),
+        order(entityId=3, storeId=2, incrementId="200000001"),
+    ]
+    result = detect_sequence_drift(orders, {}, gap_threshold=1000)
+    assert len(result["duplicates"]) == 1
+    assert result["duplicates"][0]["storeId"] == 2
+    assert result["maxNumericByStore"][1] == 100000001
+
+
+def test_strip_prefix_handles_store_prefix():
+    assert strip_prefix("ORD-000123", "ORD-") == 123
+
+
+def test_strip_prefix_handles_no_prefix():
+    assert strip_prefix("100000042", "") == 100000042
+
+
+def test_max_numeric_by_store_recommends_reset_value():
+    orders = [
+        order(entityId=1, incrementId="100000001"),
+        order(entityId=2, incrementId="100000099"),
+    ]
+    result = detect_sequence_drift(orders, {}, gap_threshold=1000)
+    recommended_reset = result["maxNumericByStore"][1] + 1
+    assert recommended_reset == 100000100</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">sequence-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectSequenceDrift, stripPrefix } from "./detect-sequence-drift.js";
+
+const order = (over = {}) => ({
+  entityId: 1,
+  storeId: 1,
+  incrementId: "100000001",
+  createdAt: "2026-07-01 00:00:00",
+  ...over,
+});
+
+test("no drift on clean sequential orders", () => {
+  const orders = [
+    order({ entityId: 1, incrementId: "100000001" }),
+    order({ entityId: 2, incrementId: "100000002" }),
+    order({ entityId: 3, incrementId: "100000003" }),
+  ];
+  const result = detectSequenceDrift(orders, {}, 1000);
+  assert.deepEqual(result.duplicates, []);
+  assert.deepEqual(result.gaps, []);
+  assert.equal(result.maxNumericByStore[1], 100000003);
+});
+
+test("duplicate increment_id across two entity_ids", () => {
+  const orders = [
+    order({ entityId: 10, incrementId: "100000050" }),
+    order({ entityId: 11, incrementId: "100000050" }),
+    order({ entityId: 12, incrementId: "100000051" }),
+  ];
+  const result = detectSequenceDrift(orders, {}, 1000);
+  assert.equal(result.duplicates.length, 1);
+  assert.deepEqual(result.duplicates[0].entityIds, [10, 11]);
+  assert.equal(result.duplicates[0].incrementId, "100000050");
+});
+
+test("gap beyond threshold is flagged", () => {
+  const orders = [
+    order({ entityId: 1, incrementId: "100004521" }),
+    order({ entityId: 2, incrementId: "100009000" }),
+  ];
+  const result = detectSequenceDrift(orders, {}, 1000);
+  assert.equal(result.gaps.length, 1);
+  assert.equal(result.gaps[0].fromIncrement, 100004521);
+  assert.equal(result.gaps[0].toIncrement, 100009000);
+  assert.equal(result.gaps[0].gapSize, 4479);
+});
+
+test("gap within threshold is not flagged", () => {
+  const orders = [
+    order({ entityId: 1, incrementId: "100000001" }),
+    order({ entityId: 2, incrementId: "100000500" }),
+  ];
+  const result = detectSequenceDrift(orders, {}, 1000);
+  assert.deepEqual(result.gaps, []);
+});
+
+test("stores are isolated from each other", () => {
+  const orders = [
+    order({ entityId: 1, storeId: 1, incrementId: "100000001" }),
+    order({ entityId: 2, storeId: 2, incrementId: "200000001" }),
+    order({ entityId: 3, storeId: 2, incrementId: "200000001" }),
+  ];
+  const result = detectSequenceDrift(orders, {}, 1000);
+  assert.equal(result.duplicates.length, 1);
+  assert.equal(result.duplicates[0].storeId, 2);
+  assert.equal(result.maxNumericByStore[1], 100000001);
+});
+
+test("stripPrefix handles store prefix", () => {
+  assert.equal(stripPrefix("ORD-000123", "ORD-"), 123);
+});
+
+test("stripPrefix handles no prefix", () => {
+  assert.equal(stripPrefix("100000042", ""), 100000042);
+});
+
+test("maxNumericByStore recommends reset value", () => {
+  const orders = [
+    order({ entityId: 1, incrementId: "100000001" }),
+    order({ entityId: 2, incrementId: "100000099" }),
+  ];
+  const result = detectSequenceDrift(orders, {}, 1000);
+  const recommendedReset = result.maxNumericByStore[1] + 1;
+  assert.equal(recommendedReset, 100000100);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Duplicate increment_id</span>
+      <h4>Two customers, one order number</h4>
+      <p>A furniture retailer migrated off Magento 1 over a weekend using the data-migration-tool. The migration itself reported success, and every historical order looked right in the admin grid. Three weeks later, a customer emailed asking why their invoice had the same order number as a stranger's shipping confirmation forwarded to them by mistake.</p>
+      <p>The detection script, run against the live store, sorted every order by store and found a handful of <code>increment_id</code> values shared across two distinct <code>entity_id</code> rows, exactly at the point where new post-migration orders started overlapping the tail end of the migrated history. A DBA reset the affected store's sequence <code>AUTO_INCREMENT</code> to the reported max plus one, and every order minted after that carried a number nothing else had ever used.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Numbering gap</span>
+      <h4>The report that jumped by four thousand overnight</h4>
+      <p>A multi-store B2B site restored a production database backup into a new environment after a hosting migration, and the sequence tables came back seeded far ahead of the actual order history for one store view. Finance noticed the new store's invoice numbers had jumped from the four thousands into the nine thousands with no matching sales spike, and worried the missing range meant lost orders.</p>
+      <p>Running the script with <code>GAP_THRESHOLD=1000</code> confirmed no orders were missing. <code>sales_order</code> was complete and correct, and the gap was purely in the sequence, which had simply been re-seeded too far ahead rather than too far behind. The report gave finance the exact numeric jump and the store id, closing the "lost orders" concern in minutes instead of a week of manual reconciliation.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule following a migration, a collision or a gap is caught before it reaches a second customer's inbox or a monthly finance report. The report carries the exact <code>store_id</code>, the colliding <code>entity_id</code> values or the numeric jump, and the recommended <code>AUTO_INCREMENT</code> reset value, so a DBA can run one precise <code>ALTER TABLE</code> per affected store rather than guessing at a store-wide fix.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do new Magento orders collide with old increment_ids after a migration?</summary>
+      <p>Magento 2 generates order, invoice, shipment, and credit memo numbers from dedicated sequence_order_&lt;store&gt; tables, tracked through sales_sequence_meta and sales_sequence_profile, which are completely separate from the sales_order table's own entity_id auto increment column. A migration or manual DB restore commonly copies sales_order rows without correctly re-seeding the sequence table's last issued value, so the sequence falls behind the highest increment_id already in sales_order and reissues numbers that already exist.</p>
+    </details>
+    <details>
+      <summary>Can I fix sequence drift through the Magento REST API?</summary>
+      <p>No. Magento does not expose a REST endpoint that rewrites sequence state. The documented fix is a manual ALTER TABLE sequence_order_&lt;store&gt;_&lt;entity_type&gt; AUTO_INCREMENT = &lt;value&gt; run directly against the database by a DBA, per Adobe's own Commerce Knowledge Base article on changing the increment ID for a DB entity on a particular store. A script can only detect the drift over REST and report the recommended reset value.</p>
+    </details>
+    <details>
+      <summary>What is the difference between entity_id and increment_id on a Magento order?</summary>
+      <p>entity_id is the sales_order table's own internal auto increment primary key, invisible to customers. increment_id is the human facing order number, formatted with a prefix and step by SequenceManager and issued from a separate sequence_order_&lt;store&gt; table. A migration can leave entity_id perfectly intact while increment_id collides or jumps, because the two live in completely different tables with no shared counter.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: next generated increment_id completely wrong after DB conversion. <a href="https://github.com/magento/data-migration-tool/issues/615" rel="noopener">github.com/magento/data-migration-tool/issues/615</a></li>
+      <li>GitHub Issue: after migration, order increment id is duplicate. <a href="https://github.com/magento/data-migration-tool/issues/731" rel="noopener">github.com/magento/data-migration-tool/issues/731</a></li>
+      <li>GitHub Issue: order increment id collision. <a href="https://github.com/magento/magento2/issues/33457" rel="noopener">github.com/magento/magento2/issues/33457</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce Knowledge Base: change increment ID for a DB entity on a particular store. <a href="https://experienceleague.adobe.com/en/docs/commerce-knowledge-base/kb/how-to/change-increment-id-for-a-db-entity-order-invoice-credit-memo-etc-on-particular-store" rel="noopener">experienceleague.adobe.com change increment ID</a></li>
+      <li>Adobe Commerce Configuration Guide: change increment ID. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/multi-sites/change-increment-id" rel="noopener">experienceleague.adobe.com change increment ID (multi-sites)</a></li>
+      <li>Adobe Commerce: search using REST endpoints. <a href="https://developer.adobe.com/commerce/webapi/rest/use-rest/performing-searches" rel="noopener">developer.adobe.com performing searches</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce orders, cron, catalog data, or inventory that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a collision before a customer did?</h3>
+    <p>If this saved you a confusing support escalation or a scramble after a migration, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

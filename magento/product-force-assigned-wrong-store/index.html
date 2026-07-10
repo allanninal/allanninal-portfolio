@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Magento Product Silently Reassigned to the Wrong Store on Save</title>
+<meta name="description" content="A product save through a CLI script, cron import, or the REST API quietly wipes its multi-website assignment down to just the default website. Learn why ProductRepository::save can force this, and build a Python or Node.js script that detects and safely repairs the lost assignments through the REST API.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/product-force-assigned-wrong-store/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Magento Product Silently Reassigned to the Wrong Store on Save">
+<meta property="og:description" content="Why ProductRepository::save can force-assign a product to only the default website, and a REST API script that detects and safely repairs the lost assignments.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/product-force-assigned-wrong-store/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/product-force-assigned-wrong-store/#article","headline":"Magento Product Silently Reassigned to the Wrong Store on Save","description":"Why ProductRepository::save can force-assign a product to only the default website, and a REST API script that detects and safely repairs the lost assignments.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/product-force-assigned-wrong-store/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Catalog and Visibility","keywords":"Magento 2, Adobe Commerce, ProductRepository, assignProductToWebsites, catalog_product_website, website_ids, REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Product silently reassigned to the wrong store on save","item":"https://www.allanninal.dev/magento/product-force-assigned-wrong-store/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a Magento product lose its multi-website assignment after a save?","acceptedAnswer":{"@type":"Answer","text":"ProductRepository::save runs an internal assignProductToWebsites step. When the save happens in, or resolves to, the admin store context, which is common for CLI scripts, cron-triggered imports, custom catalog_product_save_after observers, or REST calls that do not explicitly pass a store scope, this step can force-assign the product only to the default website instead of preserving its existing website_ids, silently overwriting the catalog_product_website table."}},{"@type":"Question","name":"How do I know if a product was force-assigned to the wrong website?","acceptedAnswer":{"@type":"Answer","text":"Call GET /V1/products/{sku} or GET /V1/products/{sku}/websites and compare the returned website_ids against an expected-mapping table you keep outside Magento. If a product that should be on several websites now shows only website id 1, and the save happened in an admin store context, that is the signature of the forced default assignment."}},{"@type":"Question","name":"Is it safe to auto-repair a lost website assignment?","acceptedAnswer":{"@type":"Answer","text":"Only for the unambiguous case where a website id is missing and nothing unexpected was added. The script defaults to DRY_RUN=true and only calls POST /V1/products/{sku}/websites to add back a missing website id when there are no unexpected extra ids, since removing a website could be a deliberate merchant change and must never be auto-corrected."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Catalog and Visibility</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Catalog and Visibility</p>
+    <h1>Product silently reassigned to the wrong store on save</h1>
+    <p class="lead">A product that has always lived on three websites gets saved by a CLI import script, a cron job, or a REST call, and comes back visible on only one. Nothing in the admin UI complained, no error was logged, and the merchandiser who set up the multi-website assignment never touched it. Here is why Magento can quietly force a product onto only its default website during save, and a script that finds every product this happened to before a customer notices it missing.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Magento REST API</span>
+      <span class="chip">Guarded auto-repair (dry run default)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p><code>Magento\Catalog\Model\ProductRepository::save()</code> runs an internal <code>assignProductToWebsites()</code> step. When the save happens in, or resolves to, the admin store context, common for CLI scripts, cron-triggered imports, custom <code>catalog_product_save_after</code> observers, or REST calls that never pass an explicit store scope, this step can force-assign the product only to the default or first website instead of preserving its existing multi-website <code>website_ids</code>, silently overwriting the <code>catalog_product_website</code> table. Run a small Python or Node.js script that reads <code>extension_attributes.website_ids</code> from <code>GET /V1/products/{sku}</code> (or the flat list from <code>GET /V1/products/{sku}/websites</code>), compares it against an expected-mapping table you keep outside Magento, and flags any drift. The full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Assigning a product to more than one website is normal for stores that run separate brands, regions, or B2B and B2C storefronts off one Magento instance. That assignment lives in the <code>catalog_product_website</code> table, and once it is set, nothing should change it unless someone deliberately edits the Websites section on the product and saves.</p>
+  <p>But <code>ProductRepository::save()</code>, the same method every programmatic save goes through whether it comes from a CLI script, a scheduled import, an observer on <code>catalog_product_save_after</code>, or a REST <code>PUT</code>, includes an internal step that decides which websites the product belongs to. When the save context resolves to the admin store code instead of the store scope the caller actually intended, that step can take a shortcut and assign the product to only the default website, discarding every other website id that was there a moment before. The product still saves without an error. It is just quietly narrower than it was.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A CLI script, cron import, or REST call saves a product without an explicit store scope, ProductRepository::save resolves the context as admin, its assignProductToWebsites step force-assigns only the default website, and the catalog_product_website table is silently overwritten, dropping the other websites the product used to be on.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="75" width="175" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="97" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">CLI, cron, or REST save</text>
+      <text x="97" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">no explicit store scope</text>
+      <line x1="188" y1="108" x2="228" y2="108" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="231" y="75" width="185" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="323" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">ProductRepository::save</text>
+      <text x="323" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">context resolves as admin</text>
+      <line x1="416" y1="108" x2="456" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="436" y="65" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="436" y="135" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">assignProductToWebsites short-circuits</text>
+      <rect x="459" y="75" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="539" y="98" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Only default website</text>
+      <text x="539" y="116" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">website_ids = [1]</text>
+      <rect x="633" y="75" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Other stores</text>
+      <text x="691" y="117" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">lose the product</text>
+      <line x1="619" y1="108" x2="630" y2="108" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="380" y="195" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#6b584c">The save reports success. No error, no warning, no admin notice.</text>
+      <text x="380" y="213" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">catalog_product_website is overwritten silently, so the drift hides until a customer or a report finds it.</text>
+    </svg>
+    <figcaption>The save succeeds and looks routine. The quiet part is the website assignment narrowing to the default store without anyone asking for that.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li><code>ProductRepository::save()</code> calls an internal <code>assignProductToWebsites()</code> step on every save, regardless of caller. It is not a separate opt-in action, it runs as part of the normal save path.</li>
+    <li>CLI scripts, cron-triggered import jobs, and custom <code>catalog_product_save_after</code> observers frequently call the repository without setting an explicit store or website scope, because the code was written assuming a single-website store.</li>
+    <li>REST <code>PUT /V1/products/{sku}</code> calls have the same exposure. If the request or the area code the API runs under resolves to the admin store code, the same short-circuit applies to a REST-triggered save just as it does to a raw PHP one.</li>
+    <li>When the save context's store code equals the admin store code, the assignment logic can take the branch that assigns to the default or first website only, instead of reading and preserving the product's existing <code>website_ids</code> before writing.</li>
+  </ul>
+  <p>This has been reported independently for direct <code>ProductRepository::save()</code> PHP calls and for REST <code>PUT /V1/products/{sku}</code> updates, both tracing back to the same admin-store-context branch mis-resolving the intended website scope on save. See the citations at the end for the exact issue threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Losing a website assignment is not always a bug. A merchant might genuinely remove a product from a website on purpose. So the safe rule is never "restore whatever changed." It is "restore only what disappeared with nothing extra added," and leave anything that looks like it could be a deliberate edit for a human to review. That split, missing versus unexpected, is what keeps an automated repair from ever undoing someone's real decision.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script pulls each product's actual <code>website_ids</code> through the REST API, compares that array against an expected mapping you maintain outside Magento, such as a CSV or JSON file, and classifies the result as missing ids, unexpected ids, or both. Only when ids are missing and nothing unexpected is present does it call the write endpoint to add them back, and only when <code>DRY_RUN</code> is explicitly set to false.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the fix. The script fetches actual website_ids for each SKU, compares them to an expected mapping using decideWebsiteDrift, and if the result is a pure lost assignment with only missing ids and DRY_RUN is false it calls POST products sku websites to add back each missing website id, otherwise it only writes a flag report line and performs no write.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="205" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="112" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">GET /V1/products/{sku}</text>
+      <text x="112" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">actual website_ids</text>
+      <rect x="10" y="95" width="205" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="112" y="121" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Expected mapping</text>
+      <text x="112" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">SKU to website ids, kept outside Magento</text>
+      <line x1="218" y1="50" x2="260" y2="90" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <line x1="218" y1="125" x2="260" y2="105" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="263" y="75" width="190" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="358" y="98" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">decideWebsiteDrift</text>
+      <text x="358" y="116" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">missing, unexpected, likelyForcedDefault</text>
+      <line x1="453" y1="105" x2="495" y2="105" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="588,73 675,105 588,137 501,105" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="588" y="100" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Missing only,</text>
+      <text x="588" y="115" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">DRY_RUN false?</text>
+      <text x="678" y="95" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="675" y1="105" x2="700" y2="105" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="165" font-family="sans-serif" font-size="10.5" fill="#8a9a92" font-weight="700">no, flag and stop</text>
+      <line x1="588" y1="137" x2="588" y2="172" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="497" y="185" width="240" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="617" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">POST products/{sku}/websites</text>
+      <text x="617" y="222" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">re-add each missing website id</text>
+      <path d="M700,105 C725,105 710,150 617,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Every SKU gets a report line either way. Only a pure lost assignment, missing ids with nothing unexpected, is ever eligible for the guarded write, and only when DRY_RUN is explicitly false.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin token and your expected mapping</h3>
+      <p>Get an admin token by calling <code>POST {MAGENTO_URL}/rest/V1/integration/admin/token</code> with your admin username and password, or use a long lived integration token. Keep the base URL and token in environment variables, and maintain the SKU to expected website ids mapping outside Magento, as a small JSON file is enough to start.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export ADMIN_STORE_CODE="admin"
+export EXPECTED_WEBSITES_JSON='{"SKU-1": [1, 2], "SKU-2": [1, 3]}'
+export DRY_RUN="true"   # start safe, change to false to repair pure lost assignments</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export ADMIN_STORE_CODE="admin"
+export EXPECTED_WEBSITES_JSON='{"SKU-1": [1, 2], "SKU-2": [1, 3]}'
+export DRY_RUN="true"   // start safe, change to false to repair pure lost assignments</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends the admin token as a bearer header. Two small helpers, one for GET and one for POST, wrap the requests, raise on a bad status code, and return the parsed JSON body so the rest of the script only deals with plain data.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def magento_post(path, body):
+    r = requests.post(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        json=body,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function magentoPost(path, body) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the actual website assignment for a SKU</h3>
+      <p>Call <code>GET /V1/products/{'{'}sku{'}'}</code> and read <code>extension_attributes.website_ids</code>, an int array, or call the shorter <code>GET /V1/products/{'{'}sku{'}'}/websites</code>, which returns the flat list of website ids Magento currently has linked for that SKU straight from the <code>catalog_product_website</code> table.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def actual_website_ids(sku):
+    product = magento_get(f"/products/{sku}")
+    ext = product.get("extension_attributes", {}) or {}
+    ids = ext.get("website_ids")
+    if ids is not None:
+        return ids
+    return magento_get(f"/products/{sku}/websites")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function actualWebsiteIds(sku) {
+  const product = await magentoGet(`/products/${sku}`);
+  const ext = product.extension_attributes || {};
+  if (ext.website_ids !== undefined) return ext.website_ids;
+  return magentoGet(`/products/${sku}/websites`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the actual ids, the expected ids, and the store context code the save ran under, and returns a struct describing the drift. It normalizes both arrays into sets, computes what is missing and what is unexpected, and flags the specific signature of the forced default assignment: actual reduces to exactly <code>[1]</code>, expected has more than one id, and the store context code equals the admin store code.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">DEFAULT_WEBSITE_ID = 1
+
+def decide_website_drift(actual_website_ids, expected_website_ids, store_context_code, admin_store_code="admin"):
+    actual = sorted(set(actual_website_ids))
+    expected = sorted(set(expected_website_ids))
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    is_drifted = bool(missing) or bool(unexpected)
+    likely_forced_default = (
+        actual == [DEFAULT_WEBSITE_ID]
+        and len(expected) > 1
+        and store_context_code == admin_store_code
+    )
+    return {
+        "isDrifted": is_drifted,
+        "missing": missing,
+        "unexpected": unexpected,
+        "likelyForcedDefault": likely_forced_default,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const DEFAULT_WEBSITE_ID = 1;
+
+export function decideWebsiteDrift(actualWebsiteIds, expectedWebsiteIds, storeContextCode, adminStoreCode = "admin") {
+  const actual = [...new Set(actualWebsiteIds)].sort((a, b) =&gt; a - b);
+  const expected = [...new Set(expectedWebsiteIds)].sort((a, b) =&gt; a - b);
+  const actualSet = new Set(actual);
+  const expectedSet = new Set(expected);
+  const missing = expected.filter((id) =&gt; !actualSet.has(id));
+  const unexpected = actual.filter((id) =&gt; !expectedSet.has(id));
+  const isDrifted = missing.length &gt; 0 || unexpected.length &gt; 0;
+  const likelyForcedDefault =
+    actual.length === 1 &amp;&amp;
+    actual[0] === DEFAULT_WEBSITE_ID &amp;&amp;
+    expected.length &gt; 1 &amp;&amp;
+    storeContextCode === adminStoreCode;
+  return { isDrifted, missing, unexpected, likelyForcedDefault };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair only the unambiguous case, guarded by DRY_RUN</h3>
+      <p>When <code>missing</code> is non-empty and <code>unexpected</code> is empty, that is a pure lost assignment, safe to re-add. Call <code>POST /V1/products/{'{'}sku{'}'}/websites</code> with <code>{'{'}"productWebsiteLink": {'{'}"sku": sku, "website_id": id{'}'}{'}'}</code> for each missing id. This is the documented <code>ProductWebsiteLinkRepositoryInterface::save</code> call, and it is idempotent per website id. Anything with an unexpected id is only flagged, never touched, because removing a website could be a deliberate merchant change.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def add_website_link(sku, website_id):
+    body = {"productWebsiteLink": {"sku": sku, "website_id": website_id}}
+    return magento_post(f"/products/{sku}/websites", body)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function addWebsiteLink(sku, websiteId) {
+  const body = { productWebsiteLink: { sku, website_id: websiteId } };
+  return magentoPost(`/products/${sku}/websites`, body);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop reads every SKU in the expected mapping, pulls its actual website ids, runs the pure decision function, and only calls the write endpoint when the drift is a pure lost assignment and <code>DRY_RUN</code> is explicitly false. Every other case, including anything with an unexpected id, only produces a report line: expected versus actual versus drift type. There is no code path that ever calls <code>DELETE /V1/products/{'{'}sku{'}'}/websites/{'{'}websiteId{'}'}</code>.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and treat any SKU with an unexpected website id as a flag for a human, not something the script should touch. A false-positive removal could take a product off a live storefront, so this script never deletes a website link automatically, no matter what DRY_RUN is set to.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pulls the actual website ids for every SKU in your expected mapping, runs the pure decision function, reports every drift it finds, and repairs only the pure lost assignment case when you explicitly turn off dry run.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/product-force-assigned-wrong-store" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair_website_drift.py</div>
+      <pre><code class="language-python">"""Detect and safely repair Magento products force-assigned to the wrong website on save.
+
+Magento\\Catalog\\Model\\ProductRepository::save() runs an internal
+assignProductToWebsites() step on every save. When the save context resolves to
+the admin store code, common for CLI scripts, cron-triggered imports, custom
+catalog_product_save_after observers, or REST calls that skip an explicit store
+scope, this step can force-assign the product only to the default website,
+silently overwriting catalog_product_website and dropping every other website
+the product used to be on.
+
+This script reads the actual website_ids for each SKU in your expected mapping,
+compares them with decideWebsiteDrift, and by default only reports the drift.
+Only when the drift is a pure lost assignment, missing ids with nothing
+unexpected, does it call POST /V1/products/{sku}/websites to add each missing
+id back, and only under an explicit DRY_RUN=false operator override. It never
+calls the DELETE websites endpoint. Run on a schedule after any bulk save,
+import, or deploy that touches ProductRepository::save. Safe to run again and
+again.
+
+Guide: https://www.allanninal.dev/magento/product-force-assigned-wrong-store/
+"""
+import os
+import json
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("repair_website_drift")
+
+MAGENTO_URL = os.environ.get("MAGENTO_URL", "https://demo.example.com").rstrip("/")
+TOKEN = os.environ.get("MAGENTO_ADMIN_TOKEN", "token_dummy")
+ADMIN_STORE_CODE = os.environ.get("ADMIN_STORE_CODE", "admin")
+STORE_CONTEXT_CODE = os.environ.get("STORE_CONTEXT_CODE", ADMIN_STORE_CODE)
+EXPECTED_WEBSITES_JSON = os.environ.get("EXPECTED_WEBSITES_JSON", "{}")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+DEFAULT_WEBSITE_ID = 1
+
+
+def magento_get(path):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def magento_post(path, body):
+    r = requests.post(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        json=body,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def actual_website_ids(sku):
+    product = magento_get(f"/products/{sku}")
+    ext = product.get("extension_attributes", {}) or {}
+    ids = ext.get("website_ids")
+    if ids is not None:
+        return ids
+    return magento_get(f"/products/{sku}/websites")
+
+
+def decide_website_drift(actual_website_ids, expected_website_ids, store_context_code, admin_store_code="admin"):
+    actual = sorted(set(actual_website_ids))
+    expected = sorted(set(expected_website_ids))
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    is_drifted = bool(missing) or bool(unexpected)
+    likely_forced_default = (
+        actual == [DEFAULT_WEBSITE_ID]
+        and len(expected) > 1
+        and store_context_code == admin_store_code
+    )
+    return {
+        "isDrifted": is_drifted,
+        "missing": missing,
+        "unexpected": unexpected,
+        "likelyForcedDefault": likely_forced_default,
+    }
+
+
+def add_website_link(sku, website_id):
+    body = {"productWebsiteLink": {"sku": sku, "website_id": website_id}}
+    return magento_post(f"/products/{sku}/websites", body)
+
+
+def run():
+    expected_map = json.loads(EXPECTED_WEBSITES_JSON)
+    flagged = 0
+    repaired = 0
+
+    for sku, expected_ids in expected_map.items():
+        actual_ids = actual_website_ids(sku)
+        drift = decide_website_drift(actual_ids, expected_ids, STORE_CONTEXT_CODE, ADMIN_STORE_CODE)
+
+        if not drift["isDrifted"]:
+            continue
+
+        flagged += 1
+        log.warning(
+            "Drift on sku=%s expected=%s actual=%s missing=%s unexpected=%s likely_forced_default=%s",
+            sku, sorted(set(expected_ids)), sorted(set(actual_ids)),
+            drift["missing"], drift["unexpected"], drift["likelyForcedDefault"],
+        )
+
+        safe_to_repair = drift["missing"] and not drift["unexpected"]
+        if not safe_to_repair:
+            log.warning("Sku=%s has an unexpected website id, flagging only, no auto-repair.", sku)
+            continue
+
+        if DRY_RUN:
+            log.info("Sku=%s would add missing website id(s) %s (dry run).", sku, drift["missing"])
+            continue
+
+        for website_id in drift["missing"]:
+            add_website_link(sku, website_id)
+            log.info("Sku=%s added back website id %s.", sku, website_id)
+        repaired += 1
+
+    log.info("Done. %d sku(s) flagged, %d sku(s) repaired.", flagged, repaired)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair-website-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect and safely repair Magento products force-assigned to the wrong website on save.
+ *
+ * Magento\Catalog\Model\ProductRepository::save() runs an internal
+ * assignProductToWebsites() step on every save. When the save context resolves to
+ * the admin store code, common for CLI scripts, cron-triggered imports, custom
+ * catalog_product_save_after observers, or REST calls that skip an explicit store
+ * scope, this step can force-assign the product only to the default website,
+ * silently overwriting catalog_product_website and dropping every other website
+ * the product used to be on.
+ *
+ * This script reads the actual website_ids for each SKU in your expected mapping,
+ * compares them with decideWebsiteDrift, and by default only reports the drift.
+ * Only when the drift is a pure lost assignment, missing ids with nothing
+ * unexpected, does it call POST /V1/products/{sku}/websites to add each missing
+ * id back, and only under an explicit DRY_RUN=false operator override. It never
+ * calls the DELETE websites endpoint. Run on a schedule after any bulk save,
+ * import, or deploy that touches ProductRepository::save. Safe to run again and
+ * again.
+ *
+ * Guide: https://www.allanninal.dev/magento/product-force-assigned-wrong-store/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const ADMIN_STORE_CODE = process.env.ADMIN_STORE_CODE || "admin";
+const STORE_CONTEXT_CODE = process.env.STORE_CONTEXT_CODE || ADMIN_STORE_CODE;
+const EXPECTED_WEBSITES_JSON = process.env.EXPECTED_WEBSITES_JSON || "{}";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const DEFAULT_WEBSITE_ID = 1;
+
+export function decideWebsiteDrift(actualWebsiteIds, expectedWebsiteIds, storeContextCode, adminStoreCode = "admin") {
+  const actual = [...new Set(actualWebsiteIds)].sort((a, b) => a - b);
+  const expected = [...new Set(expectedWebsiteIds)].sort((a, b) => a - b);
+  const actualSet = new Set(actual);
+  const expectedSet = new Set(expected);
+  const missing = expected.filter((id) => !actualSet.has(id));
+  const unexpected = actual.filter((id) => !expectedSet.has(id));
+  const isDrifted = missing.length > 0 || unexpected.length > 0;
+  const likelyForcedDefault =
+    actual.length === 1 &&
+    actual[0] === DEFAULT_WEBSITE_ID &&
+    expected.length > 1 &&
+    storeContextCode === adminStoreCode;
+  return { isDrifted, missing, unexpected, likelyForcedDefault };
+}
+
+async function magentoGet(path) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function magentoPost(path, body) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function actualWebsiteIds(sku) {
+  const product = await magentoGet(`/products/${sku}`);
+  const ext = product.extension_attributes || {};
+  if (ext.website_ids !== undefined) return ext.website_ids;
+  return magentoGet(`/products/${sku}/websites`);
+}
+
+async function addWebsiteLink(sku, websiteId) {
+  const body = { productWebsiteLink: { sku, website_id: websiteId } };
+  return magentoPost(`/products/${sku}/websites`, body);
+}
+
+export async function run() {
+  const expectedMap = JSON.parse(EXPECTED_WEBSITES_JSON);
+  let flagged = 0;
+  let repaired = 0;
+
+  for (const [sku, expectedIds] of Object.entries(expectedMap)) {
+    const actualIds = await actualWebsiteIds(sku);
+    const drift = decideWebsiteDrift(actualIds, expectedIds, STORE_CONTEXT_CODE, ADMIN_STORE_CODE);
+
+    if (!drift.isDrifted) continue;
+
+    flagged++;
+    console.warn(
+      `Drift on sku=${sku} expected=${JSON.stringify([...new Set(expectedIds)].sort((a, b) => a - b))} ` +
+      `actual=${JSON.stringify([...new Set(actualIds)].sort((a, b) => a - b))} ` +
+      `missing=${JSON.stringify(drift.missing)} unexpected=${JSON.stringify(drift.unexpected)} ` +
+      `likely_forced_default=${drift.likelyForcedDefault}`
+    );
+
+    const safeToRepair = drift.missing.length > 0 && drift.unexpected.length === 0;
+    if (!safeToRepair) {
+      console.warn(`Sku=${sku} has an unexpected website id, flagging only, no auto-repair.`);
+      continue;
+    }
+
+    if (DRY_RUN) {
+      console.log(`Sku=${sku} would add missing website id(s) ${JSON.stringify(drift.missing)} (dry run).`);
+      continue;
+    }
+
+    for (const websiteId of drift.missing) {
+      await addWebsiteLink(sku, websiteId);
+      console.log(`Sku=${sku} added back website id ${websiteId}.`);
+    }
+    repaired++;
+  }
+
+  console.log(`Done. ${flagged} sku(s) flagged, ${repaired} sku(s) repaired.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>decide_website_drift</code> is the part most worth testing, because it decides which SKUs get repaired versus only flagged. It is a pure set comparison with no I/O, so the test needs no network and no Magento store. It just feeds in plain arrays and a store code and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_force_website_drift.py</div>
+      <pre><code class="language-python">from repair_website_drift import decide_website_drift
+
+
+def test_no_drift_when_ids_match_regardless_of_order():
+    result = decide_website_drift([2, 1], [1, 2], "default")
+    assert result["isDrifted"] is False
+    assert result["missing"] == []
+    assert result["unexpected"] == []
+
+
+def test_detects_missing_website_id():
+    result = decide_website_drift([1], [1, 2, 3], "admin")
+    assert result["isDrifted"] is True
+    assert result["missing"] == [2, 3]
+    assert result["unexpected"] == []
+
+
+def test_detects_unexpected_website_id():
+    result = decide_website_drift([1, 2, 9], [1, 2], "default")
+    assert result["isDrifted"] is True
+    assert result["missing"] == []
+    assert result["unexpected"] == [9]
+
+
+def test_flags_likely_forced_default_signature():
+    result = decide_website_drift([1], [1, 2, 3], "admin", "admin")
+    assert result["likelyForcedDefault"] is True
+
+
+def test_not_forced_default_when_store_context_is_not_admin():
+    result = decide_website_drift([1], [1, 2, 3], "default", "admin")
+    assert result["likelyForcedDefault"] is False
+
+
+def test_not_forced_default_when_expected_is_single_website():
+    result = decide_website_drift([1], [1], "admin", "admin")
+    assert result["likelyForcedDefault"] is False
+    assert result["isDrifted"] is False
+
+
+def test_dedupes_duplicate_ids_in_input():
+    result = decide_website_drift([1, 1, 2], [1, 2, 2], "default")
+    assert result["isDrifted"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">website-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideWebsiteDrift } from "./repair-website-drift.js";
+
+test("no drift when ids match regardless of order", () =&gt; {
+  const result = decideWebsiteDrift([2, 1], [1, 2], "default");
+  assert.equal(result.isDrifted, false);
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.unexpected, []);
+});
+
+test("detects missing website id", () =&gt; {
+  const result = decideWebsiteDrift([1], [1, 2, 3], "admin");
+  assert.equal(result.isDrifted, true);
+  assert.deepEqual(result.missing, [2, 3]);
+  assert.deepEqual(result.unexpected, []);
+});
+
+test("detects unexpected website id", () =&gt; {
+  const result = decideWebsiteDrift([1, 2, 9], [1, 2], "default");
+  assert.equal(result.isDrifted, true);
+  assert.deepEqual(result.missing, []);
+  assert.deepEqual(result.unexpected, [9]);
+});
+
+test("flags likely forced default signature", () =&gt; {
+  const result = decideWebsiteDrift([1], [1, 2, 3], "admin", "admin");
+  assert.equal(result.likelyForcedDefault, true);
+});
+
+test("not forced default when store context is not admin", () =&gt; {
+  const result = decideWebsiteDrift([1], [1, 2, 3], "default", "admin");
+  assert.equal(result.likelyForcedDefault, false);
+});
+
+test("not forced default when expected is single website", () =&gt; {
+  const result = decideWebsiteDrift([1], [1], "admin", "admin");
+  assert.equal(result.likelyForcedDefault, false);
+  assert.equal(result.isDrifted, false);
+});
+
+test("dedupes duplicate ids in input", () =&gt; {
+  const result = decideWebsiteDrift([1, 1, 2], [1, 2, 2], "default");
+  assert.equal(result.isDrifted, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Cron import</span>
+      <h4>A nightly PIM feed quietly narrowed a shared catalog</h4>
+      <p>A home goods retailer ran a nightly cron job that pulled updated pricing from their PIM and saved it back through <code>ProductRepository::save()</code> for every changed SKU. The job never set a store scope, since it was written when the store only had one website. Months later they added a second brand website sharing the same catalog, and from that point on, every SKU the nightly job touched came out assigned to only the original website.</p>
+      <p>Nobody noticed for weeks because the products still worked fine on the original site. The second brand's catalog just kept shrinking a little every night. Running the detection script against the full SKU list surfaced the exact list of affected products, all missing the second website id and nothing unexpected added, so the guarded repair added them back safely.</p>
+    </div>
+    <div class="case">
+      <span class="tag">REST integration</span>
+      <h4>An ERP sync flattened a multi-region setup</h4>
+      <p>A distributor ran separate websites for three regions off one Magento instance, with most SKUs shared across all three but a handful restricted to just one region for compliance reasons. Their ERP integration called <code>PUT /V1/products/{sku}</code> on every inventory update, and those calls resolved to the admin store context.</p>
+      <p>Every inventory sync from the ERP was quietly collapsing shared products down to the default website only, while leaving the single-region products alone since they already only had one website id. The script's expected mapping caught the shared products the moment their <code>website_ids</code> dropped to <code>[1]</code>, flagged the exact <code>likelyForcedDefault</code> signature, and the guarded repair restored the regions without touching the SKUs that were correctly single-region on purpose.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run on a schedule after any bulk save, cron import, or deploy that touches product saves, this script turns a silent, hard to notice website drift into a short, specific list of SKUs with exactly what changed: missing, unexpected, or both. The unambiguous lost-assignment case repairs itself once you trust the dry run output. Anything that looks like it could be a deliberate merchant edit stays a flag for a human, so the script never guesses wrong about which website a product should be on.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a Magento product lose its multi-website assignment after a save?</summary>
+      <p>ProductRepository::save runs an internal assignProductToWebsites step. When the save happens in, or resolves to, the admin store context, which is common for CLI scripts, cron-triggered imports, custom catalog_product_save_after observers, or REST calls that do not explicitly pass a store scope, this step can force-assign the product only to the default website instead of preserving its existing website_ids, silently overwriting the catalog_product_website table.</p>
+    </details>
+    <details>
+      <summary>How do I know if a product was force-assigned to the wrong website?</summary>
+      <p>Call GET /V1/products/{sku} or GET /V1/products/{sku}/websites and compare the returned website_ids against an expected-mapping table you keep outside Magento. If a product that should be on several websites now shows only website id 1, and the save happened in an admin store context, that is the signature of the forced default assignment.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-repair a lost website assignment?</summary>
+      <p>Only for the unambiguous case where a website id is missing and nothing unexpected was added. The script defaults to DRY_RUN=true and only calls POST /V1/products/{sku}/websites to add back a missing website id when there are no unexpected extra ids, since removing a website could be a deliberate merchant change and must never be auto-corrected.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Magento 2 GitHub issue: ProductRepository::save assigns the product to all websites. <a href="https://github.com/magento/magento2/issues/8520" rel="noopener">github.com/magento/magento2/issues/8520</a></li>
+      <li>Magento 2 GitHub issue: updating a product via the REST API assigns it to all websites automatically. <a href="https://github.com/magento/magento2/issues/11324" rel="noopener">github.com/magento/magento2/issues/11324</a></li>
+      <li>Adobe Commerce docs: set up multiple websites, stores, and store views in the Admin. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/multi-sites/ms-admin" rel="noopener">experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/multi-sites/ms-admin</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce developer docs: REST API reference for products. <a href="https://developer.adobe.com/commerce/webapi/rest/reference/" rel="noopener">developer.adobe.com/commerce/webapi/rest/reference</a></li>
+      <li>Adobe Commerce developer docs: using REST endpoints. <a href="https://developer.adobe.com/commerce/webapi/rest/use-rest/" rel="noopener">developer.adobe.com/commerce/webapi/rest/use-rest</a></li>
+      <li>Adobe Commerce docs: set up multiple websites, stores, and store views in the Admin. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/multi-sites/ms-admin" rel="noopener">experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/multi-sites/ms-admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento catalog, indexing, cron, MSI stock, or order grid sync that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this save you a missing-catalog scare?</h3>
+    <p>If this saved you hours of chasing a silent website assignment drift, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>
