@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Shopify Overselling From Concurrent Inventory Writes</title>
+<meta name="description" content="Two inventory updates raced each other and the count went wrong, so the store oversold. Learn why concurrent writes corrupt Shopify inventory and build a Python or Node.js script that uses compareQuantity so a stale write is rejected.">
+<link rel="canonical" href="https://www.allanninal.dev/shopify/overselling-from-concurrent-writes/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Shopify Overselling From Concurrent Inventory Writes">
+<meta property="og:description" content="Why two inventory updates racing each other cause overselling, and a safe Python or Node.js script that uses compareQuantity so a stale write is rejected instead of applied.">
+<meta property="og:url" content="https://www.allanninal.dev/shopify/overselling-from-concurrent-writes/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopify/assets/shopify.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopify/overselling-from-concurrent-writes/#article","headline":"Fix Shopify Overselling From Concurrent Inventory Writes","description":"Why two inventory updates racing each other cause overselling, and a safe Python or Node.js script that uses compareQuantity on the Admin GraphQL API so a stale write is rejected instead of applied.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopify/overselling-from-concurrent-writes/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Shopify inventory","keywords":"Shopify overselling, concurrent inventory writes, compareQuantity, inventorySetQuantities, race condition, Shopify Admin GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Shopify field notes","item":"https://www.allanninal.dev/shopify/"},{"@type":"ListItem","position":2,"name":"Overselling from concurrent writes","item":"https://www.allanninal.dev/shopify/overselling-from-concurrent-writes/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my Shopify store oversell an item that showed stock?","acceptedAnswer":{"@type":"Answer","text":"Two processes read the same available quantity at close to the same moment, both decided a sale or an adjustment was safe, and both wrote back a new number. The second write overwrote the first one instead of building on it, so one of the changes was silently lost and the count drifted above what was really on the shelf."}},{"@type":"Question","name":"What does compareQuantity do on inventorySetQuantities?","acceptedAnswer":{"@type":"Answer","text":"compareQuantity tells Shopify what quantity you believe is currently set. Shopify only applies your new quantity when the current value still matches what you expected. If another process already changed it, the mutation fails instead of silently overwriting that other change, which is what stops the race."}},{"@type":"Question","name":"Is it safe to run an inventory reconciliation script automatically?","acceptedAnswer":{"@type":"Answer","text":"Yes, when it only reports mismatches by default with a dry run flag, always reads the current quantity right before writing, and passes that quantity as compareQuantity so a write is rejected rather than applied on stale data. That combination means the script can never make an oversell worse."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopify/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopify</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopify/">Field notes</a> / Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory</p>
+    <h1>Overselling from concurrent writes</h1>
+    <p class="lead">Two inventory updates fired within the same second, for the same variant, at the same location. Both read the available count as five. Both decided it was fine to write a new number. One write landed, then the other landed right on top of it and erased the first one. The count that Shopify shows now has no memory of that first sale, so the store sells more than it has. Here is why the race happens and a small script that closes it with compareQuantity.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin GraphQL API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Overselling from a race happens when two writes to the same inventory item read the same starting quantity and both write a new absolute value, so the second write clobbers the first instead of combining with it. Fix it by passing <code>compareQuantity</code> on the <code>inventorySetQuantities</code> mutation with the quantity you just read. Shopify rejects the write if the live quantity has already moved, so a stale write can never silently overwrite a fresher one. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Inventory in Shopify lives as a quantity per inventory item per location. When something changes it, like a sale, a manual count, or an app syncing stock from a warehouse, that something reads the current number, works out the new number, and writes it back.</p>
+  <p>The trouble starts when two of those somethings run close together. Say the available count is five. A checkout reserves one and plans to write four. At nearly the same instant, a warehouse sync tool reads the count, also sees five, and plans to write five again after confirming a shelf count. Whichever write lands last wins, and it wins completely, with no idea the other write ever happened. If the sync's five lands after the checkout's four, the four is gone, and the store believes it still has five to sell when only four are real. Multiply that by a busy sale weekend running several inventory apps at once, and the drift adds up fast into real oversold orders.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Two processes both read the available quantity as five, both compute a new value, and the second write overwrites the first, so one change is lost and the count goes wrong.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a9a92"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="16" width="185" height="56" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="102" y="40" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Checkout A</text>
+      <text x="102" y="57" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">reads available: 5</text>
+      <rect x="10" y="150" width="185" height="56" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="102" y="174" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Warehouse sync B</text>
+      <text x="102" y="191" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">reads available: 5</text>
+      <line x1="197" y1="44" x2="260" y2="44" stroke="#8a9a92" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="263" y="16" width="175" height="56" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="350" y="40" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Writes available: 4</text>
+      <text x="350" y="57" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">after reserving 1</text>
+      <line x1="197" y1="178" x2="260" y2="178" stroke="#8a9a92" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="263" y="150" width="175" height="56" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="350" y="174" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Writes available: 5</text>
+      <text x="350" y="191" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">shelf count confirmed</text>
+      <line x1="438" y1="44" x2="560" y2="150" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <line x1="438" y1="178" x2="560" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="560" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">B lands last, overwrites A</text>
+      <rect x="563" y="122" width="180" height="56" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="653" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Available shows 5</text>
+      <text x="653" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">but only 4 truly exist</text>
+    </svg>
+    <figcaption>Both processes read the same starting quantity. The write that lands last replaces the count completely, so the earlier change disappears and the store oversells by the amount it lost.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Nothing here is a Shopify bug. It is what happens whenever two writers share one number and neither one knows about the other. A few common ways stores end up with this race:</p>
+  <ul>
+    <li>A checkout or an order edit adjusts inventory for a sale at the same moment an inventory app pushes a bulk update from a warehouse feed or a spreadsheet import.</li>
+    <li>Two sales channels, such as the online store and a point of sale terminal, both decrement the same location's stock within the same second during a busy in-store rush.</li>
+    <li>A scheduled reconciliation job sets an absolute quantity to correct drift, but it read the quantity minutes earlier and several sales completed in between.</li>
+    <li>A retry after a timeout resends a write with a quantity computed before the timeout, unaware that the first attempt actually succeeded on Shopify's side.</li>
+  </ul>
+  <p>This is a common source of confusion because each write looks correct in isolation. The checkout math is right. The warehouse sync math is right. The only thing missing is a way to notice that the ground shifted between the read and the write. See the citations at the end for the exact docs on how Shopify's inventory mutations work.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The fix is not to write less often or to lock the whole store. It is to make every write prove it still knows the truth. Shopify's <code>inventorySetQuantities</code> mutation accepts a <code>compareQuantity</code> field alongside the new quantity. When you pass the value you just read, Shopify checks that the live value has not moved before it applies your write. If it has moved, the mutation fails cleanly instead of silently clobbering someone else's change, and your script can re-read and retry with fresh numbers.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout code and we do not add a lock. We add a job that reads the current available quantity for each tracked inventory item right before it writes, sends that value as <code>compareQuantity</code> along with the corrected quantity, and treats a rejected write as a sign to re-read and try again rather than an error to ignore. Anything Shopify accepts is logged as a real correction. Anything Shopify rejects means someone else moved the number first, so we back off and reconcile fresh.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job reads the current available quantity, computes the correct quantity, and writes it with compareQuantity set to what it just read. Shopify applies the write only if the live quantity still matches, otherwise it rejects the write and the job re-reads.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#008060"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Reconcile job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Read available now</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">per item, per location</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Compute correct qty</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">against known truth</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#e5f4ef" stroke="#b9d8cc"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">Still matches</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">compareQuantity?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, re-read and retry</text>
+      <path d="M575,170 C575,205 300,205 210,168" fill="none" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ah2)"></path>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Quantity applied</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">count now correct</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The write only applies when the live quantity still matches what the job read. A stale write is rejected and the job re-reads fresh numbers instead of guessing.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create a custom app in your Shopify admin under Settings, Apps and sales channels, Develop apps. Give it the <code>read_inventory</code> and <code>write_inventory</code> scopes, plus <code>read_locations</code>, and install it to get an Admin API access token that starts with <code>shpat_</code>. Keep the token and the shop domain in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPIFY_SHOP="yourstore.myshopify.com"
+export SHOPIFY_ACCESS_TOKEN="shpat_..."
+export LOCATION_ID="gid://shopify/Location/1"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPIFY_SHOP="yourstore.myshopify.com"
+export SHOPIFY_ACCESS_TOKEN="shpat_..."
+export LOCATION_ID="gid://shopify/Location/1"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Admin GraphQL API</h3>
+      <p>Every call goes to one GraphQL endpoint with your token in the <code>X-Shopify-Access-Token</code> header. A small helper sends a query and returns the data, and raises if Shopify reports an error. We use this same helper to read live quantities and to run the mutation.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOP = os.environ["SHOPIFY_SHOP"]
+TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+
+def gql(query, variables=None):
+    r = requests.post(
+        ENDPOINT,
+        json={"query": query, "variables": variables or {}},
+        headers={"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOP = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List tracked inventory levels for the location</h3>
+      <p>Ask for inventory items at the location you are reconciling, reading back the inventory item id, the SKU, and the current available quantity from <code>quantities(names: ["available"])</code>. We page through with a cursor so the job covers a large catalog without missing anything.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">LEVELS_QUERY = """
+query($cursor: String, $locationId: ID!) {
+  location(id: $locationId) {
+    inventoryLevels(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        item { id sku }
+        quantities(names: ["available"]) { name quantity }
+      }
+    }
+  }
+}"""
+
+def inventory_levels(location_id):
+    cursor = None
+    while True:
+        loc = gql(LEVELS_QUERY, {"cursor": cursor, "locationId": location_id})["location"]
+        data = loc["inventoryLevels"]
+        for node in data["nodes"]:
+            yield node
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const LEVELS_QUERY = `
+query($cursor: String, $locationId: ID!) {
+  location(id: $locationId) {
+    inventoryLevels(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        item { id sku }
+        quantities(names: ["available"]) { name quantity }
+      }
+    }
+  }
+}`;
+
+async function* inventoryLevels(locationId) {
+  let cursor = null;
+  while (true) {
+    const loc = (await gql(LEVELS_QUERY, { cursor, locationId })).location;
+    const data = loc.inventoryLevels;
+    for (const node of data.nodes) yield node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the quantity we just read, the quantity we believe is correct, and returns the exact write we should send, or nothing if there is nothing to fix. A pure function like this is easy to read and easy to test, which we do later. It always carries <code>compareQuantity</code> set to the quantity we just read, never to a number read minutes ago, because that is what lets Shopify catch a race.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def plan_write(item_id, location_id, current_available, correct_available):
+    """Return the inventorySetQuantities write to send, or None if nothing to fix.
+    current_available must be read immediately before this call, never cached,
+    so compareQuantity always reflects the true live value at write time.
+    """
+    if current_available == correct_available:
+        return None
+    return {
+        "name": "available",
+        "reason": "correction",
+        "ignoreCompareQuantityFailures": False,
+        "quantities": [{
+            "inventoryItemId": item_id,
+            "locationId": location_id,
+            "quantity": correct_available,
+            "compareQuantity": current_available,
+        }],
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function planWrite(itemId, locationId, currentAvailable, correctAvailable) {
+  // currentAvailable must be read immediately before this call, never cached,
+  // so compareQuantity always reflects the true live value at write time.
+  if (currentAvailable === correctAvailable) return null;
+  return {
+    name: "available",
+    reason: "correction",
+    ignoreCompareQuantityFailures: false,
+    quantities: [{
+      inventoryItemId: itemId,
+      locationId,
+      quantity: correctAvailable,
+      compareQuantity: currentAvailable,
+    }],
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Write with compareQuantity, and treat a rejection as a signal</h3>
+      <p>Call <code>inventorySetQuantities</code> with the plan from step four. When the live quantity has already moved since we read it, Shopify returns a <code>userErrors</code> entry rather than applying the write. That is success for the safety mechanism, even though it is not the write we wanted, so the script logs it and moves on to re-read that item on the next pass instead of forcing the write through.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">SET_QUANTITIES_MUTATION = """
+mutation($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup { createdAt }
+    userErrors { field message code }
+  }
+}"""
+
+def apply_write(write):
+    result = gql(SET_QUANTITIES_MUTATION, {"input": write})["inventorySetQuantities"]
+    errors = result["userErrors"]
+    if errors:
+        stale = any(e.get("code") == "COMPARE_QUANTITY_STALE" for e in errors)
+        if stale:
+            return "stale"
+        raise RuntimeError(errors)
+    return "applied"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">const SET_QUANTITIES_MUTATION = `
+mutation($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup { createdAt }
+    userErrors { field message code }
+  }
+}`;
+
+async function applyWrite(write) {
+  const result = (await gql(SET_QUANTITIES_MUTATION, { input: write })).inventorySetQuantities;
+  const errors = result.userErrors;
+  if (errors.length) {
+    const stale = errors.some((e) => e.code === "COMPARE_QUANTITY_STALE");
+    if (stale) return "stale";
+    throw new Error(JSON.stringify(errors));
+  }
+  return "applied";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports which items it would correct and by how much. Read the output, agree with it, then switch it off to let it write. Run it on a schedule that matches how fast your inventory moves, for example every few minutes during a sale.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and always read <code>current_available</code> in the same pass you write it, never from an earlier snapshot. A stale <code>compareQuantity</code> defeats the whole point, since Shopify would be comparing against a number that is already wrong.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because a rejected write from a stale <code>compareQuantity</code> never corrupts anything, it simply waits for the next pass to re-read and try again.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopify-fixes/tree/main/overselling-from-concurrent-writes" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopify-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_inventory.py</div>
+      <pre><code class="language-python">"""Reconcile Shopify inventory without racing other writers.
+Reads the live available quantity right before writing and passes it as
+compareQuantity, so a write is rejected instead of silently overwriting
+a change made by another process in between. Run on a schedule.
+Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_inventory")
+
+SHOP = os.environ["SHOPIFY_SHOP"]
+TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+LOCATION_ID = os.environ["LOCATION_ID"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+LEVELS_QUERY = """
+query($cursor: String, $locationId: ID!) {
+  location(id: $locationId) {
+    inventoryLevels(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        item { id sku }
+        quantities(names: ["available"]) { name quantity }
+      }
+    }
+  }
+}"""
+
+SET_QUANTITIES_MUTATION = """
+mutation($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup { createdAt }
+    userErrors { field message code }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        ENDPOINT,
+        json={"query": query, "variables": variables or {}},
+        headers={"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def available_quantity(node):
+    for q in node.get("quantities") or []:
+        if q.get("name") == "available":
+            return q.get("quantity")
+    return None
+
+
+def plan_write(item_id, location_id, current_available, correct_available):
+    """Return the inventorySetQuantities write to send, or None if nothing to fix.
+    current_available must be read immediately before this call, never cached,
+    so compareQuantity always reflects the true live value at write time.
+    """
+    if current_available == correct_available:
+        return None
+    return {
+        "name": "available",
+        "reason": "correction",
+        "ignoreCompareQuantityFailures": False,
+        "quantities": [{
+            "inventoryItemId": item_id,
+            "locationId": location_id,
+            "quantity": correct_available,
+            "compareQuantity": current_available,
+        }],
+    }
+
+
+def inventory_levels(location_id):
+    cursor = None
+    while True:
+        loc = gql(LEVELS_QUERY, {"cursor": cursor, "locationId": location_id})["location"]
+        data = loc["inventoryLevels"]
+        for node in data["nodes"]:
+            yield node
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def apply_write(write):
+    result = gql(SET_QUANTITIES_MUTATION, {"input": write})["inventorySetQuantities"]
+    errors = result["userErrors"]
+    if errors:
+        stale = any(e.get("code") == "COMPARE_QUANTITY_STALE" for e in errors)
+        if stale:
+            return "stale"
+        raise RuntimeError(errors)
+    return "applied"
+
+
+def correct_quantity_for(sku):
+    """Look up the truth for this SKU, for example a warehouse feed or a fresh count.
+    Replace this with your own source of correct stock.
+    """
+    raise NotImplementedError
+
+
+def run():
+    corrected = 0
+    stale = 0
+    for node in inventory_levels(LOCATION_ID):
+        item_id = node["item"]["id"]
+        sku = node["item"]["sku"]
+        current = available_quantity(node)
+        if current is None:
+            continue
+        correct = correct_quantity_for(sku)
+        write = plan_write(item_id, LOCATION_ID, current, correct)
+        if write is None:
+            continue
+        log.info("SKU %s: %s -> %s. %s", sku, current, correct,
+                  "would write" if DRY_RUN else "writing")
+        if not DRY_RUN:
+            outcome = apply_write(write)
+            if outcome == "stale":
+                stale += 1
+                log.warning("SKU %s: compareQuantity stale, another write landed first. Skipping this pass.", sku)
+                continue
+        corrected += 1
+    log.info("Done. %d item(s) %s, %d rejected as stale.",
+              corrected, "to correct" if DRY_RUN else "corrected", stale)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-inventory.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile Shopify inventory without racing other writers.
+ * Reads the live available quantity right before writing and passes it as
+ * compareQuantity, so a write is rejected instead of silently overwriting
+ * a change made by another process in between. Run on a schedule.
+ * Safe to run again and again.
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOP = process.env.SHOPIFY_SHOP || "example.myshopify.com";
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || "shpat_dummy";
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const LOCATION_ID = process.env.LOCATION_ID || "gid://shopify/Location/1";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function availableQuantity(node) {
+  for (const q of node.quantities || []) {
+    if (q.name === "available") return q.quantity;
+  }
+  return null;
+}
+
+export function planWrite(itemId, locationId, currentAvailable, correctAvailable) {
+  // currentAvailable must be read immediately before this call, never cached,
+  // so compareQuantity always reflects the true live value at write time.
+  if (currentAvailable === correctAvailable) return null;
+  return {
+    name: "available",
+    reason: "correction",
+    ignoreCompareQuantityFailures: false,
+    quantities: [{
+      inventoryItemId: itemId,
+      locationId,
+      quantity: correctAvailable,
+      compareQuantity: currentAvailable,
+    }],
+  };
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const LEVELS_QUERY = `
+query($cursor: String, $locationId: ID!) {
+  location(id: $locationId) {
+    inventoryLevels(first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        item { id sku }
+        quantities(names: ["available"]) { name quantity }
+      }
+    }
+  }
+}`;
+
+const SET_QUANTITIES_MUTATION = `
+mutation($input: InventorySetQuantitiesInput!) {
+  inventorySetQuantities(input: $input) {
+    inventoryAdjustmentGroup { createdAt }
+    userErrors { field message code }
+  }
+}`;
+
+async function* inventoryLevels(locationId) {
+  let cursor = null;
+  while (true) {
+    const loc = (await gql(LEVELS_QUERY, { cursor, locationId })).location;
+    const data = loc.inventoryLevels;
+    for (const node of data.nodes) yield node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function applyWrite(write) {
+  const result = (await gql(SET_QUANTITIES_MUTATION, { input: write })).inventorySetQuantities;
+  const errors = result.userErrors;
+  if (errors.length) {
+    const stale = errors.some((e) => e.code === "COMPARE_QUANTITY_STALE");
+    if (stale) return "stale";
+    throw new Error(JSON.stringify(errors));
+  }
+  return "applied";
+}
+
+async function correctQuantityFor(sku) {
+  // Look up the truth for this SKU, for example a warehouse feed or a fresh count.
+  // Replace this with your own source of correct stock.
+  throw new Error("not implemented");
+}
+
+export async function run() {
+  let corrected = 0;
+  let stale = 0;
+  for await (const node of inventoryLevels(LOCATION_ID)) {
+    const itemId = node.item.id;
+    const sku = node.item.sku;
+    const current = availableQuantity(node);
+    if (current === null) continue;
+    const correct = await correctQuantityFor(sku);
+    const write = planWrite(itemId, LOCATION_ID, current, correct);
+    if (!write) continue;
+    console.log(`SKU ${sku}: ${current} -> ${correct}. ${DRY_RUN ? "would write" : "writing"}`);
+    if (!DRY_RUN) {
+      const outcome = await applyWrite(write);
+      if (outcome === "stale") {
+        stale++;
+        console.warn(`SKU ${sku}: compareQuantity stale, another write landed first. Skipping this pass.`);
+        continue;
+      }
+    }
+    corrected++;
+  }
+  console.log(`Done. ${corrected} item(s) ${DRY_RUN ? "to correct" : "corrected"}, ${stale} rejected as stale.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides what gets written and what protects that write from a race. Because we kept <code>plan_write</code> and <code>available_quantity</code> pure, the tests need no network and no Shopify account. They just feed in plain objects and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_overselling_compare_quantity.py</div>
+      <pre><code class="language-python">from reconcile_inventory import plan_write, available_quantity
+
+
+def test_no_write_when_already_correct():
+    assert plan_write("gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5, 5) is None
+
+
+def test_write_carries_compare_quantity_as_current_value():
+    write = plan_write("gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5, 4)
+    q = write["quantities"][0]
+    assert q["compareQuantity"] == 5
+    assert q["quantity"] == 4
+
+
+def test_write_never_forces_through_compare_failures():
+    write = plan_write("gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5, 4)
+    assert write["ignoreCompareQuantityFailures"] is False
+
+
+def test_available_quantity_reads_named_entry():
+    node = {"quantities": [{"name": "committed", "quantity": 2}, {"name": "available", "quantity": 7}]}
+    assert available_quantity(node) == 7
+
+
+def test_available_quantity_missing_returns_none():
+    assert available_quantity({"quantities": [{"name": "committed", "quantity": 2}]}) is None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-inventory.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { planWrite, availableQuantity } from "./reconcile-inventory.js";
+
+test("no write when already correct", () =&gt; {
+  assert.equal(planWrite("gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5, 5), null);
+});
+
+test("write carries compareQuantity as the current value", () =&gt; {
+  const write = planWrite("gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5, 4);
+  const q = write.quantities[0];
+  assert.equal(q.compareQuantity, 5);
+  assert.equal(q.quantity, 4);
+});
+
+test("write never forces through compare failures", () =&gt; {
+  const write = planWrite("gid://shopify/InventoryItem/1", "gid://shopify/Location/1", 5, 4);
+  assert.equal(write.ignoreCompareQuantityFailures, false);
+});
+
+test("availableQuantity reads the named entry", () =&gt; {
+  const node = { quantities: [{ name: "committed", quantity: 2 }, { name: "available", quantity: 7 }] };
+  assert.equal(availableQuantity(node), 7);
+});
+
+test("availableQuantity missing returns null", () =&gt; {
+  assert.equal(availableQuantity({ quantities: [{ name: "committed", quantity: 2 }] }), null);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash sale</span>
+      <h4>The sneaker drop that sold twelve pairs of a stock of ten</h4>
+      <p>A streetwear store ran a timed drop with a countdown page. Checkout wrote inventory on every sale, and a separate hype-tracking app polled and rewrote the same quantity every few seconds to keep its own dashboard fresh. During the first minute, several of those writes landed within the same second and clobbered each other, so the storefront still showed stock after the shelf was empty.</p>
+      <p>After adding <code>compareQuantity</code> to every write, the dashboard app's stale writes started failing instead of erasing real sales. The team saw the rejection count spike during the drop, which told them exactly how close the race had been, and stock finally ran out at the right number.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Multi channel</span>
+      <h4>The store selling the same stock online and in a physical shop</h4>
+      <p>A boutique used Shopify POS in the shop and the online store for the same location's inventory. A busy Saturday meant a cashier and an online buyer sometimes bought the last unit of something within seconds of each other, and whichever write landed second wiped out the first, so the count stayed at one when it should have been zero.</p>
+      <p>The reconciliation job now runs every five minutes, reads the live count right before writing, and lets Shopify reject any write where the count already moved. Those rejections just mean the job re-reads next pass, and the shop stopped promising a unit that was already sold at the till.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no writer can silently erase another writer's change. Every write proves it still knows the truth before Shopify accepts it, a stale write fails loudly instead of corrupting the count quietly, and the available quantity finally matches what is really on the shelf. Keep the read-then-write step tight, since any gap between reading <code>compareQuantity</code> and sending it reopens the race.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my Shopify store oversell an item that showed stock?</summary>
+      <p>Two processes read the same available quantity at close to the same moment, both decided a sale or an adjustment was safe, and both wrote back a new number. The second write overwrote the first one instead of building on it, so one of the changes was silently lost and the count drifted above what was really on the shelf.</p>
+    </details>
+    <details>
+      <summary>What does compareQuantity do on inventorySetQuantities?</summary>
+      <p>compareQuantity tells Shopify what quantity you believe is currently set. Shopify only applies your new quantity when the current value still matches what you expected. If another process already changed it, the mutation fails instead of silently overwriting that other change, which is what stops the race.</p>
+    </details>
+    <details>
+      <summary>Is it safe to run an inventory reconciliation script automatically?</summary>
+      <p>Yes, when it only reports mismatches by default with a dry run flag, always reads the current quantity right before writing, and passes that quantity as compareQuantity so a write is rejected rather than applied on stale data. That combination means the script can never make an oversell worse.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/transactions-total-mismatch/">Transactions total does not match the order</a>
+    <a href="/shopify/">Browse all Shopify field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Shopify Help Center: managing inventory quantities and locations. <a href="https://help.shopify.com/en/manual/products/inventory" rel="noopener">help.shopify.com/en/manual/products/inventory</a></li>
+      <li>Shopify Help Center: overselling and how oversold items are handled. <a href="https://help.shopify.com/en/manual/products/inventory/managing-inventory/oversell" rel="noopener">help.shopify.com/en/manual/products/inventory/managing-inventory/oversell</a></li>
+      <li>Shopify Community: inventory counts drifting when multiple apps write at once. <a href="https://community.shopify.com/c/shopify-apis-and-sdks/bd-p/shopify-apis-and-sdks" rel="noopener">community.shopify.com shopify apis and sdks</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopify Admin GraphQL: the <code>inventorySetQuantities</code> mutation, including <code>compareQuantity</code>. <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/inventorySetQuantities" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/mutations/inventorySetQuantities</a></li>
+      <li>Shopify Admin GraphQL: the InventoryLevel object and its <code>quantities</code> field. <a href="https://shopify.dev/docs/api/admin-graphql/latest/objects/InventoryLevel" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/objects/InventoryLevel</a></li>
+      <li>Shopify Admin GraphQL: managing inventory quantities concurrently across locations. <a href="https://shopify.dev/docs/apps/build/orders-fulfillment/inventory-management-apps/manage-quantities-states" rel="noopener">shopify.dev/docs/apps/build/orders-fulfillment/inventory-management-apps/manage-quantities-states</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopify orders, payments, subscriptions, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop your overselling?</h3>
+    <p>If this saved you a pile of angry customers or a wrong stock count, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopify/">Back to all Shopify field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopify.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopify/assets/shopify.js" defer></script>
+</body>
+</html>
