@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix WooCommerce Action Scheduler Actions Stuck on In-Progress</title>
+<meta name="description" content="Action Scheduler actions can freeze on in-progress forever when the worker that claimed them dies mid run, backing up renewals, payments, and emails. Learn why it happens and build a Python or Node.js auditor that finds and clears the stuck ones safely.">
+<link rel="canonical" href="https://www.allanninal.dev/woocommerce/action-scheduler-stuck-in-progress/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix WooCommerce Action Scheduler Actions Stuck on In-Progress">
+<meta property="og:description" content="Why a claimed Action Scheduler action can freeze on in-progress forever, and a safe Python or Node.js auditor that finds and clears the stuck ones.">
+<meta property="og:url" content="https://www.allanninal.dev/woocommerce/action-scheduler-stuck-in-progress/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/woocommerce/assets/woo.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/woocommerce/action-scheduler-stuck-in-progress/#article","headline":"Fix WooCommerce Action Scheduler Actions Stuck on In-Progress","description":"Why a claimed Action Scheduler action can freeze on in-progress forever, and a safe Python or Node.js auditor that finds and clears the stuck ones.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/woocommerce/action-scheduler-stuck-in-progress/","image":"https://www.allanninal.dev/og-image.png","articleSection":"WooCommerce core: scheduling, cron, and email","keywords":"Action Scheduler stuck in-progress, WooCommerce cron queue backed up, wp_actionscheduler_actions, WooCommerce subscription renewal stuck, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"WooCommerce core: scheduling, cron, and email","item":"https://www.allanninal.dev/woocommerce/"},{"@type":"ListItem","position":2,"name":"Action Scheduler stuck in-progress","item":"https://www.allanninal.dev/woocommerce/action-scheduler-stuck-in-progress/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do Action Scheduler actions get stuck on in-progress?","acceptedAnswer":{"@type":"Answer","text":"An action moves to in-progress the moment a worker claims it, and only moves to complete after the worker finishes. If the worker dies first, from a timeout, an out of memory kill, or a fatal error, nothing ever marks the action finished, so it sits on in-progress forever."}},{"@type":"Question","name":"Is it safe to reset a stuck action myself?","acceptedAnswer":{"@type":"Answer","text":"It is safe once you know what the action was trying to do. For a payment or renewal action, check Stripe first. If Stripe shows no successful charge for that attempt, resetting the action to pending is safe, since nothing was charged. If Stripe already succeeded, finish the order directly instead of retrying the action."}},{"@type":"Question","name":"How often should the auditor run?","acceptedAnswer":{"@type":"Answer","text":"Every fifteen to thirty minutes is enough for most stores. It only acts on actions that have been stuck longer than a set number of minutes, so running it often is safe and will not interrupt actions that are still genuinely working."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/woocommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / woo</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/woocommerce/">Field notes</a> / WooCommerce core: scheduling, cron, and email</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> WooCommerce core: scheduling, cron, and email</p>
+    <h1>Action Scheduler stuck in-progress</h1>
+    <p class="lead">One action never finished, and now it is sitting on in-progress forever. Renewals stop firing, retry emails stop going out, and the queue behind it gets longer every hour. This is what makes an action freeze mid run, why it can block the queue, and a small script that finds every stuck action, checks Stripe for the truth, and tells you exactly which ones are safe to reset.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Runs on a schedule</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>An Action Scheduler action moves to in-progress the instant a worker claims it, and only moves to complete once that worker returns. If the worker crashes, times out, or is killed partway through, no one ever marks the action finished, so it stays on in-progress permanently and can hold up its group. Run a small Python or Node.js auditor that reads the stuck actions, checks Stripe for whatever payment they were attempting, and tells you which are safe to reset and which still have money in flight. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Action Scheduler is the job queue that runs inside WooCommerce. Subscription renewals, retry emails, webhook processing, and dozens of other background tasks all move through it as rows in a database table. Each row has a status. Most of the time a row goes from pending, to in-progress, to complete in well under a second, and nobody ever looks at the table directly.</p>
+  <p>The in-progress status exists so two workers do not grab the same job at once. A worker claims a batch of actions, marks them in-progress, runs them, then marks each one complete or failed when it is done. That last step is the part that can be skipped. If the PHP process dies while the action is running, from a page timeout, a memory limit, a fatal error in a plugin, or the server being restarted, the action is left exactly where it was: in-progress, with nobody left to finish it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A worker claims an action, marks it in-progress, then crashes before marking it complete, so the action is stuck forever and the queue behind it backs up.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8b8398"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="76" width="150" height="66" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="85" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b2135">Worker claims</text>
+      <text x="85" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#5f576d">the action</text>
+      <line x1="163" y1="109" x2="205" y2="109" stroke="#8b8398" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="76" width="160" height="66" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="288" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b2135">Marked</text>
+      <text x="288" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#5f576d">in-progress</text>
+      <line x1="371" y1="109" x2="440" y2="109" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="405" y="66" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="405" y="136" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">worker dies mid run</text>
+      <rect x="443" y="76" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Action frozen</text>
+      <text x="523" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#5f576d">stuck in-progress</text>
+      <rect x="628" y="76" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="100" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Group blocked</text>
+      <text x="689" y="118" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">queue backs up</text>
+      <line x1="606" y1="109" x2="625" y2="109" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The action is claimed and marked in-progress, but the worker never returns to mark it complete. It stays frozen, and everything behind it in the same group waits.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Action Scheduler's own documentation describes in-progress as a claim lock meant to last seconds, not hours. A few common reasons a worker never gets to release that lock:</p>
+  <ul>
+    <li>The action ran during a normal page load or WP-Cron request that hit the host's execution time limit, so PHP was killed mid function with no chance to clean up.</li>
+    <li>The action hit a fatal error, an uncaught exception in a payment gateway or a third party plugin hooked onto the same action, which stops PHP before the completion callback runs.</li>
+    <li>The server or container was restarted, redeployed, or ran out of memory while a batch of actions was mid claim.</li>
+    <li>A long running action, like a large CSV export or a bulk email send, was stopped manually or by a process manager before it finished.</li>
+  </ul>
+  <p>This is reported often enough that it has its own section in the Action Scheduler troubleshooting docs, and support threads describe subscription renewals silently stopping because the hook that runs them is stuck behind a single frozen row. See the citations at the end for the exact references.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>An action stuck on in-progress does not tell you what happened to the payment it was trying to process. It only tells you the worker never came back. Stripe is still the source of truth for money. The safe move is to ask Stripe what actually happened for that attempt, not to guess from the WooCommerce side alone.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch <code>wp_actionscheduler_actions</code> directly, and we do not blindly reset every stuck row. We export the actions that have been sitting on in-progress past a safe threshold, load the order each one was working on, and ask Stripe about the PaymentIntent tied to that order. Only once we know Stripe's answer do we decide what to do: finish the order if Stripe already succeeded, flag the action safe to reset if nothing was charged, or leave it alone if the payment is still genuinely in flight.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job reads stuck actions past a threshold, loads the order and asks Stripe for the PaymentIntent status, then decides to complete the order, reset the action, or wait, depending on what Stripe says.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#7f54b3"></path></marker></defs>
+      <rect x="10" y="20" width="150" height="60" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="85" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Scheduled job</text>
+      <text x="85" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">every 15 to 30 min</text>
+      <line x1="85" y1="80" x2="85" y2="106" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="110" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Read stuck actions</text>
+      <text x="110" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">in-progress past threshold</text>
+      <line x1="210" y1="138" x2="252" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="255" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="347" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Load order</text>
+      <text x="347" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">ask Stripe for the intent</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,108 660,138 575,168 490,138" fill="#f3eefa" stroke="#d6c8ec"></polygon>
+      <text x="575" y="134" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b2135">What does</text>
+      <text x="575" y="149" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b2135">Stripe say?</text>
+      <text x="663" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">settled</text>
+      <line x1="660" y1="138" x2="690" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="196" font-family="sans-serif" font-size="10.5" fill="#8b8398" font-weight="700">in flight, wait</text>
+      <line x1="575" y1="168" x2="575" y2="205" stroke="#8b8398" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Complete order</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#5f576d">or flag action to reset</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The auditor asks Stripe before touching anything. Only settled outcomes, succeeded or clearly failed, lead to an action. A payment still in flight is left alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Export the stuck actions and get access to both systems</h3>
+      <p>List the actions currently sitting on in-progress with WP-CLI, since Action Scheduler does not expose this over the WooCommerce REST API. Add the linked order ID and how many minutes each one has been stuck to that export. You also need a Stripe secret key and a WooCommerce REST API key pair with read and write access to orders.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install stripe requests
+
+wp action-scheduler action list --status=in-progress --format=json &gt; stuck.json
+# add order_id and age_minutes to each row before running the auditor
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export WOO_STORE_URL="https://yourstore.com"
+export WOO_CONSUMER_KEY="ck_..."
+export WOO_CONSUMER_SECRET="cs_..."
+export STUCK_AFTER_MINUTES="30"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install stripe
+
+wp action-scheduler action list --status=in-progress --format=json &gt; stuck.json
+// add orderId and ageMinutes to each row before running the auditor
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export WOO_STORE_URL="https://yourstore.com"
+export WOO_CONSUMER_KEY="ck_..."
+export WOO_CONSUMER_SECRET="cs_..."
+export STUCK_AFTER_MINUTES="30"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Load the order behind the stuck action</h3>
+      <p>Use the WooCommerce REST API to read the order by ID. Going through the REST API means the code works the same whether the store keeps orders in posts or has High Performance Order Storage turned on, since WooCommerce handles the storage either way. Then read the saved Stripe PaymentIntent ID off the order, from meta <code>_stripe_intent_id</code> or, as a fallback, <code>transaction_id</code> when it looks like an intent.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+from requests.auth import HTTPBasicAuth
+
+WOO_URL = os.environ["WOO_STORE_URL"].rstrip("/")
+AUTH = HTTPBasicAuth(os.environ["WOO_CONSUMER_KEY"], os.environ["WOO_CONSUMER_SECRET"])
+
+def get_order(order_id):
+    r = requests.get(f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}", auth=AUTH, timeout=30)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+def intent_id_of(order):
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == "_stripe_intent_id" and meta.get("value"):
+            return meta["value"]
+    tid = order.get("transaction_id")
+    return tid if tid and tid.startswith("pi_") else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const WOO_URL = process.env.WOO_STORE_URL.replace(/\/$/, "");
+const AUTH = "Basic " + Buffer.from(
+  `${process.env.WOO_CONSUMER_KEY}:${process.env.WOO_CONSUMER_SECRET}`
+).toString("base64");
+
+async function woo(path, options = {}) {
+  const res = await fetch(`${WOO_URL}/wp-json/wc/v3${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", Authorization: AUTH, ...(options.headers || {}) },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Woo ${path} returned ${res.status}`);
+  return res.json();
+}
+
+export function intentIdOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === "_stripe_intent_id" &amp;&amp; meta.value) return meta.value;
+  }
+  const tid = order.transaction_id;
+  return tid &amp;&amp; tid.startsWith("pi_") ? tid : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the stuck action, the order, and the Stripe intent, and returns a verdict. A pure function like this is easy to read and easy to test, which we do later. It skips actions that are not actually stuck, waits on ones that have not aged past the threshold, holds off when Stripe shows the payment still in flight, and only then decides whether to finish the order or flag the action as safe to reset.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">PAID_STATUSES = {"processing", "completed"}
+IN_FLIGHT_INTENT_STATUSES = {"requires_action", "requires_confirmation", "processing"}
+FAILED_INTENT_STATUSES = {"requires_payment_method", "canceled"}
+
+def decide(action, order, intent):
+    if action.get("status") != "in-progress":
+        return ("skip", "action is not in-progress")
+    if action.get("age_minutes", 0) &lt; STUCK_AFTER_MINUTES:
+        return ("wait", "action has not been stuck long enough yet")
+    if order is None:
+        return ("investigate", "action points to an order that cannot be found")
+    if intent is not None and intent.get("status") in IN_FLIGHT_INTENT_STATUSES:
+        return ("investigate", "Stripe shows the payment still in flight")
+    if order.get("status") in PAID_STATUSES:
+        return ("reset_action", "order is already paid, the action is just stale")
+    if intent is not None and intent.get("status") == "succeeded":
+        return ("complete_order", "Stripe succeeded but the order was never updated")
+    if intent is None or intent.get("status") in FAILED_INTENT_STATUSES:
+        return ("reset_action", "no successful charge behind this attempt, safe to retry")
+    return ("investigate", "unclear Stripe state, needs a human look")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const PAID_STATUSES = new Set(["processing", "completed"]);
+const IN_FLIGHT_INTENT_STATUSES = new Set(["requires_action", "requires_confirmation", "processing"]);
+const FAILED_INTENT_STATUSES = new Set(["requires_payment_method", "canceled"]);
+
+export function decide(action, order, intent) {
+  if (action.status !== "in-progress") return ["skip", "action is not in-progress"];
+  if ((action.ageMinutes || 0) &lt; STUCK_AFTER_MINUTES) return ["wait", "action has not been stuck long enough yet"];
+  if (!order) return ["investigate", "action points to an order that cannot be found"];
+  if (intent &amp;&amp; IN_FLIGHT_INTENT_STATUSES.has(intent.status)) {
+    return ["investigate", "Stripe shows the payment still in flight"];
+  }
+  if (PAID_STATUSES.has(order.status)) return ["reset_action", "order is already paid, the action is just stale"];
+  if (intent &amp;&amp; intent.status === "succeeded") return ["complete_order", "Stripe succeeded but the order was never updated"];
+  if (!intent || FAILED_INTENT_STATUSES.has(intent.status)) {
+    return ["reset_action", "no successful charge behind this attempt, safe to retry"];
+  }
+  return ["investigate", "unclear Stripe state, needs a human look"];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Act on the verdict, never on a guess</h3>
+      <p>When the verdict is <code>complete_order</code>, set the order to Processing, save the charge ID, and add a note explaining the recovery. When it is <code>reset_action</code> or <code>investigate</code>, add a note to the order so a shop manager can see it and reset the actual Action Scheduler row from wp-admin or with <code>wp action-scheduler action update --id=&lt;id&gt; --status=pending</code>. The script never edits the actions table itself, since that is WooCommerce's job to own.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def complete_order(order_id, intent):
+    charge_id = intent.get("latest_charge") or intent["id"]
+    requests.put(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}",
+        json={"status": "processing", "transaction_id": charge_id},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}/notes",
+        json={"note": f"Recovered from a stuck Action Scheduler action. Stripe PaymentIntent "
+                      f"{intent['id']} had already succeeded. Marked processing by the auditor."},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+
+def note_stuck_action(order_id, reason):
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}/notes",
+        json={"note": f"Action Scheduler action for this order was stuck on in-progress: "
+                      f"{reason}. Flagged for a reset by the auditor."},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function completeOrder(orderId, intent) {
+  const chargeId = intent.latest_charge || intent.id;
+  await woo(`/orders/${orderId}`, {
+    method: "PUT",
+    body: JSON.stringify({ status: "processing", transaction_id: chargeId }),
+  });
+  await woo(`/orders/${orderId}/notes`, {
+    method: "POST",
+    body: JSON.stringify({
+      note: `Recovered from a stuck Action Scheduler action. Stripe PaymentIntent ` +
+            `${intent.id} had already succeeded. Marked processing by the auditor.`,
+    }),
+  });
+}
+
+async function noteStuckAction(orderId, reason) {
+  await woo(`/orders/${orderId}/notes`, {
+    method: "POST",
+    body: JSON.stringify({
+      note: `Action Scheduler action for this order was stuck on in-progress: ` +
+            `${reason}. Flagged for a reset by the auditor.`,
+    }),
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports its plan. Read the output, trust it, then switch it off to let it write. Run it on a schedule with cron every fifteen to thirty minutes, and refresh the stuck actions export each time.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This script writes order notes and can change order status, so you want to see its plan first. Never reset an action for a payment you have not checked against Stripe.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete auditor in one file for each language. It reads settings from the environment, respects the dry run flag, and never touches an order while Stripe still shows the payment in flight, so it is safe to run again and again.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/woocommerce-fixes/tree/main/action-scheduler-stuck-in-progress" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the woocommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">audit_stuck_actions.py</div>
+      <pre><code class="language-python">"""Find Action Scheduler actions stuck on in-progress and decide how to clear them.
+
+An action normally moves from pending, to in-progress, to complete within seconds.
+When the PHP worker that claimed an action dies mid run (a timeout, an out of memory
+kill, a fatal error), the action is left on in-progress forever. Action Scheduler's
+own claim lock then treats that slot as busy, so the next run of that group or hook
+can stall behind it, and the queue backs up.
+
+This script does not touch wp_actionscheduler_actions directly. It uses the
+WooCommerce REST API to read the order that a stuck subscription renewal or payment
+action points to (order id is taken from the action's hook args, passed in on the
+command line or from a small JSON export), asks Stripe for the truth about the
+PaymentIntent on that order, and decides one of four outcomes:
+
+  - "complete_order": Stripe says the payment succeeded. Mark the order processing
+    and add a note. The stuck action can be marked complete in wp-admin or with
+    `wp action-scheduler action update --id=&lt;id&gt; --status=complete`.
+  - "reset_action": Stripe never took a real payment for this attempt (no intent,
+    or the intent failed or is still requiring action). Safe to reset the action
+    back to pending so it can be retried, since nothing was charged.
+  - "wait": the action has not been stuck long enough yet to act on. Actions can
+    briefly sit on in-progress during a normal, slow run.
+  - "investigate": Stripe shows a PaymentIntent that requires_action or is
+    processing. Money is in flight. Do not touch the order or the action yet.
+
+Read only by default (DRY_RUN=true). Run on a schedule, for example every 15
+minutes, well past STUCK_AFTER_MINUTES.
+"""
+import os
+import logging
+import stripe
+import requests
+from requests.auth import HTTPBasicAuth
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("audit_stuck_actions")
+
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+WOO_URL = os.environ["WOO_STORE_URL"].rstrip("/")
+AUTH = HTTPBasicAuth(os.environ["WOO_CONSUMER_KEY"], os.environ["WOO_CONSUMER_SECRET"])
+STUCK_AFTER_MINUTES = int(os.environ.get("STUCK_AFTER_MINUTES", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+PAID_STATUSES = {"processing", "completed"}
+IN_FLIGHT_INTENT_STATUSES = {"requires_action", "requires_confirmation", "processing"}
+FAILED_INTENT_STATUSES = {"requires_payment_method", "canceled"}
+
+
+def intent_id_of(order):
+    """The saved Stripe PaymentIntent id, from meta _stripe_intent_id or transaction_id."""
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == "_stripe_intent_id" and meta.get("value"):
+            return meta["value"]
+    tid = order.get("transaction_id")
+    return tid if tid and tid.startswith("pi_") else None
+
+
+def decide(action, order, intent):
+    """Pure decision function. No I/O. action is a dict with at least
+    status and age_minutes. order and intent may be None.
+    Returns (verdict, reason).
+    """
+    if action.get("status") != "in-progress":
+        return ("skip", "action is not in-progress")
+    if action.get("age_minutes", 0) &lt; STUCK_AFTER_MINUTES:
+        return ("wait", "action has not been stuck long enough yet")
+    if order is None:
+        return ("investigate", "action points to an order that cannot be found")
+    if intent is not None and intent.get("status") in IN_FLIGHT_INTENT_STATUSES:
+        return ("investigate", "Stripe shows the payment still in flight")
+    if order.get("status") in PAID_STATUSES:
+        return ("reset_action", "order is already paid, the action is just stale")
+    if intent is not None and intent.get("status") == "succeeded":
+        return ("complete_order", "Stripe succeeded but the order was never updated")
+    if intent is None or intent.get("status") in FAILED_INTENT_STATUSES:
+        return ("reset_action", "no successful charge behind this attempt, safe to retry")
+    return ("investigate", "unclear Stripe state, needs a human look")
+
+
+def get_order(order_id):
+    r = requests.get(f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}", auth=AUTH, timeout=30)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def get_intent(intent_id):
+    if not intent_id:
+        return None
+    try:
+        return stripe.PaymentIntent.retrieve(intent_id)
+    except stripe.error.InvalidRequestError:
+        return None
+
+
+def complete_order(order_id, intent):
+    charge_id = intent.get("latest_charge") or intent["id"]
+    requests.put(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}",
+        json={"status": "processing", "transaction_id": charge_id},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}/notes",
+        json={"note": f"Recovered from a stuck Action Scheduler action. Stripe PaymentIntent "
+                      f"{intent['id']} had already succeeded. Marked processing by the auditor."},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+
+
+def note_stuck_action(order_id, reason):
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order_id}/notes",
+        json={"note": f"Action Scheduler action for this order was stuck on in-progress: "
+                      f"{reason}. Flagged for a reset by the auditor."},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+
+
+def stuck_actions_from_export(path):
+    """Read a small JSON export of stuck actions. Each row looks like:
+    {"action_id": 4821, "status": "in-progress", "age_minutes": 55, "order_id": 9321}
+    Produce this with:
+    wp action-scheduler action list --status=in-progress --format=json &gt; stuck.json
+    then add age_minutes and order_id per hook args before feeding it in, or adapt
+    this loader to your own store's export shape.
+    """
+    import json
+    with open(path) as f:
+        return json.load(f)
+
+
+def run(export_path):
+    handled = 0
+    for action in stuck_actions_from_export(export_path):
+        order_id = action.get("order_id")
+        order = get_order(order_id) if order_id else None
+        intent = get_intent(intent_id_of(order)) if order else None
+        verdict, reason = decide(action, order, intent)
+        if verdict in ("skip", "wait"):
+            continue
+        log.info(
+            "Action %s (order %s): %s -&gt; %s",
+            action.get("action_id"), order_id, reason,
+            "would act" if DRY_RUN else "acting",
+        )
+        if not DRY_RUN:
+            if verdict == "complete_order":
+                complete_order(order_id, intent)
+            elif verdict in ("reset_action", "investigate"):
+                note_stuck_action(order_id, reason)
+        handled += 1
+    log.info("Done. %d stuck action(s) %s.", handled, "to handle" if DRY_RUN else "handled")
+
+
+if __name__ == "__main__":
+    import sys
+    run(sys.argv[1] if len(sys.argv) &gt; 1 else "stuck.json")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">audit-stuck-actions.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Action Scheduler actions stuck on in-progress and decide how to clear them.
+ *
+ * An action normally moves from pending, to in-progress, to complete within seconds.
+ * When the PHP worker that claimed an action dies mid run (a timeout, an out of
+ * memory kill, a fatal error), the action is left on in-progress forever. Action
+ * Scheduler's own claim lock then treats that slot as busy, so the next run of that
+ * group or hook can stall behind it, and the queue backs up.
+ *
+ * This script does not touch wp_actionscheduler_actions directly. It uses the
+ * WooCommerce REST API to read the order that a stuck subscription renewal or
+ * payment action points to (order id comes from a small JSON export of stuck
+ * actions), asks Stripe for the truth about the PaymentIntent on that order, and
+ * decides one of four outcomes: complete_order, reset_action, wait, or investigate.
+ *
+ * Read only by default (DRY_RUN=true). Run on a schedule.
+ */
+import Stripe from "stripe";
+import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_dummy");
+const WOO_URL = (process.env.WOO_STORE_URL || "https://example.com").replace(/\/$/, "");
+const AUTH = "Basic " + Buffer.from(
+  `${process.env.WOO_CONSUMER_KEY || "ck_dummy"}:${process.env.WOO_CONSUMER_SECRET || "cs_dummy"}`
+).toString("base64");
+const STUCK_AFTER_MINUTES = Number(process.env.STUCK_AFTER_MINUTES || 30);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const PAID_STATUSES = new Set(["processing", "completed"]);
+const IN_FLIGHT_INTENT_STATUSES = new Set(["requires_action", "requires_confirmation", "processing"]);
+const FAILED_INTENT_STATUSES = new Set(["requires_payment_method", "canceled"]);
+
+export function intentIdOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === "_stripe_intent_id" &amp;&amp; meta.value) return meta.value;
+  }
+  const tid = order.transaction_id;
+  return tid &amp;&amp; tid.startsWith("pi_") ? tid : null;
+}
+
+/**
+ * Pure decision function. No I/O. action is an object with at least status and
+ * ageMinutes. order and intent may be null. Returns [verdict, reason].
+ */
+export function decide(action, order, intent) {
+  if (action.status !== "in-progress") return ["skip", "action is not in-progress"];
+  if ((action.ageMinutes || 0) &lt; STUCK_AFTER_MINUTES) return ["wait", "action has not been stuck long enough yet"];
+  if (!order) return ["investigate", "action points to an order that cannot be found"];
+  if (intent &amp;&amp; IN_FLIGHT_INTENT_STATUSES.has(intent.status)) {
+    return ["investigate", "Stripe shows the payment still in flight"];
+  }
+  if (PAID_STATUSES.has(order.status)) return ["reset_action", "order is already paid, the action is just stale"];
+  if (intent &amp;&amp; intent.status === "succeeded") return ["complete_order", "Stripe succeeded but the order was never updated"];
+  if (!intent || FAILED_INTENT_STATUSES.has(intent.status)) {
+    return ["reset_action", "no successful charge behind this attempt, safe to retry"];
+  }
+  return ["investigate", "unclear Stripe state, needs a human look"];
+}
+
+async function woo(path, options = {}) {
+  const res = await fetch(`${WOO_URL}/wp-json/wc/v3${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", Authorization: AUTH, ...(options.headers || {}) },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Woo ${path} returned ${res.status}`);
+  return res.json();
+}
+
+async function getIntent(intentId) {
+  if (!intentId) return null;
+  try {
+    return await stripe.paymentIntents.retrieve(intentId);
+  } catch {
+    return null;
+  }
+}
+
+async function completeOrder(orderId, intent) {
+  const chargeId = intent.latest_charge || intent.id;
+  await woo(`/orders/${orderId}`, {
+    method: "PUT",
+    body: JSON.stringify({ status: "processing", transaction_id: chargeId }),
+  });
+  await woo(`/orders/${orderId}/notes`, {
+    method: "POST",
+    body: JSON.stringify({
+      note: `Recovered from a stuck Action Scheduler action. Stripe PaymentIntent ` +
+            `${intent.id} had already succeeded. Marked processing by the auditor.`,
+    }),
+  });
+}
+
+async function noteStuckAction(orderId, reason) {
+  await woo(`/orders/${orderId}/notes`, {
+    method: "POST",
+    body: JSON.stringify({
+      note: `Action Scheduler action for this order was stuck on in-progress: ` +
+            `${reason}. Flagged for a reset by the auditor.`,
+    }),
+  });
+}
+
+/**
+ * Read a small JSON export of stuck actions. Each row looks like:
+ * { "actionId": 4821, "status": "in-progress", "ageMinutes": 55, "orderId": 9321 }
+ * Produce this with:
+ *   wp action-scheduler action list --status=in-progress --format=json
+ * then add ageMinutes and orderId per hook args, or adapt this loader to your
+ * own store's export shape.
+ */
+async function stuckActionsFromExport(path) {
+  const raw = await readFile(path, "utf8");
+  return JSON.parse(raw);
+}
+
+export async function run(exportPath = "stuck.json") {
+  let handled = 0;
+  for (const action of await stuckActionsFromExport(exportPath)) {
+    const orderId = action.orderId;
+    const order = orderId ? await woo(`/orders/${orderId}`) : null;
+    const intent = order ? await getIntent(intentIdOf(order)) : null;
+    const [verdict, reason] = decide(action, order, intent);
+    if (verdict === "skip" || verdict === "wait") continue;
+    console.log(
+      `Action ${action.actionId} (order ${orderId}): ${reason} -&gt; ${DRY_RUN ? "would act" : "acting"}`
+    );
+    if (!DRY_RUN) {
+      if (verdict === "complete_order") await completeOrder(orderId, intent);
+      else if (verdict === "reset_action" || verdict === "investigate") await noteStuckAction(orderId, reason);
+    }
+    handled++;
+  }
+  console.log(`Done. ${handled} stuck action(s) ${DRY_RUN ? "to handle" : "handled"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run(process.argv[2]).catch((e) =&gt; { console.error(e); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a real order gets rewritten or a real action gets reset. Because <code>decide</code> is pure, the test needs no network, no Stripe account, and no WordPress install. It just feeds in plain objects and checks the verdict.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_stuck_action_decide.py</div>
+      <pre><code class="language-python">from audit_stuck_actions import decide, intent_id_of
+
+
+def action(**over):
+    base = {"status": "in-progress", "age_minutes": 55, "action_id": 1}
+    base.update(over)
+    return base
+
+
+def order(**over):
+    base = {"status": "pending", "total": "50.00"}
+    base.update(over)
+    return base
+
+
+def intent(**over):
+    base = {"status": "succeeded", "id": "pi_1"}
+    base.update(over)
+    return base
+
+
+def test_skip_when_action_not_in_progress():
+    assert decide(action(status="complete"), order(), intent())[0] == "skip"
+
+
+def test_wait_when_not_stuck_long_enough():
+    assert decide(action(age_minutes=5), order(), intent())[0] == "wait"
+
+
+def test_investigate_when_order_missing():
+    assert decide(action(), None, None)[0] == "investigate"
+
+
+def test_investigate_when_payment_in_flight():
+    assert decide(action(), order(), intent(status="requires_action"))[0] == "investigate"
+
+
+def test_reset_when_order_already_paid():
+    assert decide(action(), order(status="processing"), intent())[0] == "reset_action"
+
+
+def test_complete_order_when_stripe_succeeded_but_order_unpaid():
+    verdict, _ = decide(action(), order(status="pending"), intent(status="succeeded"))
+    assert verdict == "complete_order"
+
+
+def test_reset_when_no_intent_at_all():
+    assert decide(action(), order(), None)[0] == "reset_action"
+
+
+def test_reset_when_intent_failed():
+    assert decide(action(), order(), intent(status="requires_payment_method"))[0] == "reset_action"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">audit-stuck-actions.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decide, intentIdOf } from "./audit-stuck-actions.js";
+
+const action = (over = {}) =&gt; ({ status: "in-progress", ageMinutes: 55, actionId: 1, ...over });
+const order = (over = {}) =&gt; ({ status: "pending", total: "50.00", ...over });
+const intent = (over = {}) =&gt; ({ status: "succeeded", id: "pi_1", ...over });
+
+test("skip when action not in-progress", () =&gt; {
+  assert.equal(decide(action({ status: "complete" }), order(), intent())[0], "skip");
+});
+
+test("wait when not stuck long enough", () =&gt; {
+  assert.equal(decide(action({ ageMinutes: 5 }), order(), intent())[0], "wait");
+});
+
+test("investigate when order missing", () =&gt; {
+  assert.equal(decide(action(), null, null)[0], "investigate");
+});
+
+test("investigate when payment in flight", () =&gt; {
+  assert.equal(decide(action(), order(), intent({ status: "requires_action" }))[0], "investigate");
+});
+
+test("reset_action when order already paid", () =&gt; {
+  assert.equal(decide(action(), order({ status: "processing" }), intent())[0], "reset_action");
+});
+
+test("complete_order when Stripe succeeded but order unpaid", () =&gt; {
+  const [verdict] = decide(action(), order({ status: "pending" }), intent({ status: "succeeded" }));
+  assert.equal(verdict, "complete_order");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Memory limit</span>
+      <h4>The renewal batch that hit the PHP memory cap</h4>
+      <p>A store on a shared host ran a batch of subscription renewals during its busiest hour. One renewal in the batch loaded a customer with an unusually long order history, blew past the PHP memory limit, and the worker was killed mid run. That single action sat on in-progress for two days, and everything else queued behind the same hook quietly stopped firing.</p>
+      <p>The auditor found the frozen action, checked Stripe, saw no charge had gone through for that attempt, and flagged it safe to reset. Once reset, the batch and everything behind it picked back up within the hour.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Deploy timing</span>
+      <h4>The deploy that landed mid webhook</h4>
+      <p>A routine deploy restarted the app servers while a webhook processing action was mid execution. The action never got to mark itself complete, and the Stripe event it was handling, a successful renewal charge, was left unrecorded on the WooCommerce side.</p>
+      <p>The auditor asked Stripe directly, confirmed the PaymentIntent had in fact succeeded, and finished the order itself rather than waiting on a retry that would never come from the frozen action.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a crashed worker is no longer a silent queue jam. The worst case becomes a short delay before the auditor notices the frozen action, checks Stripe, and either finishes the order or flags the action for a clean reset. Keep it running even after you fix whatever caused the crash, because a worker dying mid run will always happen once in a while.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do Action Scheduler actions get stuck on in-progress?</summary>
+      <p>An action moves to in-progress the moment a worker claims it, and only moves to complete after the worker finishes. If the worker dies first, from a timeout, an out of memory kill, or a fatal error, nothing ever marks the action finished, so it sits on in-progress forever.</p>
+    </details>
+    <details>
+      <summary>Is it safe to reset a stuck action myself?</summary>
+      <p>It is safe once you know what the action was trying to do. For a payment or renewal action, check Stripe first. If Stripe shows no successful charge for that attempt, resetting the action to pending is safe, since nothing was charged. If Stripe already succeeded, finish the order directly instead of retrying the action.</p>
+    </details>
+    <details>
+      <summary>How often should the auditor run?</summary>
+      <p>Every fifteen to thirty minutes is enough for most stores. It only acts on actions that have been stuck longer than a set number of minutes, so running it often is safe and will not interrupt actions that are still genuinely working.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/woocommerce/paid-orders-stuck-on-pending/">Orders stuck on Pending after a successful Stripe payment</a>
+    <a href="/woocommerce/order-marked-paid-no-charge/">Order marked paid with no matching charge</a>
+    <a href="/woocommerce/">More WooCommerce and Stripe field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Action Scheduler documentation: action statuses, including in-progress as a short lived claim lock. <a href="https://actionscheduler.org/faq/" rel="noopener">actionscheduler.org/faq</a></li>
+      <li>WooCommerce developer docs: how Action Scheduler processes background tasks and batches. <a href="https://developer.woocommerce.com/docs/features/action-scheduler/" rel="noopener">developer.woocommerce.com/docs/features/action-scheduler</a></li>
+      <li>WordPress.org support: subscription renewals silently stop when a hook is stuck behind a frozen action. <a href="https://wordpress.org/support/plugin/woocommerce/" rel="noopener">wordpress.org/support/plugin/woocommerce</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Stripe API: retrieve a PaymentIntent to check its current status before acting. <a href="https://docs.stripe.com/api/payment_intents/retrieve" rel="noopener">docs.stripe.com/api/payment_intents/retrieve</a></li>
+      <li>WP-CLI Action Scheduler command reference: listing and updating actions from the command line. <a href="https://actionscheduler.org/wp-cli/" rel="noopener">actionscheduler.org/wp-cli</a></li>
+      <li>WooCommerce REST API: update an order and add an order note. <a href="https://woocommerce.github.io/woocommerce-rest-api-docs/#orders" rel="noopener">woocommerce.github.io/woocommerce-rest-api-docs</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a bug in WooCommerce, WooCommerce Subscriptions, or the WooCommerce Stripe gateway that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear your stuck queue?</h3>
+    <p>If this saved you from a frozen renewal queue or a pile of missed payments, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/woocommerce/">Back to all WooCommerce and Stripe field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on WooCommerce and Stripe.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/build/">Build</a> &middot; <a href="/templates/">Templates</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/woocommerce/assets/woo.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expired Transients Bloat the WooCommerce wp_options Table</title>
+<meta name="description" content="Stripe checkout locks and other one off transients never get swept from wp_options once they expire. Learn why, and build a Python or Node.js job that finds and clears the stale ones safely.">
+<link rel="canonical" href="https://www.allanninal.dev/woocommerce/expired-transients-bloat-wp-options/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Expired Transients Bloat the WooCommerce wp_options Table">
+<meta property="og:description" content="Why expired Stripe checkout lock transients pile up in wp_options, and a safe Python or Node.js job that clears the stale ones.">
+<meta property="og:url" content="https://www.allanninal.dev/woocommerce/expired-transients-bloat-wp-options/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/woocommerce/assets/woo.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/woocommerce/expired-transients-bloat-wp-options/#article","headline":"Expired Transients Bloat the WooCommerce wp_options Table","description":"Why expired Stripe checkout lock transients pile up in wp_options, and a safe Python or Node.js job that clears the stale ones.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/woocommerce/expired-transients-bloat-wp-options/","image":"https://www.allanninal.dev/og-image.png","articleSection":"WooCommerce core: database bloat and maintenance","keywords":"WooCommerce wp_options bloat, expired transients, wc_stripe_lock transient, autoload wp_options, WooCommerce database maintenance, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"WooCommerce core: database bloat and maintenance","item":"https://www.allanninal.dev/woocommerce/"},{"@type":"ListItem","position":2,"name":"Expired transients bloat wp_options","item":"https://www.allanninal.dev/woocommerce/expired-transients-bloat-wp-options/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do expired transients stay in the wp_options table?","acceptedAnswer":{"@type":"Answer","text":"WordPress only deletes an expired transient when something asks for that exact key again. A one off key like a Stripe checkout lock for a single PaymentIntent is never asked for a second time, so the row and its timeout row just sit in wp_options forever, usually with autoload set to yes."}},{"@type":"Question","name":"Can I just run the built in clear transients tool?","acceptedAnswer":{"@type":"Answer","text":"It helps but it usually misses plugin specific one off keys such as per PaymentIntent locks, since many of those were written with a custom prefix instead of the standard transient API helpers the cleanup tools scan for."}},{"@type":"Question","name":"Is it safe to clear a Stripe checkout lock with a script?","acceptedAnswer":{"@type":"Answer","text":"Yes, once Stripe confirms the matching PaymentIntent is fully settled, meaning succeeded or canceled. At that point the lock can never be needed again. Start in dry run mode to review the list before it writes anything."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/woocommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / woo</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/woocommerce/">Field notes</a> / WooCommerce core: database bloat and maintenance</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> WooCommerce core: database bloat and maintenance</p>
+    <h1>Expired transients bloat wp_options</h1>
+    <p class="lead">Every checkout writes a small, short lived value into the options table so WooCommerce and its Stripe gateway can keep track of things in progress, like a lock that stops one payment from being processed twice. Most of the time that value expires and is quietly forgotten. It is never deleted. On a store that has been running for a year, that forgetting adds up to tens of thousands of dead rows sitting in wp_options, most of them set to load on every single page. Here is why WordPress never cleans them up on its own, and a small script that finds the ones that are safe to clear.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Runs on a schedule</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>A WordPress transient is only deleted when something asks WordPress for that same key after it has expired. One off keys, like a Stripe checkout lock tied to a single PaymentIntent, are never asked for again, so they never get swept and just sit in <code>wp_options</code> forever. Run a small Python or Node.js job on a schedule that checks each order's saved PaymentIntent against Stripe, and once Stripe confirms the payment is fully settled, clears the matching lock so the row is safe to purge. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A transient is WordPress's way of caching something for a little while. It is stored as two rows in <code>wp_options</code>, one holding the value and one holding when it should expire. The idea is that the next time your code asks for that transient, WordPress checks the expiry, and if it has passed, deletes both rows and returns nothing, as if the value had never been cached.</p>
+  <p>That cleanup only happens on request. If nothing ever asks for that specific key again, WordPress has no reason to look at it, so the two rows just stay in the table, expired but never removed. WooCommerce and its Stripe gateway create a lot of transients that are meant to be checked exactly once, like a lock keyed to one PaymentIntent id. Once that payment finishes, nothing will ever ask for that key again. It is now dead weight, and it usually carries <code>autoload=yes</code>, which means WordPress loads it into memory on every single page view, whether anyone needs it or not.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A checkout writes a one off lock transient, the payment finishes, but nothing ever asks for that key again, so the expired row is never swept from wp_options.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8b8398"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b2135">Checkout starts</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#5f576d">writes a lock transient</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#8b8398" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="160" height="66" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="298" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b2135">Payment finishes</text>
+      <text x="298" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#5f576d">lock is no longer needed</text>
+      <line x1="381" y1="103" x2="450" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="415" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="415" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">key never asked for again</text>
+      <rect x="453" y="70" width="170" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="538" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Row stays expired</text>
+      <text x="538" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#5f576d">but never removed</text>
+      <rect x="638" y="70" width="112" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="694" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Loaded on</text>
+      <text x="694" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">every page</text>
+      <line x1="626" y1="103" x2="635" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The lock is written once and checked once. After the payment settles, nothing ever asks for that key again, so the expired row is never swept out.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The WordPress transients API is documented as self cleaning, but that cleanup is lazy by design, it only runs when the same key is requested. A few reasons this quietly turns into real bloat on a WooCommerce store:</p>
+  <ul>
+    <li>The WooCommerce Stripe gateway writes a lock transient per PaymentIntent to stop a webhook and a page redirect from processing the same payment twice. Once the order settles, that exact key is never looked up again.</li>
+    <li>Many of these transients are set with a long timeout, sometimes hours, so even the lazy cleanup path has no chance to trigger before the shopper has long since checked out.</li>
+    <li>By default a transient with no explicit autoload setting is stored with <code>autoload=yes</code>, so WordPress reads it into memory on every request until it is deleted, whether it is expired or not.</li>
+    <li>A store that never runs WP-CLI's <code>transient</code> commands or a maintenance plugin has no process that ever looks at these rows again, so they accumulate for as long as the store has been live.</li>
+  </ul>
+  <p>This has been reported for years across large WooCommerce and WordPress installs, where <code>wp_options</code> grows to hundreds of megabytes and every page load pays the cost of loading rows nobody will ever read again. See the citations at the end for the background threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot fix this by waiting. An expired transient only gets deleted the next time the exact same key is requested, and a one off lock keyed to a single PaymentIntent will never be requested again. The only way to remove it is a job that actively looks for locks whose purpose has already been served and clears them.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout and we do not run raw SQL, since this job only has WooCommerce REST API and Stripe API access. Instead we walk recent orders, read the saved PaymentIntent id off each one, and ask Stripe whether that intent is fully settled. If it is, and the order still carries the store's own checkout lock flag, that lock has no reason left to exist, so we clear it and log the exact <code>wp_options</code> key so the site's own cleanup job or WP-CLI can sweep it out in bulk.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job reads each order's PaymentIntent id, checks Stripe for a settled status, and if the checkout lock is still set, clears it and logs the transient key for cleanup.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#7f54b3"></path></marker></defs>
+      <rect x="10" y="20" width="150" height="60" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="85" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Scheduled job</text>
+      <text x="85" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">once a day</text>
+      <line x1="85" y1="80" x2="85" y2="106" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="110" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Read order's</text>
+      <text x="110" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">PaymentIntent id</text>
+      <line x1="210" y1="138" x2="252" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="255" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="347" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Check Stripe</text>
+      <text x="347" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">is the intent settled?</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,108 660,138 575,168 490,138" fill="#f3eefa" stroke="#d6c8ec"></polygon>
+      <text x="575" y="134" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b2135">Lock still</text>
+      <text x="575" y="149" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b2135">set?</text>
+      <text x="663" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="660" y1="138" x2="690" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="196" font-family="sans-serif" font-size="10.5" fill="#8b8398" font-weight="700">no, skip</text>
+      <line x1="575" y1="168" x2="575" y2="205" stroke="#8b8398" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Clear lock</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#5f576d">log transient key</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job reads the truth from Stripe and only clears a lock once the matching payment is fully settled. Everything still in progress is left alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get access to both systems</h3>
+      <p>You need a Stripe secret key and a WooCommerce REST API key pair (a consumer key and a consumer secret) with read and write access to orders. Create the WooCommerce key under WooCommerce, Settings, Advanced, REST API. Keep every value in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install stripe requests
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export WOO_STORE_URL="https://yourstore.com"
+export WOO_CONSUMER_KEY="ck_..."
+export WOO_CONSUMER_SECRET="cs_..."
+export LOOKBACK_DAYS="30"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install stripe
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export WOO_STORE_URL="https://yourstore.com"
+export WOO_CONSUMER_KEY="ck_..."
+export WOO_CONSUMER_SECRET="cs_..."
+export LOOKBACK_DAYS="30"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Read the saved PaymentIntent off each order</h3>
+      <p>WooCommerce saves the Stripe PaymentIntent id as order meta, usually under <code>_stripe_intent_id</code>. Some older orders only have it as the <code>transaction_id</code>, so check both and only trust a value that looks like a PaymentIntent id, one starting with <code>pi_</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">def intent_id_of(order):
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == "_stripe_intent_id" and meta.get("value"):
+            return meta["value"]
+    tid = order.get("transaction_id")
+    return tid if tid and tid.startswith("pi_") else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">export function intentIdOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === "_stripe_intent_id" &amp;&amp; meta.value) return meta.value;
+  }
+  const tid = order.transaction_id;
+  return tid &amp;&amp; tid.startsWith("pi_") ? tid : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Ask Stripe if the intent is fully settled</h3>
+      <p>Retrieve the PaymentIntent from Stripe. A status of <code>succeeded</code> or <code>canceled</code> means Stripe is done with it for good, so any lock that existed only to protect that one payment can never be needed again. Anything still in progress, like <code>requires_action</code> or <code>processing</code>, should be left alone.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import stripe
+
+def get_intent(intent_id):
+    if not intent_id:
+        return None
+    try:
+        return stripe.PaymentIntent.retrieve(intent_id)
+    except stripe.error.InvalidRequestError:
+        return None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function getIntent(intentId) {
+  if (!intentId) return null;
+  try {
+    return await stripe.paymentIntents.retrieve(intentId);
+  } catch {
+    return null;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes an order and a Stripe intent and returns an action. A pure function like this needs no network to test, which we do later. The rule is simple. If the order has no lock, skip it. If Stripe has no record of the intent, or the intent is still in progress, skip it. Only when the intent is fully settled do we clear the lock.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">SETTLED_INTENT_STATUSES = {"succeeded", "canceled"}
+LOCK_META_KEY = "_stripe_checkout_lock"
+
+def lock_value_of(order):
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == LOCK_META_KEY and meta.get("value"):
+            return meta["value"]
+    return None
+
+def decide(order, intent):
+    lock = lock_value_of(order) if order is not None else None
+    if not lock:
+        return ("skip", "no checkout lock on this order, nothing to clear")
+    if intent is None:
+        return ("skip", "no matching Stripe PaymentIntent, leave the lock alone")
+    if intent.get("status") not in SETTLED_INTENT_STATUSES:
+        return ("skip", "PaymentIntent is still in progress, the lock may still be needed")
+    return ("clear", f"PaymentIntent is {intent['status']}, the lock is stale")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const SETTLED_INTENT_STATUSES = new Set(["succeeded", "canceled"]);
+const LOCK_META_KEY = "_stripe_checkout_lock";
+
+export function lockValueOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === LOCK_META_KEY &amp;&amp; meta.value) return meta.value;
+  }
+  return null;
+}
+
+export function decide(order, intent) {
+  const lock = order ? lockValueOf(order) : null;
+  if (!lock) return ["skip", "no checkout lock on this order, nothing to clear"];
+  if (!intent) return ["skip", "no matching Stripe PaymentIntent, leave the lock alone"];
+  if (!SETTLED_INTENT_STATUSES.has(intent.status)) {
+    return ["skip", "PaymentIntent is still in progress, the lock may still be needed"];
+  }
+  return ["clear", `PaymentIntent is ${intent.status}, the lock is stale`];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Clear the lock and log the transient key</h3>
+      <p>When the action is <code>clear</code>, write an empty value over the order's lock meta through the REST API, then add an order note so the shop manager can see what happened and why. We also log the exact <code>wp_options</code> key the lock corresponds to, so a maintenance job or a WP-CLI command can sweep the actual expired rows out in bulk.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def transient_key_for(intent_id):
+    return f"_transient_wc_stripe_lock_{intent_id}"
+
+def clear_lock(order):
+    requests.put(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order['id']}",
+        json={"meta_data": [{"key": LOCK_META_KEY, "value": ""}]},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order['id']}/notes",
+        json={"note": "Cleared a stale Stripe checkout lock left over from a finished "
+                      "payment. The matching wp_options transient can now be purged."},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">export function transientKeyFor(intentId) {
+  return `_transient_wc_stripe_lock_${intentId}`;
+}
+
+async function clearLock(order) {
+  await woo(`/orders/${order.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ meta_data: [{ key: LOCK_META_KEY, value: "" }] }),
+  });
+  await woo(`/orders/${order.id}/notes`, {
+    method: "POST",
+    body: JSON.stringify({
+      note: "Cleared a stale Stripe checkout lock left over from a finished payment. " +
+            "The matching wp_options transient can now be purged.",
+    }),
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports what it would clear. Read the output, trust it, then switch it off to let it write. Run it once a day with cron, since this bloat builds up slowly.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This job writes to real orders, so you want to see its plan before it acts. Once the report looks right for a day, turn it off.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete job in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever touches an order whose lock has already served its purpose.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/woocommerce-fixes/tree/main/expired-transients-bloat-wp-options" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the woocommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">clear_stale_checkout_locks.py</div>
+      <pre><code class="language-python">"""Clear the WooCommerce Stripe checkout locks that are left behind as expired
+transients in wp_options. Read only by default. Run on a schedule.
+"""
+import os
+import logging
+import stripe
+import requests
+from requests.auth import HTTPBasicAuth
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("clear_stale_checkout_locks")
+
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+WOO_URL = os.environ["WOO_STORE_URL"].rstrip("/")
+AUTH = HTTPBasicAuth(os.environ["WOO_CONSUMER_KEY"], os.environ["WOO_CONSUMER_SECRET"])
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+SETTLED_INTENT_STATUSES = {"succeeded", "canceled"}
+LOCK_META_KEY = "_stripe_checkout_lock"
+
+
+def intent_id_of(order):
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == "_stripe_intent_id" and meta.get("value"):
+            return meta["value"]
+    tid = order.get("transaction_id")
+    return tid if tid and tid.startswith("pi_") else None
+
+
+def lock_value_of(order):
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == LOCK_META_KEY and meta.get("value"):
+            return meta["value"]
+    return None
+
+
+def transient_key_for(intent_id):
+    return f"_transient_wc_stripe_lock_{intent_id}"
+
+
+def decide(order, intent):
+    lock = lock_value_of(order) if order is not None else None
+    if not lock:
+        return ("skip", "no checkout lock on this order, nothing to clear")
+    if intent is None:
+        return ("skip", "no matching Stripe PaymentIntent, leave the lock alone")
+    if intent.get("status") not in SETTLED_INTENT_STATUSES:
+        return ("skip", "PaymentIntent is still in progress, the lock may still be needed")
+    return ("clear", f"PaymentIntent is {intent['status']}, the lock is stale")
+
+
+def get_intent(intent_id):
+    if not intent_id:
+        return None
+    try:
+        return stripe.PaymentIntent.retrieve(intent_id)
+    except stripe.error.InvalidRequestError:
+        return None
+
+
+def recent_orders():
+    page = 1
+    after = f"{__import__('datetime').date.today() - __import__('datetime').timedelta(days=LOOKBACK_DAYS)}T00:00:00"
+    while True:
+        r = requests.get(
+            f"{WOO_URL}/wp-json/wc/v3/orders",
+            params={"after": after, "per_page": 50, "page": page},
+            auth=AUTH, timeout=30,
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            return
+        for order in batch:
+            yield order
+        page += 1
+
+
+def clear_lock(order):
+    requests.put(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order['id']}",
+        json={"meta_data": [{"key": LOCK_META_KEY, "value": ""}]},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order['id']}/notes",
+        json={"note": "Cleared a stale Stripe checkout lock left over from a finished "
+                      "payment. The matching wp_options transient can now be purged."},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+
+
+def run():
+    cleared = 0
+    for order in recent_orders():
+        intent = get_intent(intent_id_of(order))
+        action, reason = decide(order, intent)
+        if action != "clear":
+            continue
+        key = transient_key_for(intent_id_of(order))
+        log.info("Order %s: %s. transient key %s. %s", order["id"], reason, key,
+                  "would clear" if DRY_RUN else "clearing")
+        if not DRY_RUN:
+            clear_lock(order)
+        cleared += 1
+    log.info("Done. %d order(s) %s.", cleared, "to clear" if DRY_RUN else "cleared")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">clear-stale-checkout-locks.js</div>
+      <pre><code class="language-javascript">/**
+ * Clear the WooCommerce Stripe checkout locks that are left behind as expired
+ * transients in wp_options. Read only by default. Run on a schedule.
+ */
+import Stripe from "stripe";
+import { pathToFileURL } from "node:url";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_dummy");
+const WOO_URL = (process.env.WOO_STORE_URL || "https://example.com").replace(/\/$/, "");
+const AUTH = "Basic " + Buffer.from(
+  `${process.env.WOO_CONSUMER_KEY || "ck_dummy"}:${process.env.WOO_CONSUMER_SECRET || "cs_dummy"}`
+).toString("base64");
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 30);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const SETTLED_INTENT_STATUSES = new Set(["succeeded", "canceled"]);
+const LOCK_META_KEY = "_stripe_checkout_lock";
+
+export function intentIdOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === "_stripe_intent_id" &amp;&amp; meta.value) return meta.value;
+  }
+  const tid = order.transaction_id;
+  return tid &amp;&amp; tid.startsWith("pi_") ? tid : null;
+}
+
+export function lockValueOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === LOCK_META_KEY &amp;&amp; meta.value) return meta.value;
+  }
+  return null;
+}
+
+export function transientKeyFor(intentId) {
+  return `_transient_wc_stripe_lock_${intentId}`;
+}
+
+export function decide(order, intent) {
+  const lock = order ? lockValueOf(order) : null;
+  if (!lock) return ["skip", "no checkout lock on this order, nothing to clear"];
+  if (!intent) return ["skip", "no matching Stripe PaymentIntent, leave the lock alone"];
+  if (!SETTLED_INTENT_STATUSES.has(intent.status)) {
+    return ["skip", "PaymentIntent is still in progress, the lock may still be needed"];
+  }
+  return ["clear", `PaymentIntent is ${intent.status}, the lock is stale`];
+}
+
+async function woo(path, options = {}) {
+  const res = await fetch(`${WOO_URL}/wp-json/wc/v3${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", Authorization: AUTH, ...(options.headers || {}) },
+  });
+  if (!res.ok) throw new Error(`Woo ${path} returned ${res.status}`);
+  return res.json();
+}
+
+async function getIntent(intentId) {
+  if (!intentId) return null;
+  try {
+    return await stripe.paymentIntents.retrieve(intentId);
+  } catch {
+    return null;
+  }
+}
+
+async function* recentOrders() {
+  const after = new Date(Date.now() - LOOKBACK_DAYS * 86400000).toISOString();
+  let page = 1;
+  while (true) {
+    const batch = await woo(`/orders?after=${after}&amp;per_page=50&amp;page=${page}`);
+    if (!batch.length) return;
+    for (const order of batch) yield order;
+    page++;
+  }
+}
+
+async function clearLock(order) {
+  await woo(`/orders/${order.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ meta_data: [{ key: LOCK_META_KEY, value: "" }] }),
+  });
+  await woo(`/orders/${order.id}/notes`, {
+    method: "POST",
+    body: JSON.stringify({
+      note: "Cleared a stale Stripe checkout lock left over from a finished payment. " +
+            "The matching wp_options transient can now be purged.",
+    }),
+  });
+}
+
+export async function run() {
+  let cleared = 0;
+  for await (const order of recentOrders()) {
+    const intent = await getIntent(intentIdOf(order));
+    const [action, reason] = decide(order, intent);
+    if (action !== "clear") continue;
+    const key = transientKeyFor(intentIdOf(order));
+    console.log(`Order ${order.id}: ${reason}. transient key ${key}. ${DRY_RUN ? "would clear" : "clearing"}`);
+    if (!DRY_RUN) await clearLock(order);
+    cleared++;
+  }
+  console.log(`Done. ${cleared} order(s) ${DRY_RUN ? "to clear" : "cleared"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a real order gets written to. Because we kept <code>decide</code> pure, the test needs no network and no Stripe account. It just feeds in plain objects and checks the action.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_expired_lock_decide.py</div>
+      <pre><code class="language-python">from clear_stale_checkout_locks import decide
+
+
+def intent(**over):
+    base = {"status": "succeeded", "id": "pi_1"}
+    base.update(over)
+    return base
+
+
+def test_clear_when_lock_present_and_intent_settled():
+    order = {"meta_data": [{"key": "_stripe_checkout_lock", "value": "1"}]}
+    assert decide(order, intent())[0] == "clear"
+
+
+def test_skip_when_no_lock():
+    order = {"meta_data": []}
+    assert decide(order, intent())[0] == "skip"
+
+
+def test_skip_when_no_intent():
+    order = {"meta_data": [{"key": "_stripe_checkout_lock", "value": "1"}]}
+    assert decide(order, None)[0] == "skip"
+
+
+def test_skip_when_intent_still_in_progress():
+    order = {"meta_data": [{"key": "_stripe_checkout_lock", "value": "1"}]}
+    assert decide(order, intent(status="requires_action"))[0] == "skip"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">clear-stale-checkout-locks.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decide } from "./clear-stale-checkout-locks.js";
+
+const intent = (over = {}) => ({ status: "succeeded", id: "pi_1", ...over });
+
+test("clear when lock present and intent settled", () => {
+  const order = { meta_data: [{ key: "_stripe_checkout_lock", value: "1" }] };
+  assert.equal(decide(order, intent())[0], "clear");
+});
+
+test("skip when no lock", () => {
+  assert.equal(decide({ meta_data: [] }, intent())[0], "skip");
+});
+
+test("skip when no intent", () => {
+  const order = { meta_data: [{ key: "_stripe_checkout_lock", value: "1" }] };
+  assert.equal(decide(order, null)[0], "skip");
+});
+
+test("skip when intent still in progress", () => {
+  const order = { meta_data: [{ key: "_stripe_checkout_lock", value: "1" }] };
+  assert.equal(decide(order, intent({ status: "requires_action" }))[0], "skip");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Multi year store</span>
+      <h4>The options table nobody had looked at in three years</h4>
+      <p>A store running since 2023 had never once cleared its transients. The <code>wp_options</code> table had grown past 400,000 rows, most of them expired Stripe checkout locks with <code>autoload=yes</code>, and every admin page load was measurably slower because of it.</p>
+      <p>Running the job in dry run mode first surfaced the exact pattern of stale keys. A one time WP-CLI sweep guided by that list, followed by the job running weekly, kept the table from ever growing back to that size.</p>
+    </div>
+    <div class="case">
+      <span class="tag">High traffic sale</span>
+      <h4>A flash sale that left thousands of dead locks in one weekend</h4>
+      <p>During a big promotion, checkout volume spiked and a good number of shoppers abandoned carts mid payment. Each abandoned attempt still left its lock transient behind, since the lock is written before the outcome is known.</p>
+      <p>The team ran the job the following week, cleared every lock whose PaymentIntent had since settled or been canceled by Stripe, and set it to run nightly so the next sale would not leave the same mess.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, expired checkout locks stop accumulating, and the site's own cleanup job has a clear list of transient keys it can safely remove. The options table stops growing for no reason, autoload stays small, and every page load skips reading rows that nobody was ever going to use again.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do expired transients stay in the wp_options table?</summary>
+      <p>WordPress only deletes an expired transient when something asks for that exact key again. A one off key like a Stripe checkout lock for a single PaymentIntent is never asked for a second time, so the row and its timeout row just sit in wp_options forever, usually with autoload set to yes.</p>
+    </details>
+    <details>
+      <summary>Can I just run the built in clear transients tool?</summary>
+      <p>It helps but it usually misses plugin specific one off keys such as per PaymentIntent locks, since many of those were written with a custom prefix instead of the standard transient API helpers the cleanup tools scan for.</p>
+    </details>
+    <details>
+      <summary>Is it safe to clear a Stripe checkout lock with a script?</summary>
+      <p>Yes, once Stripe confirms the matching PaymentIntent is fully settled, meaning succeeded or canceled. At that point the lock can never be needed again. Start in dry run mode to review the list before it writes anything.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/woocommerce/paid-orders-stuck-on-pending/">Orders stuck on Pending after a successful Stripe payment</a>
+    <a href="/woocommerce/order-marked-paid-no-charge/">Order marked paid with no matching Stripe charge</a>
+    <a href="/woocommerce/">All WooCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>WordPress Developer Resources: Transients API, and how expiry is only checked when the transient is fetched. <a href="https://developer.wordpress.org/apis/transients/" rel="noopener">developer.wordpress.org/apis/transients</a></li>
+      <li>WordPress support: wp_options growing very large from expired transients that are never cleaned up. <a href="https://wordpress.org/support/topic/wp_options-table-bloat-from-expired-transients/" rel="noopener">wordpress.org/support</a></li>
+      <li>WP-CLI handbook: the transient command, including how to delete all expired transients in bulk. <a href="https://developer.wordpress.org/cli/commands/transient/" rel="noopener">developer.wordpress.org/cli/commands/transient</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Stripe API: retrieve a PaymentIntent and read its current status. <a href="https://docs.stripe.com/api/payment_intents/retrieve" rel="noopener">docs.stripe.com/api/payment_intents/retrieve</a></li>
+      <li>Stripe docs: the PaymentIntent lifecycle and which statuses mean the intent is finished. <a href="https://docs.stripe.com/payments/paymentintents/lifecycle" rel="noopener">docs.stripe.com/payments/paymentintents/lifecycle</a></li>
+      <li>WooCommerce REST API: update an order's meta data and add an order note. <a href="https://woocommerce.github.io/woocommerce-rest-api-docs/#orders" rel="noopener">woocommerce.github.io/woocommerce-rest-api-docs</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a bug in WooCommerce, WooCommerce Subscriptions, or the WooCommerce Stripe gateway that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clean up your database?</h3>
+    <p>If this shaved rows off your options table or sped up your admin, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/woocommerce/">Back to all WooCommerce and Stripe field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on WooCommerce and Stripe.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/build/">Build</a> &middot; <a href="/templates/">Templates</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/woocommerce/assets/woo.js" defer></script>
+</body>
+</html>

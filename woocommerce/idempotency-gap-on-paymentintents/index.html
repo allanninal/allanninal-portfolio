@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix the Idempotency Gap That Charges a WooCommerce Order Twice</title>
+<meta name="description" content="A retry without a Stripe Idempotency-Key can charge the same WooCommerce order twice. Learn why it happens and build a Python or Node.js script that finds and reports the duplicate PaymentIntents safely.">
+<link rel="canonical" href="https://www.allanninal.dev/woocommerce/idempotency-gap-on-paymentintents/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix the Idempotency Gap That Charges a WooCommerce Order Twice">
+<meta property="og:description" content="Why a retry without an Idempotency-Key creates a second Stripe charge, and a safe Python or Node.js script that finds the duplicate PaymentIntents so you can clean them up.">
+<meta property="og:url" content="https://www.allanninal.dev/woocommerce/idempotency-gap-on-paymentintents/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/woocommerce/assets/woo.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/woocommerce/idempotency-gap-on-paymentintents/#article","headline":"Fix the Idempotency Gap That Charges a WooCommerce Order Twice","description":"Why a retry without an Idempotency-Key creates a second Stripe charge, and a safe Python or Node.js script that finds the duplicate PaymentIntents so you can clean them up.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/woocommerce/idempotency-gap-on-paymentintents/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Charges and money","keywords":"Stripe idempotency key, duplicate PaymentIntent, WooCommerce charged twice, Stripe duplicate charge, WooCommerce Stripe reconciler, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"WooCommerce and Stripe field notes","item":"https://www.allanninal.dev/woocommerce/"},{"@type":"ListItem","position":2,"name":"Idempotency gap on PaymentIntents","item":"https://www.allanninal.dev/woocommerce/idempotency-gap-on-paymentintents/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my customer get charged twice on a single WooCommerce order?","acceptedAnswer":{"@type":"Answer","text":"A retry, from a flaky network, a page refresh, or a double-click on Place order, sent the same checkout request to Stripe twice without the same Idempotency-Key attached. Stripe had no way to tell the two requests were meant to be the same payment, so it created two separate PaymentIntents, and both succeeded."}},{"@type":"Question","name":"What is a Stripe Idempotency-Key and why does it prevent this?","acceptedAnswer":{"@type":"Answer","text":"An Idempotency-Key is a unique value you attach to a request. If Stripe sees the same key again within its retention window, it returns the original result instead of creating a new charge. Without that key, every retry looks like a brand new payment, which is exactly how a duplicate charge gets made."}},{"@type":"Question","name":"Is it safe to refund a duplicate charge automatically?","acceptedAnswer":{"@type":"Answer","text":"Automatic refunds are risky, because a false match means refunding a real, separate purchase. The safer pattern is to detect likely duplicates by customer, amount, and a short time window, write the finding to the order as a note, and let a human confirm in Stripe before the refund goes out."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/woocommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / woo</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/woocommerce/">Field notes</a> / Charges and money</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Charges and money</p>
+    <h1>Idempotency gap on PaymentIntents</h1>
+    <p class="lead">A retry went out without an idempotency key, and Stripe had no way to know it was the same payment as the first one. It made a second charge. The customer paid twice, the order shows one payment, and nobody notices until the customer emails you about a strange amount on their card statement. Here is why the gap opens and a small script that finds every likely duplicate so you can review and refund it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Runs on a schedule</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Stripe only collapses a repeated request into one charge when the retry carries the exact same <code>Idempotency-Key</code> as the first attempt. If a retry goes out with no key, or a different key, Stripe treats it as a brand new payment and can create a second PaymentIntent that also succeeds. Run a small Python or Node.js script on a schedule that reads the PaymentIntent id saved on each paid order, looks up the same Stripe customer, and lists any other succeeded PaymentIntent with a matching amount inside a short time window. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Idempotency is the property that lets you send the same request twice and get the same result once. Stripe supports this with an <code>Idempotency-Key</code> header. If your checkout code sends that key with the payment request, and the request has to be retried, Stripe recognizes the key and hands back the original PaymentIntent instead of creating a new one.</p>
+  <p>The gap opens when a retry happens without that key attached, or with a new key generated for every attempt instead of one key per checkout attempt. A slow response makes the browser or the server think the first request failed, so it tries again. Stripe sees two unrelated requests, not one request repeated, and charges the card both times. WooCommerce only stores one PaymentIntent id on the order, usually in order meta <code>_stripe_intent_id</code> or as the order's <code>transaction_id</code>, so the second successful charge sits in Stripe with no order pointing back at it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. The buyer's payment request times out and is retried without an idempotency key, so Stripe creates a second PaymentIntent and charges the card twice, while the order only stores one payment id.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8b8398"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="150" height="60" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="85" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Buyer clicks</text>
+      <text x="85" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">Place order</text>
+      <line x1="85" y1="80" x2="85" y2="106" stroke="#8b8398" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="108" width="150" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="85" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b2135">Request 1</text>
+      <text x="85" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#5f576d">no idempotency key</text>
+      <text x="200" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#8b8398">times out,</text>
+      <text x="200" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#8b8398">page retries</text>
+      <line x1="160" y1="138" x2="252" y2="138" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="255" y="108" width="150" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="330" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b2135">Request 2</text>
+      <text x="330" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#5f576d">different key, or none</text>
+      <line x1="405" y1="138" x2="447" y2="138" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="450" y="20" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="525" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">PaymentIntent A</text>
+      <text x="525" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">succeeded</text>
+      <rect x="450" y="108" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="525" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">PaymentIntent B</text>
+      <text x="525" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">succeeded, same card</text>
+      <line x1="330" y1="108" x2="490" y2="80" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <line x1="600" y1="138" x2="642" y2="138" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="645" y="108" width="105" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="697" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">Charged</text>
+      <text x="697" y="147" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">twice</text>
+      <text x="330" y="196" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">Order only stores one PaymentIntent id, the other charge is invisible</text>
+    </svg>
+    <figcaption>Two requests for one checkout, no shared idempotency key, so Stripe treats them as two separate payments and charges the card both times.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Stripe's own docs are direct about this: idempotency keys only protect you when the same key is reused for retries of the same operation. A few common ways the key gets dropped or changes between attempts:</p>
+  <ul>
+    <li>The checkout code generates a fresh key on every function call instead of once per checkout attempt, so a retry inside the same attempt still looks new to Stripe.</li>
+    <li>A custom checkout flow calls the Payment Intents API directly and the idempotency header was simply never added to the request.</li>
+    <li>The browser times out waiting for a response and the customer, or a background retry, resubmits the form, generating an entirely new request from scratch.</li>
+    <li>A load balancer or proxy retries a request it thinks failed, without knowing an idempotency key exists or how to preserve it.</li>
+  </ul>
+  <p>Stripe's guidance on this exact situation is that idempotency keys should be generated once per unique operation and reused for every retry of that operation, not regenerated per attempt. When that rule is not followed, the systems disagree quietly: Stripe has two successful charges, WooCommerce has one order and one saved payment id, and the second charge just sits there until someone goes looking.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot go back and add an idempotency key to a request that already happened. The fix here is not prevention after the fact, it is detection. Stripe is still the source of truth for what was actually charged, so a script that asks Stripe "did this customer pay twice for the same amount around the same time" finds what the order alone cannot show you.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout. We add a job that runs on a schedule, walks recent paid orders, and for each one reads the PaymentIntent that WooCommerce saved. It then asks Stripe for every other succeeded PaymentIntent belonging to the same customer. If any of those match the order's amount and were created inside a short window of the saved one, it is a likely duplicate. The script reports it as an order note. It never issues a refund by itself, because a refund is real money and deserves a human to confirm the match first.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job reads the saved PaymentIntent for a paid order, looks up other succeeded PaymentIntents for the same customer, checks whether any match the amount and time window, and flags the order with a note for human review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#7f54b3"></path></marker></defs>
+      <rect x="10" y="20" width="150" height="60" rx="10" fill="#f3eefa" stroke="#d6c8ec"></rect>
+      <text x="85" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b2135">Scheduled job</text>
+      <text x="85" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">once a day</text>
+      <line x1="85" y1="80" x2="85" y2="106" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="102" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b2135">Read saved</text>
+      <text x="102" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">PaymentIntent on order</text>
+      <line x1="195" y1="138" x2="237" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="240" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#d6c8ec"></rect>
+      <text x="335" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b2135">List other succeeded</text>
+      <text x="335" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#5f576d">intents, same customer</text>
+      <line x1="430" y1="138" x2="472" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="565,108 655,138 565,168 475,138" fill="#f3eefa" stroke="#d6c8ec"></polygon>
+      <text x="565" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b2135">Amount and</text>
+      <text x="565" y="147" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b2135">window match?</text>
+      <text x="658" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="655" y1="138" x2="686" y2="138" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="580" y="196" font-family="sans-serif" font-size="10.5" fill="#8b8398" font-weight="700">no, skip</text>
+      <line x1="565" y1="168" x2="565" y2="205" stroke="#8b8398" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="614" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="680" y="208" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Flag order</text>
+      <text x="680" y="225" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#5f576d">note for human review</text>
+      <path d="M686,138 C706,138 680,150 680,183" fill="none" stroke="#7f54b3" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only reports likely duplicates. Refunding the extra charge is a deliberate, separate step a person takes after checking Stripe.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get access to both systems</h3>
+      <p>You need a Stripe secret key and a WooCommerce REST API key pair (a consumer key and a consumer secret) with read access to orders, and write access if you want the script to leave notes. Create the WooCommerce key under WooCommerce, Settings, Advanced, REST API. Keep every value in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install stripe requests
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export WOO_STORE_URL="https://yourstore.com"
+export WOO_CONSUMER_KEY="ck_..."
+export WOO_CONSUMER_SECRET="cs_..."
+export LOOKBACK_DAYS="7"
+export MATCH_WINDOW_MINUTES="30"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install stripe
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export WOO_STORE_URL="https://yourstore.com"
+export WOO_CONSUMER_KEY="ck_..."
+export WOO_CONSUMER_SECRET="cs_..."
+export LOOKBACK_DAYS="7"
+export MATCH_WINDOW_MINUTES="30"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Read the PaymentIntent id saved on the order</h3>
+      <p>The WooCommerce Stripe plugin saves the PaymentIntent id in order meta as <code>_stripe_intent_id</code>. Older orders or other integrations sometimes save it as the order's <code>transaction_id</code> instead, prefixed <code>pi_</code>. Check both, and treat a <code>transaction_id</code> that starts with <code>ch_</code> as a charge id, not a PaymentIntent id.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">def intent_id_of(order):
+    """The saved Stripe PaymentIntent id, from meta _stripe_intent_id or transaction_id."""
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == "_stripe_intent_id" and meta.get("value"):
+            return meta["value"]
+    tid = order.get("transaction_id")
+    return tid if tid and tid.startswith("pi_") else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">export function intentIdOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === "_stripe_intent_id" &amp;&amp; meta.value) return meta.value;
+  }
+  const tid = order.transaction_id;
+  return tid &amp;&amp; tid.startsWith("pi_") ? tid : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Ask Stripe for the customer's other successful payments</h3>
+      <p>Once you have the saved PaymentIntent, read its <code>customer</code> field and list every other succeeded PaymentIntent for that same customer inside your lookback window. This is the set of candidates that might be an accidental duplicate of the order's real payment.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import time, stripe
+
+def other_succeeded_for_customer(customer_id, exclude_intent_id, lookback_days):
+    if not customer_id:
+        return []
+    since = int(time.time()) - lookback_days * 86400
+    results = []
+    for intent in stripe.PaymentIntent.list(
+        customer=customer_id, limit=100, created={"gte": since}
+    ).auto_paging_iter():
+        if intent.id == exclude_intent_id:
+            continue
+        if intent.status == "succeeded":
+            results.append(intent)
+    return results</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function otherSucceededForCustomer(customerId, excludeIntentId, lookbackDays) {
+  if (!customerId) return [];
+  const since = Math.floor(Date.now() / 1000) - lookbackDays * 86400;
+  const results = [];
+  for await (const intent of stripe.paymentIntents.list({ customer: customerId, limit: 100, created: { gte: since } })) {
+    if (intent.id === excludeIntentId) continue;
+    if (intent.status === "succeeded") results.push(intent);
+  }
+  return results;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the matching rule in its own function that takes the order's primary PaymentIntent, the list of other candidate intents, the order amount in cents, and a time window, then returns the ones that look like duplicates. A pure function like this is easy to read and easy to test, which we do later. A candidate only counts when it succeeded, is not the primary intent itself, matches the order amount, and was created close enough in time to the primary intent.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def order_amount_minor(order):
+    # Works for two decimal currencies. Zero decimal currencies (JPY and friends)
+    # have their own guide, since 50.00 is wrong for those.
+    return round(float(order["total"]) * 100)
+
+def find_candidate_duplicates(primary_intent, other_intents, order_amount_minor_value, window_seconds):
+    """Pure decision function. No I/O. Returns a list of (intent, reason) pairs."""
+    duplicates = []
+    if primary_intent is None or primary_intent.get("status") != "succeeded":
+        return duplicates
+    primary_created = primary_intent.get("created", 0)
+    for candidate in other_intents:
+        if candidate.get("id") == primary_intent.get("id"):
+            continue
+        if candidate.get("status") != "succeeded":
+            continue
+        if abs(candidate.get("amount_received", 0) - order_amount_minor_value) &gt; 1:
+            continue
+        if abs(candidate.get("created", 0) - primary_created) &gt; window_seconds:
+            continue
+        duplicates.append((candidate, "same customer, same amount, created within the match window"))
+    return duplicates</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function orderAmountMinor(order) {
+  // Works for two decimal currencies. Zero decimal currencies (JPY and friends)
+  // have their own guide, since 50.00 is wrong for those.
+  return Math.round(parseFloat(order.total) * 100);
+}
+
+export function findCandidateDuplicates(primaryIntent, otherIntents, orderAmountMinorValue, windowSeconds) {
+  const duplicates = [];
+  if (!primaryIntent || primaryIntent.status !== "succeeded") return duplicates;
+  const primaryCreated = primaryIntent.created || 0;
+  for (const candidate of otherIntents) {
+    if (candidate.id === primaryIntent.id) continue;
+    if (candidate.status !== "succeeded") continue;
+    if (Math.abs((candidate.amount_received || 0) - orderAmountMinorValue) &gt; 1) continue;
+    if (Math.abs((candidate.created || 0) - primaryCreated) &gt; windowSeconds) continue;
+    duplicates.push([candidate, "same customer, same amount, created within the match window"]);
+  }
+  return duplicates;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Flag the order, do not refund automatically</h3>
+      <p>When a duplicate is found, add an order note listing the extra PaymentIntent ids and why they were flagged. That gives the shop manager or support agent everything they need to open Stripe, confirm the second charge is really a duplicate, and issue a refund from there. The script never calls the refund API itself, because a false match here means refunding money a customer meant to spend on a second, real purchase.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def flag(order, duplicate_intent_ids):
+    note = (
+        "Possible duplicate charge detected. This order's saved PaymentIntent "
+        "succeeded, but Stripe also shows " + ", ".join(duplicate_intent_ids) +
+        " as succeeded for the same customer, amount, and time window. "
+        "This can happen when a retry goes out without an Idempotency-Key. "
+        "Please review in Stripe before refunding."
+    )
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order['id']}/notes",
+        json={"note": note},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function flag(order, duplicateIntentIds) {
+  const note =
+    "Possible duplicate charge detected. This order's saved PaymentIntent " +
+    "succeeded, but Stripe also shows " + duplicateIntentIds.join(", ") +
+    " as succeeded for the same customer, amount, and time window. " +
+    "This can happen when a retry goes out without an Idempotency-Key. " +
+    "Please review in Stripe before refunding.";
+  await woo(`/orders/${order.id}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ note }),
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports what it would flag. Read the output, confirm a couple of matches in the Stripe dashboard yourself, then switch it off to let it write notes. This job is cheap to run once a day, since duplicates from a stuck retry are rare and do not need minute by minute checking.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This script never issues a refund on its own, but it does write order notes once live, so you still want to see its plan before it acts. Tune <code>MATCH_WINDOW_MINUTES</code> to your own checkout, a shorter window means fewer false positives, a longer one catches slower retries.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because flagging the same order twice just adds another note, it never issues a refund.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/woocommerce-fixes/tree/main/idempotency-gap-on-paymentintents" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the woocommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_duplicate_intents.py</div>
+      <pre><code class="language-python">"""Find WooCommerce orders that were charged twice because a retry went out
+without a Stripe Idempotency-Key.
+
+A flaky network, a page refresh, or a double-click on "Place order" can send
+the same checkout request twice. When neither request carries the same
+Idempotency-Key, Stripe treats them as two different payments and can create
+two separate PaymentIntents, both of which succeed. WooCommerce only stores
+one PaymentIntent id on the order, so the extra charge is invisible unless you
+go looking for it in Stripe.
+
+This script reads the PaymentIntent id saved on each recent paid order (meta
+_stripe_intent_id, falling back to transaction_id), looks up that intent's
+Stripe Customer, and lists every other succeeded PaymentIntent created for
+that same customer within a short window with the same amount. Anything it
+finds beyond the one saved on the order is a likely duplicate charge.
+
+Read only by default. Refunding is a separate, explicit step you take after
+reviewing the report, never automatic.
+"""
+import os
+import logging
+import stripe
+import requests
+from requests.auth import HTTPBasicAuth
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_duplicate_intents")
+
+stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
+WOO_URL = os.environ["WOO_STORE_URL"].rstrip("/")
+AUTH = HTTPBasicAuth(os.environ["WOO_CONSUMER_KEY"], os.environ["WOO_CONSUMER_SECRET"])
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
+MATCH_WINDOW_MINUTES = int(os.environ.get("MATCH_WINDOW_MINUTES", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+PAID_STATUSES = {"processing", "completed"}
+
+
+def intent_id_of(order):
+    """The saved Stripe PaymentIntent id, from meta _stripe_intent_id or transaction_id."""
+    for meta in order.get("meta_data") or []:
+        if meta.get("key") == "_stripe_intent_id" and meta.get("value"):
+            return meta["value"]
+    tid = order.get("transaction_id")
+    return tid if tid and tid.startswith("pi_") else None
+
+
+def order_amount_minor(order):
+    # Works for two decimal currencies. Zero decimal currencies (JPY and friends)
+    # have their own guide, since 50.00 is wrong for those.
+    return round(float(order["total"]) * 100)
+
+
+def find_candidate_duplicates(primary_intent, other_intents, order_amount_minor_value, window_seconds):
+    """Pure decision function. No I/O.
+
+    primary_intent: the PaymentIntent whose id is saved on the order.
+    other_intents: every other succeeded PaymentIntent for the same customer,
+        as plain dicts with at least id, status, amount_received, created.
+    order_amount_minor_value: the order total in minor units (cents).
+    window_seconds: how close in time a second charge has to be to count.
+
+    Returns a list of (intent_dict, reason) tuples, one per likely duplicate.
+    An intent only counts as a duplicate when it succeeded, is not the
+    primary intent, matches the order amount, and was created within the
+    time window of the primary intent.
+    """
+    duplicates = []
+    if primary_intent is None or primary_intent.get("status") != "succeeded":
+        return duplicates
+    primary_created = primary_intent.get("created", 0)
+    for candidate in other_intents:
+        if candidate.get("id") == primary_intent.get("id"):
+            continue
+        if candidate.get("status") != "succeeded":
+            continue
+        if abs(candidate.get("amount_received", 0) - order_amount_minor_value) &gt; 1:
+            continue
+        if abs(candidate.get("created", 0) - primary_created) &gt; window_seconds:
+            continue
+        duplicates.append((candidate, "same customer, same amount, created within the match window"))
+    return duplicates
+
+
+def get_intent(intent_id):
+    if not intent_id:
+        return None
+    try:
+        return stripe.PaymentIntent.retrieve(intent_id)
+    except stripe.error.InvalidRequestError:
+        return None
+
+
+def other_succeeded_for_customer(customer_id, exclude_intent_id, lookback_days):
+    if not customer_id:
+        return []
+    since = int(__import__("time").time()) - lookback_days * 86400
+    results = []
+    for intent in stripe.PaymentIntent.list(
+        customer=customer_id, limit=100, created={"gte": since}
+    ).auto_paging_iter():
+        if intent.id == exclude_intent_id:
+            continue
+        if intent.status == "succeeded":
+            results.append(intent)
+    return results
+
+
+def paid_orders(lookback_days):
+    page = 1
+    after = f"{__import__('datetime').date.today() - __import__('datetime').timedelta(days=lookback_days)}T00:00:00"
+    while True:
+        r = requests.get(
+            f"{WOO_URL}/wp-json/wc/v3/orders",
+            params={"status": "processing,completed", "after": after, "per_page": 50, "page": page},
+            auth=AUTH, timeout=30,
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            return
+        for order in batch:
+            yield order
+        page += 1
+
+
+def flag(order, duplicate_intent_ids):
+    note = (
+        "Possible duplicate charge detected. This order's saved PaymentIntent "
+        "succeeded, but Stripe also shows " + ", ".join(duplicate_intent_ids) +
+        " as succeeded for the same customer, amount, and time window. "
+        "This can happen when a retry goes out without an Idempotency-Key. "
+        "Please review in Stripe before refunding."
+    )
+    requests.post(
+        f"{WOO_URL}/wp-json/wc/v3/orders/{order['id']}/notes",
+        json={"note": note},
+        auth=AUTH, timeout=30,
+    ).raise_for_status()
+
+
+def run():
+    flagged = 0
+    for order in paid_orders(LOOKBACK_DAYS):
+        if order["status"] not in PAID_STATUSES:
+            continue
+        primary = get_intent(intent_id_of(order))
+        if primary is None:
+            continue
+        customer_id = primary.get("customer")
+        others = other_succeeded_for_customer(customer_id, primary["id"], LOOKBACK_DAYS)
+        others_as_dicts = [dict(o) for o in others]
+        duplicates = find_candidate_duplicates(
+            dict(primary), others_as_dicts, order_amount_minor(order), MATCH_WINDOW_MINUTES * 60
+        )
+        if not duplicates:
+            continue
+        duplicate_ids = [d["id"] for d, _reason in duplicates]
+        log.warning(
+            "Order %s: %d likely duplicate charge(s) found: %s. %s",
+            order["id"], len(duplicate_ids), ", ".join(duplicate_ids),
+            "would flag" if DRY_RUN else "flagging",
+        )
+        if not DRY_RUN:
+            flag(order, duplicate_ids)
+        flagged += 1
+    log.info("Done. %d order(s) %s.", flagged, "to flag" if DRY_RUN else "flagged")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-duplicate-intents.js</div>
+      <pre><code class="language-javascript">/**
+ * Find WooCommerce orders that were charged twice because a retry went out
+ * without a Stripe Idempotency-Key.
+ *
+ * A flaky network, a page refresh, or a double-click on "Place order" can
+ * send the same checkout request twice. When neither request carries the
+ * same Idempotency-Key, Stripe treats them as two different payments and can
+ * create two separate PaymentIntents, both of which succeed. WooCommerce
+ * only stores one PaymentIntent id on the order, so the extra charge is
+ * invisible unless you go looking for it in Stripe.
+ *
+ * This script reads the PaymentIntent id saved on each recent paid order
+ * (meta _stripe_intent_id, falling back to transaction_id), looks up that
+ * intent's Stripe Customer, and lists every other succeeded PaymentIntent
+ * created for that same customer within a short window with the same
+ * amount. Anything it finds beyond the one saved on the order is a likely
+ * duplicate charge.
+ *
+ * Read only by default. Refunding is a separate, explicit step you take
+ * after reviewing the report, never automatic.
+ */
+import Stripe from "stripe";
+import { pathToFileURL } from "node:url";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_dummy");
+const WOO_URL = (process.env.WOO_STORE_URL || "https://example.com").replace(/\/$/, "");
+const AUTH = "Basic " + Buffer.from(
+  `${process.env.WOO_CONSUMER_KEY || "ck_dummy"}:${process.env.WOO_CONSUMER_SECRET || "cs_dummy"}`
+).toString("base64");
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 7);
+const MATCH_WINDOW_MINUTES = Number(process.env.MATCH_WINDOW_MINUTES || 30);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const PAID_STATUSES = new Set(["processing", "completed"]);
+
+export function intentIdOf(order) {
+  for (const meta of order.meta_data || []) {
+    if (meta.key === "_stripe_intent_id" &amp;&amp; meta.value) return meta.value;
+  }
+  const tid = order.transaction_id;
+  return tid &amp;&amp; tid.startsWith("pi_") ? tid : null;
+}
+
+export function orderAmountMinor(order) {
+  // Works for two decimal currencies. Zero decimal currencies (JPY and friends)
+  // have their own guide, since 50.00 is wrong for those.
+  return Math.round(parseFloat(order.total) * 100);
+}
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * primaryIntent: the PaymentIntent whose id is saved on the order.
+ * otherIntents: every other succeeded PaymentIntent for the same customer,
+ *   as plain objects with at least id, status, amount_received, created.
+ * orderAmountMinorValue: the order total in minor units (cents).
+ * windowSeconds: how close in time a second charge has to be to count.
+ *
+ * Returns an array of [intent, reason] pairs, one per likely duplicate. An
+ * intent only counts as a duplicate when it succeeded, is not the primary
+ * intent, matches the order amount, and was created within the time window
+ * of the primary intent.
+ */
+export function findCandidateDuplicates(primaryIntent, otherIntents, orderAmountMinorValue, windowSeconds) {
+  const duplicates = [];
+  if (!primaryIntent || primaryIntent.status !== "succeeded") return duplicates;
+  const primaryCreated = primaryIntent.created || 0;
+  for (const candidate of otherIntents) {
+    if (candidate.id === primaryIntent.id) continue;
+    if (candidate.status !== "succeeded") continue;
+    if (Math.abs((candidate.amount_received || 0) - orderAmountMinorValue) &gt; 1) continue;
+    if (Math.abs((candidate.created || 0) - primaryCreated) &gt; windowSeconds) continue;
+    duplicates.push([candidate, "same customer, same amount, created within the match window"]);
+  }
+  return duplicates;
+}
+
+async function woo(path, options = {}) {
+  const res = await fetch(`${WOO_URL}/wp-json/wc/v3${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", Authorization: AUTH, ...(options.headers || {}) },
+  });
+  if (!res.ok) throw new Error(`Woo ${path} returned ${res.status}`);
+  return res.json();
+}
+
+async function getIntent(intentId) {
+  if (!intentId) return null;
+  try {
+    return await stripe.paymentIntents.retrieve(intentId);
+  } catch {
+    return null;
+  }
+}
+
+async function otherSucceededForCustomer(customerId, excludeIntentId, lookbackDays) {
+  if (!customerId) return [];
+  const since = Math.floor(Date.now() / 1000) - lookbackDays * 86400;
+  const results = [];
+  for await (const intent of stripe.paymentIntents.list({ customer: customerId, limit: 100, created: { gte: since } })) {
+    if (intent.id === excludeIntentId) continue;
+    if (intent.status === "succeeded") results.push(intent);
+  }
+  return results;
+}
+
+async function* paidOrders(lookbackDays) {
+  const after = new Date(Date.now() - lookbackDays * 86400000).toISOString();
+  let page = 1;
+  while (true) {
+    const batch = await woo(`/orders?status=processing,completed&amp;after=${after}&amp;per_page=50&amp;page=${page}`);
+    if (!batch.length) return;
+    for (const order of batch) yield order;
+    page++;
+  }
+}
+
+async function flag(order, duplicateIntentIds) {
+  const note =
+    "Possible duplicate charge detected. This order's saved PaymentIntent " +
+    "succeeded, but Stripe also shows " + duplicateIntentIds.join(", ") +
+    " as succeeded for the same customer, amount, and time window. " +
+    "This can happen when a retry goes out without an Idempotency-Key. " +
+    "Please review in Stripe before refunding.";
+  await woo(`/orders/${order.id}/notes`, {
+    method: "POST",
+    body: JSON.stringify({ note }),
+  });
+}
+
+export async function run() {
+  let flagged = 0;
+  for await (const order of paidOrders(LOOKBACK_DAYS)) {
+    if (!PAID_STATUSES.has(order.status)) continue;
+    const primary = await getIntent(intentIdOf(order));
+    if (!primary) continue;
+    const others = await otherSucceededForCustomer(primary.customer, primary.id, LOOKBACK_DAYS);
+    const duplicates = findCandidateDuplicates(primary, others, orderAmountMinor(order), MATCH_WINDOW_MINUTES * 60);
+    if (!duplicates.length) continue;
+    const duplicateIds = duplicates.map(([intent]) => intent.id);
+    console.warn(
+      `Order ${order.id}: ${duplicateIds.length} likely duplicate charge(s) found: ${duplicateIds.join(", ")}. ` +
+      `${DRY_RUN ? "would flag" : "flagging"}`
+    );
+    if (!DRY_RUN) await flag(order, duplicateIds);
+    flagged++;
+  }
+  console.log(`Done. ${flagged} order(s) ${DRY_RUN ? "to flag" : "flagged"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The matching rule is the part most worth testing, because it decides which charges get called out as possible duplicates. Because we kept <code>find_candidate_duplicates</code> pure, the test needs no network and no Stripe account. It just feeds in plain objects and checks which ones come back.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_idempotency_duplicates.py</div>
+      <pre><code class="language-python">from find_duplicate_intents import find_candidate_duplicates, intent_id_of, order_amount_minor
+
+
+def intent(**over):
+    base = {"id": "pi_primary", "status": "succeeded", "amount_received": 5000, "created": 1_700_000_000}
+    base.update(over)
+    return base
+
+
+def test_finds_duplicate_same_amount_same_window():
+    primary = intent()
+    other = intent(id="pi_retry", created=1_700_000_120)
+    result = find_candidate_duplicates(primary, [other], 5000, window_seconds=1800)
+    assert len(result) == 1
+    assert result[0][0]["id"] == "pi_retry"
+
+
+def test_ignores_itself():
+    primary = intent()
+    result = find_candidate_duplicates(primary, [intent()], 5000, window_seconds=1800)
+    assert result == []
+
+
+def test_ignores_non_succeeded_candidates():
+    primary = intent()
+    other = intent(id="pi_failed", status="requires_payment_method", created=1_700_000_60)
+    result = find_candidate_duplicates(primary, [other], 5000, window_seconds=1800)
+    assert result == []
+
+
+def test_ignores_different_amount():
+    primary = intent()
+    other = intent(id="pi_other_amount", amount_received=1500, created=1_700_000_60)
+    result = find_candidate_duplicates(primary, [other], 5000, window_seconds=1800)
+    assert result == []
+
+
+def test_ignores_outside_time_window():
+    primary = intent()
+    other = intent(id="pi_far_away", created=1_700_000_000 + 7200)
+    result = find_candidate_duplicates(primary, [other], 5000, window_seconds=1800)
+    assert result == []
+
+
+def test_no_duplicates_when_primary_not_succeeded():
+    primary = intent(status="requires_payment_method")
+    other = intent(id="pi_retry", created=1_700_000_120)
+    result = find_candidate_duplicates(primary, [other], 5000, window_seconds=1800)
+    assert result == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-duplicate-intents.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findCandidateDuplicates, intentIdOf, orderAmountMinor } from "./find-duplicate-intents.js";
+
+const intent = (over = {}) => ({ id: "pi_primary", status: "succeeded", amount_received: 5000, created: 1_700_000_000, ...over });
+
+test("finds duplicate with same amount in same window", () => {
+  const primary = intent();
+  const other = intent({ id: "pi_retry", created: 1_700_000_120 });
+  const result = findCandidateDuplicates(primary, [other], 5000, 1800);
+  assert.equal(result.length, 1);
+  assert.equal(result[0][0].id, "pi_retry");
+});
+
+test("ignores itself", () => {
+  const primary = intent();
+  const result = findCandidateDuplicates(primary, [intent()], 5000, 1800);
+  assert.deepEqual(result, []);
+});
+
+test("ignores non succeeded candidates", () => {
+  const primary = intent();
+  const other = intent({ id: "pi_failed", status: "requires_payment_method", created: 1_700_000_060 });
+  const result = findCandidateDuplicates(primary, [other], 5000, 1800);
+  assert.deepEqual(result, []);
+});
+
+test("ignores different amount", () => {
+  const primary = intent();
+  const other = intent({ id: "pi_other_amount", amount_received: 1500, created: 1_700_000_060 });
+  const result = findCandidateDuplicates(primary, [other], 5000, 1800);
+  assert.deepEqual(result, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Slow gateway response</span>
+      <h4>The store on a shared host that timed out under load</h4>
+      <p>A store on a busy shared host had a checkout page that occasionally took over thirty seconds to hear back from Stripe during a sale. The customer's browser gave up and auto-retried the form post, and the checkout code generated a new key for that retry instead of reusing the first one. Twelve customers were charged twice over one weekend before anyone noticed, because each order in WooCommerce still looked completely normal.</p>
+      <p>Running the script with a seven day lookback found all twelve in one pass. Each note listed the exact duplicate PaymentIntent id, so support could refund every one from the Stripe dashboard in an afternoon instead of waiting for customers to notice their statements.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Custom checkout</span>
+      <h4>The headless storefront that skipped the idempotency header entirely</h4>
+      <p>A custom React storefront called the Payment Intents API directly from its own server, bypassing the plugin's built in handling, and the idempotency header had simply been left out during development. It worked fine in testing because nobody double-clicked the button on a fast connection. In production, a subset of mobile customers on slow connections tapped Pay twice, and each tap became its own successful charge.</p>
+      <p>The fix in the API code came later. In the meantime, the reconciler ran daily and caught the pattern early, at a handful of orders a week, which kept the support backlog from growing while the checkout code was corrected.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Once the idempotency header is generated correctly for every checkout attempt, this problem stops happening for new orders. Keep the script running daily anyway, since third party plugins, custom checkout code, and future integrations can all reintroduce the same gap without warning. A daily report of zero duplicates costs nothing and tells you the fix is holding.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my customer get charged twice on a single WooCommerce order?</summary>
+      <p>A retry, from a flaky network, a page refresh, or a double-click on Place order, sent the same checkout request to Stripe twice without the same Idempotency-Key attached. Stripe had no way to tell the two requests were meant to be the same payment, so it created two separate PaymentIntents, and both succeeded.</p>
+    </details>
+    <details>
+      <summary>What is a Stripe Idempotency-Key and why does it prevent this?</summary>
+      <p>An Idempotency-Key is a unique value you attach to a request. If Stripe sees the same key again within its retention window, it returns the original result instead of creating a new charge. Without that key, every retry looks like a brand new payment, which is exactly how a duplicate charge gets made.</p>
+    </details>
+    <details>
+      <summary>Is it safe to refund a duplicate charge automatically?</summary>
+      <p>Automatic refunds are risky, because a false match means refunding a real, separate purchase. The safer pattern is to detect likely duplicates by customer, amount, and a short time window, write the finding to the order as a note, and let a human confirm in Stripe before the refund goes out.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/woocommerce/paid-orders-stuck-on-pending/">Paid orders stuck on Pending after a Stripe payment</a>
+    <a href="/woocommerce/order-marked-paid-no-charge/">Order marked paid with no matching Stripe charge</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Stripe docs: idempotent requests, how keys are matched, and what happens when a key is missing or reused incorrectly. <a href="https://docs.stripe.com/api/idempotent_requests" rel="noopener">docs.stripe.com/api/idempotent_requests</a></li>
+      <li>Stripe docs: designing an idempotency key strategy for payment retries. <a href="https://docs.stripe.com/error-handling" rel="noopener">docs.stripe.com/error-handling</a></li>
+      <li>WooCommerce Stripe plugin docs: how the PaymentIntent id is saved to the order and where to find it. <a href="https://woocommerce.com/document/stripe/" rel="noopener">woocommerce.com/document/stripe</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Stripe API: list PaymentIntents filtered by customer and creation date, with auto pagination. <a href="https://docs.stripe.com/api/payment_intents/list" rel="noopener">docs.stripe.com/api/payment_intents/list</a></li>
+      <li>Stripe docs: issuing a refund for a PaymentIntent once a duplicate is confirmed. <a href="https://docs.stripe.com/refunds" rel="noopener">docs.stripe.com/refunds</a></li>
+      <li>WooCommerce REST API: reading orders and adding an order note. <a href="https://woocommerce.github.io/woocommerce-rest-api-docs/#orders" rel="noopener">woocommerce.github.io/woocommerce-rest-api-docs</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a bug in WooCommerce, WooCommerce Subscriptions, or the WooCommerce Stripe gateway that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a duplicate charge for you?</h3>
+    <p>If this saved a customer from an awkward refund conversation, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/woocommerce/">Back to all WooCommerce and Stripe field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on WooCommerce and Stripe.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/woocommerce/assets/woo.js" defer></script>
+</body>
+</html>
