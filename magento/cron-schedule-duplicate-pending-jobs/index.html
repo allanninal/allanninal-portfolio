@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cron_schedule Fills With Duplicate Pending Jobs in Magento 2</title>
+<meta name="description" content="Magento 2 or Adobe Commerce cron_schedule keeps piling up duplicate pending rows for the same job_code. Learn why the cron generator does this and build a Python or Node.js script that detects and safely prunes the surplus rows.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/cron-schedule-duplicate-pending-jobs/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="cron_schedule Fills With Duplicate Pending Jobs in Magento 2">
+<meta property="og:description" content="Why Magento's cron generator keeps inserting duplicate pending rows for the same job_code, and a safe Python or Node.js script that finds and prunes the surplus while keeping one job alive per code.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/cron-schedule-duplicate-pending-jobs/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/cron-schedule-duplicate-pending-jobs/#article","headline":"cron_schedule Fills With Duplicate Pending Jobs in Magento 2","description":"Why Magento's cron generator keeps inserting duplicate pending rows for the same job_code, and a safe Python or Node.js script that finds and prunes the surplus while keeping one job alive per code.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/cron-schedule-duplicate-pending-jobs/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Cron","keywords":"Magento 2 cron_schedule duplicate pending jobs, ProcessCronQueueObserver, schedule_ahead_for, schedule_generate_every, history_cleanup_every, Adobe Commerce, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"cron_schedule fills with duplicate pending jobs","item":"https://www.allanninal.dev/magento/cron-schedule-duplicate-pending-jobs/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does cron_schedule keep filling up with duplicate pending rows for the same job?","acceptedAnswer":{"@type":"Answer","text":"Magento's cron generator, ProcessCronQueueObserver::_generate(), only looks at rows already in pending status when it decides what is already scheduled. It ignores rows stuck in running status. If a job's previous run is still executing, whether because it is genuinely long running, stuck, or crashed without flipping to success or error, the generator does not see it as scheduled and inserts a fresh pending row for the same job_code on every cron:run pass, which by default happens every minute."}},{"@type":"Question","name":"Can I clean up cron_schedule through the Magento REST API?","acceptedAnswer":{"@type":"Answer","text":"No. Magento's module-cron does not ship a webapi.xml route for cron_schedule, so it is not reachable over REST like products or orders are. Detection and repair both have to query and modify the table directly. schedule_lifetime and history_cleanup_every only prune old success, error, and missed rows, they do not touch an already bloated pending backlog."}},{"@type":"Question","name":"Is it safe to delete rows from cron_schedule?","acceptedAnswer":{"@type":"Answer","text":"Yes, when you delete only surplus pending rows and always keep the single earliest scheduled pending row per job_code untouched, so the job still fires once. Never delete running, success, or error rows as part of this cleanup, and run in dry run first so you can see exactly which schedule_id values would be removed before anything is deleted."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Cron</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Cron</p>
+    <h1>cron_schedule fills with duplicate pending jobs</h1>
+    <p class="lead">You open the cron_schedule table expecting a handful of pending rows per job and instead find dozens, sometimes hundreds, all pending, all for the same job_code. Real cron work gets delayed or starves entirely behind the pile. Here is why Magento's cron generator keeps stacking duplicates and a small script that finds the surplus and prunes it safely, keeping the one job that still needs to run.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Direct database access</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento's cron generator, <code>Cron\Model\ObserverManager</code> via <code>ProcessCronQueueObserver::_generate()</code>, builds its list of "already scheduled" timestamps by querying <code>cron_schedule</code> for rows in <code>pending</code> status only, and it runs this check on every <code>cron:run</code> pass, by default every minute. Rows stuck in <code>running</code> status are invisible to that check. If a job's previous run is still executing past its slot, whether it is genuinely long running, stuck, or crashed without ever flipping to <code>success</code> or <code>error</code>, the generator does not see it as scheduled and inserts a fresh pending row for the same <code>job_code</code>, over and over. Run a small Python or Node.js script that queries <code>cron_schedule</code> directly, groups pending rows by <code>job_code</code>, and reports or prunes the surplus while always keeping the single earliest pending row per job so it still fires. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every time cron runs, Magento's generator asks one question before it inserts new rows: which job codes already have a pending row scheduled at a given time? If the answer is yes, it skips inserting a duplicate. If the answer is no, it inserts one. That check only looks at <code>status = 'pending'</code>.</p>
+  <p>A job that is currently executing sits in <code>running</code> status, not <code>pending</code>. So the moment a job's run takes longer than its own schedule slot, or its process crashes and never writes back <code>success</code> or <code>error</code>, the generator stops seeing it as already scheduled. On the very next pass, and every pass after that, it inserts another pending row for the same <code>job_code</code>. Combined with <code>schedule_ahead_for</code> pre-populating several minutes of future rows on every pass, the pending backlog for that one job code can grow far faster than anything is consuming it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A job run gets stuck in running status. On every cron:run pass the generator checks only pending rows, does not see the stuck running row, and inserts another pending row for the same job code, so duplicates pile up.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a8078"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Job run stalls</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">status stays running</text>
+      <line x1="163" y1="103" x2="203" y2="103" stroke="#8a8078" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="206" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="286" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Generator checks</text>
+      <text x="286" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">pending rows only</text>
+      <line x1="369" y1="103" x2="438" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="403" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="403" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">running row invisible</text>
+      <rect x="441" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="521" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">New pending row</text>
+      <text x="521" y="112" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">inserted every minute</text>
+      <rect x="626" y="70" width="124" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="688" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Duplicates</text>
+      <text x="688" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">pile up</text>
+      <line x1="604" y1="103" x2="623" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="403" y="175" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">history_cleanup_every only prunes success, error, and missed rows, never pending ones.</text>
+    </svg>
+    <figcaption>Once a job run gets stuck in running status, the generator keeps treating the job as unscheduled and keeps inserting more pending rows for it.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a documented property of how the cron generator decides what to insert, not a one-off glitch. A few concrete ways it shows up on real stores:</p>
+  <ul>
+    <li>A long-running job, like a large export or an indexer-adjacent task, genuinely takes longer than its own <code>schedule_generate_every</code> interval, so a later pass never sees it as pending.</li>
+    <li>A cron process gets killed by a deploy, an out-of-memory event, or a server restart mid-run, leaving the row stuck in <code>running</code> forever since nothing ever writes back <code>success</code> or <code>error</code>.</li>
+    <li>A server slowdown makes several ordinary jobs run past their slot at once, and each one starts accumulating its own pile of duplicate pending rows in parallel.</li>
+    <li><code>schedule_ahead_for</code> pre-populates several minutes of future pending rows on every pass, so once duplication starts it compounds quickly instead of adding just one extra row at a time.</li>
+  </ul>
+  <p>None of this throws an error a merchant would notice directly. The symptom is indirect: real cron jobs run late or stop running at all, because the queue is dominated by rows for one stuck job_code. See the citations at the end for the exact threads that describe this behavior.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no <code>webapi.xml</code> route for <code>cron_schedule</code> in <code>module-cron</code>, unlike products or orders it is a plain internal table, not a REST-modeled entity. So detection and repair both have to go straight at the database. And because <code>schedule_lifetime</code> and <code>history_cleanup_every</code> only prune old <code>success</code>, <code>error</code>, and <code>missed</code> rows, they will never retroactively clean an already bloated pending backlog. The corrective action here has to be a guarded manual prune, not a config change.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the cron generator or try to make Magento run a reindex-style command. We query <code>cron_schedule</code> for pending rows, group them by <code>job_code</code>, find the true duplicates that share the same <code>scheduled_at</code>, and separately find job codes whose pending backlog has grown past a sane threshold. A pure function decides exactly which schedule_id values to prune, always keeping the single soonest pending row per job. Only when an operator explicitly opts out of dry run does the script execute the delete.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A script reads pending rows from cron_schedule, groups them by job code, and the pure function decides which rows are true duplicates or excess backlog to prune, keeping the earliest pending row per job, then either reports the plan in dry run or deletes the surplus rows.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read pending rows</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">from cron_schedule</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Group by job_code</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">and scheduled_at</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="150" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="345" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Decide prune set</text>
+      <text x="345" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">pure function</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="555,106 662,138 555,170 448,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="555" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">DRY_RUN</text>
+      <text x="555" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">is false?</text>
+      <text x="665" y="118" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="695" y2="118" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="60" width="132" height="50" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="80" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">DELETE surplus</text>
+      <text x="684" y="96" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">keeps earliest row</text>
+      <text x="665" y="200" font-family="sans-serif" font-size="10.5" fill="#b9791a" font-weight="700">no</text>
+      <line x1="662" y1="138" x2="695" y2="185" stroke="#b9791a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="188" width="132" height="50" rx="10" fill="#fbf3e3" stroke="#b9791a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#b9791a">Report only</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">prints schedule_ids</text>
+    </svg>
+    <figcaption>The script only ever deletes the surplus pending rows it has decided are duplicates or excess backlog, and it always leaves the earliest pending row per job_code in place.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Connect to the database, not the REST API</h3>
+      <p><code>cron_schedule</code> has no <code>webapi.xml</code> route, so there is nothing to authenticate over REST for this task. Keep the database connection details in environment variables, never in the file, and use a read-only account for the detection pass if your setup allows it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install mysql-connector-python
+
+export MAGENTO_DB_HOST="127.0.0.1"
+export MAGENTO_DB_NAME="magento"
+export MAGENTO_DB_USER="magento"
+export MAGENTO_DB_PASSWORD="change-me"
+export MAX_PENDING_PER_JOB="20"
+export DRY_RUN="true"   # start safe, change to false to actually delete rows</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install mysql2
+
+export MAGENTO_DB_HOST="127.0.0.1"
+export MAGENTO_DB_NAME="magento"
+export MAGENTO_DB_USER="magento"
+export MAGENTO_DB_PASSWORD="change-me"
+export MAX_PENDING_PER_JOB="20"
+export DRY_RUN="true"   // start safe, change to false to actually delete rows</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Read the pending rows</h3>
+      <p>Select every column the decision function needs: <code>schedule_id</code>, <code>job_code</code>, <code>status</code>, <code>scheduled_at</code>, <code>created_at</code>. We only pull rows already in <code>pending</code> status, the same status the cron generator itself checks, since those are the only rows we ever consider pruning.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os
+import mysql.connector
+
+def get_connection():
+    return mysql.connector.connect(
+        host=os.environ["MAGENTO_DB_HOST"],
+        database=os.environ["MAGENTO_DB_NAME"],
+        user=os.environ["MAGENTO_DB_USER"],
+        password=os.environ["MAGENTO_DB_PASSWORD"],
+    )
+
+def fetch_pending_rows(conn):
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        "SELECT schedule_id, job_code, status, scheduled_at, created_at "
+        "FROM cron_schedule WHERE status = 'pending'"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return rows</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import mysql from "mysql2/promise";
+
+async function getConnection() {
+  return mysql.createConnection({
+    host: process.env.MAGENTO_DB_HOST,
+    database: process.env.MAGENTO_DB_NAME,
+    user: process.env.MAGENTO_DB_USER,
+    password: process.env.MAGENTO_DB_PASSWORD,
+  });
+}
+
+async function fetchPendingRows(conn) {
+  const [rows] = await conn.execute(
+    "SELECT schedule_id, job_code, status, scheduled_at, created_at " +
+    "FROM cron_schedule WHERE status = 'pending'"
+  );
+  return rows;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>See the backlog before you decide anything</h3>
+      <p>Two queries tell the whole story. The first finds true duplicates, rows that share both <code>job_code</code> and <code>scheduled_at</code>, which should never legitimately happen. The second finds job codes whose overall pending backlog has grown past a sane threshold, regardless of whether any single timestamp repeats.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.sql</div>
+      <pre><code class="language-python">-- True duplicates: same job_code and scheduled_at should never repeat
+SELECT job_code, scheduled_at, COUNT(*) AS cnt
+FROM cron_schedule
+WHERE status = 'pending'
+GROUP BY job_code, scheduled_at
+HAVING cnt > 1
+ORDER BY cnt DESC;
+
+-- Overall backlog per job, flag anything past your threshold
+SELECT job_code, COUNT(*) AS pending_count,
+       MIN(created_at) AS oldest, MAX(created_at) AS newest
+FROM cron_schedule
+WHERE status = 'pending'
+GROUP BY job_code
+HAVING pending_count > 20
+ORDER BY pending_count DESC;</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.sql</div>
+      <pre><code class="language-javascript">-- True duplicates: same job_code and scheduled_at should never repeat
+SELECT job_code, scheduled_at, COUNT(*) AS cnt
+FROM cron_schedule
+WHERE status = 'pending'
+GROUP BY job_code, scheduled_at
+HAVING cnt > 1
+ORDER BY cnt DESC;
+
+-- Overall backlog per job, flag anything past your threshold
+SELECT job_code, COUNT(*) AS pending_count,
+       MIN(created_at) AS oldest, MAX(created_at) AS newest
+FROM cron_schedule
+WHERE status = 'pending'
+GROUP BY job_code
+HAVING pending_count > 20
+ORDER BY pending_count DESC;</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes only the rows already fetched and a threshold, and returns which schedule_id values to prune per job_code. It groups by <code>job_code</code>, then within a job_code groups by identical <code>scheduled_at</code> and keeps only the lowest <code>schedule_id</code>, the earliest created one, per timestamp. On the deduplicated remainder, if the count still exceeds the threshold, it marks the oldest excess rows for pruning by <code>created_at</code>, always keeping at least the single soonest-scheduled pending row per job_code. No database or network calls happen inside it, which is what makes it easy to test.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_pending_schedules_to_prune(rows, max_pending_per_job):
+    by_job = {}
+    for row in rows:
+        by_job.setdefault(row["job_code"], []).append(row)
+
+    results = []
+    for job_code, job_rows in by_job.items():
+        by_time = {}
+        for row in job_rows:
+            by_time.setdefault(row["scheduled_at"], []).append(row)
+
+        deduped = []
+        prune_ids = []
+        for scheduled_at, group in by_time.items():
+            group_sorted = sorted(group, key=lambda r: r["schedule_id"])
+            keeper = group_sorted[0]
+            deduped.append(keeper)
+            prune_ids.extend(r["schedule_id"] for r in group_sorted[1:])
+
+        deduped.sort(key=lambda r: (r["created_at"], r["schedule_id"]))
+        keep_ids = [r["schedule_id"] for r in deduped]
+
+        # Never prune the last remaining pending row for a job_code, even if
+        # max_pending_per_job is 0: the job still needs to fire at least once.
+        effective_max = max(max_pending_per_job, 1)
+        if len(deduped) > effective_max:
+            excess = deduped[: len(deduped) - effective_max]
+            prune_ids.extend(r["schedule_id"] for r in excess)
+            keep_ids = [r["schedule_id"] for r in deduped[len(deduped) - effective_max:]]
+
+        results.append({
+            "job_code": job_code,
+            "prune_ids": sorted(prune_ids),
+            "keep_ids": sorted(keep_ids),
+        })
+    return results</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decidePendingSchedulesToPrune(rows, maxPendingPerJob) {
+  const byJob = new Map();
+  for (const row of rows) {
+    if (!byJob.has(row.job_code)) byJob.set(row.job_code, []);
+    byJob.get(row.job_code).push(row);
+  }
+
+  const results = [];
+  for (const [jobCode, jobRows] of byJob) {
+    const byTime = new Map();
+    for (const row of jobRows) {
+      if (!byTime.has(row.scheduled_at)) byTime.set(row.scheduled_at, []);
+      byTime.get(row.scheduled_at).push(row);
+    }
+
+    let deduped = [];
+    let pruneIds = [];
+    for (const group of byTime.values()) {
+      const sorted = [...group].sort((a, b) => a.schedule_id - b.schedule_id);
+      deduped.push(sorted[0]);
+      pruneIds.push(...sorted.slice(1).map((r) => r.schedule_id));
+    }
+
+    deduped.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.schedule_id - b.schedule_id);
+    let keepIds = deduped.map((r) => r.schedule_id);
+
+    // Never prune the last remaining pending row for a job_code, even if
+    // maxPendingPerJob is 0: the job still needs to fire at least once.
+    const effectiveMax = Math.max(maxPendingPerJob, 1);
+    if (deduped.length > effectiveMax) {
+      const excess = deduped.slice(0, deduped.length - effectiveMax);
+      pruneIds.push(...excess.map((r) => r.schedule_id));
+      keepIds = deduped.slice(deduped.length - effectiveMax).map((r) => r.schedule_id);
+    }
+
+    results.push({
+      job_code: jobCode,
+      prune_ids: pruneIds.sort((a, b) => a - b),
+      keep_ids: keepIds.sort((a, b) => a - b),
+    });
+  }
+  return results;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Prune the surplus, DRY_RUN guarded</h3>
+      <p>For each flagged job_code, build a single <code>DELETE ... WHERE schedule_id IN (...)</code> statement from the pruned ids. When <code>DRY_RUN</code> is true, the default, the script only logs the ids it would delete. It only executes the delete when an operator explicitly sets <code>DRY_RUN=false</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">prune.py</div>
+      <pre><code class="language-python">def prune_schedules(conn, schedule_ids):
+    if not schedule_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(schedule_ids))
+    cur = conn.cursor()
+    cur.execute(
+        f"DELETE FROM cron_schedule WHERE schedule_id IN ({placeholders})",
+        schedule_ids,
+    )
+    conn.commit()
+    deleted = cur.rowcount
+    cur.close()
+    return deleted</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">prune.js</div>
+      <pre><code class="language-javascript">async function pruneSchedules(conn, scheduleIds) {
+  if (scheduleIds.length === 0) return 0;
+  const placeholders = scheduleIds.map(() => "?").join(",");
+  const [result] = await conn.execute(
+    `DELETE FROM cron_schedule WHERE schedule_id IN (${placeholders})`,
+    scheduleIds
+  );
+  return result.affectedRows;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop connects once, fetches all pending rows, runs the pure decision function per job_code, and reports. Notice the dry run guard. Leave <code>DRY_RUN</code> on so the script only prints the schedule_id values it would delete. When you turn it off, it deletes exactly those ids and nothing else, always leaving the earliest pending row per job_code in place.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script only ever deletes rows already in <code>pending</code> status that the pure function selected for pruning. It never touches <code>running</code>, <code>success</code>, or <code>error</code> rows, and it always leaves at least the single soonest pending row per job_code so the job still runs. Always start with <code>DRY_RUN=true</code> and read the printed plan before switching it off.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only deletes the exact surplus pending rows the pure function selected.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/cron-schedule-duplicate-pending-jobs" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">prune_cron_schedule.py</div>
+      <pre><code class="language-python">"""Find and prune duplicate pending jobs in Magento 2 or Adobe Commerce cron_schedule.
+
+Magento's cron generator, ProcessCronQueueObserver::_generate(), only checks
+rows already in pending status when it decides what is already scheduled. It
+ignores rows stuck in running status. If a job's previous run is still
+executing, whether long running, stuck, or crashed without flipping to
+success or error, the generator keeps inserting a fresh pending row for the
+same job_code on every cron:run pass. cron_schedule has no webapi.xml route,
+so this script queries and prunes the table directly. It only ever deletes
+surplus pending rows, always keeping the single earliest pending row per
+job_code so the job still fires. Safe to run again and again.
+"""
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("prune_cron_schedule")
+
+DB_HOST = os.environ.get("MAGENTO_DB_HOST", "127.0.0.1")
+DB_NAME = os.environ.get("MAGENTO_DB_NAME", "magento")
+DB_USER = os.environ.get("MAGENTO_DB_USER", "magento")
+DB_PASSWORD = os.environ.get("MAGENTO_DB_PASSWORD", "")
+MAX_PENDING_PER_JOB = int(os.environ.get("MAX_PENDING_PER_JOB", "20"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def decide_pending_schedules_to_prune(rows, max_pending_per_job):
+    by_job = {}
+    for row in rows:
+        by_job.setdefault(row["job_code"], []).append(row)
+
+    results = []
+    for job_code, job_rows in by_job.items():
+        by_time = {}
+        for row in job_rows:
+            by_time.setdefault(row["scheduled_at"], []).append(row)
+
+        deduped = []
+        prune_ids = []
+        for scheduled_at, group in by_time.items():
+            group_sorted = sorted(group, key=lambda r: r["schedule_id"])
+            keeper = group_sorted[0]
+            deduped.append(keeper)
+            prune_ids.extend(r["schedule_id"] for r in group_sorted[1:])
+
+        deduped.sort(key=lambda r: (r["created_at"], r["schedule_id"]))
+        keep_ids = [r["schedule_id"] for r in deduped]
+
+        # Never prune the last remaining pending row for a job_code, even if
+        # max_pending_per_job is 0: the job still needs to fire at least once.
+        effective_max = max(max_pending_per_job, 1)
+        if len(deduped) > effective_max:
+            excess = deduped[: len(deduped) - effective_max]
+            prune_ids.extend(r["schedule_id"] for r in excess)
+            keep_ids = [r["schedule_id"] for r in deduped[len(deduped) - effective_max:]]
+
+        results.append({
+            "job_code": job_code,
+            "prune_ids": sorted(prune_ids),
+            "keep_ids": sorted(keep_ids),
+        })
+    return results
+
+
+def get_connection():
+    import mysql.connector
+    return mysql.connector.connect(
+        host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD
+    )
+
+
+def fetch_pending_rows(conn):
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        "SELECT schedule_id, job_code, status, scheduled_at, created_at "
+        "FROM cron_schedule WHERE status = 'pending'"
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def prune_schedules(conn, schedule_ids):
+    if not schedule_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(schedule_ids))
+    cur = conn.cursor()
+    cur.execute(
+        f"DELETE FROM cron_schedule WHERE schedule_id IN ({placeholders})",
+        schedule_ids,
+    )
+    conn.commit()
+    deleted = cur.rowcount
+    cur.close()
+    return deleted
+
+
+def run():
+    conn = get_connection()
+    try:
+        rows = fetch_pending_rows(conn)
+        plans = decide_pending_schedules_to_prune(rows, MAX_PENDING_PER_JOB)
+        total_pruned = 0
+        for plan in plans:
+            if not plan["prune_ids"]:
+                continue
+            log.info(
+                "job_code=%s would prune %d row(s): %s",
+                plan["job_code"], len(plan["prune_ids"]), plan["prune_ids"],
+            )
+            if not DRY_RUN:
+                deleted = prune_schedules(conn, plan["prune_ids"])
+                total_pruned += deleted
+                log.info("job_code=%s pruned %d row(s)", plan["job_code"], deleted)
+            else:
+                total_pruned += len(plan["prune_ids"])
+        log.info(
+            "Done. %d row(s) %s.", total_pruned,
+            "would be pruned (dry run)" if DRY_RUN else "pruned",
+        )
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">prune-cron-schedule.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and prune duplicate pending jobs in Magento 2 or Adobe Commerce cron_schedule.
+ *
+ * Magento's cron generator, ProcessCronQueueObserver::_generate(), only checks
+ * rows already in pending status when it decides what is already scheduled. It
+ * ignores rows stuck in running status. If a job's previous run is still
+ * executing, whether long running, stuck, or crashed without flipping to
+ * success or error, the generator keeps inserting a fresh pending row for the
+ * same job_code on every cron:run pass. cron_schedule has no webapi.xml route,
+ * so this script queries and prunes the table directly. It only ever deletes
+ * surplus pending rows, always keeping the single earliest pending row per
+ * job_code so the job still fires. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/cron-schedule-duplicate-pending-jobs/
+ */
+import { pathToFileURL } from "node:url";
+
+const DB_HOST = process.env.MAGENTO_DB_HOST || "127.0.0.1";
+const DB_NAME = process.env.MAGENTO_DB_NAME || "magento";
+const DB_USER = process.env.MAGENTO_DB_USER || "magento";
+const DB_PASSWORD = process.env.MAGENTO_DB_PASSWORD || "";
+const MAX_PENDING_PER_JOB = Number(process.env.MAX_PENDING_PER_JOB || 20);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decidePendingSchedulesToPrune(rows, maxPendingPerJob) {
+  const byJob = new Map();
+  for (const row of rows) {
+    if (!byJob.has(row.job_code)) byJob.set(row.job_code, []);
+    byJob.get(row.job_code).push(row);
+  }
+
+  const results = [];
+  for (const [jobCode, jobRows] of byJob) {
+    const byTime = new Map();
+    for (const row of jobRows) {
+      if (!byTime.has(row.scheduled_at)) byTime.set(row.scheduled_at, []);
+      byTime.get(row.scheduled_at).push(row);
+    }
+
+    let deduped = [];
+    let pruneIds = [];
+    for (const group of byTime.values()) {
+      const sorted = [...group].sort((a, b) => a.schedule_id - b.schedule_id);
+      deduped.push(sorted[0]);
+      pruneIds.push(...sorted.slice(1).map((r) => r.schedule_id));
+    }
+
+    deduped.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.schedule_id - b.schedule_id);
+    let keepIds = deduped.map((r) => r.schedule_id);
+
+    // Never prune the last remaining pending row for a job_code, even if
+    // maxPendingPerJob is 0: the job still needs to fire at least once.
+    const effectiveMax = Math.max(maxPendingPerJob, 1);
+    if (deduped.length > effectiveMax) {
+      const excess = deduped.slice(0, deduped.length - effectiveMax);
+      pruneIds.push(...excess.map((r) => r.schedule_id));
+      keepIds = deduped.slice(deduped.length - effectiveMax).map((r) => r.schedule_id);
+    }
+
+    results.push({
+      job_code: jobCode,
+      prune_ids: pruneIds.sort((a, b) => a - b),
+      keep_ids: keepIds.sort((a, b) => a - b),
+    });
+  }
+  return results;
+}
+
+async function getConnection() {
+  const mysql = await import("mysql2/promise");
+  return mysql.default.createConnection({
+    host: DB_HOST, database: DB_NAME, user: DB_USER, password: DB_PASSWORD,
+  });
+}
+
+async function fetchPendingRows(conn) {
+  const [rows] = await conn.execute(
+    "SELECT schedule_id, job_code, status, scheduled_at, created_at " +
+    "FROM cron_schedule WHERE status = 'pending'"
+  );
+  return rows;
+}
+
+async function pruneSchedules(conn, scheduleIds) {
+  if (scheduleIds.length === 0) return 0;
+  const placeholders = scheduleIds.map(() => "?").join(",");
+  const [result] = await conn.execute(
+    `DELETE FROM cron_schedule WHERE schedule_id IN (${placeholders})`,
+    scheduleIds
+  );
+  return result.affectedRows;
+}
+
+export async function run() {
+  const conn = await getConnection();
+  try {
+    const rows = await fetchPendingRows(conn);
+    const plans = decidePendingSchedulesToPrune(rows, MAX_PENDING_PER_JOB);
+    let totalPruned = 0;
+    for (const plan of plans) {
+      if (plan.prune_ids.length === 0) continue;
+      console.log(`job_code=${plan.job_code} would prune ${plan.prune_ids.length} row(s): ${plan.prune_ids}`);
+      if (!DRY_RUN) {
+        const deleted = await pruneSchedules(conn, plan.prune_ids);
+        totalPruned += deleted;
+        console.log(`job_code=${plan.job_code} pruned ${deleted} row(s)`);
+      } else {
+        totalPruned += plan.prune_ids.length;
+      }
+    }
+    console.log(`Done. ${totalPruned} row(s) ${DRY_RUN ? "would be pruned (dry run)" : "pruned"}.`);
+  } finally {
+    await conn.end();
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which rows get deleted out of a live table. Since <code>decide_pending_schedules_to_prune</code> and <code>decidePendingSchedulesToPrune</code> are pure, the tests need no network and no Magento database. They just feed in plain row objects and check which schedule_id values come back marked for pruning.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_cron_schedule_prune.py</div>
+      <pre><code class="language-python">from prune_cron_schedule import decide_pending_schedules_to_prune
+
+
+def row(schedule_id, job_code, scheduled_at, created_at):
+    return {
+        "schedule_id": schedule_id,
+        "job_code": job_code,
+        "status": "pending",
+        "scheduled_at": scheduled_at,
+        "created_at": created_at,
+    }
+
+
+def test_keeps_earliest_of_true_duplicates():
+    rows = [
+        row(1, "sales_grid_sync", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+        row(2, "sales_grid_sync", "2026-07-10 10:00:00", "2026-07-10 09:59:30"),
+        row(3, "sales_grid_sync", "2026-07-10 10:00:00", "2026-07-10 10:00:10"),
+    ]
+    result = decide_pending_schedules_to_prune(rows, max_pending_per_job=20)
+    plan = result[0]
+    assert plan["job_code"] == "sales_grid_sync"
+    assert plan["prune_ids"] == [2, 3]
+    assert plan["keep_ids"] == [1]
+
+
+def test_no_duplicates_no_prune():
+    rows = [
+        row(1, "indexer_update_all_views", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+        row(2, "indexer_update_all_views", "2026-07-10 10:01:00", "2026-07-10 10:00:00"),
+    ]
+    result = decide_pending_schedules_to_prune(rows, max_pending_per_job=20)
+    plan = result[0]
+    assert plan["prune_ids"] == []
+    assert plan["keep_ids"] == [1, 2]
+
+
+def test_excess_backlog_beyond_threshold_prunes_oldest_first():
+    rows = [row(i, "stuck_job", f"2026-07-10 10:{i:02d}:00", f"2026-07-10 09:{i:02d}:00") for i in range(1, 6)]
+    result = decide_pending_schedules_to_prune(rows, max_pending_per_job=2)
+    plan = result[0]
+    assert plan["prune_ids"] == [1, 2, 3]
+    assert plan["keep_ids"] == [4, 5]
+
+
+def test_always_keeps_at_least_one_row_per_job():
+    rows = [row(i, "very_stuck_job", f"2026-07-10 10:{i:02d}:00", f"2026-07-10 09:{i:02d}:00") for i in range(1, 4)]
+    result = decide_pending_schedules_to_prune(rows, max_pending_per_job=0)
+    plan = result[0]
+    assert len(plan["keep_ids"]) >= 1
+
+
+def test_separate_job_codes_do_not_interfere():
+    rows = [
+        row(1, "job_a", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+        row(2, "job_a", "2026-07-10 10:00:00", "2026-07-10 09:59:30"),
+        row(3, "job_b", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+    ]
+    result = decide_pending_schedules_to_prune(rows, max_pending_per_job=20)
+    by_job = {plan["job_code"]: plan for plan in result}
+    assert by_job["job_a"]["prune_ids"] == [2]
+    assert by_job["job_b"]["prune_ids"] == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">cron-schedule-prune.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decidePendingSchedulesToPrune } from "./prune-cron-schedule.js";
+
+const row = (scheduleId, jobCode, scheduledAt, createdAt) => ({
+  schedule_id: scheduleId,
+  job_code: jobCode,
+  status: "pending",
+  scheduled_at: scheduledAt,
+  created_at: createdAt,
+});
+
+test("keeps earliest of true duplicates", () =&gt; {
+  const rows = [
+    row(1, "sales_grid_sync", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+    row(2, "sales_grid_sync", "2026-07-10 10:00:00", "2026-07-10 09:59:30"),
+    row(3, "sales_grid_sync", "2026-07-10 10:00:00", "2026-07-10 10:00:10"),
+  ];
+  const [plan] = decidePendingSchedulesToPrune(rows, 20);
+  assert.equal(plan.job_code, "sales_grid_sync");
+  assert.deepEqual(plan.prune_ids, [2, 3]);
+  assert.deepEqual(plan.keep_ids, [1]);
+});
+
+test("no duplicates no prune", () =&gt; {
+  const rows = [
+    row(1, "indexer_update_all_views", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+    row(2, "indexer_update_all_views", "2026-07-10 10:01:00", "2026-07-10 10:00:00"),
+  ];
+  const [plan] = decidePendingSchedulesToPrune(rows, 20);
+  assert.deepEqual(plan.prune_ids, []);
+  assert.deepEqual(plan.keep_ids, [1, 2]);
+});
+
+test("excess backlog beyond threshold prunes oldest first", () =&gt; {
+  const rows = [1, 2, 3, 4, 5].map((i) =&gt;
+    row(i, "stuck_job", `2026-07-10 10:0${i}:00`, `2026-07-10 09:0${i}:00`)
+  );
+  const [plan] = decidePendingSchedulesToPrune(rows, 2);
+  assert.deepEqual(plan.prune_ids, [1, 2, 3]);
+  assert.deepEqual(plan.keep_ids, [4, 5]);
+});
+
+test("always keeps at least one row per job", () =&gt; {
+  const rows = [1, 2, 3].map((i) =&gt;
+    row(i, "very_stuck_job", `2026-07-10 10:0${i}:00`, `2026-07-10 09:0${i}:00`)
+  );
+  const [plan] = decidePendingSchedulesToPrune(rows, 0);
+  assert.ok(plan.keep_ids.length &gt;= 1);
+});
+
+test("separate job codes do not interfere", () =&gt; {
+  const rows = [
+    row(1, "job_a", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+    row(2, "job_a", "2026-07-10 10:00:00", "2026-07-10 09:59:30"),
+    row(3, "job_b", "2026-07-10 10:00:00", "2026-07-10 09:59:00"),
+  ];
+  const byJob = Object.fromEntries(
+    decidePendingSchedulesToPrune(rows, 20).map((p) =&gt; [p.job_code, p])
+  );
+  assert.deepEqual(byJob.job_a.prune_ids, [2]);
+  assert.deepEqual(byJob.job_b.prune_ids, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Crashed deploy</span>
+      <h4>A killed deploy left one job stuck in running forever</h4>
+      <p>A mid-size catalog store restarted its application servers during a deploy while a custom export job was mid-run. The row for that job never flipped to success or error, it just sat in running status. From that moment, every cron pass inserted a fresh pending row for the same job_code, and within a day the table held over 400 pending rows for that one job alone.</p>
+      <p>Running the script in dry run showed the exact backlog, all created after the deploy, all for the same job_code, with the one legitimate pending row highlighted as the row it would keep. The operator pruned the surplus, restarted the stuck process by hand, and the job_code went back to a handful of pending rows on the next pass.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Long-running job</span>
+      <h4>An indexer-adjacent job that outran its own schedule</h4>
+      <p>A store with a large catalog ran a custom cron job that synced product data to a search provider. On busy days the sync took longer than its own <code>schedule_generate_every</code> window, so the generator never saw it as pending and kept queuing more copies of the same job. Unrelated cron groups started running late because the queue was dominated by one job_code.</p>
+      <p>The detection query flagged the job_code immediately, with a pending count far beyond what its configured frequency should ever produce. The team lowered the job's actual frequency, added a lock inside the job itself, and used the script's dry run to clear the existing backlog once so unrelated jobs could catch up.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After running this, cron_schedule stops silently filling up behind a single stuck or slow job. You get a precise, per job_code list of what is a true duplicate versus a legitimate backlog, a dry run you can review before anything is deleted, and a guarantee that the one pending row a job actually needs is never touched. The underlying stuck process or overrun job still deserves a look, but the queue itself stops choking on it.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does cron_schedule keep filling up with duplicate pending rows for the same job?</summary>
+      <p>Magento's cron generator, ProcessCronQueueObserver::_generate(), only looks at rows already in pending status when it decides what is already scheduled. It ignores rows stuck in running status. If a job's previous run is still executing, whether because it is genuinely long running, stuck, or crashed without flipping to success or error, the generator does not see it as scheduled and inserts a fresh pending row for the same job_code on every cron:run pass, which by default happens every minute.</p>
+    </details>
+    <details>
+      <summary>Can I clean up cron_schedule through the Magento REST API?</summary>
+      <p>No. Magento's module-cron does not ship a webapi.xml route for cron_schedule, so it is not reachable over REST like products or orders are. Detection and repair both have to query and modify the table directly. schedule_lifetime and history_cleanup_every only prune old success, error, and missed rows, they do not touch an already bloated pending backlog.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete rows from cron_schedule?</summary>
+      <p>Yes, when you delete only surplus pending rows and always keep the single earliest scheduled pending row per job_code untouched, so the job still fires once. Never delete running, success, or error rows as part of this cleanup, and run in dry run first so you can see exactly which schedule_id values would be removed before anything is deleted.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento and Adobe Commerce field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Many duplicate pending cron jobs in cron_schedule table (Magento Community Forum). <a href="https://community.magento.com/t5/Magento-2-x-Technical-Issues/Many-duplicate-pending-cron-jobs-in-cron-schedule-table/td-p/454278" rel="noopener">community.magento.com many-duplicate-pending-cron-jobs</a></li>
+      <li>Cron may double schedule jobs in edge case, magento/magento2 issue 10279. <a href="https://github.com/magento/magento2/issues/10279" rel="noopener">github.com/magento/magento2/issues/10279</a></li>
+      <li>cron_schedule forever increasing in size, lots of pending jobs never cleared, magento/magento2 issue 11002. <a href="https://github.com/magento/magento2/issues/11002" rel="noopener">github.com/magento/magento2/issues/11002</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Configure and run cron jobs, Adobe Commerce Operations. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/configure-cron-jobs" rel="noopener">experienceleague.adobe.com configure-cron-jobs</a></li>
+      <li>Custom cron job and cron group reference, Adobe Commerce Operations. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron-reference" rel="noopener">experienceleague.adobe.com custom-cron-reference</a></li>
+      <li>Cron (scheduled tasks), Adobe Commerce Admin. <a href="https://experienceleague.adobe.com/docs/commerce-admin/systems/tools/cron.html" rel="noopener">experienceleague.adobe.com commerce-admin cron</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento indexing, cron, MSI stock, or order grid that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear your cron backlog?</h3>
+    <p>If this saved you a confusing morning of late cron jobs, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

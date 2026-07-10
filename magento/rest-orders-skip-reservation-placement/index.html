@@ -1,0 +1,1193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REST Created Orders Skip Reservation Placement in Magento 2</title>
+<meta name="description" content="Orders injected through POST /V1/orders never fire the checkout event that writes an inventory_reservation row, so MSI salable quantity stays wrong. Learn why it happens and build a Python or Node.js script that flags the affected order lines.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/rest-orders-skip-reservation-placement/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="REST Created Orders Skip Reservation Placement in Magento 2">
+<meta property="og:description" content="Why orders created through POST /V1/orders never write an inventory_reservation row, and a safe Python or Node.js script that flags the affected order lines and reports the missing reservation amount.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/rest-orders-skip-reservation-placement/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/rest-orders-skip-reservation-placement/#article","headline":"REST Created Orders Skip Reservation Placement in Magento 2","description":"Why orders created through POST /V1/orders never fire the checkout event that writes an inventory_reservation row, and a safe Python or Node.js script that flags the affected order lines and reports the missing reservation amount.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/rest-orders-skip-reservation-placement/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory (MSI)","keywords":"Magento 2 MSI reservation, POST /V1/orders, inventory_reservations_placement, PlaceReservationsForSalesEventInterface, get-product-salable-quantity, Adobe Commerce REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"REST created orders skip reservation placement","item":"https://www.allanninal.dev/magento/rest-orders-skip-reservation-placement/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does an order created through POST /V1/orders not reduce salable quantity?","acceptedAnswer":{"@type":"Answer","text":"MSI reduces salable quantity by writing a negative inventory_reservation row, and that row is only created by a plugin hooked to the sales_order_place_after event fired by the normal quote to order checkout pipeline. An order built and saved directly through POST /V1/orders never runs that pipeline, so the reservation plugin never executes, the order gets real order_items rows and a decremented product quantity, but zero matching inventory_reservation rows."}},{"@type":"Question","name":"Is there a REST endpoint to create the missing reservation?","acceptedAnswer":{"@type":"Answer","text":"No. Reservations are append only and Magento deliberately does not expose a setter or creation web API for InventoryReservationsApi, to prevent exactly this kind of external manipulation. A script can detect and report the affected order lines over REST, but writing the reservation row itself is CLI and cron territory, not REST."}},{"@type":"Question","name":"What is the safe way to stop this from happening to new orders?","acceptedAnswer":{"@type":"Answer","text":"Switch the integration that injects orders to go through the same checkout flow a storefront order uses, such as cart and payment-information, so the sales_order_place_after event fires normally. For orders already created without a reservation, the report should flag them so an operator can run the appropriate reindex or reservation tooling, and only as a stopgap, with a confirmed operator decision, adjust the legacy stock_item quantity directly through PUT /rest/V1/products/{sku}."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Inventory (MSI)</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Inventory (MSI)</p>
+    <h1>REST created orders skip reservation placement</h1>
+    <p class="lead">An ERP or marketplace connector posts historical or external orders straight to <code>POST /V1/orders</code>, and every one of them looks fine. Real order items, a decremented product quantity, a normal looking order in the grid. But MSI's salable quantity never moves, because the only thing that reduces it, a row in <code>inventory_reservation</code>, is only ever written by a plugin that hooks the checkout flow those orders never touch. Here is why that gap opens and a small script that finds exactly which order lines were never reserved.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Adobe Commerce REST API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>MSI reduces salable quantity only by writing an append only, negative row to the <code>inventory_reservation</code> table, and that row is created by a plugin around <code>PlaceReservationsForSalesEventInterface</code> hooked to the <code>sales_order_place_after</code> event, which fires from the normal quote to order checkout pipeline, <code>OrderManagementInterface::place</code>. An order built and persisted directly through <code>POST /V1/orders</code>, the way ERPs and marketplaces inject historical or external orders, never runs that pipeline, so the reservation plugin never executes for those items. You end up with real <code>order_items</code> rows and a decremented product quantity, but zero matching reservation rows, so salable quantity still reports the item as sellable when it is not. Run a small Python or Node.js script that lists recent orders over REST, sums each order's per SKU quantity ordered, and cross checks it against source item quantity minus the currently reported salable quantity for that SKU. Where the two do not reconcile, the order's reservation was skipped. The script only reports, since there is no REST endpoint to create a reservation. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Magento's Multi Source Inventory never blocks stock the moment an order row is saved. It blocks stock by adding a small append only entry to <code>inventory_reservation</code>, a negative quantity tied to the SKU and stock, and salable quantity is always calculated on the fly as source item quantity minus the sum of every reservation ever written. That entry only gets written by one place, a plugin wired around <code>PlaceReservationsForSalesEventInterface</code> that listens for the <code>sales_order_place_after</code> event.</p>
+  <p>That event only fires when an order goes through the normal checkout path, cart to quote to order, ending in <code>OrderManagementInterface::place</code>. When an ERP, a marketplace connector, or a migration script instead calls <code>POST /V1/orders</code> to inject an order directly, entity_id, items, totals, and all, it skips that pipeline entirely. The order row and its <code>order_items</code> rows get written straight to the database. The legacy <code>stock_item</code> quantity even gets decremented, because that part is older code with no dependency on the checkout event. But the reservation plugin was never in the call stack, so it never runs, and no row lands in <code>inventory_reservation</code> for that order. The result looks completely normal in the order grid and completely wrong in salable quantity math.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. An order created through POST /V1/orders never routes through the quote to order checkout pipeline, so the sales_order_place_after event never fires, the reservation plugin never runs, and no inventory_reservation row is written, leaving salable quantity wrong.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a8078"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">POST /V1/orders</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">ERP injects order</text>
+      <line x1="163" y1="103" x2="203" y2="103" stroke="#8a8078" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="206" y="70" width="150" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="281" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Order saved directly</text>
+      <text x="281" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">order_items written</text>
+      <line x1="359" y1="103" x2="428" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="393" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="393" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">sales_order_place_after never fires</text>
+      <rect x="431" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="511" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Reservation plugin</text>
+      <text x="511" y="110" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">never runs for</text>
+      <text x="511" y="125" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">these order items</text>
+      <rect x="616" y="70" width="134" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="683" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Salable qty wrong</text>
+      <text x="683" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">item still shows sellable</text>
+      <line x1="594" y1="103" x2="613" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="393" y="175" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">Zero rows land in inventory_reservation for this order's items, even though the product quantity was decremented.</text>
+    </svg>
+    <figcaption>The order is real, the items are real, but the checkout event that writes the reservation row never fires for orders created directly through the REST order endpoint.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>None of this is a bug in the subtraction that computes salable quantity. The gap comes from a legitimate REST endpoint being used for a job it was never wired to also do, keep the reservation ledger current. A few concrete ways it shows up on real stores:</p>
+  <ul>
+    <li>An ERP or order management system pushes historical or external orders into Magento through <code>POST /V1/orders</code> so reporting and fulfillment can see them in one place, but that endpoint constructs and persists an <code>Order</code> entity without routing through the quote to order placement pipeline.</li>
+    <li>A marketplace connector, syncing orders placed on a channel outside Magento's own checkout, uses the same endpoint for the same reason, since there is no other documented REST resource meant for creating a finished order.</li>
+    <li>A migration or backfill script recreates old orders from another system, and the legacy <code>stock_item</code> quantity gets decremented as part of that create call, because that code path has no dependency on the checkout event, while <code>inventory_reservation</code> gets nothing.</li>
+    <li>This exact gap is documented in Magento's own GitHub tracker as the REST API <code>rest/all/V1/orders/create</code> not triggering the <code>inventory_reservations_placement</code> plugin, so it is a known limitation of the endpoint rather than a one off misconfiguration.</li>
+  </ul>
+  <p>None of this throws an error anyone would notice at order creation time. The order grid, the invoice, the shipment, all look completely normal. The only place the gap shows is in <code>InventorySalesApi</code>'s salable quantity calculation, source items total minus reservations, which reports quantity as still salable because the reservation that should have removed it from the pool never got written. See the citations at the end for the exact tracker issues and wiki page that describe this.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no public REST list endpoint for raw <code>inventory_reservation</code> rows, it is a low level database table, not an exposed API resource. So this has to be detected indirectly, by comparing what salable quantity should be against what it actually reports. For each SKU on a recent order, sum the source item quantity, read the current salable quantity, and compare that gap against the total quantity ordered across every open order referencing that SKU. If the gap does not reconcile, the missing amount is exactly the reservation that never got written.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never attempt to write a reservation row from this script, because there is no REST resource for it. Instead, for each SKU we pull the real source item quantity, the currently reported salable quantity, and the quantity ordered across every open order that references the SKU. We derive how much reservation impact should exist, compare it against what actually happened, source minus salable, and attribute any shortfall back to the earliest under reserved order lines for that SKU.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A script lists open orders, sums qty ordered per SKU, fetches source item quantity and reported salable quantity per SKU, and if actual reserved quantity is less than expected reserved quantity it flags the affected order and SKU with the missing reservation amount, otherwise it does nothing.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">List open orders</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">GET /V1/orders</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b1a10">Sum qty_ordered</text>
+      <text x="117" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">per SKU across open orders</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="150" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="345" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b1a10">source qty minus</text>
+      <text x="345" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">salable qty per SKU</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="555,106 662,138 555,170 448,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="555" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Actual under</text>
+      <text x="555" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">expected?</text>
+      <text x="665" y="118" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="695" y2="118" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="606" y="55" width="144" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="678" y="76" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Flag order + SKU</text>
+      <text x="678" y="92" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">missing reservation qty</text>
+      <text x="665" y="200" font-family="sans-serif" font-size="10.5" fill="#8a8078" font-weight="700">no</text>
+      <line x1="662" y1="138" x2="695" y2="185" stroke="#8a8078" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="188" width="132" height="50" rx="10" fill="#f4f1ee" stroke="#c9beb4"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#6b584c">Reconciled</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">nothing written</text>
+    </svg>
+    <figcaption>The script only ever reports. Writing the actual reservation row is CLI and cron territory, and the report tells the operator exactly which order and SKU need attention.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin token</h3>
+      <p>Authenticate against the admin token endpoint with an admin username and password, or use an integration access token if you already have one. Keep the base URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_USERNAME="admin"
+export MAGENTO_ADMIN_PASSWORD="change-me"
+export STOCK_ID="1"
+export ORDER_STATUSES="processing,pending"
+export DRY_RUN="true"   # report only, this script never writes a reservation row</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_USERNAME="admin"
+export MAGENTO_ADMIN_PASSWORD="change-me"
+export STOCK_ID="1"
+export ORDER_STATUSES="processing,pending"
+export DRY_RUN="true"   // report only, this script never writes a reservation row</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List recent open orders and their items</h3>
+      <p>POST to <code>/rest/V1/integration/admin/token</code> for a bearer token, then GET <code>/rest/V1/orders</code> with <code>searchCriteria</code> filters on <code>created_at</code>, condition type <code>gteq</code>, and <code>status</code>, paged with <code>searchCriteria[pageSize]</code> and <code>searchCriteria[currentPage]</code>. For each order read <code>entity_id</code>, <code>increment_id</code>, and the <code>items[]</code> array, keeping <code>sku</code>, <code>qty_ordered</code>, and <code>item_id</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+
+def get_token(username, password):
+    r = requests.post(
+        f"{MAGENTO_URL}/rest/V1/integration/admin/token",
+        json={"username": username, "password": password},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_open_orders(token, since_iso, statuses, page_size=100):
+    orders = []
+    page = 1
+    while True:
+        params = {
+            "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+            "searchCriteria[filterGroups][0][filters][0][value]": since_iso,
+            "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+            "searchCriteria[pageSize]": page_size,
+            "searchCriteria[currentPage]": page,
+        }
+        for i, status in enumerate(statuses):
+            params[f"searchCriteria[filterGroups][1][filters][{i}][field]"] = "status"
+            params[f"searchCriteria[filterGroups][1][filters][{i}][value]"] = status
+            params[f"searchCriteria[filterGroups][1][filters][{i}][conditionType]"] = "eq"
+        r = requests.get(
+            f"{MAGENTO_URL}/rest/V1/orders",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        items = body.get("items", [])
+        orders.extend(items)
+        if len(items) &lt; page_size:
+            return orders
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+
+async function getToken(username, password) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/integration/admin/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function listOpenOrders(token, sinceIso, statuses, pageSize = 100) {
+  const orders = [];
+  let page = 1;
+  while (true) {
+    const params = new URLSearchParams({
+      "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+      "searchCriteria[filterGroups][0][filters][0][value]": sinceIso,
+      "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+      "searchCriteria[pageSize]": String(pageSize),
+      "searchCriteria[currentPage]": String(page),
+    });
+    statuses.forEach((status, i) =&gt; {
+      params.set(`searchCriteria[filterGroups][1][filters][${i}][field]`, "status");
+      params.set(`searchCriteria[filterGroups][1][filters][${i}][value]`, status);
+      params.set(`searchCriteria[filterGroups][1][filters][${i}][conditionType]`, "eq");
+    });
+    const res = await fetch(`${MAGENTO_URL}/rest/V1/orders?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`Magento ${res.status}`);
+    const body = await res.json();
+    const items = body.items || [];
+    orders.push(...items);
+    if (items.length &lt; pageSize) return orders;
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read source quantity and reported salable quantity per SKU</h3>
+      <p>There is no public REST resource for raw <code>inventory_reservation</code> rows, so we cross check indirectly. For each distinct SKU across the open orders, sum <code>/rest/V1/inventory/source-items</code> filtered by SKU, and read <code>/rest/V1/inventory/get-product-salable-quantity/{sku}/{stockId}</code> for the current reported number.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def source_qty_sum(token, sku):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+        "searchCriteria[filterGroups][0][filters][0][value]": sku,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/inventory/source-items",
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    return sum(item.get("quantity", 0) for item in items)
+
+def salable_qty(token, sku, stock_id):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/inventory/get-product-salable-quantity/{sku}/{stock_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function sourceQtySum(token, sku) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+    "searchCriteria[filterGroups][0][filters][0][value]": sku,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/inventory/source-items?${params}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  const items = body.items || [];
+  return items.reduce((sum, item) =&gt; sum + (item.quantity || 0), 0);
+}
+
+async function salableQty(token, sku, stockId) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/inventory/get-product-salable-quantity/${encodeURIComponent(sku)}/${stockId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the reconciliation math in its own function that takes only already fetched values, the open orders with their items, source quantity per SKU, and salable quantity per SKU, and returns the exact affected order and SKU pairs. It has no I/O, so it is trivial to unit test with fixed inputs and never depends on the network being up.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_unreserved.py</div>
+      <pre><code class="language-python">def find_unreserved_order_items(open_orders, source_qty_by_sku, salable_qty_by_sku):
+    expected_by_sku = {}
+    for order in open_orders:
+        for item in order["items"]:
+            sku = item["sku"]
+            expected_by_sku[sku] = expected_by_sku.get(sku, 0) + item["qtyOrdered"]
+
+    findings = []
+    for sku, expected_reserved in expected_by_sku.items():
+        source_qty = source_qty_by_sku.get(sku, 0)
+        salable_qty = salable_qty_by_sku.get(sku, 0)
+        actual_reserved = source_qty - salable_qty
+        shortfall = expected_reserved - actual_reserved
+        if shortfall &lt;= 0:
+            continue
+        remaining = shortfall
+        for order in open_orders:
+            if remaining &lt;= 0:
+                break
+            for item in order["items"]:
+                if item["sku"] != sku:
+                    continue
+                take = min(remaining, item["qtyOrdered"])
+                if take &lt;= 0:
+                    continue
+                findings.append({
+                    "incrementId": order["incrementId"],
+                    "sku": sku,
+                    "qtyOrdered": item["qtyOrdered"],
+                    "missingReservationQty": take,
+                })
+                remaining -= take
+    return findings</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-unreserved.js</div>
+      <pre><code class="language-javascript">export function findUnreservedOrderItems(openOrders, sourceQtyBySku, salableQtyBySku) {
+  const expectedBySku = {};
+  for (const order of openOrders) {
+    for (const item of order.items) {
+      expectedBySku[item.sku] = (expectedBySku[item.sku] || 0) + item.qtyOrdered;
+    }
+  }
+
+  const findings = [];
+  for (const [sku, expectedReserved] of Object.entries(expectedBySku)) {
+    const sourceQty = sourceQtyBySku[sku] || 0;
+    const salableQty = salableQtyBySku[sku] || 0;
+    const actualReserved = sourceQty - salableQty;
+    let remaining = expectedReserved - actualReserved;
+    if (remaining &lt;= 0) continue;
+
+    for (const order of openOrders) {
+      if (remaining &lt;= 0) break;
+      for (const item of order.items) {
+        if (item.sku !== sku) continue;
+        const take = Math.min(remaining, item.qtyOrdered);
+        if (take &lt;= 0) continue;
+        findings.push({
+          incrementId: order.incrementId,
+          sku,
+          qtyOrdered: item.qtyOrdered,
+          missingReservationQty: take,
+        });
+        remaining -= take;
+      }
+    }
+  }
+  return findings;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>There is no REST write for this, report and guard the stopgap instead</h3>
+      <p>Reservations are append only and Magento deliberately omits a setter or creation web API for <code>InventoryReservationsApi</code>, to prevent exactly this kind of external manipulation. So the script only ever emits one record per affected order and SKU with the missing reservation quantity. Only when an operator explicitly sets <code>DRY_RUN=false</code> does it fall back to the one safe REST lever available, adjusting <code>extension_attributes.stock_item.qty</code> directly through <code>PUT /rest/V1/products/{sku}</code> as a stopgap, logged and idempotent per <code>increment_id</code> so it is never applied twice.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">stopgap.py</div>
+      <pre><code class="language-python">def apply_stopgap_stock_correction(token, sku, current_qty, missing_qty, applied_increment_ids):
+    """Idempotent per increment_id. Only called when DRY_RUN is false and an
+    operator has confirmed the finding. This is a legacy stock_item adjustment,
+    not a reservation, and is a stopgap only."""
+    new_qty = current_qty - missing_qty
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/products/{sku}",
+        json={"product": {"sku": sku, "extension_attributes": {
+            "stock_item": {"qty": new_qty}
+        }}},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return new_qty</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">stopgap.js</div>
+      <pre><code class="language-javascript">// Idempotent per incrementId. Only called when DRY_RUN is false and an
+// operator has confirmed the finding. This is a legacy stock_item adjustment,
+// not a reservation, and is a stopgap only.
+async function applyStopgapStockCorrection(token, sku, currentQty, missingQty) {
+  const newQty = currentQty - missingQty;
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/products/${encodeURIComponent(sku)}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ product: { sku, extension_attributes: { stock_item: { qty: newQty } } } }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return newQty;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop authenticates once, lists open orders since a lookback window, fetches source quantity and salable quantity for every distinct SKU on those orders, runs the pure finder function, and writes one report row per affected order and SKU. It also keeps a small ledger of <code>increment_id</code> values it has already stopgap corrected, so a second run never double applies the fix. <code>DRY_RUN</code> defaults to true.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never calls a reservation write endpoint, because none exists. It reports the affected orders, SKUs, and missing reservation quantity so a human can see exactly what is wrong, and it points the operator at switching order ingestion to the checkout flow or running the CLI reservation tooling. The <code>PUT /rest/V1/products/{sku}</code> stopgap only ever runs with an explicit operator confirmation and <code>DRY_RUN=false</code>, and it tracks applied order ids so it cannot double correct the same order.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only ever performs reads plus the guarded stopgap write when explicitly enabled.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/rest-orders-skip-reservation-placement" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_unreserved_orders.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 or Adobe Commerce order lines whose reservation placement
+was skipped because the order was created directly through POST /V1/orders.
+
+MSI reduces salable quantity only by writing an append only, negative row to
+inventory_reservation. That row is written by a plugin hooked to the
+sales_order_place_after event, which fires from the normal quote to order
+checkout pipeline, OrderManagementInterface::place. An order built and
+persisted directly through POST /V1/orders, the way ERPs and marketplaces
+inject historical or external orders, never runs that pipeline, so the
+reservation plugin never executes for those items. This script lists recent
+open orders, sums qty_ordered per SKU, and cross checks that against source
+item quantity minus reported salable quantity for the same SKU. Any shortfall
+means a reservation was never written, and it is attributed back to the
+earliest under reserved order lines. There is no REST endpoint to create a
+reservation, so this script only reports, unless DRY_RUN=false and an operator
+has confirmed the guarded legacy stock_item stopgap. Safe to run again and
+again.
+"""
+import os
+import csv
+import json
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_unreserved_orders")
+
+MAGENTO_URL = os.environ.get("MAGENTO_URL", "https://example.test").rstrip("/")
+ADMIN_USERNAME = os.environ.get("MAGENTO_ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("MAGENTO_ADMIN_PASSWORD", "change-me")
+ADMIN_TOKEN = os.environ.get("MAGENTO_ADMIN_TOKEN")
+STOCK_ID = os.environ.get("STOCK_ID", "1")
+ORDER_STATUSES = [s.strip() for s in os.environ.get("ORDER_STATUSES", "processing,pending").split(",") if s.strip()]
+LOOKBACK_DAYS = float(os.environ.get("LOOKBACK_DAYS", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "unreserved_order_items.csv")
+APPLIED_LEDGER = os.environ.get("APPLIED_LEDGER", "unreserved_stopgap_applied.json")
+
+
+def get_token():
+    if ADMIN_TOKEN:
+        return ADMIN_TOKEN
+    r = requests.post(
+        f"{MAGENTO_URL}/rest/V1/integration/admin/token",
+        json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def list_open_orders(token, since_iso, statuses, page_size=100):
+    orders = []
+    page = 1
+    while True:
+        params = {
+            "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+            "searchCriteria[filterGroups][0][filters][0][value]": since_iso,
+            "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+            "searchCriteria[pageSize]": page_size,
+            "searchCriteria[currentPage]": page,
+        }
+        for i, status in enumerate(statuses):
+            params[f"searchCriteria[filterGroups][1][filters][{i}][field]"] = "status"
+            params[f"searchCriteria[filterGroups][1][filters][{i}][value]"] = status
+            params[f"searchCriteria[filterGroups][1][filters][{i}][conditionType]"] = "eq"
+        r = requests.get(
+            f"{MAGENTO_URL}/rest/V1/orders",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        items = body.get("items", [])
+        orders.extend(items)
+        if len(items) &lt; page_size:
+            return orders
+        page += 1
+
+
+def source_qty_sum(token, sku):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+        "searchCriteria[filterGroups][0][filters][0][value]": sku,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/inventory/source-items",
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    return sum(item.get("quantity", 0) for item in items)
+
+
+def salable_qty(token, sku, stock_id):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/inventory/get-product-salable-quantity/{sku}/{stock_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def find_unreserved_order_items(open_orders, source_qty_by_sku, salable_qty_by_sku):
+    expected_by_sku = {}
+    for order in open_orders:
+        for item in order["items"]:
+            sku = item["sku"]
+            expected_by_sku[sku] = expected_by_sku.get(sku, 0) + item["qtyOrdered"]
+
+    findings = []
+    for sku, expected_reserved in expected_by_sku.items():
+        source_qty = source_qty_by_sku.get(sku, 0)
+        salable = salable_qty_by_sku.get(sku, 0)
+        actual_reserved = source_qty - salable
+        remaining = expected_reserved - actual_reserved
+        if remaining &lt;= 0:
+            continue
+        for order in open_orders:
+            if remaining &lt;= 0:
+                break
+            for item in order["items"]:
+                if item["sku"] != sku:
+                    continue
+                take = min(remaining, item["qtyOrdered"])
+                if take &lt;= 0:
+                    continue
+                findings.append({
+                    "incrementId": order["incrementId"],
+                    "sku": sku,
+                    "qtyOrdered": item["qtyOrdered"],
+                    "missingReservationQty": take,
+                })
+                remaining -= take
+    return findings
+
+
+def apply_stopgap_stock_correction(token, sku, current_qty, missing_qty):
+    new_qty = current_qty - missing_qty
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1/products/{sku}",
+        json={"product": {"sku": sku, "extension_attributes": {
+            "stock_item": {"qty": new_qty}
+        }}},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return new_qty
+
+
+def load_applied_ledger():
+    if os.path.exists(APPLIED_LEDGER):
+        with open(APPLIED_LEDGER) as fh:
+            return set(json.load(fh))
+    return set()
+
+
+def save_applied_ledger(applied):
+    with open(APPLIED_LEDGER, "w") as fh:
+        json.dump(sorted(applied), fh)
+
+
+def run():
+    token = get_token()
+    since_iso = (datetime.datetime.utcnow() - datetime.timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    raw_orders = list_open_orders(token, since_iso, ORDER_STATUSES)
+
+    open_orders = []
+    for order in raw_orders:
+        items = [
+            {"sku": line["sku"], "qtyOrdered": line.get("qty_ordered", 0) or 0}
+            for line in order.get("items", [])
+            if (line.get("qty_ordered", 0) or 0) &gt; 0
+        ]
+        if items:
+            open_orders.append({"incrementId": order["increment_id"], "items": items})
+
+    skus = sorted({item["sku"] for order in open_orders for item in order["items"]})
+    source_qty_by_sku = {sku: source_qty_sum(token, sku) for sku in skus}
+    salable_qty_by_sku = {sku: salable_qty(token, sku, STOCK_ID) for sku in skus}
+
+    findings = find_unreserved_order_items(open_orders, source_qty_by_sku, salable_qty_by_sku)
+
+    if findings:
+        with open(OUTPUT_CSV, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["incrementId", "sku", "qtyOrdered", "missingReservationQty"])
+            writer.writeheader()
+            writer.writerows(findings)
+
+    applied = load_applied_ledger()
+    for finding in findings:
+        log.info(
+            "Order %s SKU %s: qty_ordered=%s missing_reservation_qty=%s",
+            finding["incrementId"], finding["sku"], finding["qtyOrdered"], finding["missingReservationQty"],
+        )
+        ledger_key = f"{finding['incrementId']}:{finding['sku']}"
+        if DRY_RUN or ledger_key in applied:
+            continue
+        current_qty = source_qty_by_sku[finding["sku"]]
+        apply_stopgap_stock_correction(token, finding["sku"], current_qty, finding["missingReservationQty"])
+        applied.add(ledger_key)
+    if not DRY_RUN and findings:
+        save_applied_ledger(applied)
+
+    log.info(
+        "Done. %d order/SKU pair(s) flagged, %s. No REST endpoint writes inventory_reservation; "
+        "switch order ingestion to the checkout flow or run the CLI reservation tooling.",
+        len(findings), "dry run, nothing written" if DRY_RUN else "stopgap applied where confirmed",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-unreserved-orders.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 or Adobe Commerce order lines whose reservation placement
+ * was skipped because the order was created directly through POST /V1/orders.
+ *
+ * MSI reduces salable quantity only by writing an append only, negative row to
+ * inventory_reservation. That row is written by a plugin hooked to the
+ * sales_order_place_after event, which fires from the normal quote to order
+ * checkout pipeline, OrderManagementInterface::place. An order built and
+ * persisted directly through POST /V1/orders, the way ERPs and marketplaces
+ * inject historical or external orders, never runs that pipeline, so the
+ * reservation plugin never executes for those items. This script lists recent
+ * open orders, sums qty_ordered per SKU, and cross checks that against source
+ * item quantity minus reported salable quantity for the same SKU. Any
+ * shortfall means a reservation was never written, and it is attributed back
+ * to the earliest under reserved order lines. There is no REST endpoint to
+ * create a reservation, so this script only reports, unless DRY_RUN=false and
+ * an operator has confirmed the guarded legacy stock_item stopgap. Safe to run
+ * again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/rest-orders-skip-reservation-placement/
+ */
+import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://example.test").replace(/\/$/, "");
+const ADMIN_USERNAME = process.env.MAGENTO_ADMIN_USERNAME || "admin";
+const ADMIN_PASSWORD = process.env.MAGENTO_ADMIN_PASSWORD || "change-me";
+const ADMIN_TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "";
+const STOCK_ID = process.env.STOCK_ID || "1";
+const ORDER_STATUSES = (process.env.ORDER_STATUSES || "processing,pending").split(",").map((s) =&gt; s.trim()).filter(Boolean);
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 30);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const OUTPUT_CSV = process.env.OUTPUT_CSV || "unreserved_order_items.csv";
+const APPLIED_LEDGER = process.env.APPLIED_LEDGER || "unreserved_stopgap_applied.json";
+
+export function findUnreservedOrderItems(openOrders, sourceQtyBySku, salableQtyBySku) {
+  const expectedBySku = {};
+  for (const order of openOrders) {
+    for (const item of order.items) {
+      expectedBySku[item.sku] = (expectedBySku[item.sku] || 0) + item.qtyOrdered;
+    }
+  }
+
+  const findings = [];
+  for (const [sku, expectedReserved] of Object.entries(expectedBySku)) {
+    const sourceQty = sourceQtyBySku[sku] || 0;
+    const salableQty = salableQtyBySku[sku] || 0;
+    const actualReserved = sourceQty - salableQty;
+    let remaining = expectedReserved - actualReserved;
+    if (remaining &lt;= 0) continue;
+
+    for (const order of openOrders) {
+      if (remaining &lt;= 0) break;
+      for (const item of order.items) {
+        if (item.sku !== sku) continue;
+        const take = Math.min(remaining, item.qtyOrdered);
+        if (take &lt;= 0) continue;
+        findings.push({
+          incrementId: order.incrementId,
+          sku,
+          qtyOrdered: item.qtyOrdered,
+          missingReservationQty: take,
+        });
+        remaining -= take;
+      }
+    }
+  }
+  return findings;
+}
+
+async function getToken() {
+  if (ADMIN_TOKEN) return ADMIN_TOKEN;
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/integration/admin/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function listOpenOrders(token, sinceIso, statuses, pageSize = 100) {
+  const orders = [];
+  let page = 1;
+  while (true) {
+    const params = new URLSearchParams({
+      "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+      "searchCriteria[filterGroups][0][filters][0][value]": sinceIso,
+      "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+      "searchCriteria[pageSize]": String(pageSize),
+      "searchCriteria[currentPage]": String(page),
+    });
+    statuses.forEach((status, i) =&gt; {
+      params.set(`searchCriteria[filterGroups][1][filters][${i}][field]`, "status");
+      params.set(`searchCriteria[filterGroups][1][filters][${i}][value]`, status);
+      params.set(`searchCriteria[filterGroups][1][filters][${i}][conditionType]`, "eq");
+    });
+    const res = await fetch(`${MAGENTO_URL}/rest/V1/orders?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`Magento ${res.status}`);
+    const body = await res.json();
+    const items = body.items || [];
+    orders.push(...items);
+    if (items.length &lt; pageSize) return orders;
+    page += 1;
+  }
+}
+
+async function sourceQtySum(token, sku) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "sku",
+    "searchCriteria[filterGroups][0][filters][0][value]": sku,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/inventory/source-items?${params}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  const items = body.items || [];
+  return items.reduce((sum, item) =&gt; sum + (item.quantity || 0), 0);
+}
+
+async function salableQty(token, sku, stockId) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/inventory/get-product-salable-quantity/${encodeURIComponent(sku)}/${stockId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function applyStopgapStockCorrection(token, sku, currentQty, missingQty) {
+  const newQty = currentQty - missingQty;
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/products/${encodeURIComponent(sku)}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ product: { sku, extension_attributes: { stock_item: { qty: newQty } } } }),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return newQty;
+}
+
+function loadAppliedLedger() {
+  if (fs.existsSync(APPLIED_LEDGER)) {
+    return new Set(JSON.parse(fs.readFileSync(APPLIED_LEDGER, "utf8")));
+  }
+  return new Set();
+}
+
+function saveAppliedLedger(applied) {
+  fs.writeFileSync(APPLIED_LEDGER, JSON.stringify([...applied].sort()));
+}
+
+export async function run() {
+  const token = await getToken();
+  const since = new Date(Date.now() - LOOKBACK_DAYS * 86400 * 1000);
+  const sinceIso = since.toISOString().slice(0, 19).replace("T", " ");
+  const rawOrders = await listOpenOrders(token, sinceIso, ORDER_STATUSES);
+
+  const openOrders = [];
+  for (const order of rawOrders) {
+    const items = (order.items || [])
+      .filter((line) =&gt; (line.qty_ordered || 0) &gt; 0)
+      .map((line) =&gt; ({ sku: line.sku, qtyOrdered: line.qty_ordered || 0 }));
+    if (items.length) openOrders.push({ incrementId: order.increment_id, items });
+  }
+
+  const skus = [...new Set(openOrders.flatMap((order) =&gt; order.items.map((item) =&gt; item.sku)))];
+  const sourceQtyBySku = {};
+  const salableQtyBySku = {};
+  for (const sku of skus) {
+    sourceQtyBySku[sku] = await sourceQtySum(token, sku);
+    salableQtyBySku[sku] = await salableQty(token, sku, STOCK_ID);
+  }
+
+  const findings = findUnreservedOrderItems(openOrders, sourceQtyBySku, salableQtyBySku);
+
+  const applied = loadAppliedLedger();
+  for (const finding of findings) {
+    console.log(`Order ${finding.incrementId} SKU ${finding.sku}: qty_ordered=${finding.qtyOrdered} missing_reservation_qty=${finding.missingReservationQty}`);
+    const ledgerKey = `${finding.incrementId}:${finding.sku}`;
+    if (DRY_RUN || applied.has(ledgerKey)) continue;
+    await applyStopgapStockCorrection(token, finding.sku, sourceQtyBySku[finding.sku], finding.missingReservationQty);
+    applied.add(ledgerKey);
+  }
+  if (!DRY_RUN &amp;&amp; findings.length) saveAppliedLedger(applied);
+
+  console.log(
+    `Done. ${findings.length} order/SKU pair(s) flagged, ${DRY_RUN ? "dry run, nothing written" : "stopgap applied where confirmed"}. ` +
+    `No REST endpoint writes inventory_reservation; switch order ingestion to the checkout flow or run the CLI reservation tooling.`
+  );
+  return findings;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The reconciliation rule is the part most worth testing, because it decides which orders and SKUs get reported as under reserved. Since <code>find_unreserved_order_items</code> and <code>findUnreservedOrderItems</code> are pure, the tests need no network and no Magento instance. They just feed in plain order lists and quantity maps, covering a fully reserved SKU, a completely skipped reservation, a partially skipped one, and multiple orders sharing the same SKU.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_rest_unreserved.py</div>
+      <pre><code class="language-python">from flag_unreserved_orders import find_unreserved_order_items
+
+
+def test_fully_reserved_sku_is_not_flagged():
+    orders = [{"incrementId": "100000001", "items": [{"sku": "SKU-1", "qtyOrdered": 5}]}]
+    findings = find_unreserved_order_items(orders, {"SKU-1": 100}, {"SKU-1": 95})
+    assert findings == []
+
+
+def test_completely_skipped_reservation_is_flagged():
+    orders = [{"incrementId": "100000002", "items": [{"sku": "SKU-2", "qtyOrdered": 5}]}]
+    findings = find_unreserved_order_items(orders, {"SKU-2": 100}, {"SKU-2": 100})
+    assert findings == [{
+        "incrementId": "100000002",
+        "sku": "SKU-2",
+        "qtyOrdered": 5,
+        "missingReservationQty": 5,
+    }]
+
+
+def test_partially_reserved_sku_reports_only_the_shortfall():
+    orders = [{"incrementId": "100000003", "items": [{"sku": "SKU-3", "qtyOrdered": 10}]}]
+    # expected reserved is 10, actual reserved is 100-96=4, shortfall is 6
+    findings = find_unreserved_order_items(orders, {"SKU-3": 100}, {"SKU-3": 96})
+    assert findings == [{
+        "incrementId": "100000003",
+        "sku": "SKU-3",
+        "qtyOrdered": 10,
+        "missingReservationQty": 6,
+    }]
+
+
+def test_shortfall_attributed_to_earliest_orders_first():
+    orders = [
+        {"incrementId": "100000004", "items": [{"sku": "SKU-4", "qtyOrdered": 3}]},
+        {"incrementId": "100000005", "items": [{"sku": "SKU-4", "qtyOrdered": 4}]},
+    ]
+    # expected reserved is 7, actual reserved is 0, so both orders are short
+    findings = find_unreserved_order_items(orders, {"SKU-4": 100}, {"SKU-4": 100})
+    assert findings == [
+        {"incrementId": "100000004", "sku": "SKU-4", "qtyOrdered": 3, "missingReservationQty": 3},
+        {"incrementId": "100000005", "sku": "SKU-4", "qtyOrdered": 4, "missingReservationQty": 4},
+    ]
+
+
+def test_shortfall_smaller_than_first_order_only_flags_that_order():
+    orders = [
+        {"incrementId": "100000006", "items": [{"sku": "SKU-5", "qtyOrdered": 5}]},
+        {"incrementId": "100000007", "items": [{"sku": "SKU-5", "qtyOrdered": 5}]},
+    ]
+    # expected reserved is 10, actual reserved is 100-97=3, shortfall is 7
+    findings = find_unreserved_order_items(orders, {"SKU-5": 100}, {"SKU-5": 97})
+    assert findings == [
+        {"incrementId": "100000006", "sku": "SKU-5", "qtyOrdered": 5, "missingReservationQty": 5},
+        {"incrementId": "100000007", "sku": "SKU-5", "qtyOrdered": 5, "missingReservationQty": 2},
+    ]
+
+
+def test_multiple_skus_are_evaluated_independently():
+    orders = [
+        {"incrementId": "100000008", "items": [
+            {"sku": "SKU-6", "qtyOrdered": 2},
+            {"sku": "SKU-7", "qtyOrdered": 3},
+        ]},
+    ]
+    findings = find_unreserved_order_items(
+        orders,
+        {"SKU-6": 50, "SKU-7": 50},
+        {"SKU-6": 48, "SKU-7": 50},
+    )
+    assert findings == [{
+        "incrementId": "100000008",
+        "sku": "SKU-7",
+        "qtyOrdered": 3,
+        "missingReservationQty": 3,
+    }]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">rest-unreserved.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findUnreservedOrderItems } from "./flag-unreserved-orders.js";
+
+test("fully reserved SKU is not flagged", () =&gt; {
+  const orders = [{ incrementId: "100000001", items: [{ sku: "SKU-1", qtyOrdered: 5 }] }];
+  const findings = findUnreservedOrderItems(orders, { "SKU-1": 100 }, { "SKU-1": 95 });
+  assert.deepEqual(findings, []);
+});
+
+test("completely skipped reservation is flagged", () =&gt; {
+  const orders = [{ incrementId: "100000002", items: [{ sku: "SKU-2", qtyOrdered: 5 }] }];
+  const findings = findUnreservedOrderItems(orders, { "SKU-2": 100 }, { "SKU-2": 100 });
+  assert.deepEqual(findings, [
+    { incrementId: "100000002", sku: "SKU-2", qtyOrdered: 5, missingReservationQty: 5 },
+  ]);
+});
+
+test("partially reserved SKU reports only the shortfall", () =&gt; {
+  const orders = [{ incrementId: "100000003", items: [{ sku: "SKU-3", qtyOrdered: 10 }] }];
+  const findings = findUnreservedOrderItems(orders, { "SKU-3": 100 }, { "SKU-3": 96 });
+  assert.deepEqual(findings, [
+    { incrementId: "100000003", sku: "SKU-3", qtyOrdered: 10, missingReservationQty: 6 },
+  ]);
+});
+
+test("shortfall attributed to earliest orders first", () =&gt; {
+  const orders = [
+    { incrementId: "100000004", items: [{ sku: "SKU-4", qtyOrdered: 3 }] },
+    { incrementId: "100000005", items: [{ sku: "SKU-4", qtyOrdered: 4 }] },
+  ];
+  const findings = findUnreservedOrderItems(orders, { "SKU-4": 100 }, { "SKU-4": 100 });
+  assert.deepEqual(findings, [
+    { incrementId: "100000004", sku: "SKU-4", qtyOrdered: 3, missingReservationQty: 3 },
+    { incrementId: "100000005", sku: "SKU-4", qtyOrdered: 4, missingReservationQty: 4 },
+  ]);
+});
+
+test("shortfall smaller than first order only flags that order", () =&gt; {
+  const orders = [
+    { incrementId: "100000006", items: [{ sku: "SKU-5", qtyOrdered: 5 }] },
+    { incrementId: "100000007", items: [{ sku: "SKU-5", qtyOrdered: 5 }] },
+  ];
+  const findings = findUnreservedOrderItems(orders, { "SKU-5": 100 }, { "SKU-5": 97 });
+  assert.deepEqual(findings, [
+    { incrementId: "100000006", sku: "SKU-5", qtyOrdered: 5, missingReservationQty: 5 },
+    { incrementId: "100000007", sku: "SKU-5", qtyOrdered: 5, missingReservationQty: 2 },
+  ]);
+});
+
+test("multiple SKUs are evaluated independently", () =&gt; {
+  const orders = [
+    { incrementId: "100000008", items: [
+      { sku: "SKU-6", qtyOrdered: 2 },
+      { sku: "SKU-7", qtyOrdered: 3 },
+    ] },
+  ];
+  const findings = findUnreservedOrderItems(
+    orders,
+    { "SKU-6": 50, "SKU-7": 50 },
+    { "SKU-6": 48, "SKU-7": 50 }
+  );
+  assert.deepEqual(findings, [
+    { incrementId: "100000008", sku: "SKU-7", qtyOrdered: 3, missingReservationQty: 3 },
+  ]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">ERP backfill</span>
+      <h4>Historical orders that quietly oversold new stock</h4>
+      <p>A distributor's ERP pushed three years of historical orders into a new Magento store through <code>POST /V1/orders</code> so reporting had a single source of truth. The import looked flawless, correct totals, correct items, correct customer records. Months later, a handful of SKUs that had been reordered since the import started overselling on the storefront even though the warehouse counted enough stock.</p>
+      <p>Running the script against open orders on those SKUs turned up a consistent shortfall, the exact quantity from the historical import that had never been reserved. The team switched future ERP pushes to route through the cart and payment-information checkout flow instead, and used the report to justify a one time stopgap correction on the affected SKUs.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Marketplace connector</span>
+      <h4>Channel orders that never touched checkout</h4>
+      <p>A housewares brand synced marketplace orders into Magento through a connector that called <code>POST /V1/orders</code> directly for speed, skipping the storefront cart entirely. Salable quantity on the marketplace's own best sellers slowly drifted higher than what the warehouse actually had, since none of those orders ever wrote a reservation.</p>
+      <p>The report flagged the exact increment ids and SKUs involved weeks before a stockout would have hit a paying customer. The connector team scheduled a fix to route new orders through the checkout API, and used the dry run report to size how much stock had been silently oversold in the interim.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After running this on a schedule, an order that skipped reservation placement stops being invisible. You get a short, dated list of exactly which order and SKU pairs are under reserved and by how much, so a human can decide between switching the integration to the checkout flow, running the CLI reservation tooling, or approving a guarded stopgap correction. The actual reservation row still belongs to the checkout pipeline, but nobody has to discover the gap from an oversold order first.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does an order created through POST /V1/orders not reduce salable quantity?</summary>
+      <p>MSI reduces salable quantity by writing a negative inventory_reservation row, and that row is only created by a plugin hooked to the sales_order_place_after event fired by the normal quote to order checkout pipeline. An order built and saved directly through POST /V1/orders never runs that pipeline, so the reservation plugin never executes, the order gets real order_items rows and a decremented product quantity, but zero matching inventory_reservation rows.</p>
+    </details>
+    <details>
+      <summary>Is there a REST endpoint to create the missing reservation?</summary>
+      <p>No. Reservations are append only and Magento deliberately does not expose a setter or creation web API for InventoryReservationsApi, to prevent exactly this kind of external manipulation. A script can detect and report the affected order lines over REST, but writing the reservation row itself is CLI and cron territory, not REST.</p>
+    </details>
+    <details>
+      <summary>What is the safe way to stop this from happening to new orders?</summary>
+      <p>Switch the integration that injects orders to go through the same checkout flow a storefront order uses, such as cart and payment-information, so the sales_order_place_after event fires normally. For orders already created without a reservation, the report should flag them so an operator can run the appropriate reindex or reservation tooling, and only as a stopgap, with a confirmed operator decision, adjust the legacy stock_item quantity directly through PUT /rest/V1/products/{sku}.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento and Adobe Commerce field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>REST API rest/all/V1/orders/create does not trigger "inventory_reservations_placement" plugin, magento/magento2 issue 26575. <a href="https://github.com/magento/magento2/issues/26575" rel="noopener">github.com/magento/magento2/issues/26575</a></li>
+      <li>Inventory Reservation not taken into account when setting Product out of Stock, magento/magento2 issue 25696. <a href="https://github.com/magento/magento2/issues/25696" rel="noopener">github.com/magento/magento2/issues/25696</a></li>
+      <li>Salable Quantity Calculation and Mechanism of Reservations, magento/inventory Wiki. <a href="https://github.com/magento/inventory/wiki/Salable-Quantity-Calculation-and-Mechanism-of-Reservations" rel="noopener">github.com/magento/inventory/wiki/Salable-Quantity-Calculation-and-Mechanism-of-Reservations</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Reservations, Inventory Management Guide, Adobe Commerce and Magento Open Source devdocs. <a href="https://devdocs.magento.com/guides/v2.4/inventory/reservations.html" rel="noopener">devdocs.magento.com guides/v2.4/inventory/reservations</a></li>
+      <li>Reservations, Commerce PHP Extensions, Adobe Commerce Developer docs. <a href="https://developer.adobe.com/commerce/php/development/framework/inventory-management/reservations" rel="noopener">developer.adobe.com commerce/php/development/framework/inventory-management/reservations</a></li>
+      <li>Inventory Management API Reference, Commerce PHP Extensions. <a href="https://developer.adobe.com/commerce/php/development/components/web-api/inventory-management" rel="noopener">developer.adobe.com commerce/php/development/components/web-api/inventory-management</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento indexing, cron, MSI stock, or order grid that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silent oversell?</h3>
+    <p>If this saved you a confusing oversell or a mystery stock discrepancy, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

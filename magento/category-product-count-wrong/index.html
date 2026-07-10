@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Magento Category Product Count Wrong or Zero on Large Catalogs</title>
+<meta name="description" content="Magento's category product count goes stale or drops to zero after a bad reindex, especially on anchor categories. Learn why the temp table swap breaks and build a Python or Node.js script that diffs the reported count against the real assignments over REST.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/category-product-count-wrong/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Magento Category Product Count Wrong or Zero on Large Catalogs">
+<meta property="og:description" content="Why the catalog_category_product indexer's temp table swap leaves category product_count stale or zeroed, and a Python or Node.js script that diffs reported count against real assignments over REST.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/category-product-count-wrong/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/category-product-count-wrong/#article","headline":"Fix Magento Category Product Count Wrong or Zero on Large Catalogs","description":"Why the catalog_category_product indexer's temp table swap leaves category product_count stale or zeroed on large catalogs, especially on anchor categories, and a Python or Node.js script that diffs the reported count against the real assignments over REST.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/category-product-count-wrong/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Magento indexing","keywords":"Magento category product count, catalog_category_product, anchor category, product_count zero, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Category product count wrong or zero on large catalogs","item":"https://www.allanninal.dev/magento/category-product-count-wrong/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a Magento category show the wrong product count?","acceptedAnswer":{"@type":"Answer","text":"The category product count is read from a precomputed index table, catalog_category_product_index, that the catalog_category_product indexer rebuilds using a temp table swap. If that swap is interrupted by a full temp table, a memory limit, a bulk product limit, or an overlapping reindex, the swap can partially commit or abort and leave the index table stale or zeroed, even though the real product to category assignments on disk are untouched."}},{"@type":"Question","name":"Why is an anchor category more likely to show zero products?","acceptedAnswer":{"@type":"Answer","text":"An anchor category's count is aggregated from every subcategory during the same temp table pass, so it does the most work and touches the most rows. A partial failure during that aggregation is far more likely to hit the anchor category's row than a leaf category, which is why anchor categories are the most common victim of a zeroed or undercounted product_count."}},{"@type":"Question","name":"Can a script fix the wrong product count automatically?","acceptedAnswer":{"@type":"Answer","text":"Not directly over REST. The real fix is bin/magento indexer:reindex catalog_category_product, a CLI or cron action outside the REST API. A script can detect and report the discrepancy safely, and optionally resave the category with an unchanged payload to mark the indexer invalid so the next scheduled reindex picks it up, but that is a soft nudge, not a guaranteed fix."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Indexing</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Indexing</p>
+    <h1>Magento category product count wrong or zero on large catalogs</h1>
+    <p class="lead">A category page in the admin, or the product_count attribute over the REST API, says a category has far fewer products than it actually does, sometimes zero, even though every product is still correctly assigned to it. Nobody removed anything. The catalog is fine. What broke is the index table that Magento reads the count from, usually after a reindex that got interrupted partway through. Here is why it happens, why anchor categories are hit hardest, and a small script that finds every category where the reported count disagrees with the real assignments.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Magento REST API</span>
+      <span class="chip">Detect and report (dry run by default)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento's category product count is not computed live. It is read from a precomputed index table, <code>catalog_category_product_index</code>, that the <code>catalog_category_product</code> indexer rebuilds by swapping in a temp table rather than updating rows in place. If that swap gets interrupted, the index table is left stale or zeroed while the real product to category assignments on disk are untouched. Run a small Python or Node.js script that pulls the reported <code>product_count</code> from <code>GET /rest/V1/categories/{id}</code> and the real total from <code>GET /rest/V1/products</code> filtered by <code>category_id</code>, then flags any category where the two disagree, with anchor categories called out separately since they are the usual victim. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Magento does not count a category's products by querying <code>catalog_category_product</code> every time a page loads. That table holds the raw assignment between a product and a category, and it can be large. Instead Magento precomputes the number into an index, <code>catalog_category_product_index</code>, plus a per store view copy, and reads from that index whenever a category page, a grid, or the REST API asks for a product count.</p>
+  <p>Building that index is not a small update. The <code>catalog_category_product</code> indexer rebuilds it by writing into a temp table (or a replica table on newer versions) and then swapping it in for the live table, rather than patching rows one by one. That swap is fast when it works. But it is also the single point where the whole rebuild can fail: a full temp table, a memory limit, a bulk product limit truncation like the one reported in magento/magento2 issue #8018, or a second category save that overlaps the same reindex. When the swap is interrupted, it can partially commit or abort outright, and whatever was in the index table at that moment is what gets reported until the next successful reindex. Meanwhile the actual assignment rows in <code>catalog_category_product</code> never moved.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. The category product assignment table is correct on disk, but the indexer's temp table swap gets interrupted, so the reported product count in the index table goes stale or drops to zero while the real assignments are untouched.">
+      <defs>
+        <marker id="mah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#a8998d"></path></marker>
+        <marker id="mahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="72" width="165" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="92" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Product saved</text>
+      <text x="92" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">assigned to category</text>
+      <line x1="178" y1="105" x2="220" y2="105" stroke="#a8998d" stroke-width="2" marker-end="url(#mah)"></line>
+      <rect x="223" y="72" width="175" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="310" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Indexer rebuilds</text>
+      <text x="310" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">writes to temp table</text>
+      <line x1="401" y1="105" x2="450" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#mahr)"></line>
+      <text x="426" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="426" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">swap interrupted</text>
+      <rect x="453" y="72" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="533" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Index stale</text>
+      <text x="533" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">or zeroed</text>
+      <rect x="638" y="72" width="112" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="694" y="96" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">product_count</text>
+      <text x="694" y="114" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">wrong or 0</text>
+      <line x1="616" y1="105" x2="635" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#mahr)"></line>
+      <rect x="223" y="164" width="175" height="46" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="310" y="192" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#2b1a10">catalog_category_product assignment table on disk: still correct</text>
+    </svg>
+    <figcaption>The product to category link on disk never changes. Only the precomputed index the count is read from can go stale, and anchor categories are hit hardest because they aggregate every subcategory in the same pass.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The index is a snapshot, and the way Magento refreshes that snapshot creates a specific failure window:</p>
+  <ul>
+    <li>The rebuild writes to <code>catalog_category_product_index_tmp</code> (or a replica table in newer versions) and swaps it in, instead of updating rows in place. If the swap does not complete cleanly, the table left behind is whatever state the swap was in, not the true count.</li>
+    <li>A full temp table, a hit memory limit, or a bulk product limit truncation, as reported in magento/magento2 issue #8018 with <code>indexer:reindex catalog_category_product</code> failing at a limit of 500, can abort the rebuild partway through.</li>
+    <li>A category save that overlaps another reindex already in progress can race the same temp table, so one process's partial write clobbers the other's.</li>
+    <li>Anchor categories are hit hardest, because their count is aggregated from every subcategory during the same temp table pass. That is more rows and more work in the same failure window, and a partial failure there can zero out or undercount the parent even though each child's own assignment rows are fine. This is the exact anchor category zeroing pattern Adobe describes in ACSD-46519, and the same temp table root cause is discussed for search indexing in Smile-SA/elasticsuite issue #622.</li>
+  </ul>
+  <p>The result is confusing precisely because it looks like data loss. Merchandisers see a category with fifty products and a product_count of three, or zero, and assume products were unassigned or disabled. Nothing was. The only thing wrong is the cached count, and a full reindex fixes it, but nobody runs that until something tips them off. See the citations at the end for the exact reports.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The reported <code>product_count</code> comes from the index. The real membership of a product in a category comes from the live assignment table. Those are two different sources, and the REST API happens to expose both: <code>GET /rest/V1/categories/{id}</code> for the cached count, and <code>GET /rest/V1/products</code> filtered by <code>category_id</code> for the live total. Diffing the two over the API, with no filesystem access, is exactly how you catch this without waiting for someone to notice the storefront looks wrong.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We cannot trigger a real reindex from REST, that is a CLI or cron action. So the script's job is to detect and report every category where the two counts disagree, flag the severity, and, only if you opt in, nudge Magento's own invalidation mechanism so the next scheduled cron reindex actually runs.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. For each category, read the reported product count and the actual count from the products search, compare them, and if they disagree flag the category as drift or zeroed, otherwise optionally invalidate the indexer to nudge a future reindex.">
+      <defs><marker id="mah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="165" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="92" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">For each category</text>
+      <text x="92" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">list categories via API</text>
+      <line x1="92" y1="80" x2="92" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#mah2)"></line>
+      <rect x="10" y="108" width="210" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="115" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">GET reported count</text>
+      <text x="115" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">categories/{id} product_count</text>
+      <line x1="220" y1="138" x2="262" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#mah2)"></line>
+      <rect x="265" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="365" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">GET actual count</text>
+      <text x="365" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">products search total_count</text>
+      <line x1="465" y1="138" x2="507" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#mah2)"></line>
+      <polygon points="585,106 662,138 585,170 508,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="585" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Counts</text>
+      <text x="585" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">match?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#a8998d" font-weight="700">yes, skip</text>
+      <line x1="662" y1="138" x2="700" y2="138" stroke="#a8998d" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="565" y="198" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">no, drift or zeroed</text>
+      <line x1="585" y1="170" x2="585" y2="205" stroke="#cf4b3f" stroke-width="2" marker-end="url(#mahr)"></line>
+      <rect x="513" y="185" width="145" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="585" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag in report</text>
+      <text x="585" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">optional: nudge invalidate</text>
+    </svg>
+    <figcaption>The script only ever reads and reports. Triggering the real fix, indexer:reindex catalog_category_product, stays a CLI or cron action outside its reach.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>Call <code>POST /rest/V1/integration/admin/token</code> with your admin username and password, or use a preconfigured integration token. Either way you end up with a bearer token you send as <code>Authorization: Bearer &lt;token&gt;</code> on every call. Keep the token and the store URL in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="your admin bearer token"
+export DRY_RUN="true"   # start safe, change to false to allow the invalidate nudge</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="your admin bearer token"
+export DRY_RUN="true"   // start safe, change to false to allow the invalidate nudge</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call goes to <code>{MAGENTO_URL}/rest/V1</code> with your token in the <code>Authorization</code> header. A small helper sends the request and raises on a non success status, and we reuse it for reading categories, reading products, and the optional invalidate nudge.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+def api_get(path, params=None):
+    r = requests.get(f"{MAGENTO_URL}/rest/V1{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/+$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+const HEADERS = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the reported count and whether the category is an anchor</h3>
+      <p><code>GET /rest/V1/categories/{id}</code> returns the category with a <code>custom_attributes</code> array. The attribute with code <code>product_count</code> holds the cached count Magento would show in the admin and storefront, and the attribute with code <code>is_anchor</code> tells us whether this category rolls up subcategory products, which is where a partial reindex is most likely to land.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def custom_attr(attrs, code, default=None):
+    for a in attrs or []:
+        if a.get("attribute_code") == code:
+            return a.get("value")
+    return default
+
+def reported_category_count(category_id):
+    cat = api_get(f"/categories/{category_id}")
+    attrs = cat.get("custom_attributes")
+    reported = int(custom_attr(attrs, "product_count", 0) or 0)
+    is_anchor = str(custom_attr(attrs, "is_anchor", "0")) == "1"
+    return reported, is_anchor</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">function customAttr(attrs, code, fallback = null) {
+  for (const a of attrs || []) {
+    if (a.attribute_code === code) return a.value;
+  }
+  return fallback;
+}
+
+async function reportedCategoryCount(categoryId) {
+  const cat = await apiGet(`/categories/${categoryId}`);
+  const attrs = cat.custom_attributes;
+  const reported = Number(customAttr(attrs, "product_count", 0) || 0);
+  const isAnchor = String(customAttr(attrs, "is_anchor", "0")) === "1";
+  return { reported, isAnchor };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Read the actual count from the live product assignments</h3>
+      <p><code>GET /rest/V1/products</code> with a <code>searchCriteria</code> filter on <code>category_id</code> queries the live <code>catalog_category_product</code> assignments, not the index. Setting <code>pageSize=1</code> means Magento still computes and returns the full <code>total_count</code>, but we do not have to pull every SKU to get it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def actual_category_count(category_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "category_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": category_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[pageSize]": 1,
+    }
+    result = api_get("/products", params)
+    return int(result.get("total_count", 0))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function actualCategoryCount(categoryId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "category_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": categoryId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[pageSize]": 1,
+  };
+  const result = await apiGet("/products", params);
+  return Number(result.total_count || 0);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function so it is easy to read and easy to test with no network calls. The rule treats a reported count of zero with real assignments as the worst case, a full index loss, regardless of tolerance. Anything else that differs by more than the tolerance is drift. <code>isAnchor</code> only changes how the finding is prioritized in the report, never whether it is flagged.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_category_count_discrepancy(reported_count, actual_count, is_anchor, tolerance=0):
+    delta = actual_count - reported_count
+    if actual_count > 0 and reported_count == 0:
+        return {"flagged": True, "severity": "zeroed", "delta": delta}
+    if abs(delta) > tolerance:
+        return {"flagged": True, "severity": "drift", "delta": delta}
+    return {"flagged": False, "severity": "none", "delta": delta}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideCategoryCountDiscrepancy(reportedCount, actualCount, isAnchor, tolerance = 0) {
+  const delta = actualCount - reportedCount;
+  if (actualCount > 0 && reportedCount === 0) {
+    return { flagged: true, severity: "zeroed", delta };
+  }
+  if (Math.abs(delta) > tolerance) {
+    return { flagged: true, severity: "drift", delta };
+  }
+  return { flagged: false, severity: "none", delta };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report, and optionally nudge the indexer</h3>
+      <p>The default and safest path is a DRY_RUN report of every flagged category id, its severity, and its delta. The real repair, <code>bin/magento indexer:reindex catalog_category_product</code>, needs CLI or cron access this script does not have. If you set <code>MAGENTO_ALLOW_INDEXER_INVALIDATE=true</code>, the script can call <code>PUT /rest/V1/categories/{id}</code> with an unchanged payload, resending the same name, purely to trigger Magento's category save observer and mark the indexer invalid so the next scheduled cron reindex picks it up. That is a soft nudge, not a guaranteed fix, and it is skipped whenever DRY_RUN is true.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Leave <code>DRY_RUN=true</code> until you have read the report and confirmed the flagged categories are real. The invalidate nudge only marks the indexer state dirty, it does not run a reindex itself, so it depends on your cron actually being active on schedule.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only ever reads categories and products unless you explicitly opt into the invalidate nudge.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/category-product-count-wrong" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">category_count_check.py</div>
+      <pre><code class="language-python">"""Flag Magento categories whose reported product_count disagrees with the
+real product to category assignments, especially anchor categories after a
+partial catalog_category_product reindex. Report only by default.
+
+The catalog_category_product indexer rebuilds catalog_category_product_index
+(and the per store index) with a temp table swap rather than updating rows in
+place. If that swap is interrupted the index table can go stale or zero out
+while the live assignment table is untouched. This script cannot trigger a
+real reindex over REST, so it detects and reports the gap, and only if you
+opt in with MAGENTO_ALLOW_INDEXER_INVALIDATE=true does it resave the category
+to nudge Magento's own indexer invalidation for the next scheduled cron run.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("category_count_check")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+TOLERANCE = int(os.environ.get("COUNT_TOLERANCE", "0"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+ALLOW_INVALIDATE = os.environ.get("MAGENTO_ALLOW_INDEXER_INVALIDATE", "false").lower() == "true"
+
+
+def api_get(path, params=None):
+    r = requests.get(f"{MAGENTO_URL}/rest/V1{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_put(path, payload):
+    r = requests.put(f"{MAGENTO_URL}/rest/V1{path}", headers=HEADERS, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def custom_attr(attrs, code, default=None):
+    for a in attrs or []:
+        if a.get("attribute_code") == code:
+            return a.get("value")
+    return default
+
+
+def list_category_ids():
+    result = api_get("/categories/list", {
+        "searchCriteria[pageSize]": 200,
+    })
+    return [item["id"] for item in result.get("items", [])]
+
+
+def reported_category_count(category_id):
+    cat = api_get(f"/categories/{category_id}")
+    attrs = cat.get("custom_attributes")
+    reported = int(custom_attr(attrs, "product_count", 0) or 0)
+    is_anchor = str(custom_attr(attrs, "is_anchor", "0")) == "1"
+    return reported, is_anchor, cat
+
+
+def actual_category_count(category_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "category_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": category_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[pageSize]": 1,
+    }
+    result = api_get("/products", params)
+    return int(result.get("total_count", 0))
+
+
+def decide_category_count_discrepancy(reported_count, actual_count, is_anchor, tolerance=0):
+    delta = actual_count - reported_count
+    if actual_count > 0 and reported_count == 0:
+        return {"flagged": True, "severity": "zeroed", "delta": delta}
+    if abs(delta) > tolerance:
+        return {"flagged": True, "severity": "drift", "delta": delta}
+    return {"flagged": False, "severity": "none", "delta": delta}
+
+
+def nudge_indexer_invalidate(category_id, category):
+    name = category.get("name")
+    api_put(f"/categories/{category_id}", {"category": {"id": category_id, "name": name}})
+
+
+def run():
+    flagged = 0
+    for category_id in list_category_ids():
+        reported, is_anchor, category = reported_category_count(category_id)
+        actual = actual_category_count(category_id)
+        decision = decide_category_count_discrepancy(reported, actual, is_anchor, TOLERANCE)
+        if not decision["flagged"]:
+            continue
+        flagged += 1
+        log.warning(
+            "Category %s %s: reported=%d actual=%d delta=%+d anchor=%s",
+            category_id, decision["severity"], reported, actual, decision["delta"], is_anchor,
+        )
+        if ALLOW_INVALIDATE and not DRY_RUN:
+            nudge_indexer_invalidate(category_id, category)
+            log.info("Category %s: resaved to invalidate catalog_category_product indexer", category_id)
+    log.info("Done. %d categor%s flagged.", flagged, "y" if flagged == 1 else "ies")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">category-count-check.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento categories whose reported product_count disagrees with the
+ * real product to category assignments, especially anchor categories after a
+ * partial catalog_category_product reindex. Report only by default.
+ *
+ * Guide: https://www.allanninal.dev/magento/category-product-count-wrong/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://example.test").replace(/\/+$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "dummy-token";
+const HEADERS = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+const TOLERANCE = Number(process.env.COUNT_TOLERANCE || 0);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const ALLOW_INVALIDATE = (process.env.MAGENTO_ALLOW_INDEXER_INVALIDATE || "false").toLowerCase() === "true";
+
+export function decideCategoryCountDiscrepancy(reportedCount, actualCount, isAnchor, tolerance = 0) {
+  const delta = actualCount - reportedCount;
+  if (actualCount > 0 && reportedCount === 0) {
+    return { flagged: true, severity: "zeroed", delta };
+  }
+  if (Math.abs(delta) > tolerance) {
+    return { flagged: true, severity: "drift", delta };
+  }
+  return { flagged: false, severity: "none", delta };
+}
+
+function customAttr(attrs, code, fallback = null) {
+  for (const a of attrs || []) {
+    if (a.attribute_code === code) return a.value;
+  }
+  return fallback;
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, payload) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function listCategoryIds() {
+  const result = await apiGet("/categories/list", { "searchCriteria[pageSize]": 200 });
+  return (result.items || []).map((item) => item.id);
+}
+
+async function reportedCategoryCount(categoryId) {
+  const cat = await apiGet(`/categories/${categoryId}`);
+  const attrs = cat.custom_attributes;
+  const reported = Number(customAttr(attrs, "product_count", 0) || 0);
+  const isAnchor = String(customAttr(attrs, "is_anchor", "0")) === "1";
+  return { reported, isAnchor, category: cat };
+}
+
+async function actualCategoryCount(categoryId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "category_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": categoryId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[pageSize]": 1,
+  };
+  const result = await apiGet("/products", params);
+  return Number(result.total_count || 0);
+}
+
+async function nudgeIndexerInvalidate(categoryId, category) {
+  await apiPut(`/categories/${categoryId}`, { category: { id: categoryId, name: category.name } });
+}
+
+export async function run() {
+  let flagged = 0;
+  for (const categoryId of await listCategoryIds()) {
+    const { reported, isAnchor, category } = await reportedCategoryCount(categoryId);
+    const actual = await actualCategoryCount(categoryId);
+    const decision = decideCategoryCountDiscrepancy(reported, actual, isAnchor, TOLERANCE);
+    if (!decision.flagged) continue;
+    flagged++;
+    console.warn(
+      `Category ${categoryId} ${decision.severity}: reported=${reported} actual=${actual} delta=${decision.delta >= 0 ? "+" : ""}${decision.delta} anchor=${isAnchor}`
+    );
+    if (ALLOW_INVALIDATE && !DRY_RUN) {
+      await nudgeIndexerInvalidate(categoryId, category);
+      console.log(`Category ${categoryId}: resaved to invalidate catalog_category_product indexer`);
+    }
+  }
+  console.log(`Done. ${flagged} categor${flagged === 1 ? "y" : "ies"} flagged.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides what severity gets reported for a category a merchandiser will look at next. Because <code>decide_category_count_discrepancy</code> is pure, the test needs no network and no Magento store. It just feeds in plain numbers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_category_count.py</div>
+      <pre><code class="language-python">from category_count_check import decide_category_count_discrepancy
+
+
+def test_equal_counts_not_flagged():
+    result = decide_category_count_discrepancy(42, 42, False)
+    assert result == {"flagged": False, "severity": "none", "delta": 0}
+
+
+def test_off_by_one_is_drift():
+    result = decide_category_count_discrepancy(41, 42, False)
+    assert result["flagged"] is True
+    assert result["severity"] == "drift"
+    assert result["delta"] == 1
+
+
+def test_reported_zero_with_real_assignments_is_zeroed():
+    result = decide_category_count_discrepancy(0, 50, True)
+    assert result["flagged"] is True
+    assert result["severity"] == "zeroed"
+    assert result["delta"] == 50
+
+
+def test_reported_zero_and_actual_zero_not_flagged():
+    result = decide_category_count_discrepancy(0, 0, True)
+    assert result["flagged"] is False
+    assert result["severity"] == "none"
+
+
+def test_near_miss_within_tolerance_not_flagged():
+    result = decide_category_count_discrepancy(100, 102, False, tolerance=5)
+    assert result["flagged"] is False
+
+
+def test_drift_beyond_tolerance_is_flagged():
+    result = decide_category_count_discrepancy(100, 108, False, tolerance=5)
+    assert result["flagged"] is True
+    assert result["severity"] == "drift"
+
+
+def test_zeroed_ignores_tolerance():
+    result = decide_category_count_discrepancy(0, 3, True, tolerance=10)
+    assert result["flagged"] is True
+    assert result["severity"] == "zeroed"
+
+
+def test_is_anchor_does_not_change_flag_boundary():
+    anchor = decide_category_count_discrepancy(10, 20, True)
+    leaf = decide_category_count_discrepancy(10, 20, False)
+    assert anchor["flagged"] == leaf["flagged"] == True
+    assert anchor["severity"] == leaf["severity"] == "drift"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">category-count.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideCategoryCountDiscrepancy } from "./category-count-check.js";
+
+test("equal counts not flagged", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(42, 42, false);
+  assert.deepEqual(result, { flagged: false, severity: "none", delta: 0 });
+});
+
+test("off by one is drift", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(41, 42, false);
+  assert.equal(result.flagged, true);
+  assert.equal(result.severity, "drift");
+  assert.equal(result.delta, 1);
+});
+
+test("reported zero with real assignments is zeroed", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(0, 50, true);
+  assert.equal(result.flagged, true);
+  assert.equal(result.severity, "zeroed");
+  assert.equal(result.delta, 50);
+});
+
+test("reported zero and actual zero not flagged", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(0, 0, true);
+  assert.equal(result.flagged, false);
+  assert.equal(result.severity, "none");
+});
+
+test("near miss within tolerance not flagged", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(100, 102, false, 5);
+  assert.equal(result.flagged, false);
+});
+
+test("drift beyond tolerance is flagged", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(100, 108, false, 5);
+  assert.equal(result.flagged, true);
+  assert.equal(result.severity, "drift");
+});
+
+test("zeroed ignores tolerance", () =&gt; {
+  const result = decideCategoryCountDiscrepancy(0, 3, true, 10);
+  assert.equal(result.flagged, true);
+  assert.equal(result.severity, "zeroed");
+});
+
+test("isAnchor does not change the flag boundary", () =&gt; {
+  const anchor = decideCategoryCountDiscrepancy(10, 20, true);
+  const leaf = decideCategoryCountDiscrepancy(10, 20, false);
+  assert.equal(anchor.flagged, leaf.flagged);
+  assert.equal(anchor.severity, leaf.severity);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Anchor category zeroed</span>
+      <h4>A seasonal sale category showed zero products</h4>
+      <p>A retailer ran a bulk product import overnight that triggered a <code>catalog_category_product</code> reindex on a large anchor category with dozens of subcategories. The reindex hit a limit partway through, the same shape reported in magento/magento2 issue #8018, and the anchor category's product_count dropped to zero the next morning. Merchandisers assumed the import had unassigned every product from the sale category and started manually reassigning them.</p>
+      <p>Running the diff script against the REST API showed <code>actual_total_count</code> was still the full 340 products, only the reported count had zeroed, matching the pattern described in ACSD-46519. A scheduled <code>indexer:reindex catalog_category_product</code> fixed it in under a minute once the team knew that was the actual problem.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Slow drift</span>
+      <h4>Leaf categories quietly undercounted for weeks</h4>
+      <p>A B2B catalog with frequent small product edits kept triggering partial category reindexes that never fully failed, just left a handful of leaf categories a few products short of their true count. Nobody noticed because the storefront listing itself still rendered the right products, only the summary count next to the category name in the admin grid was off.</p>
+      <p>A weekly run of the script against every category id flagged the drifted ones with their exact delta, which made it obvious the discrepancies were index staleness rather than a data problem, and a routine reindex kept them in sync going forward.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, nobody has to guess whether a low or zero product count means missing inventory or a stale index. The script tells you exactly which categories disagree, by how much, and whether they are anchor categories most likely to have been hit by a partial reindex, so the team can go straight to running the real fix instead of chasing a phantom data loss.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a Magento category show the wrong product count?</summary>
+      <p>The category product count is read from a precomputed index table, catalog_category_product_index, that the catalog_category_product indexer rebuilds using a temp table swap. If that swap is interrupted by a full temp table, a memory limit, a bulk product limit, or an overlapping reindex, the swap can partially commit or abort and leave the index table stale or zeroed, even though the real product to category assignments on disk are untouched.</p>
+    </details>
+    <details>
+      <summary>Why is an anchor category more likely to show zero products?</summary>
+      <p>An anchor category's count is aggregated from every subcategory during the same temp table pass, so it does the most work and touches the most rows. A partial failure during that aggregation is far more likely to hit the anchor category's row than a leaf category, which is why anchor categories are the most common victim of a zeroed or undercounted product_count.</p>
+    </details>
+    <details>
+      <summary>Can a script fix the wrong product count automatically?</summary>
+      <p>Not directly over REST. The real fix is bin/magento indexer:reindex catalog_category_product, a CLI or cron action outside the REST API. A script can detect and report the discrepancy safely, and optionally resave the category with an unchanged payload to mark the indexer invalid so the next scheduled reindex picks it up, but that is a soft nudge, not a guaranteed fix.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/magento/">Browse all Magento field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Smile-SA/elasticsuite: category product index is wrong after switching to temp tables for indexing. <a href="https://github.com/Smile-SA/elasticsuite/issues/622" rel="noopener">github.com/Smile-SA/elasticsuite/issues/622</a></li>
+      <li>magento/magento2: running indexer:reindex catalog_category_product fails due to limit 500. <a href="https://github.com/magento/magento2/issues/8018" rel="noopener">github.com/magento/magento2/issues/8018</a></li>
+      <li>Adobe Commerce Knowledge Base: ACSD-46519, product_count in categoryList GraphQL query returns 0 for anchor categories. <a href="https://experienceleague.adobe.com/docs/commerce-knowledge-base/kb/support-tools/patches/v1-1-23/acsd-46519-product-count-categorylist-graphql-query-returns-zero-anchor-categories.html?lang=en" rel="noopener">experienceleague.adobe.com acsd-46519</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce Operations: Indexing overview, indexers, reindex, and cron. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/indexers" rel="noopener">experienceleague.adobe.com commerce-operations indexers</a></li>
+      <li>Adobe Commerce Web API: Products endpoint and searchCriteria reference. <a href="https://developer.adobe.com/commerce/webapi/rest/tutorials/searching-with-rest/" rel="noopener">developer.adobe.com searching-with-rest</a></li>
+      <li>Adobe Commerce Web API: Categories endpoint reference. <a href="https://developer.adobe.com/commerce/webapi/rest/rest-endpoints/" rel="noopener">developer.adobe.com rest-endpoints</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento indexing, cron, MSI stock, or catalog data that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this explain your category count?</h3>
+    <p>If this saved you a wrong assumption about missing products or a wasted afternoon reassigning things that were never unassigned, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

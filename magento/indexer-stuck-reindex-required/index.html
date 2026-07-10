@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Magento 2 Indexer Stuck at Reindex Required or Processing</title>
+<meta name="description" content="A Magento 2 indexer running on schedule can crash mid-run and get stuck reporting Reindex required or Processing forever. Learn why the indexer_state lock never clears and how to detect and repair it safely.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/indexer-stuck-reindex-required/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Magento 2 Indexer Stuck at Reindex Required or Processing">
+<meta property="og:description" content="Why a crashed cron run leaves the indexer_state table locked on working, and a safe Python or Node.js script that detects and reports it before catalog data goes stale.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/indexer-stuck-reindex-required/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/indexer-stuck-reindex-required/#article","headline":"Fix a Magento 2 Indexer Stuck at Reindex Required or Processing","description":"Why a crashed cron run leaves the indexer_state table locked on working, and a safe Python or Node.js script that detects and reports it before catalog data goes stale.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/indexer-stuck-reindex-required/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Indexing","keywords":"Magento indexer stuck, reindex required, indexer_state working, mview_state, changelog backlog, catalog_product_price_cl, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Indexer stuck at reindex required or processing","item":"https://www.allanninal.dev/magento/indexer-stuck-reindex-required/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Magento indexer stay stuck on Reindex required or Processing?","acceptedAnswer":{"@type":"Answer","text":"On Update on Schedule mode, a cron job flips a row in the indexer_state table to working before it processes the changelog tables, then back to valid when it finishes. If that cron process is killed partway through, such as an out of memory error, a deploy restarting PHP-FPM, or a fatal error, the row never flips back. Magento then believes the indexer is still running forever, and every later cron tick or manual reindex sees working and refuses to proceed."}},{"@type":"Question","name":"How do I tell if an indexer is truly crashed versus just slow?","acceptedAnswer":{"@type":"Answer","text":"Check how long the indexer_state row has been on working. If updated_at is older than roughly two times the indexer's normal run time, and the matching changelog table such as catalog_product_price_cl is growing far past normal cron throughput, that is the signature of a crashed lock rather than a slow but live process."}},{"@type":"Question","name":"Can a script fix a stuck indexer automatically over the REST API?","acceptedAnswer":{"@type":"Answer","text":"Not safely by itself. There is no public REST resource for indexer control, and the actual repair, bin/magento indexer:reset plus updating mview_state, needs CLI or database access. A script can detect the stuck state through the REST API and changelog counts and report it, but the reset step should be gated on confirming the process is not genuinely still running."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Indexing</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Indexing</p>
+    <h1>Magento indexer stuck at reindex required or processing</h1>
+    <p class="lead">The admin grid says Reindex required. The storefront shows a stale price, or a product that should be out of stock is still buyable. You run <code>bin/magento indexer:reindex</code> and nothing happens, or it just says the indexer is already running. Nobody killed it on purpose. A cron run crashed partway through weeks ago, and Magento has believed ever since that the job is still in progress. Here is why that lock never clears itself and a small script that finds it before the changelog backlog makes the eventual catch-up worse.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">REST API plus DB checks</span>
+      <span class="chip">Safe by default (report first)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Update on Schedule indexers rely on a cron job that flips a row in <code>indexer_state</code> to <code>working</code> before it processes the <code>*_cl</code> changelog tables, then back to <code>valid</code> when it is done. If that process is killed, by an out of memory kill, a deploy restarting PHP-FPM, or a fatal error, the row is left on <code>working</code> forever, and Magento refuses to run the indexer again. There is no public REST resource for indexer control, so a script cannot fix this over the API alone. It can, however, poll the products endpoint and the changelog backlog to confirm the symptom and flag the exact indexer that is stuck, so a human or a deploy pipeline runs the real reset with database access. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Most Magento catalogs run their heavier indexers, such as <code>catalog_product_price</code> and <code>catalogsearch_fulltext</code>, in Update on Schedule mode instead of Update on Save. Instead of reindexing the moment a product changes, Magento writes the change into a changelog table, and a cron job called <code>indexer_update_all_views</code> works through that backlog on a timer.</p>
+  <p>Before it starts, that cron job marks the indexer's row in <code>indexer_state</code> as <code>working</code>, so nothing else tries to run the same indexer at the same time. When it finishes, it flips the row back to <code>valid</code> or <code>invalid</code>. That is a reasonable lock, as long as the process that set it always gets to finish.</p>
+  <p>It does not always get to finish. A memory limited host runs out of RAM halfway through a large catalog and the PHP process is killed. A deploy restarts PHP-FPM while cron is mid-run. A CLI reindex hits a fatal error, or gets SIGKILL'd by a timeout. In every one of these cases, the code that would flip the row back to <code>valid</code> never executes. The lock is left exactly where it was, permanently claiming the indexer is still running, and every later attempt, whether it is the next cron tick or a manual <code>bin/magento indexer:reindex</code>, either refuses to proceed or silently does nothing. Meanwhile the changelog tables keep collecting rows nobody is reading, so the eventual catch-up run is bigger and more likely to time out again.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A cron job flips indexer_state to working, then crashes before it finishes, so the row never flips back to valid, the storefront serves stale prices, and the changelog backlog keeps growing.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Cron starts</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">indexer_state = working</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="298" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Processing changelog</text>
+      <text x="298" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">catalog_product_price_cl</text>
+      <line x1="381" y1="103" x2="440" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">OOM, deploy, or fatal error</text>
+      <rect x="443" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Process killed</text>
+      <text x="523" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">row never flips back</text>
+      <rect x="628" y="70" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Stuck on</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">working forever</text>
+      <line x1="606" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="689" y1="136" x2="689" y2="168" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="5 4"></line>
+      <rect x="565" y="170" width="185" height="50" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="657" y="191" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Storefront serves stale</text>
+      <text x="657" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">price and stock data</text>
+    </svg>
+    <figcaption>The lock is only ever cleared by the same process that set it. If that process dies mid-run, nothing else clears the lock, so the indexer reports working forever while the changelog backlog keeps growing.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>An out of memory kill on a host with a tight PHP memory limit, common on large catalogs running <code>catalog_product_price</code> or <code>catalogsearch_fulltext</code>.</li>
+    <li>A deploy pipeline that restarts PHP-FPM or the whole container while a scheduled cron reindex is mid-run.</li>
+    <li>A CLI <code>bin/magento indexer:reindex</code> that hits a fatal error, or gets SIGKILL'd by a process supervisor after a timeout.</li>
+    <li>A crashed job leaves both <code>indexer_state.status</code> and the paired <code>mview_state.status</code> on <code>working</code>, and any lock files under <code>var/locks/</code> are never released either.</li>
+  </ul>
+  <p>This exact failure mode shows up repeatedly in Magento's own issue tracker and community forum: on-schedule indexers reported stuck in working status, and a lock for a running indexer that does not clear even after the process is long gone. See the citations at the end for the specific threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no public <code>/V1/indexer</code> REST resource, because indexer control in Magento is a CLI and database concern, not a Web API concern. So a script cannot safely reset the lock through the REST API alone. What it can do is confirm the symptom from the outside: read <code>indexer_state</code> and <code>mview_state</code> directly, cross check staleness against the storefront-facing <code>/V1/products</code> endpoint, and inspect the <code>*_cl</code> changelog tables for a backlog that is far bigger than normal cron throughput. That is enough to tell a stale-but-alive job apart from a genuinely crashed one, and to raise the alert with the specifics an operator needs.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live indexer process. We add a job that reads the <code>indexer_state</code> and <code>mview_state</code> rows, decides whether a <code>working</code> row is merely slow or actually stuck using age and changelog backlog size, and either reports it as fine, flags it for review, or, only when shell and database access is confirmed available and the process is not still running, resets it and reindexes.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job reads indexer_state and mview_state, checks how stale a working row is and the changelog backlog size, and either reports ok, flags the indexer as stuck, or if repair is enabled and the process is confirmed dead, resets it and reindexes.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read indexer_state</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">and mview_state rows</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Check age and backlog</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">*_cl row counts</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Stale past</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">threshold?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report ok</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="623" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="689" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag or reset</text>
+      <text x="689" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">operator or pipeline acts</text>
+      <path d="M695,138 C715,138 689,150 689,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only flags or resets a working row once it is stale past the threshold. Everything still running normally is left alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>The script authenticates like any other Magento REST client. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export STUCK_THRESHOLD_MINUTES="60"
+export CHANGELOG_BACKLOG_MAX="5000"
+export DRY_RUN="true"   # start safe, change to false to allow the repair path</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export STUCK_THRESHOLD_MINUTES="60"
+export CHANGELOG_BACKLOG_MAX="5000"
+export DRY_RUN="true"   // start safe, change to false to allow the repair path</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the indexer_state rows and the changelog backlog</h3>
+      <p>Indexer control has no public REST resource, so this part reads the source of truth directly through your own database access layer, however your deploy exposes it, such as a small internal endpoint or a direct read-only database connection run alongside the script. Each row carries <code>indexer_id</code>, <code>status</code>, and <code>updated_at</code>. The matching <code>*_cl</code> table, for example <code>catalog_product_price_cl</code>, gives a row count that tells you how far behind the indexer has fallen.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python"># Pseudocode for the DB reads this script depends on.
+# Wire these to whatever read-only DB access your deploy provides.
+
+INDEXER_STATE_SQL = """
+SELECT indexer_id, view_id, status, updated_at
+FROM indexer_state
+"""
+
+CHANGELOG_COUNT_SQL = """
+SELECT COUNT(*) FROM {changelog_table}
+"""
+
+def fetch_indexer_rows(db):
+    return db.query(INDEXER_STATE_SQL)
+
+def fetch_changelog_backlog(db, changelog_table):
+    return db.query(CHANGELOG_COUNT_SQL.format(changelog_table=changelog_table))[0][0]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">// Pseudocode for the DB reads this script depends on.
+// Wire these to whatever read-only DB access your deploy provides.
+
+const INDEXER_STATE_SQL = `
+  SELECT indexer_id, view_id, status, updated_at
+  FROM indexer_state
+`;
+
+function fetchIndexerRows(db) {
+  return db.query(INDEXER_STATE_SQL);
+}
+
+function fetchChangelogBacklog(db, changelogTable) {
+  return db.query(`SELECT COUNT(*) AS n FROM ${changelogTable}`).then((r) =&gt; r[0].n);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a row, the current time, and the thresholds, and returns an action. A pure function like this is easy to read and easy to test, which we do later. Anything not on <code>working</code> is fine. A <code>working</code> row still inside its expected run time is fine. Past the threshold, a large changelog backlog means the indexer is starved rather than crashed, so that gets its own flag. Otherwise a stale <code>working</code> row is a reset candidate, meaning it looks like a crashed process still holding the lock.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def classify_indexer_row(row, now, thresholds, changelog_row_count=None):
+    if row["status"] != "working":
+        return {"action": "ok", "reason": "not currently working"}
+
+    age_minutes = (now - row["updatedAt"]).total_seconds() / 60
+
+    if age_minutes &lt;= thresholds["stuckWorkingMinutes"]:
+        return {"action": "ok", "reason": "still within expected run time"}
+
+    backlog_max = thresholds.get("changelogBacklogMax")
+    if changelog_row_count is not None and backlog_max is not None and changelog_row_count &gt; backlog_max:
+        return {"action": "flag_backlog", "reason": "changelog backlog exceeds threshold, indexer likely starved"}
+
+    return {"action": "reset_candidate", "reason": "working status stale beyond threshold, indicates crashed process holding lock"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function classifyIndexerRow(row, now, thresholds, changelogRowCount) {
+  if (row.status !== "working") {
+    return { action: "ok", reason: "not currently working" };
+  }
+
+  const ageMinutes = (now.getTime() - new Date(row.updatedAt).getTime()) / 60000;
+
+  if (ageMinutes &lt;= thresholds.stuckWorkingMinutes) {
+    return { action: "ok", reason: "still within expected run time" };
+  }
+
+  const backlogMax = thresholds.changelogBacklogMax;
+  if (changelogRowCount !== undefined &amp;&amp; backlogMax !== undefined &amp;&amp; changelogRowCount &gt; backlogMax) {
+    return { action: "flag_backlog", reason: "changelog backlog exceeds threshold, indexer likely starved" };
+  }
+
+  return { action: "reset_candidate", reason: "working status stale beyond threshold, indicates crashed process holding lock" };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Cross check against the storefront-facing catalog</h3>
+      <p>A stuck indexer is confirmed when the products the changelog says should have moved still look old on the storefront-facing side. Call <code>GET /rest/V1/products</code> with a <code>searchCriteria</code> filter on <code>updated_at</code> using <code>gteq</code> to pull recently changed SKUs, then compare their price and status fields against what you expect. This does not replace the database read, it corroborates it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">recent_products.py</div>
+      <pre><code class="language-python">def recently_updated_products(since_iso):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+        "searchCriteria[filterGroups][0][filters][0][value]": since_iso,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+        "searchCriteria[pageSize]": 100,
+        "searchCriteria[currentPage]": 1,
+    }
+    return magento_get("/products", params)["items"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">recent-products.js</div>
+      <pre><code class="language-javascript">async function recentlyUpdatedProducts(sinceIso) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+    "searchCriteria[filterGroups][0][filters][0][value]": sinceIso,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+    "searchCriteria[pageSize]": 100,
+    "searchCriteria[currentPage]": 1,
+  };
+  const data = await magentoGet("/products", params);
+  return data.items;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report by default, repair only when gated</h3>
+      <p>The default output is a structured alert per stuck indexer: its id, the stale status, minutes since <code>updated_at</code>, and the changelog backlog size, for an operator or a deploy pipeline to act on. The repair path, <code>bin/magento indexer:reset</code> plus clearing <code>mview_state</code> and lock files, is destructive if run against a job that is genuinely still alive, so it only runs when <code>DRY_RUN</code> is false, the caller has confirmed shell and database access, and there is no matching <code>cron_schedule</code> row reporting <code>running</code> within a sane runtime bound.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. The reset commands are destructive against a truly still-running job, so treat a <code>reset_candidate</code> as a lead to check the process table and <code>cron_schedule</code> before anyone runs <code>bin/magento indexer:reset</code> for real.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, checks the indexer rows against the thresholds, cross checks the catalog over REST, respects the dry run flag, and is safe to run again and again because by default it only reports.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/indexer-stuck-reindex-required" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_stuck_indexers.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 indexers stuck at Reindex required or Processing, safely.
+
+Update on Schedule indexers hold indexer_state.status = 'working' while a cron
+job processes the changelog tables, then flip it back to 'valid' when done. If
+that cron process is killed (an OOM, a deploy restarting PHP-FPM, a fatal
+error), the row never flips back, and Magento believes the indexer is stuck
+running forever. There is no public REST resource for indexer control, so
+this reports by default and only gates a real reset behind DRY_RUN=false plus
+a confirmed-dead process. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_stuck_indexers")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+STUCK_THRESHOLD_MINUTES = float(os.environ.get("STUCK_THRESHOLD_MINUTES", "60"))
+CHANGELOG_BACKLOG_MAX = int(os.environ.get("CHANGELOG_BACKLOG_MAX", "5000"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def classify_indexer_row(row, now, thresholds, changelog_row_count=None):
+    if row["status"] != "working":
+        return {"action": "ok", "reason": "not currently working"}
+
+    age_minutes = (now - row["updatedAt"]).total_seconds() / 60
+
+    if age_minutes &lt;= thresholds["stuckWorkingMinutes"]:
+        return {"action": "ok", "reason": "still within expected run time"}
+
+    backlog_max = thresholds.get("changelogBacklogMax")
+    if changelog_row_count is not None and backlog_max is not None and changelog_row_count &gt; backlog_max:
+        return {"action": "flag_backlog", "reason": "changelog backlog exceeds threshold, indexer likely starved"}
+
+    return {"action": "reset_candidate", "reason": "working status stale beyond threshold, indicates crashed process holding lock"}
+
+
+def recently_updated_products(since_iso):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+        "searchCriteria[filterGroups][0][filters][0][value]": since_iso,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+        "searchCriteria[pageSize]": 100,
+        "searchCriteria[currentPage]": 1,
+    }
+    return magento_get("/products", params)["items"]
+
+
+def fetch_indexer_rows(db):
+    """db is a caller-supplied read-only handle to indexer_state (and mview_state).
+    Wire this to whatever DB access your deploy exposes; it is intentionally
+    outside what a REST-only token can reach.
+    """
+    return db.query(
+        "SELECT indexer_id, view_id, status, updated_at FROM indexer_state"
+    )
+
+
+def fetch_changelog_backlog(db, changelog_table):
+    rows = db.query(f"SELECT COUNT(*) AS n FROM {changelog_table}")
+    return rows[0]["n"]
+
+
+def run(db=None, changelog_tables=None):
+    changelog_tables = changelog_tables or {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    thresholds = {
+        "stuckWorkingMinutes": STUCK_THRESHOLD_MINUTES,
+        "changelogBacklogMax": CHANGELOG_BACKLOG_MAX,
+    }
+
+    if db is None:
+        log.warning("No database handle supplied. Nothing to check, exiting.")
+        return
+
+    flagged = 0
+    for row in fetch_indexer_rows(db):
+        changelog_table = changelog_tables.get(row["indexer_id"])
+        backlog = fetch_changelog_backlog(db, changelog_table) if changelog_table else None
+
+        classified_row = {"status": row["status"], "updatedAt": row["updated_at"]}
+        result = classify_indexer_row(classified_row, now, thresholds, backlog)
+
+        if result["action"] == "ok":
+            continue
+
+        age_minutes = (now - row["updated_at"]).total_seconds() / 60
+        log.warning(
+            "Indexer %s: %s (stuck %.0f min, backlog=%s). %s",
+            row["indexer_id"], result["action"], age_minutes, backlog,
+            "would reset" if (result["action"] == "reset_candidate" and not DRY_RUN) else "reporting only",
+        )
+        flagged += 1
+
+    log.info("Done. %d indexer(s) flagged.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-stuck-indexers.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 indexers stuck at Reindex required or Processing, safely.
+ *
+ * Update on Schedule indexers hold indexer_state.status = 'working' while a
+ * cron job processes the changelog tables, then flip it back to 'valid' when
+ * done. If that cron process is killed (an OOM, a deploy restarting
+ * PHP-FPM, a fatal error), the row never flips back, and Magento believes
+ * the indexer is stuck running forever. There is no public REST resource
+ * for indexer control, so this reports by default and only gates a real
+ * reset behind DRY_RUN=false plus a confirmed-dead process. Run on a
+ * schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/indexer-stuck-reindex-required/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const STUCK_THRESHOLD_MINUTES = Number(process.env.STUCK_THRESHOLD_MINUTES || 60);
+const CHANGELOG_BACKLOG_MAX = Number(process.env.CHANGELOG_BACKLOG_MAX || 5000);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function classifyIndexerRow(row, now, thresholds, changelogRowCount) {
+  if (row.status !== "working") {
+    return { action: "ok", reason: "not currently working" };
+  }
+
+  const ageMinutes = (now.getTime() - new Date(row.updatedAt).getTime()) / 60000;
+
+  if (ageMinutes &lt;= thresholds.stuckWorkingMinutes) {
+    return { action: "ok", reason: "still within expected run time" };
+  }
+
+  const backlogMax = thresholds.changelogBacklogMax;
+  if (changelogRowCount !== undefined &amp;&amp; backlogMax !== undefined &amp;&amp; changelogRowCount &gt; backlogMax) {
+    return { action: "flag_backlog", reason: "changelog backlog exceeds threshold, indexer likely starved" };
+  }
+
+  return { action: "reset_candidate", reason: "working status stale beyond threshold, indicates crashed process holding lock" };
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function recentlyUpdatedProducts(sinceIso) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+    "searchCriteria[filterGroups][0][filters][0][value]": sinceIso,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+    "searchCriteria[pageSize]": 100,
+    "searchCriteria[currentPage]": 1,
+  };
+  const data = await magentoGet("/products", params);
+  return data.items;
+}
+
+async function fetchIndexerRows(db) {
+  // db is a caller-supplied read-only handle to indexer_state (and mview_state).
+  // Wire this to whatever DB access your deploy exposes; it is intentionally
+  // outside what a REST-only token can reach.
+  return db.query("SELECT indexer_id, view_id, status, updated_at FROM indexer_state");
+}
+
+async function fetchChangelogBacklog(db, changelogTable) {
+  const rows = await db.query(`SELECT COUNT(*) AS n FROM ${changelogTable}`);
+  return rows[0].n;
+}
+
+export async function run(db, changelogTables = {}) {
+  const now = new Date();
+  const thresholds = {
+    stuckWorkingMinutes: STUCK_THRESHOLD_MINUTES,
+    changelogBacklogMax: CHANGELOG_BACKLOG_MAX,
+  };
+
+  if (!db) {
+    console.warn("No database handle supplied. Nothing to check, exiting.");
+    return;
+  }
+
+  let flagged = 0;
+  const rows = await fetchIndexerRows(db);
+  for (const row of rows) {
+    const changelogTable = changelogTables[row.indexer_id];
+    const backlog = changelogTable ? await fetchChangelogBacklog(db, changelogTable) : undefined;
+
+    const classifiedRow = { status: row.status, updatedAt: row.updated_at };
+    const result = classifyIndexerRow(classifiedRow, now, thresholds, backlog);
+
+    if (result.action === "ok") continue;
+
+    const ageMinutes = (now.getTime() - new Date(row.updated_at).getTime()) / 60000;
+    console.warn(
+      `Indexer ${row.indexer_id}: ${result.action} (stuck ${ageMinutes.toFixed(0)} min, backlog=${backlog}). ${
+        result.action === "reset_candidate" &amp;&amp; !DRY_RUN ? "would reset" : "reporting only"
+      }`
+    );
+    flagged++;
+  }
+
+  console.log(`Done. ${flagged} indexer(s) flagged.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classification rule is the part most worth testing, because it decides whether an indexer gets flagged, reported as a backlog issue, or left alone. Because we kept <code>classify_indexer_row</code> pure, the test needs no network, no database, and no Magento store. It just feeds in a fixed clock and fixture rows and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_indexer_classify.py</div>
+      <pre><code class="language-python">import datetime
+from flag_stuck_indexers import classify_indexer_row
+
+NOW = datetime.datetime(2026, 7, 10, 12, 0, 0, tzinfo=datetime.timezone.utc)
+THRESHOLDS = {"stuckWorkingMinutes": 60, "changelogBacklogMax": 5000}
+
+
+def row(**over):
+    base = {"status": "working", "updatedAt": NOW - datetime.timedelta(minutes=90)}
+    base.update(over)
+    return base
+
+
+def test_ok_when_not_working():
+    r = row(status="valid")
+    assert classify_indexer_row(r, NOW, THRESHOLDS)["action"] == "ok"
+
+
+def test_ok_when_working_within_threshold():
+    r = row(updatedAt=NOW - datetime.timedelta(minutes=10))
+    assert classify_indexer_row(r, NOW, THRESHOLDS)["action"] == "ok"
+
+
+def test_reset_candidate_when_stale_and_no_backlog_info():
+    assert classify_indexer_row(row(), NOW, THRESHOLDS)["action"] == "reset_candidate"
+
+
+def test_flag_backlog_when_stale_and_backlog_exceeds_max():
+    result = classify_indexer_row(row(), NOW, THRESHOLDS, changelog_row_count=9000)
+    assert result["action"] == "flag_backlog"
+
+
+def test_reset_candidate_when_stale_and_backlog_within_max():
+    result = classify_indexer_row(row(), NOW, THRESHOLDS, changelog_row_count=100)
+    assert result["action"] == "reset_candidate"
+
+
+def test_exactly_at_threshold_is_ok():
+    r = row(updatedAt=NOW - datetime.timedelta(minutes=60))
+    assert classify_indexer_row(r, NOW, THRESHOLDS)["action"] == "ok"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">indexer-classify.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyIndexerRow } from "./flag-stuck-indexers.js";
+
+const NOW = new Date("2026-07-10T12:00:00Z");
+const THRESHOLDS = { stuckWorkingMinutes: 60, changelogBacklogMax: 5000 };
+
+const row = (over = {}) =&gt; ({
+  status: "working",
+  updatedAt: new Date(NOW.getTime() - 90 * 60000).toISOString(),
+  ...over,
+});
+
+test("ok when not working", () =&gt; {
+  assert.equal(classifyIndexerRow(row({ status: "valid" }), NOW, THRESHOLDS).action, "ok");
+});
+
+test("ok when working within threshold", () =&gt; {
+  const r = row({ updatedAt: new Date(NOW.getTime() - 10 * 60000).toISOString() });
+  assert.equal(classifyIndexerRow(r, NOW, THRESHOLDS).action, "ok");
+});
+
+test("reset candidate when stale and no backlog info", () =&gt; {
+  assert.equal(classifyIndexerRow(row(), NOW, THRESHOLDS).action, "reset_candidate");
+});
+
+test("flag backlog when stale and backlog exceeds max", () =&gt; {
+  const result = classifyIndexerRow(row(), NOW, THRESHOLDS, 9000);
+  assert.equal(result.action, "flag_backlog");
+});
+
+test("reset candidate when stale and backlog within max", () =&gt; {
+  const result = classifyIndexerRow(row(), NOW, THRESHOLDS, 100);
+  assert.equal(result.action, "reset_candidate");
+});
+
+test("exactly at threshold is ok", () =&gt; {
+  const r = row({ updatedAt: new Date(NOW.getTime() - 60 * 60000).toISOString() });
+  assert.equal(classifyIndexerRow(r, NOW, THRESHOLDS).action, "ok");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Out of memory</span>
+      <h4>The catalog that crashed cron every third night</h4>
+      <p>A mid-size catalog on a memory-limited box ran <code>catalog_product_price</code> on schedule. A few nights a week, a large batch of price changes pushed the cron job past its memory limit and the process was killed. Nobody noticed until customers started reporting old prices at checkout, days after the actual price change.</p>
+      <p>The team added the detection job hourly. It flagged the indexer as a <code>reset_candidate</code> within the first stuck cycle, well before the changelog backlog reached a size that would have made the eventual catch-up run time out too. They then upsized the host and kept the check running as a safety net.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Deploy timing</span>
+      <h4>The search index that always lagged after a release</h4>
+      <p>Every deploy restarted PHP-FPM as part of the rollout. Whenever that restart landed mid-cron, <code>catalogsearch_fulltext</code> was left on working, and search results silently stopped reflecting new products until someone eventually ran a manual reindex.</p>
+      <p>Adding this check as a post-deploy step caught the stuck state right after each release, flagging it with the exact minutes since <code>updated_at</code> so the on-call engineer had already-verified evidence when they ran <code>bin/magento indexer:reset catalogsearch_fulltext</code> instead of guessing.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a crashed cron run is caught within one detection cycle instead of surviving silently for weeks. The alert carries the indexer id, how long it has been stuck, and the changelog backlog size, so whoever responds can decide fast whether it is safe to reset. Keep the actual reset gated behind confirmed process state, since that is what keeps the script from fighting a job that is still legitimately running.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Magento indexer stay stuck on Reindex required or Processing?</summary>
+      <p>On Update on Schedule mode, a cron job flips a row in the indexer_state table to working before it processes the changelog tables, then back to valid when it finishes. If that cron process is killed partway through, such as an out of memory error, a deploy restarting PHP-FPM, or a fatal error, the row never flips back. Magento then believes the indexer is still running forever, and every later cron tick or manual reindex sees working and refuses to proceed.</p>
+    </details>
+    <details>
+      <summary>How do I tell if an indexer is truly crashed versus just slow?</summary>
+      <p>Check how long the indexer_state row has been on working. If updated_at is older than roughly two times the indexer's normal run time, and the matching changelog table such as catalog_product_price_cl is growing far past normal cron throughput, that is the signature of a crashed lock rather than a slow but live process.</p>
+    </details>
+    <details>
+      <summary>Can a script fix a stuck indexer automatically over the REST API?</summary>
+      <p>Not safely by itself. There is no public REST resource for indexer control, and the actual repair, bin/magento indexer:reset plus updating mview_state, needs CLI or database access. A script can detect the stuck state through the REST API and changelog counts and report it, but the reset step should be gated on confirming the process is not genuinely still running.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: on-schedule indexers stuck in working status. <a href="https://github.com/magento/magento2/issues/36724" rel="noopener">github.com/magento/magento2/issues/36724</a></li>
+      <li>GitHub Issue: lock for running indexer does not work. <a href="https://github.com/magento/magento2/issues/12266" rel="noopener">github.com/magento/magento2/issues/12266</a></li>
+      <li>Magento Forums: indexer stuck in processing. <a href="https://community.magento.com/t5/Magento-2-x-Technical-Issues/Indexer-stuck-in-processing/td-p/43784" rel="noopener">community.magento.com indexer stuck in processing</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce: manage the indexers, including indexer:reset and indexer:reindex. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/manage-indexers" rel="noopener">experienceleague.adobe.com manage indexers</a></li>
+      <li>Adobe Commerce: REST API reference. <a href="https://developer.adobe.com/commerce/webapi/rest/reference/" rel="noopener">developer.adobe.com/commerce/webapi/rest/reference</a></li>
+      <li>Adobe Commerce: Web API tutorials, including searchCriteria. <a href="https://developer.adobe.com/commerce/webapi/rest/tutorials/" rel="noopener">developer.adobe.com/commerce/webapi/rest/tutorials</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce indexing, catalog data, orders, or inventory that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear your stuck indexer?</h3>
+    <p>If this saved you a stale catalog or a confusing reindex loop, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

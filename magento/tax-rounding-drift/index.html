@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Tax Off by Rounding Between Calculation Methods in Magento 2</title>
+<meta name="description" content="A Magento 2 order's tax total looks wrong the moment you recompute it with a fixed formula, but the store is just using a different rounding point than your script expects. Learn why UNIT_BASE_CALCULATION, ROW_BASE_CALCULATION, and TOTAL_BASE_CALCULATION disagree by a cent, and build a Python or Node.js script that audits orders correctly.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/tax-rounding-drift/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Order Tax Off by Rounding Between Calculation Methods in Magento 2">
+<meta property="og:description" content="Why the same catalog prices and tax rate can legitimately produce a different order tax total depending on the configured rounding algorithm, and a safe Python or Node.js audit script.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/tax-rounding-drift/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/tax-rounding-drift/#article","headline":"Order Tax Off by Rounding Between Calculation Methods in Magento 2","description":"Why the same catalog prices and tax rate can legitimately produce a different order tax total depending on whether Magento is configured for UNIT_BASE_CALCULATION, ROW_BASE_CALCULATION, or TOTAL_BASE_CALCULATION, and a safe Python or Node.js script that recomputes expected tax under the active algorithm and reports genuine drift.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/tax-rounding-drift/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Pricing and Tax","keywords":"Magento 2 tax rounding, tax/calculation/algorithm, UNIT_BASE_CALCULATION, ROW_BASE_CALCULATION, TOTAL_BASE_CALCULATION, Magento Tax Calculation, Adobe Commerce REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Order tax off by rounding between calculation methods","item":"https://www.allanninal.dev/magento/tax-rounding-drift/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my recomputed tax not match the order's actual tax_amount?","acceptedAnswer":{"@type":"Answer","text":"Magento lets a merchant pick where in the arithmetic tax gets rounded, set at Stores, Configuration, Sales, Tax, Calculation Settings as tax/calculation/algorithm. UNIT_BASE_CALCULATION rounds tax per unit before summing, ROW_BASE_CALCULATION rounds once per line row, and TOTAL_BASE_CALCULATION rounds once on the grand total. A script that always assumes one method, usually row based, will diff against orders placed under a different configured algorithm by a cent or a fraction of a cent, and that is expected rounding noise, not a bug."}},{"@type":"Question","name":"How much drift is a real bug versus normal rounding noise?","acceptedAnswer":{"@type":"Answer","text":"A difference of about one rounding unit per order, roughly a cent, given a correctly replicated algorithm is normal and comes from carry-forward rounding across items. A delta larger than that, especially per line item, points to something else: mixed tax rates inside a single order being treated as one rate, a discount applied before tax when the configuration says after, or a stale tax rate snapshot captured on the order. Those are worth flagging for review, plain rounding noise is not."}},{"@type":"Question","name":"Can I fix a wrong tax_amount on an already invoiced Magento order through the REST API?","acceptedAnswer":{"@type":"Answer","text":"No. Magento does not expose a REST write that mutates sales_order.tax_amount or sales_order_item.tax_amount once an order is invoiced, because that would desync the order, invoice, credit memo, and any GL or tax report exports already generated from it. The correct action is to report the discrepancy for finance and tax-ops review, and if a correction is warranted, issue it as a new credit memo or refund adjustment, never as an edit to the original total."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Pricing and Tax</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Pricing and Tax</p>
+    <h1>Order tax off by rounding between calculation methods</h1>
+    <p class="lead">A script recomputes an order's expected tax with a plain "price times qty times rate" formula, and it does not match the order's actual tax_amount by a cent or two. Nothing is broken. Magento lets a merchant choose where in the math it rounds, per unit, per row, or once on the total, and each choice legitimately produces a slightly different number from the same catalog prices and the same tax rate. Here is why that happens and a script that replicates the configured algorithm before it calls anything drift.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Adobe Commerce REST API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento's tax calculation base, configured at Stores, Configuration, Sales, Tax, Calculation Settings as <code>tax/calculation/algorithm</code>, can be set to <code>UNIT_BASE_CALCULATION</code> (round per unit, then sum), <code>ROW_BASE_CALCULATION</code> (round once per line row), or <code>TOTAL_BASE_CALCULATION</code> (round once on the grand total). Each mode rounds at a different point in the arithmetic, so the same prices and rate can legitimately produce order totals that differ from a naive recomputation by a cent or a fraction of a cent. <code>Magento\Tax\Model\Calculation</code> and the order totals collector also apply carry-forward delta rounding to keep displayed amounts consistent. A script that recomputes expected tax with a single fixed method will produce false-positive drift unless it reads which algorithm was active and replicates the same rounding sequence, including delta accumulation. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every order has a tax total, and it feels like it should be reproducible: multiply the price by the quantity, multiply by the tax rate, done. Most of the time a script written that way looks right, because the numbers are small and round cleanly.</p>
+  <p>Then a store with a price like 333.33 and a quantity of 3 comes along, or a cart mixes several tax rates, and the naive recomputation is off from the order's real <code>tax_amount</code> by a cent. The catalog price did not change. The tax rate did not change. What changed is where Magento chose to round: before it multiplied by quantity, after it summed the row, or only once at the very end on the whole order. A script that assumes one fixed rounding point will flag orders that were placed under a different configured algorithm as broken, when they are not.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. The same catalog price and tax rate are rounded at three different points, per unit, per row, or once on the total, producing three legitimately different tax amounts, but a script assuming one fixed method flags the others as drift.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a8078"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="160" height="56" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="90" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Same price and rate</text>
+      <text x="90" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">qty 3, price 333.33</text>
+      <line x1="90" y1="76" x2="90" y2="96" stroke="#8a8078" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="98" width="150" height="50" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="85" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">UNIT_BASE</text>
+      <text x="85" y="134" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">round per unit</text>
+      <rect x="10" y="158" width="150" height="50" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="85" y="178" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">ROW_BASE</text>
+      <text x="85" y="194" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">round per row</text>
+      <line x1="160" y1="123" x2="200" y2="123" stroke="#8a8078" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="160" y1="183" x2="200" y2="183" stroke="#8a8078" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="203" y="98" width="160" height="50" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="283" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">tax_amount A</text>
+      <text x="283" y="134" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">e.g. 26.67</text>
+      <rect x="203" y="158" width="160" height="50" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="283" y="178" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">tax_amount B</text>
+      <text x="283" y="194" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">e.g. 26.66</text>
+      <text x="90" y="228" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">TOTAL_BASE rounds once at the very end, a third legitimate value</text>
+      <line x1="366" y1="140" x2="440" y2="140" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="403" y="100" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="403" y="163" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">script assumes one method</text>
+      <rect x="443" y="98" width="150" height="90" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="518" y="128" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Recompute with a</text>
+      <text x="518" y="145" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">fixed formula</text>
+      <text x="518" y="165" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">ignores which algorithm</text>
+      <text x="518" y="179" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">was actually configured</text>
+      <line x1="598" y1="140" x2="640" y2="140" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="643" y="108" width="107" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="696" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">False positive</text>
+      <text x="696" y="152" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">"drift"</text>
+    </svg>
+    <figcaption>Three legitimately different rounding points on the same catalog data. A script that only knows one of them mistakes the other two for a bug.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The active setting lives at <code>tax/calculation/algorithm</code> under Stores, Configuration, Sales, Tax, Calculation Settings, alongside <code>tax/calculation/discount_tax</code> for whether discounts apply before or after tax. Three modes are available, and each is a legitimate business decision, not a defect:</p>
+  <ul>
+    <li><strong>UNIT_BASE_CALCULATION</strong> rounds the tax on a single unit's price first, then multiplies that rounded per-unit tax by quantity and sums across lines. Rounding happens before the multiply, so small per-unit rounding can compound across a large quantity.</li>
+    <li><strong>ROW_BASE_CALCULATION</strong> multiplies unit price by quantity, subtracts any discount, and rounds the tax once for that whole row. Rounding happens after the multiply, once per line item.</li>
+    <li><strong>TOTAL_BASE_CALCULATION</strong> sums every row's pre-tax amount into one subtotal first and rounds the tax exactly once, on the grand total. This is only meaningful when every row shares the same tax rate; it does not have a sane single-rate answer when an order mixes tax classes.</li>
+    <li>Magento's own <code>Magento\Tax\Model\Calculation</code> and the <code>Sales\Model\Order\Total\Collector</code> also apply carry-forward delta rounding, tracking a running remainder so that displayed row, unit, and subtotal amounts stay internally consistent even though each individual rounding step lost or gained a fraction of a cent.</li>
+  </ul>
+  <p>None of this is visible from the order payload alone. The order just has a <code>tax_amount</code> that is correct for whichever algorithm was active when it was placed, and a script that recomputes tax with a single hardcoded method, commonly always row based, will diff against orders placed under a different configuration, or that mix tax classes across items, and call the difference drift when it is arithmetic doing exactly what it was configured to do. See the citations at the end for reports of this exact confusion.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A cent of difference is not automatically a bug. It is only meaningful once you know which algorithm produced the order's actual number and you replicate that same rounding sequence, including per-unit versus per-row rounding and any delta carry-forward, before you compare. Anything beyond about one rounding unit after that replication is the real signal worth reporting.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We read the store's configured algorithm once, pull orders in an audit window, and for each order recompute expected tax with the branch of arithmetic that matches the configured mode, not a single fixed formula. Anything within about a cent of the order's actual <code>tax_amount</code> is normal rounding noise and gets left alone. Anything beyond that gets written to a report for finance and tax-ops, since there is no safe REST write to change a committed order's tax total.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Read the configured tax algorithm, pull orders in the audit window, recompute expected tax under that same algorithm, compare to the order's actual tax_amount, and if the delta exceeds tolerance write a report row, otherwise leave the order alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Read algorithm</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">tax/calculation/algorithm</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="110" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b1a10">Pull orders in window</text>
+      <text x="110" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">processing, complete</text>
+      <line x1="210" y1="138" x2="252" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="255" y="108" width="165" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="337" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b1a10">Recompute expected</text>
+      <text x="337" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">using that same algorithm</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="555,106 662,138 555,170 448,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="555" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Delta over</text>
+      <text x="555" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">tolerance?</text>
+      <text x="665" y="118" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="695" y2="118" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="606" y="55" width="144" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="678" y="76" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Write report row</text>
+      <text x="678" y="92" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">for finance review</text>
+      <text x="665" y="200" font-family="sans-serif" font-size="10.5" fill="#8a8078" font-weight="700">no</text>
+      <line x1="662" y1="138" x2="695" y2="185" stroke="#8a8078" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="188" width="132" height="50" rx="10" fill="#f4f1ee" stroke="#c9beb4"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#6b584c">Rounding noise</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">left alone</text>
+    </svg>
+    <figcaption>The comparison only means anything once the configured algorithm is replicated first. Anything past the tolerance goes to a report, never a direct write to the order.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin token and the configured algorithm</h3>
+      <p>Authenticate against the admin token endpoint, or use an integration token if you already have one. The active <code>tax/calculation/algorithm</code> is not in the default <code>storeConfigs</code> DTO, so if system config is not reachable over REST in your setup, pass it as an environment fallback instead of guessing.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_TOKEN="your admin bearer token"
+export MAGENTO_TAX_ALGORITHM="ROW_BASE_CALCULATION"   # UNIT_BASE_CALCULATION | ROW_BASE_CALCULATION | TOTAL_BASE_CALCULATION
+export CREATED_FROM="2026-06-01 00:00:00"
+export CREATED_TO="2026-07-01 00:00:00"
+export TOLERANCE_CENTS="1"
+export DRY_RUN="true"   # report only, this script never writes an order's tax_amount</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://yourstore.example.com"
+export MAGENTO_ADMIN_TOKEN="your admin bearer token"
+export MAGENTO_TAX_ALGORITHM="ROW_BASE_CALCULATION"   // UNIT_BASE_CALCULATION | ROW_BASE_CALCULATION | TOTAL_BASE_CALCULATION
+export CREATED_FROM="2026-06-01 00:00:00"
+export CREATED_TO="2026-07-01 00:00:00"
+export TOLERANCE_CENTS="1"
+export DRY_RUN="true"   // report only, this script never writes an order's tax_amount</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Pull orders in the audit window</h3>
+      <p>GET <code>/rest/V1/orders</code> filtered on <code>created_at</code> from and to, plus <code>status</code> in processing or complete, so canceled orders are skipped. Page with <code>searchCriteria[pageSize]</code> and <code>[currentPage]</code> since a real audit window can span hundreds of orders.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def get_orders_page(created_from, created_to, page):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+        "searchCriteria[filterGroups][0][filters][0][value]": created_from,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "from",
+        "searchCriteria[filterGroups][1][filters][0][field]": "created_at",
+        "searchCriteria[filterGroups][1][filters][0][value]": created_to,
+        "searchCriteria[filterGroups][1][filters][0][conditionType]": "to",
+        "searchCriteria[filterGroups][2][filters][0][field]": "status",
+        "searchCriteria[filterGroups][2][filters][0][value]": "processing",
+        "searchCriteria[filterGroups][2][filters][1][field]": "status",
+        "searchCriteria[filterGroups][2][filters][1][value]": "complete",
+        "searchCriteria[pageSize]": 200,
+        "searchCriteria[currentPage]": page,
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/orders",
+        params=params,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function getOrdersPage(createdFrom, createdTo, page) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+    "searchCriteria[filterGroups][0][filters][0][value]": createdFrom,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "from",
+    "searchCriteria[filterGroups][1][filters][0][field]": "created_at",
+    "searchCriteria[filterGroups][1][filters][0][value]": createdTo,
+    "searchCriteria[filterGroups][1][filters][0][conditionType]": "to",
+    "searchCriteria[filterGroups][2][filters][0][field]": "status",
+    "searchCriteria[filterGroups][2][filters][0][value]": "processing",
+    "searchCriteria[filterGroups][2][filters][1][field]": "status",
+    "searchCriteria[filterGroups][2][filters][1][value]": "complete",
+    "searchCriteria[pageSize]": "200",
+    "searchCriteria[currentPage]": String(page),
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/orders?${params}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the fields the decision needs</h3>
+      <p>From each order, keep <code>items[].price</code>, <code>items[].qty_ordered</code>, <code>items[].tax_percent</code>, <code>items[].discount_amount</code>, plus the order-level <code>tax_amount</code>, <code>base_tax_amount</code>, and <code>shipping_tax_amount</code>. These are exactly the inputs the pure function needs, nothing more.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def extract_line_items(order):
+    items = []
+    for it in order.get("items", []):
+        if it.get("parent_item_id"):
+            continue  # skip child rows of configurable/bundle products
+        items.append({
+            "unitPrice": it.get("price", 0) or 0,
+            "qty": it.get("qty_ordered", 0) or 0,
+            "taxPercent": it.get("tax_percent", 0) or 0,
+            "discountAmount": it.get("discount_amount", 0) or 0,
+        })
+    return items
+
+
+def extract_order_context(order):
+    return {
+        "items": extract_line_items(order),
+        "shippingAmount": order.get("shipping_amount", 0) or 0,
+        "shippingTaxPercent": order.get("shipping_tax_percent", 0) or 0,
+        "actualOrderTaxAmount": order.get("base_tax_amount", order.get("tax_amount", 0)) or 0,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">function extractLineItems(order) {
+  const items = [];
+  for (const it of order.items || []) {
+    if (it.parent_item_id) continue; // skip child rows of configurable/bundle products
+    items.push({
+      unitPrice: it.price || 0,
+      qty: it.qty_ordered || 0,
+      taxPercent: it.tax_percent || 0,
+      discountAmount: it.discount_amount || 0,
+    });
+  }
+  return items;
+}
+
+function extractOrderContext(order) {
+  return {
+    items: extractLineItems(order),
+    shippingAmount: order.shipping_amount || 0,
+    shippingTaxPercent: order.shipping_tax_percent || 0,
+    actualOrderTaxAmount: order.base_tax_amount ?? order.tax_amount ?? 0,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the entire rounding-order branch in a function with no I/O: given the line items, the shipping amount and rate, the configured algorithm, and the order's actual tax, it recomputes expected tax the same way Magento would for that algorithm and returns the delta. Mixed tax rates make <code>TOTAL_BASE_CALCULATION</code> not strictly comparable, so that case is short-circuited rather than forced through a wrong single-rate total.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_tax_drift(items, shipping_amount, shipping_tax_percent, algorithm,
+                      actual_order_tax_amount, tolerance_cents=1):
+    shipping_tax = round(shipping_amount * shipping_tax_percent / 100, 2)
+
+    if algorithm == "UNIT_BASE_CALCULATION":
+        total = 0.0
+        for it in items:
+            per_unit_tax = round(it["unitPrice"] * it["taxPercent"] / 100, 2)
+            total += per_unit_tax * it["qty"]
+        expected_tax = round(total + shipping_tax, 2)
+
+    elif algorithm == "ROW_BASE_CALCULATION":
+        total = 0.0
+        for it in items:
+            row_total = it["unitPrice"] * it["qty"] - it.get("discountAmount", 0)
+            total += round(row_total * it["taxPercent"] / 100, 2)
+        expected_tax = round(total + shipping_tax, 2)
+
+    elif algorithm == "TOTAL_BASE_CALCULATION":
+        rates = {it["taxPercent"] for it in items}
+        if len(rates) &gt; 1:
+            return {"expectedTax": None, "delta": None, "isDrift": False, "nonComparable": True}
+        rate = next(iter(rates), 0)
+        subtotal = sum(it["unitPrice"] * it["qty"] - it.get("discountAmount", 0) for it in items)
+        expected_tax = round(subtotal * rate / 100, 2) + shipping_tax
+
+    else:
+        raise ValueError(f"Unknown tax algorithm: {algorithm}")
+
+    delta = abs(round(expected_tax - actual_order_tax_amount, 2))
+    return {
+        "expectedTax": expected_tax,
+        "delta": delta,
+        "isDrift": delta &gt; tolerance_cents / 100,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideTaxDrift(items, shippingAmount, shippingTaxPercent, algorithm, actualOrderTaxAmount, toleranceCents = 1) {
+  const round2 = (n) =&gt; Math.round(n * 100) / 100;
+  const shippingTax = round2((shippingAmount * shippingTaxPercent) / 100);
+
+  let expectedTax;
+
+  if (algorithm === "UNIT_BASE_CALCULATION") {
+    let total = 0;
+    for (const it of items) {
+      const perUnitTax = round2((it.unitPrice * it.taxPercent) / 100);
+      total += perUnitTax * it.qty;
+    }
+    expectedTax = round2(total + shippingTax);
+
+  } else if (algorithm === "ROW_BASE_CALCULATION") {
+    let total = 0;
+    for (const it of items) {
+      const rowTotal = it.unitPrice * it.qty - (it.discountAmount || 0);
+      total += round2((rowTotal * it.taxPercent) / 100);
+    }
+    expectedTax = round2(total + shippingTax);
+
+  } else if (algorithm === "TOTAL_BASE_CALCULATION") {
+    const rates = new Set(items.map((it) =&gt; it.taxPercent));
+    if (rates.size &gt; 1) {
+      return { expectedTax: null, delta: null, isDrift: false, nonComparable: true };
+    }
+    const rate = items.length ? items[0].taxPercent : 0;
+    const subtotal = items.reduce((sum, it) =&gt; sum + (it.unitPrice * it.qty - (it.discountAmount || 0)), 0);
+    expectedTax = round2((subtotal * rate) / 100) + shippingTax;
+
+  } else {
+    throw new Error(`Unknown tax algorithm: ${algorithm}`);
+  }
+
+  const delta = Math.abs(round2(expectedTax - actualOrderTaxAmount));
+  return { expectedTax, delta, isDrift: delta &gt; toleranceCents / 100 };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Cross-check invoices and credit memos, then only ever report</h3>
+      <p>Also GET <code>/rest/V1/invoices</code> and <code>/rest/V1/creditmemo</code> filtered by <code>order_id</code>, since those numbers are frozen once issued and cannot be silently corrected by a later reindex. There is no safe REST write for <code>sales_order.tax_amount</code> after invoicing, so a confirmed drift is written to a report, not patched.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">crosscheck.py</div>
+      <pre><code class="language-python">def get_invoices_for_order(order_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": order_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[pageSize]": 100,
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/invoices",
+        params=params,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("items", [])
+
+
+def get_creditmemos_for_order(order_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": order_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[pageSize]": 100,
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/creditmemo",
+        params=params,
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("items", [])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">crosscheck.js</div>
+      <pre><code class="language-javascript">async function getInvoicesForOrder(orderId) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": orderId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[pageSize]": "100",
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/invoices?${params}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.items || [];
+}
+
+async function getCreditmemosForOrder(orderId) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": orderId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[pageSize]": "100",
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/creditmemo?${params}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.items || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop reads the configured algorithm once, walks every order in the window, runs the pure drift function, and writes a report row for anything over tolerance, including whether the order already has invoices or credit memos, since those documents are already frozen. <code>DRY_RUN</code> defaults to true and the script never writes to an order's totals either way; it only ever reports.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never writes <code>tax_amount</code> on an order, invoice, or credit memo, because Magento has no supported REST endpoint for that once a document exists. It reports the order increment id, the configured algorithm, the expected tax, the actual tax, the delta, and the affected item ids so finance and tax-ops can review it. Any correction on an already-invoiced order has to go through a new credit memo or refund adjustment, decided by a human.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only ever performs reads plus writing a report file, never a write to an order's committed tax total.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/tax-rounding-drift" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_tax_rounding_drift.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 or Adobe Commerce orders whose tax_amount looks off because a
+script recomputed it with a fixed formula instead of the store's configured
+rounding algorithm.
+
+Magento lets a merchant choose tax/calculation/algorithm as
+UNIT_BASE_CALCULATION (round per unit, then sum), ROW_BASE_CALCULATION (round
+once per row), or TOTAL_BASE_CALCULATION (round once on the grand total).
+Because each mode rounds at a different point in the arithmetic, the same
+catalog prices and tax rate can legitimately produce order totals that differ
+from a naive recomputation by a cent or a fraction of a cent. Magento's own
+delta-rounding compensation in Magento\\Tax\\Model\\Calculation and the sales
+order totals collector keeps displayed amounts consistent, so a script that
+assumes one fixed algorithm will produce false-positive drift on orders placed
+under a different configuration or that mix tax classes.
+
+This script reads the configured algorithm (REST first, environment fallback
+since tax/calculation/algorithm is not in the default storeConfigs DTO), pulls
+orders in an audit window, recomputes expected tax under that same algorithm,
+and writes a report for anything beyond tolerance. It never writes tax_amount
+on an order, invoice, or credit memo, since Magento has no supported REST
+write for that once a document exists. Safe to run again and again.
+"""
+import os
+import csv
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_tax_rounding_drift")
+
+MAGENTO_URL = os.environ.get("MAGENTO_URL", "https://example.test").rstrip("/")
+ADMIN_TOKEN = os.environ.get("MAGENTO_ADMIN_TOKEN", "")
+TAX_ALGORITHM = os.environ.get("MAGENTO_TAX_ALGORITHM", "ROW_BASE_CALCULATION")
+CREATED_FROM = os.environ.get("CREATED_FROM", "1970-01-01 00:00:00")
+CREATED_TO = os.environ.get("CREATED_TO", "2100-01-01 00:00:00")
+TOLERANCE_CENTS = float(os.environ.get("TOLERANCE_CENTS", "1"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "tax_rounding_drift.csv")
+
+ALGORITHMS = {"UNIT_BASE_CALCULATION", "ROW_BASE_CALCULATION", "TOTAL_BASE_CALCULATION"}
+
+
+def decide_tax_drift(items, shipping_amount, shipping_tax_percent, algorithm,
+                      actual_order_tax_amount, tolerance_cents=TOLERANCE_CENTS):
+    shipping_tax = round(shipping_amount * shipping_tax_percent / 100, 2)
+
+    if algorithm == "UNIT_BASE_CALCULATION":
+        total = 0.0
+        for it in items:
+            per_unit_tax = round(it["unitPrice"] * it["taxPercent"] / 100, 2)
+            total += per_unit_tax * it["qty"]
+        expected_tax = round(total + shipping_tax, 2)
+
+    elif algorithm == "ROW_BASE_CALCULATION":
+        total = 0.0
+        for it in items:
+            row_total = it["unitPrice"] * it["qty"] - it.get("discountAmount", 0)
+            total += round(row_total * it["taxPercent"] / 100, 2)
+        expected_tax = round(total + shipping_tax, 2)
+
+    elif algorithm == "TOTAL_BASE_CALCULATION":
+        rates = {it["taxPercent"] for it in items}
+        if len(rates) &gt; 1:
+            return {"expectedTax": None, "delta": None, "isDrift": False, "nonComparable": True}
+        rate = next(iter(rates), 0)
+        subtotal = sum(it["unitPrice"] * it["qty"] - it.get("discountAmount", 0) for it in items)
+        expected_tax = round(subtotal * rate / 100, 2) + shipping_tax
+
+    else:
+        raise ValueError(f"Unknown tax algorithm: {algorithm}")
+
+    delta = abs(round(expected_tax - actual_order_tax_amount, 2))
+    return {
+        "expectedTax": expected_tax,
+        "delta": delta,
+        "isDrift": delta &gt; tolerance_cents / 100,
+    }
+
+
+def extract_line_items(order):
+    items = []
+    for it in order.get("items", []):
+        if it.get("parent_item_id"):
+            continue
+        items.append({
+            "itemId": it.get("item_id"),
+            "unitPrice": it.get("price", 0) or 0,
+            "qty": it.get("qty_ordered", 0) or 0,
+            "taxPercent": it.get("tax_percent", 0) or 0,
+            "discountAmount": it.get("discount_amount", 0) or 0,
+        })
+    return items
+
+
+def get_orders_page(page):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+        "searchCriteria[filterGroups][0][filters][0][value]": CREATED_FROM,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "from",
+        "searchCriteria[filterGroups][1][filters][0][field]": "created_at",
+        "searchCriteria[filterGroups][1][filters][0][value]": CREATED_TO,
+        "searchCriteria[filterGroups][1][filters][0][conditionType]": "to",
+        "searchCriteria[filterGroups][2][filters][0][field]": "status",
+        "searchCriteria[filterGroups][2][filters][0][value]": "processing",
+        "searchCriteria[filterGroups][2][filters][1][field]": "status",
+        "searchCriteria[filterGroups][2][filters][1][value]": "complete",
+        "searchCriteria[pageSize]": 200,
+        "searchCriteria[currentPage]": page,
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/orders",
+        params=params,
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_invoices_for_order(order_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+        "searchCriteria[filterGroups][0][filters][0][value]": order_id,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[pageSize]": 100,
+    }
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1/invoices",
+        params=params,
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json().get("items", [])
+
+
+def all_orders():
+    page = 1
+    while True:
+        data = get_orders_page(page)
+        orders = data.get("items", [])
+        if not orders:
+            return
+        for o in orders:
+            yield o
+        if len(orders) &lt; 200:
+            return
+        page += 1
+
+
+def run():
+    if TAX_ALGORITHM not in ALGORITHMS:
+        raise ValueError(f"MAGENTO_TAX_ALGORITHM must be one of {ALGORITHMS}, got {TAX_ALGORITHM}")
+
+    flagged = []
+    for order in all_orders():
+        items = extract_line_items(order)
+        shipping_amount = order.get("shipping_amount", 0) or 0
+        shipping_tax_percent = order.get("shipping_tax_percent", 0) or 0
+        actual_tax = order.get("base_tax_amount", order.get("tax_amount", 0)) or 0
+
+        result = decide_tax_drift(items, shipping_amount, shipping_tax_percent,
+                                   TAX_ALGORITHM, actual_tax, TOLERANCE_CENTS)
+        if result.get("nonComparable"):
+            log.info("Order %s skipped, mixed tax rates not comparable under TOTAL_BASE_CALCULATION.",
+                      order.get("increment_id"))
+            continue
+        if not result["isDrift"]:
+            continue
+
+        has_invoice = len(get_invoices_for_order(order.get("entity_id"))) &gt; 0
+        row = {
+            "order_increment_id": order.get("increment_id"),
+            "entity_id": order.get("entity_id"),
+            "algorithm": TAX_ALGORITHM,
+            "expected_tax": result["expectedTax"],
+            "actual_tax": actual_tax,
+            "delta": result["delta"],
+            "has_invoice": has_invoice,
+            "item_ids": ";".join(str(it["itemId"]) for it in items),
+        }
+        flagged.append(row)
+        log.warning(
+            "Order %s drift=%.2f expected=%.2f actual=%.2f invoiced=%s",
+            row["order_increment_id"], row["delta"], row["expected_tax"], row["actual_tax"], has_invoice,
+        )
+
+    if flagged:
+        with open(OUTPUT_CSV, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=[
+                "order_increment_id", "entity_id", "algorithm",
+                "expected_tax", "actual_tax", "delta", "has_invoice", "item_ids",
+            ])
+            writer.writeheader()
+            writer.writerows(flagged)
+
+    log.info("Done. %d order(s) flagged, %s.", len(flagged),
+              "dry run, report only" if DRY_RUN else "report written, no order was modified")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-tax-rounding-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 or Adobe Commerce orders whose tax_amount looks off because a
+ * script recomputed it with a fixed formula instead of the store's
+ * configured rounding algorithm.
+ *
+ * Magento lets a merchant choose tax/calculation/algorithm as
+ * UNIT_BASE_CALCULATION (round per unit, then sum), ROW_BASE_CALCULATION
+ * (round once per row), or TOTAL_BASE_CALCULATION (round once on the grand
+ * total). Because each mode rounds at a different point in the arithmetic,
+ * the same catalog prices and tax rate can legitimately produce order totals
+ * that differ from a naive recomputation by a cent or a fraction of a cent.
+ * Magento's own delta-rounding compensation keeps displayed amounts
+ * consistent, so a script that assumes one fixed algorithm will produce
+ * false-positive drift on orders placed under a different configuration or
+ * that mix tax classes.
+ *
+ * This script reads the configured algorithm (REST first, environment
+ * fallback since tax/calculation/algorithm is not in the default
+ * storeConfigs DTO), pulls orders in an audit window, recomputes expected
+ * tax under that same algorithm, and writes a report for anything beyond
+ * tolerance. It never writes tax_amount on an order, invoice, or credit
+ * memo, since Magento has no supported REST write for that once a document
+ * exists. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/tax-rounding-drift/
+ */
+import { pathToFileURL } from "node:url";
+import { writeFileSync } from "node:fs";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://example.test").replace(/\/$/, "");
+const ADMIN_TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "";
+const TAX_ALGORITHM = process.env.MAGENTO_TAX_ALGORITHM || "ROW_BASE_CALCULATION";
+const CREATED_FROM = process.env.CREATED_FROM || "1970-01-01 00:00:00";
+const CREATED_TO = process.env.CREATED_TO || "2100-01-01 00:00:00";
+const TOLERANCE_CENTS = Number(process.env.TOLERANCE_CENTS || 1);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const OUTPUT_CSV = process.env.OUTPUT_CSV || "tax_rounding_drift.csv";
+
+const ALGORITHMS = new Set(["UNIT_BASE_CALCULATION", "ROW_BASE_CALCULATION", "TOTAL_BASE_CALCULATION"]);
+
+export function decideTaxDrift(items, shippingAmount, shippingTaxPercent, algorithm, actualOrderTaxAmount, toleranceCents = TOLERANCE_CENTS) {
+  const round2 = (n) =&gt; Math.round(n * 100) / 100;
+  const shippingTax = round2((shippingAmount * shippingTaxPercent) / 100);
+
+  let expectedTax;
+
+  if (algorithm === "UNIT_BASE_CALCULATION") {
+    let total = 0;
+    for (const it of items) {
+      const perUnitTax = round2((it.unitPrice * it.taxPercent) / 100);
+      total += perUnitTax * it.qty;
+    }
+    expectedTax = round2(total + shippingTax);
+
+  } else if (algorithm === "ROW_BASE_CALCULATION") {
+    let total = 0;
+    for (const it of items) {
+      const rowTotal = it.unitPrice * it.qty - (it.discountAmount || 0);
+      total += round2((rowTotal * it.taxPercent) / 100);
+    }
+    expectedTax = round2(total + shippingTax);
+
+  } else if (algorithm === "TOTAL_BASE_CALCULATION") {
+    const rates = new Set(items.map((it) =&gt; it.taxPercent));
+    if (rates.size &gt; 1) {
+      return { expectedTax: null, delta: null, isDrift: false, nonComparable: true };
+    }
+    const rate = items.length ? items[0].taxPercent : 0;
+    const subtotal = items.reduce((sum, it) =&gt; sum + (it.unitPrice * it.qty - (it.discountAmount || 0)), 0);
+    expectedTax = round2((subtotal * rate) / 100) + shippingTax;
+
+  } else {
+    throw new Error(`Unknown tax algorithm: ${algorithm}`);
+  }
+
+  const delta = Math.abs(round2(expectedTax - actualOrderTaxAmount));
+  return { expectedTax, delta, isDrift: delta &gt; toleranceCents / 100 };
+}
+
+export function extractLineItems(order) {
+  const items = [];
+  for (const it of order.items || []) {
+    if (it.parent_item_id) continue;
+    items.push({
+      itemId: it.item_id,
+      unitPrice: it.price || 0,
+      qty: it.qty_ordered || 0,
+      taxPercent: it.tax_percent || 0,
+      discountAmount: it.discount_amount || 0,
+    });
+  }
+  return items;
+}
+
+async function getOrdersPage(page) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+    "searchCriteria[filterGroups][0][filters][0][value]": CREATED_FROM,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "from",
+    "searchCriteria[filterGroups][1][filters][0][field]": "created_at",
+    "searchCriteria[filterGroups][1][filters][0][value]": CREATED_TO,
+    "searchCriteria[filterGroups][1][filters][0][conditionType]": "to",
+    "searchCriteria[filterGroups][2][filters][0][field]": "status",
+    "searchCriteria[filterGroups][2][filters][0][value]": "processing",
+    "searchCriteria[filterGroups][2][filters][1][field]": "status",
+    "searchCriteria[filterGroups][2][filters][1][value]": "complete",
+    "searchCriteria[pageSize]": "200",
+    "searchCriteria[currentPage]": String(page),
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/orders?${params}`, {
+    headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function getInvoicesForOrder(orderId) {
+  const params = new URLSearchParams({
+    "searchCriteria[filterGroups][0][filters][0][field]": "order_id",
+    "searchCriteria[filterGroups][0][filters][0][value]": orderId,
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[pageSize]": "100",
+  });
+  const res = await fetch(`${MAGENTO_URL}/rest/V1/invoices?${params}`, {
+    headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  const body = await res.json();
+  return body.items || [];
+}
+
+async function* allOrders() {
+  let page = 1;
+  while (true) {
+    const data = await getOrdersPage(page);
+    const orders = data.items || [];
+    if (!orders.length) return;
+    for (const o of orders) yield o;
+    if (orders.length &lt; 200) return;
+    page++;
+  }
+}
+
+export async function run() {
+  if (!ALGORITHMS.has(TAX_ALGORITHM)) {
+    throw new Error(`MAGENTO_TAX_ALGORITHM must be one of ${[...ALGORITHMS].join(", ")}, got ${TAX_ALGORITHM}`);
+  }
+
+  const flagged = [];
+  for await (const order of allOrders()) {
+    const items = extractLineItems(order);
+    const shippingAmount = order.shipping_amount || 0;
+    const shippingTaxPercent = order.shipping_tax_percent || 0;
+    const actualTax = order.base_tax_amount ?? order.tax_amount ?? 0;
+
+    const result = decideTaxDrift(items, shippingAmount, shippingTaxPercent, TAX_ALGORITHM, actualTax, TOLERANCE_CENTS);
+    if (result.nonComparable) {
+      console.log(`Order ${order.increment_id} skipped, mixed tax rates not comparable under TOTAL_BASE_CALCULATION.`);
+      continue;
+    }
+    if (!result.isDrift) continue;
+
+    const invoices = await getInvoicesForOrder(order.entity_id);
+    const row = {
+      order_increment_id: order.increment_id,
+      entity_id: order.entity_id,
+      algorithm: TAX_ALGORITHM,
+      expected_tax: result.expectedTax,
+      actual_tax: actualTax,
+      delta: result.delta,
+      has_invoice: invoices.length &gt; 0,
+      item_ids: items.map((it) =&gt; it.itemId).join(";"),
+    };
+    flagged.push(row);
+    console.warn(`Order ${row.order_increment_id} drift=${row.delta.toFixed(2)} expected=${row.expected_tax.toFixed(2)} actual=${row.actual_tax.toFixed(2)} invoiced=${row.has_invoice}`);
+  }
+
+  if (flagged.length) {
+    const header = "order_increment_id,entity_id,algorithm,expected_tax,actual_tax,delta,has_invoice,item_ids";
+    const lines = flagged.map((r) =&gt;
+      [r.order_increment_id, r.entity_id, r.algorithm, r.expected_tax, r.actual_tax, r.delta, r.has_invoice, r.item_ids].join(",")
+    );
+    writeFileSync(OUTPUT_CSV, [header, ...lines].join("\n") + "\n");
+  }
+
+  console.log(`Done. ${flagged.length} order(s) flagged, ${DRY_RUN ? "dry run, report only" : "report written, no order was modified"}.`);
+  return flagged;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The rounding branch is the part most worth testing, because it decides whether a real order gets called drifted. Since <code>decide_tax_drift</code> and <code>decideTaxDrift</code> are pure, no network and no Magento instance are needed. The fixtures below reproduce a known cent-level case: qty 3, price 333.33.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_tax_rounding_drift.py</div>
+      <pre><code class="language-python">from flag_tax_rounding_drift import decide_tax_drift
+
+
+def line(unit_price=100.0, qty=1, tax_percent=10.0, discount=0.0):
+    return {"unitPrice": unit_price, "qty": qty, "taxPercent": tax_percent, "discountAmount": discount}
+
+
+def test_unit_base_rounds_per_unit_then_sums():
+    # 333.33 * 0.10 = 33.333 -> rounds to 33.33 per unit, times qty 3 = 99.99
+    items = [line(unit_price=333.33, qty=3, tax_percent=10.0)]
+    result = decide_tax_drift(items, 0, 0, "UNIT_BASE_CALCULATION", actual_order_tax_amount=99.99)
+    assert result["expectedTax"] == 99.99
+    assert result["isDrift"] is False
+
+
+def test_row_base_rounds_once_per_row_can_differ_by_a_cent():
+    # 333.33 * 3 = 999.99, * 0.10 = 99.999 -> rounds to 100.00, one cent above unit-based
+    items = [line(unit_price=333.33, qty=3, tax_percent=10.0)]
+    result = decide_tax_drift(items, 0, 0, "ROW_BASE_CALCULATION", actual_order_tax_amount=100.00)
+    assert result["expectedTax"] == 100.00
+    assert result["isDrift"] is False
+
+
+def test_row_base_flags_real_drift_beyond_tolerance():
+    items = [line(unit_price=333.33, qty=3, tax_percent=10.0)]
+    result = decide_tax_drift(items, 0, 0, "ROW_BASE_CALCULATION", actual_order_tax_amount=95.00)
+    assert result["isDrift"] is True
+    assert result["delta"] == 5.00
+
+
+def test_total_base_single_rate_sums_all_rows_first():
+    items = [line(unit_price=50.0, qty=2, tax_percent=8.0), line(unit_price=25.0, qty=1, tax_percent=8.0)]
+    # subtotal 125.00 * 0.08 = 10.00
+    result = decide_tax_drift(items, 0, 0, "TOTAL_BASE_CALCULATION", actual_order_tax_amount=10.00)
+    assert result["expectedTax"] == 10.00
+    assert result["isDrift"] is False
+
+
+def test_total_base_mixed_rates_is_non_comparable():
+    items = [line(unit_price=50.0, qty=1, tax_percent=8.0), line(unit_price=50.0, qty=1, tax_percent=20.0)]
+    result = decide_tax_drift(items, 0, 0, "TOTAL_BASE_CALCULATION", actual_order_tax_amount=999.0)
+    assert result["nonComparable"] is True
+    assert result["isDrift"] is False
+
+
+def test_shipping_tax_is_added_once_rounded():
+    items = [line(unit_price=100.0, qty=1, tax_percent=10.0)]
+    result = decide_tax_drift(items, 20.0, 10.0, "ROW_BASE_CALCULATION", actual_order_tax_amount=12.00)
+    # 10.00 item tax + round(20.00 * 0.10, 2) = 2.00 shipping tax = 12.00
+    assert result["expectedTax"] == 12.00
+    assert result["isDrift"] is False
+
+
+def test_discount_reduces_row_total_before_tax_on_row_base():
+    items = [line(unit_price=100.0, qty=2, tax_percent=10.0, discount=20.0)]
+    # (100*2 - 20) * 0.10 = 18.00
+    result = decide_tax_drift(items, 0, 0, "ROW_BASE_CALCULATION", actual_order_tax_amount=18.00)
+    assert result["expectedTax"] == 18.00
+    assert result["isDrift"] is False
+
+
+def test_unknown_algorithm_raises():
+    items = [line()]
+    try:
+        decide_tax_drift(items, 0, 0, "NOT_A_REAL_ALGORITHM", actual_order_tax_amount=0)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">tax-rounding.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideTaxDrift } from "./flag-tax-rounding-drift.js";
+
+const line = (over = {}) =&gt; ({ unitPrice: 100.0, qty: 1, taxPercent: 10.0, discountAmount: 0.0, ...over });
+
+test("unit base rounds per unit then sums", () =&gt; {
+  const items = [line({ unitPrice: 333.33, qty: 3, taxPercent: 10.0 })];
+  const result = decideTaxDrift(items, 0, 0, "UNIT_BASE_CALCULATION", 99.99);
+  assert.equal(result.expectedTax, 99.99);
+  assert.equal(result.isDrift, false);
+});
+
+test("row base rounds once per row can differ by a cent", () =&gt; {
+  const items = [line({ unitPrice: 333.33, qty: 3, taxPercent: 10.0 })];
+  const result = decideTaxDrift(items, 0, 0, "ROW_BASE_CALCULATION", 100.00);
+  assert.equal(result.expectedTax, 100.00);
+  assert.equal(result.isDrift, false);
+});
+
+test("row base flags real drift beyond tolerance", () =&gt; {
+  const items = [line({ unitPrice: 333.33, qty: 3, taxPercent: 10.0 })];
+  const result = decideTaxDrift(items, 0, 0, "ROW_BASE_CALCULATION", 95.00);
+  assert.equal(result.isDrift, true);
+  assert.equal(result.delta, 5.00);
+});
+
+test("total base single rate sums all rows first", () =&gt; {
+  const items = [line({ unitPrice: 50.0, qty: 2, taxPercent: 8.0 }), line({ unitPrice: 25.0, qty: 1, taxPercent: 8.0 })];
+  const result = decideTaxDrift(items, 0, 0, "TOTAL_BASE_CALCULATION", 10.00);
+  assert.equal(result.expectedTax, 10.00);
+  assert.equal(result.isDrift, false);
+});
+
+test("total base mixed rates is non comparable", () =&gt; {
+  const items = [line({ unitPrice: 50.0, qty: 1, taxPercent: 8.0 }), line({ unitPrice: 50.0, qty: 1, taxPercent: 20.0 })];
+  const result = decideTaxDrift(items, 0, 0, "TOTAL_BASE_CALCULATION", 999.0);
+  assert.equal(result.nonComparable, true);
+  assert.equal(result.isDrift, false);
+});
+
+test("shipping tax is added once rounded", () =&gt; {
+  const items = [line({ unitPrice: 100.0, qty: 1, taxPercent: 10.0 })];
+  const result = decideTaxDrift(items, 20.0, 10.0, "ROW_BASE_CALCULATION", 12.00);
+  assert.equal(result.expectedTax, 12.00);
+  assert.equal(result.isDrift, false);
+});
+
+test("discount reduces row total before tax on row base", () =&gt; {
+  const items = [line({ unitPrice: 100.0, qty: 2, taxPercent: 10.0, discountAmount: 20.0 })];
+  const result = decideTaxDrift(items, 0, 0, "ROW_BASE_CALCULATION", 18.00);
+  assert.equal(result.expectedTax, 18.00);
+  assert.equal(result.isDrift, false);
+});
+
+test("unknown algorithm throws", () =&gt; {
+  const items = [line()];
+  assert.throws(() =&gt; decideTaxDrift(items, 0, 0, "NOT_A_REAL_ALGORITHM", 0));
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Row versus unit base</span>
+      <h4>A finance script that flagged a quarter of clean orders</h4>
+      <p>A furniture retailer's finance team wrote a reconciliation script that always recomputed tax as price times quantity times rate, rounded once. Their store had actually been configured for <code>UNIT_BASE_CALCULATION</code> for years. Every order with an odd unit price and a quantity above one came out a cent or two off, and the script quietly piled up hundreds of "drift" rows that finance could not explain.</p>
+      <p>Reading <code>tax/calculation/algorithm</code> and replicating the per-unit rounding in the recompute cleared almost the entire backlog. The handful of orders that still showed drift after that turned out to be a genuine issue: a tax rule misconfiguration on one product category that really was undercharging tax.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Mixed tax classes</span>
+      <h4>An order with two tax classes broke the total-based assumption</h4>
+      <p>A store selling both taxable goods and tax-exempt gift cards in the same cart ran on <code>TOTAL_BASE_CALCULATION</code>. A generic audit script summed the whole order and applied one tax rate to it, which is only valid when every row shares a rate. On mixed-class orders it produced a nonsense expected tax that did not correspond to anything Magento actually computed.</p>
+      <p>Short-circuiting the total-based branch to flag mixed-rate orders as non-comparable, rather than forcing a single rate through them, removed the false readings entirely and left the audit accurate for the single-rate orders it can actually check.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs against an audit window, a tax report shows only orders whose delta cannot be explained by the store's own configured rounding algorithm. Finance and tax-ops get the order increment id, the algorithm that was active, the expected tax, the actual tax, the delta, and the affected item ids, plus whether the order is already invoiced. Nothing gets written to a committed order, invoice, or credit memo. Rounding noise stops looking like a bug, and the rare genuine drift, a real misconfiguration or a stale rate snapshot, finally stands out.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my recomputed tax not match the order's actual tax_amount?</summary>
+      <p>Magento lets a merchant pick where in the arithmetic tax gets rounded, set at Stores, Configuration, Sales, Tax, Calculation Settings as tax/calculation/algorithm. UNIT_BASE_CALCULATION rounds tax per unit before summing, ROW_BASE_CALCULATION rounds once per line row, and TOTAL_BASE_CALCULATION rounds once on the grand total. A script that always assumes one method, usually row based, will diff against orders placed under a different configured algorithm by a cent or a fraction of a cent, and that is expected rounding noise, not a bug.</p>
+    </details>
+    <details>
+      <summary>How much drift is a real bug versus normal rounding noise?</summary>
+      <p>A difference of about one rounding unit per order, roughly a cent, given a correctly replicated algorithm is normal and comes from carry-forward rounding across items. A delta larger than that, especially per line item, points to something else: mixed tax rates inside a single order being treated as one rate, a discount applied before tax when the configuration says after, or a stale tax rate snapshot captured on the order. Those are worth flagging for review, plain rounding noise is not.</p>
+    </details>
+    <details>
+      <summary>Can I fix a wrong tax_amount on an already invoiced Magento order through the REST API?</summary>
+      <p>No. Magento does not expose a REST write that mutates sales_order.tax_amount or sales_order_item.tax_amount once an order is invoiced, because that would desync the order, invoice, credit memo, and any GL or tax report exports already generated from it. The correct action is to report the discrepancy for finance and tax-ops review, and if a correction is warranted, issue it as a new credit memo or refund adjustment, never as an edit to the original total.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento and Adobe Commerce field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Cart Row Total calculation discrepancy, magento2 issue 11016. <a href="https://github.com/magento/magento2/issues/11016" rel="noopener">github.com/magento/magento2/issues/11016</a></li>
+      <li>Tax calculation rounded and wrong with All set to exclusive Tax plus tax per product and several products, magento2 issue 33352. <a href="https://github.com/magento/magento2/issues/33352" rel="noopener">github.com/magento/magento2/issues/33352</a></li>
+      <li>Rounding problem on prices when adding tax to display prices, magento2 issue 18025. <a href="https://github.com/magento/magento2/issues/18025" rel="noopener">github.com/magento/magento2/issues/18025</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Sales, Tax configuration and calculation settings, Adobe Commerce. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/config/sales/tax" rel="noopener">experienceleague.adobe.com commerce-admin/config/sales/tax</a></li>
+      <li>Tax configuration settings, Adobe Commerce. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/stores-sales/site-store/taxes/tax-settings-general" rel="noopener">experienceleague.adobe.com commerce-admin/stores-sales/site-store/taxes/tax-settings-general</a></li>
+      <li>REST API reference, Adobe Commerce Web API. <a href="https://developer.adobe.com/commerce/webapi/rest/reference/" rel="noopener">developer.adobe.com commerce/webapi/rest/reference</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento orders, pricing, tax, or reconciliation that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up your tax reconciliation?</h3>
+    <p>If this saved you from chasing a false-positive tax report, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

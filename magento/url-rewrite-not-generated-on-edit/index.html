@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Magento URL Rewrites Not Generated on Product Edit or Duplicate</title>
+<meta name="description" content="A product is saved or duplicated through the REST API, no error appears, but no url_rewrite row shows up and the product URL 404s. Learn why Magento's store scope resolution silently skips the rewrite, and build a Python or Node.js script that detects the missing rows over REST and reports the fix.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/url-rewrite-not-generated-on-edit/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Magento URL Rewrites Not Generated on Product Edit or Duplicate">
+<meta property="og:description" content="Why Product::getStoreIds() silently skips url_rewrite generation on a REST-driven product save or duplicate, and a Python or Node.js script that detects the missing rows over REST and reports the safe repair.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/url-rewrite-not-generated-on-edit/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/url-rewrite-not-generated-on-edit/#article","headline":"Fix Magento URL Rewrites Not Generated on Product Edit or Duplicate","description":"Why Product::getStoreIds() mishandles website_ids on a REST-driven product save or duplicate, causing ProductProcessUrlRewriteSavingObserver to silently skip url_rewrite generation with no error and a 200 OK, and a Python or Node.js script that detects the missing rows over REST and reports the safe repair.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/url-rewrite-not-generated-on-edit/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Magento URL rewrites","keywords":"Magento url_rewrite not generated, ProductProcessUrlRewriteSavingObserver, getStoreIds, single store mode url rewrite, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"URL rewrite not generated on product edit or duplicate","item":"https://www.allanninal.dev/magento/url-rewrite-not-generated-on-edit/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does editing or duplicating a product not create a url_rewrite row?","acceptedAnswer":{"@type":"Answer","text":"Magento regenerates url_rewrite rows for a saved product through ProductProcessUrlRewriteSavingObserver, which relies on Product::getStoreIds() to know which stores to write rows for. In single-store mode, and especially when the save comes from PUT /V1/products/{sku} rather than the admin form, getStoreIds() mishandles website_ids and resolves the wrong or an empty store scope, so the generator is called with nothing to write. No exception is thrown and the API still returns 200 OK, so the missing rewrite goes unnoticed until the product URL 404s."}},{"@type":"Question","name":"Can I just call an API to regenerate the missing url_rewrite row?","acceptedAnswer":{"@type":"Answer","text":"There is no public REST endpoint to insert or regenerate a url_rewrite row directly, and writing to the table by hand risks a URL_REWRITE_REQUEST_PATH_STORE_ID collision with an existing row. The documented workaround is to resave the product over REST with extension_attributes.website_ids intentionally duplicated, for example [1, 1], which forces getStoreIds() down a code path that resolves correctly, or to resave the product through the Admin UI, which uses a different, unaffected code path."}},{"@type":"Question","name":"Does duplicating a product in Magento copy its URL rewrite?","acceptedAnswer":{"@type":"Answer","text":"No. A duplicated product is a new entity with its own entity_id, and ProductRepository::save() for that duplicate runs through the same ProductProcessUrlRewriteSavingObserver and the same getStoreIds() resolution as any other save. When that resolution is wrong, the duplicate ends up with no url_rewrite row at all, so its product page 404s until it is resaved correctly."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / URL Rewrites</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> URL Rewrites</p>
+    <h1>URL rewrites not generated on product edit or duplicate</h1>
+    <p class="lead">You save a product through the REST API, or you duplicate one in the admin grid, and everything looks fine. No error, a clean 200 OK. Then someone clicks the product link and gets a 404. Nothing wrote a url_rewrite row for it. This is not a misconfiguration. It is a long-standing core bug in how Magento resolves the store scope for a saved product, and it fails silently every time. Here is why it happens and a small script that finds the affected SKUs before your customers do.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Magento REST API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento regenerates a product's <code>url_rewrite</code> rows on <code>catalog_product_save_after</code> through <code>Magento\CatalogUrlRewrite\Observer\ProductProcessUrlRewriteSavingObserver</code>, which asks <code>Product::getStoreIds()</code> which stores to write for. In single-store mode, and reliably when the save comes from <code>PUT /V1/products/{sku}</code> instead of the admin form, <code>getStoreIds()</code> runs a spurious <code>array_keys()</code> over an already-keyed <code>website_ids</code> array and resolves the wrong or an empty store scope, so the generator writes nothing. No exception, still a 200 OK. A duplicated product follows the exact same save path, so it inherits no rewrite at all. Run a small Python or Node.js script that reads a product's <code>url_key</code> and website scope over REST, computes the request_path it should have per store, and checks the live storefront URL for a 404. There is no public API to insert the missing row safely, so the script reports affected SKUs and the documented workaround rather than writing blind. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every time you save a product, Magento is supposed to make sure its friendly URL still works. It listens for <code>catalog_product_save_after</code>, and a dedicated observer regenerates whatever <code>url_rewrite</code> rows that product needs for every store it is visible in. That part works exactly as expected almost all of the time.</p>
+  <p>The part that breaks is figuring out which stores to generate for. Magento asks the product itself, through <code>getStoreIds()</code>, and that method has a bug in how it reads <code>website_ids</code>. In a normal admin save this usually resolves fine. But in single-store mode, and consistently when the product was saved through <code>PUT /V1/products/{sku}</code> rather than clicked and saved in the admin form, the method calls <code>array_keys()</code> on an array that is already keyed by id, which returns the wrong values, sometimes an empty set. The rewrite generator is handed that broken scope, decides there is nothing to do, and quietly returns. The save itself still succeeds. Nothing in the response tells you the rewrite step failed.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A product is saved through the REST API, catalog_product_save_after fires, getStoreIds mishandles website_ids and resolves the wrong store scope, the rewrite generator is called with nothing to write, and the response is still 200 OK while the product URL 404s.">
+      <defs>
+        <marker id="uah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#a8998d"></path></marker>
+        <marker id="uahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="72" width="170" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">PUT product save</text>
+      <text x="95" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">or duplicate</text>
+      <line x1="183" y1="105" x2="225" y2="105" stroke="#a8998d" stroke-width="2" marker-end="url(#uah)"></line>
+      <rect x="228" y="72" width="175" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="315" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">getStoreIds()</text>
+      <text x="315" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">mishandles website_ids</text>
+      <line x1="406" y1="105" x2="450" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#uahr)"></line>
+      <text x="426" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="426" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">wrong or empty scope</text>
+      <rect x="453" y="72" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="533" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Generator skips</text>
+      <text x="533" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">writes nothing</text>
+      <rect x="638" y="72" width="112" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="694" y="96" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Product URL</text>
+      <text x="694" y="114" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">404s</text>
+      <line x1="616" y1="105" x2="635" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#uahr)"></line>
+      <rect x="228" y="164" width="240" height="46" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="348" y="192" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#2b1a10">meanwhile the save still returns 200 OK, no exception thrown</text>
+    </svg>
+    <figcaption>The save succeeds and the API says nothing went wrong, because from Magento's point of view nothing did. It just decided there were no stores to write a rewrite for.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a confirmed core bug, not a merchant misconfiguration, and it has been reported across several Magento 2.x versions. A few shapes it takes:</p>
+  <ul>
+    <li>A single-store mode installation saves a product and the rewrite is not generated at all, since <code>getStoreIds()</code> takes a shortcut through the website id array that assumes a shape it does not have, a pattern reported in <code>magento/magento2</code> issue #25190.</li>
+    <li>A product updated through <code>PUT /V1/products/{sku}</code> with a new or unchanged <code>url_key</code> does not get a new rewrite row, even though the same edit made through the admin form works correctly, reported in <code>magento/magento2</code> issue #30316.</li>
+    <li>Editing or duplicating a product in the admin grid can also hit this path and silently skip the rewrite, tracked in <code>magento/magento2</code> issue #33884.</li>
+    <li>Because <code>ProductRepository::save()</code> for a duplicated product runs through the identical <code>catalog_product_save_after</code> and <code>getStoreIds()</code> resolution, a duplicate can be created with zero rewrite rows from the moment it exists.</li>
+  </ul>
+  <p>The reason this is so easy to miss is that nothing fails loudly. The REST call returns 200. The product record itself has a perfectly valid <code>url_key</code>. It is only the join between the product and the <code>url_rewrite</code> table that never happened, and that only shows up when a real visitor or a crawler hits the URL and gets a 404. See the citations at the end for the exact threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A product's <code>url_key</code> being correct tells you nothing about whether its <code>url_rewrite</code> row exists. Those are two different systems, and the bug lives entirely in the second one, in how Magento decides which stores to write rows for. So detection cannot stop at reading the product's custom attributes. It has to compute the request_path Magento should be serving and actually check the storefront for it, store by store, because that is the only place this failure becomes visible.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>There is no public API to write a url_rewrite row directly, and no safe way to auto-insert one without risking a collision with a row that already claims that request_path. So the script's job is to find the gap precisely and hand you the documented workaround, not to silently patch the table itself. It reads the product's scope and url_key over REST, works out the expected request_path per store, and checks the live storefront URL. Anything that 404s where it should not gets flagged with the exact remediation, gated behind a dry run.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Fetch the product's url_key, website_ids, and store views over REST, compute the expected request_path per store using the configured URL suffix, check the storefront URL for each store, and if it 404s report the SKU and store with the suggested re-save workaround, gated behind DRY_RUN.">
+      <defs><marker id="uah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Fetch product</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">url_key, website_ids</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#uah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Resolve store views</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">and url suffix per store</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#uah2)"></line>
+      <rect x="270" y="108" width="195" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="367" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Compute expected path</text>
+      <text x="367" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">url_key + suffix</text>
+      <line x1="465" y1="138" x2="507" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#uah2)"></line>
+      <polygon points="585,106 662,138 585,170 508,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="585" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Rewrite</text>
+      <text x="585" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">found?</text>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">no, flag it</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="500" y="185" width="150" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="575" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Report SKU</text>
+      <text x="575" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">suggest re-save workaround</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="700" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#uah2)"></line>
+      <rect x="655" y="105" width="95" height="66" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="702" y="130" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">All good</text>
+      <text x="702" y="146" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">no action</text>
+      <text x="702" y="162" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">DRY_RUN guarded</text>
+    </svg>
+    <figcaption>Nothing is written to url_rewrite directly. The script only tells you which SKU and store are missing a rewrite, and offers the documented re-save workaround behind an explicit DRY_RUN=false confirmation.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>Call <code>POST /rest/V1/integration/admin/token</code> with your admin username and password, or use a preconfigured integration token. Either way you end up with a bearer token you send as <code>Authorization: Bearer &lt;token&gt;</code> on every call. Keep the token and the store URL in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="your admin bearer token"
+export DRY_RUN="true"   # start safe, change to false to confirm a re-save workaround</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="your admin bearer token"
+export DRY_RUN="true"   // start safe, change to false to confirm a re-save workaround</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call goes to <code>{MAGENTO_URL}/rest/V1</code> with your token in the <code>Authorization</code> header. A small helper sends the request and raises on a non success status, and we reuse it for reading the product, reading store views, and reading store config.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+
+def api_get(path, params=None):
+    r = requests.get(f"{MAGENTO_URL}/rest/V1{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/+$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+const HEADERS = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the product, the store views, and the URL suffix</h3>
+      <p><code>GET /rest/V1/products/{sku}</code> gives you the product's <code>url_key</code> custom attribute and <code>extension_attributes.website_ids</code>. <code>GET /rest/V1/store/storeViews</code> resolves the store codes and ids the product should be visible in. <code>GET /rest/V1/store/storeConfigs?storeCodes[]=...</code> reads the <code>catalog/seo/product_url_suffix</code> path per store, defaulting to <code>.html</code> when the store does not set one.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def custom_attr(attrs, code, default=None):
+    for a in attrs or []:
+        if a.get("attribute_code") == code:
+            return a.get("value")
+    return default
+
+def fetch_product(sku):
+    item = api_get(f"/products/{sku}")
+    return {
+        "sku": item["sku"],
+        "url_key": custom_attr(item.get("custom_attributes"), "url_key"),
+        "website_ids": (item.get("extension_attributes") or {}).get("website_ids", []),
+    }
+
+def fetch_store_views():
+    return api_get("/store/storeViews")
+
+def fetch_url_suffix(store_code):
+    configs = api_get("/store/storeConfigs", {"storeCodes[]": store_code})
+    if not configs:
+        return ".html"
+    return configs[0].get("product_url_suffix") or ".html"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">function customAttr(attrs, code, fallback = null) {
+  for (const a of attrs || []) {
+    if (a.attribute_code === code) return a.value;
+  }
+  return fallback;
+}
+
+async function fetchProduct(sku) {
+  const item = await apiGet(`/products/${sku}`);
+  return {
+    sku: item.sku,
+    url_key: customAttr(item.custom_attributes, "url_key"),
+    website_ids: item.extension_attributes?.website_ids || [],
+  };
+}
+
+async function fetchStoreViews() {
+  return apiGet("/store/storeViews");
+}
+
+async function fetchUrlSuffix(storeCode) {
+  const configs = await apiGet("/store/storeConfigs", { "storeCodes[]": storeCode });
+  if (!configs.length) return ".html";
+  return configs[0].product_url_suffix || ".html";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the product, the URL suffix, and a pre-fetched map of store id to the request_paths that already exist for that store, and returns the pairs that are missing a rewrite. It never touches the network itself, it only computes and compares, which makes it trivial to test with fixture data instead of a live store.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def is_url_rewrite_missing(product, expected_suffix, existing_rewrite_paths):
+    missing = []
+    for store_id in product["storeIds"]:
+        expected_path = f"{product['urlKey']}{expected_suffix}"
+        known_paths = existing_rewrite_paths.get(store_id, set())
+        if expected_path not in known_paths:
+            missing.append({
+                "sku": product["sku"],
+                "storeId": store_id,
+                "expectedPath": expected_path,
+            })
+    return missing</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function isUrlRewriteMissing(product, expectedSuffix, existingRewritePaths) {
+  const missing = [];
+  for (const storeId of product.storeIds) {
+    const expectedPath = `${product.urlKey}${expectedSuffix}`;
+    const knownPaths = existingRewritePaths.get(storeId) || new Set();
+    if (!knownPaths.has(expectedPath)) {
+      missing.push({ sku: product.sku, storeId, expectedPath });
+    }
+  }
+  return missing;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Check the storefront, since there is no rewrite search endpoint</h3>
+      <p>Core Magento has no public <code>/V1/url-rewrites</code> search resource, so the only outside confirmation that a row exists is the storefront itself. For each store's base URL, request <code>{store_base_url}/{expected_path}</code> and treat a 404 as proof the rewrite is missing, while a 301 or 200 means it resolved. This is what actually feeds the <code>existingRewritePaths</code> map the pure function reads.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">check.py</div>
+      <pre><code class="language-python">def path_resolves(store_base_url, expected_path):
+    r = requests.head(f"{store_base_url.rstrip('/')}/{expected_path}", timeout=15, allow_redirects=False)
+    if r.status_code == 405:
+        r = requests.get(f"{store_base_url.rstrip('/')}/{expected_path}", timeout=15, allow_redirects=False)
+    return r.status_code in (200, 301, 302)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">check.js</div>
+      <pre><code class="language-javascript">async function pathResolves(storeBaseUrl, expectedPath) {
+  const url = `${storeBaseUrl.replace(/\/+$/, "")}/${expectedPath}`;
+  let res = await fetch(url, { method: "HEAD", redirect: "manual" });
+  if (res.status === 405) res = await fetch(url, { method: "GET", redirect: "manual" });
+  return [200, 301, 302].includes(res.status);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report, guarded by a dry run, never write blind</h3>
+      <p>There is no public API to insert a <code>url_rewrite</code> row, and a blind write risks a <code>URL_REWRITE_REQUEST_PATH_STORE_ID</code> collision with a row that already claims that path. So the script always reports affected SKUs with the store id and expected path. With <code>DRY_RUN=false</code> it also issues the documented workaround, a <code>PUT /V1/products/{sku}</code> with <code>extension_attributes.website_ids</code> intentionally duplicated, for example <code>[1, 1]</code>, which forces <code>getStoreIds()</code> down a code path that resolves correctly. The alternative, resaving through the Admin UI or running <code>bin/magento indexer:reindex catalog_url_rewrite</code>, is CLI or admin only and is reported as an option, not executed.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code> and read the report before writing anything. Never insert or edit <code>url_rewrite</code> rows directly, and treat the duplicated <code>website_ids</code> workaround as a deliberate, documented core workaround, not a guess.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only ever repairs a SKU by resaving it through the normal REST API with the documented workaround, one at a time.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/url-rewrite-not-generated-on-edit" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">url_rewrite_missing.py</div>
+      <pre><code class="language-python">"""Detect Magento products whose url_rewrite row was not generated on
+save or duplicate, and report the safe repair.
+
+ProductProcessUrlRewriteSavingObserver regenerates url_rewrite rows on
+catalog_product_save_after using Product::getStoreIds() to resolve which
+stores to write for. In single-store mode, and reliably when a product is
+saved through PUT /V1/products/{sku} instead of the admin form,
+getStoreIds() mishandles website_ids and resolves the wrong or an empty
+scope, so no rewrite row is written. No exception is thrown and the save
+still returns 200 OK. There is no public API to insert a url_rewrite row
+directly, and a blind write risks a URL_REWRITE_REQUEST_PATH_STORE_ID
+collision, so this script only reports affected SKUs and, when DRY_RUN is
+explicitly disabled, applies the documented re-save workaround. Report
+only by default.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("url_rewrite_missing")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+SKUS = [s.strip() for s in os.environ.get("CHECK_SKUS", "").split(",") if s.strip()]
+STORE_BASE_URLS = os.environ.get("STORE_BASE_URLS", "")  # "1:https://store1.example.com,2:https://store2.example.com"
+
+
+def api_get(path, params=None):
+    r = requests.get(f"{MAGENTO_URL}/rest/V1{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_put(path, payload):
+    r = requests.put(f"{MAGENTO_URL}/rest/V1{path}", headers=HEADERS, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def custom_attr(attrs, code, default=None):
+    for a in attrs or []:
+        if a.get("attribute_code") == code:
+            return a.get("value")
+    return default
+
+
+def fetch_product(sku):
+    item = api_get(f"/products/{sku}")
+    return {
+        "sku": item["sku"],
+        "urlKey": custom_attr(item.get("custom_attributes"), "url_key"),
+        "storeIds": (item.get("extension_attributes") or {}).get("website_ids", []),
+    }
+
+
+def fetch_url_suffix(store_code):
+    configs = api_get("/store/storeConfigs", {"storeCodes[]": store_code})
+    if not configs:
+        return ".html"
+    return configs[0].get("product_url_suffix") or ".html"
+
+
+def parse_store_base_urls(raw):
+    mapping = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        store_id, url = pair.split(":", 1)
+        mapping[int(store_id)] = url
+    return mapping
+
+
+def is_url_rewrite_missing(product, expected_suffix, existing_rewrite_paths):
+    missing = []
+    for store_id in product["storeIds"]:
+        expected_path = f"{product['urlKey']}{expected_suffix}"
+        known_paths = existing_rewrite_paths.get(store_id, set())
+        if expected_path not in known_paths:
+            missing.append({
+                "sku": product["sku"],
+                "storeId": store_id,
+                "expectedPath": expected_path,
+            })
+    return missing
+
+
+def path_resolves(store_base_url, expected_path):
+    r = requests.head(f"{store_base_url.rstrip('/')}/{expected_path}", timeout=15, allow_redirects=False)
+    if r.status_code == 405:
+        r = requests.get(f"{store_base_url.rstrip('/')}/{expected_path}", timeout=15, allow_redirects=False)
+    return r.status_code in (200, 301, 302)
+
+
+def repair_with_duplicated_website_ids(sku, website_ids):
+    doubled = list(website_ids) + list(website_ids)
+    payload = {"product": {"sku": sku, "extension_attributes": {"website_ids": doubled}}}
+    return api_put(f"/products/{sku}", payload)
+
+
+def run():
+    store_base_urls = parse_store_base_urls(STORE_BASE_URLS)
+    flagged = 0
+
+    for sku in SKUS:
+        product = fetch_product(sku)
+        if not product["urlKey"]:
+            log.warning("SKU %s has no url_key, skipping", sku)
+            continue
+
+        existing_rewrite_paths = {}
+        for store_id in product["storeIds"]:
+            base_url = store_base_urls.get(store_id)
+            if not base_url:
+                log.warning("No STORE_BASE_URLS entry for store_id=%s, skipping check", store_id)
+                continue
+            suffix = fetch_url_suffix(str(store_id))
+            expected_path = f"{product['urlKey']}{suffix}"
+            existing_rewrite_paths[store_id] = (
+                {expected_path} if path_resolves(base_url, expected_path) else set()
+            )
+
+        default_suffix = ".html"
+        missing = is_url_rewrite_missing(product, default_suffix, existing_rewrite_paths)
+
+        for gap in missing:
+            log.warning(
+                "Missing url_rewrite: sku=%s store_id=%s expected_path=%s",
+                gap["sku"], gap["storeId"], gap["expectedPath"],
+            )
+            flagged += 1
+
+        if missing:
+            log.info(
+                "%s sku=%s website_ids=%s (duplicated workaround)",
+                "Would PUT" if DRY_RUN else "PUTting",
+                sku, product["storeIds"],
+            )
+            if not DRY_RUN:
+                repair_with_duplicated_website_ids(sku, product["storeIds"])
+
+    log.info("Done. %d missing rewrite(s) found.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">url-rewrite-missing.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect Magento products whose url_rewrite row was not generated on
+ * save or duplicate, and report the safe repair.
+ *
+ * ProductProcessUrlRewriteSavingObserver regenerates url_rewrite rows on
+ * catalog_product_save_after using Product::getStoreIds() to resolve which
+ * stores to write for. In single-store mode, and reliably when a product is
+ * saved through PUT /V1/products/{sku} instead of the admin form,
+ * getStoreIds() mishandles website_ids and resolves the wrong or an empty
+ * scope, so no rewrite row is written, with no exception and a 200 OK. There
+ * is no public API to insert a url_rewrite row directly, so this script only
+ * reports affected SKUs and, when DRY_RUN is explicitly disabled, applies the
+ * documented re-save workaround.
+ *
+ * Guide: https://www.allanninal.dev/magento/url-rewrite-not-generated-on-edit/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://example.test").replace(/\/+$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "dummy-token";
+const HEADERS = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const SKUS = (process.env.CHECK_SKUS || "").split(",").map((s) => s.trim()).filter(Boolean);
+const STORE_BASE_URLS = process.env.STORE_BASE_URLS || "";
+
+export function isUrlRewriteMissing(product, expectedSuffix, existingRewritePaths) {
+  const missing = [];
+  for (const storeId of product.storeIds) {
+    const expectedPath = `${product.urlKey}${expectedSuffix}`;
+    const knownPaths = existingRewritePaths.get(storeId) || new Set();
+    if (!knownPaths.has(expectedPath)) {
+      missing.push({ sku: product.sku, storeId, expectedPath });
+    }
+  }
+  return missing;
+}
+
+function customAttr(attrs, code, fallback = null) {
+  for (const a of attrs || []) {
+    if (a.attribute_code === code) return a.value;
+  }
+  return fallback;
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, payload) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function fetchProduct(sku) {
+  const item = await apiGet(`/products/${sku}`);
+  return {
+    sku: item.sku,
+    urlKey: customAttr(item.custom_attributes, "url_key"),
+    storeIds: item.extension_attributes?.website_ids || [],
+  };
+}
+
+async function fetchUrlSuffix(storeCode) {
+  const configs = await apiGet("/store/storeConfigs", { "storeCodes[]": storeCode });
+  if (!configs.length) return ".html";
+  return configs[0].product_url_suffix || ".html";
+}
+
+function parseStoreBaseUrls(raw) {
+  const mapping = new Map();
+  for (const pair of raw.split(",")) {
+    const trimmed = pair.trim();
+    if (!trimmed || !trimmed.includes(":")) continue;
+    const idx = trimmed.indexOf(":");
+    const storeId = Number(trimmed.slice(0, idx));
+    const url = trimmed.slice(idx + 1);
+    mapping.set(storeId, url);
+  }
+  return mapping;
+}
+
+async function pathResolves(storeBaseUrl, expectedPath) {
+  const url = `${storeBaseUrl.replace(/\/+$/, "")}/${expectedPath}`;
+  let res = await fetch(url, { method: "HEAD", redirect: "manual" });
+  if (res.status === 405) res = await fetch(url, { method: "GET", redirect: "manual" });
+  return [200, 301, 302].includes(res.status);
+}
+
+async function repairWithDuplicatedWebsiteIds(sku, websiteIds) {
+  const doubled = [...websiteIds, ...websiteIds];
+  const payload = { product: { sku, extension_attributes: { website_ids: doubled } } };
+  return apiPut(`/products/${sku}`, payload);
+}
+
+export async function run() {
+  const storeBaseUrls = parseStoreBaseUrls(STORE_BASE_URLS);
+  let flagged = 0;
+
+  for (const sku of SKUS) {
+    const product = await fetchProduct(sku);
+    if (!product.urlKey) {
+      console.warn(`SKU ${sku} has no url_key, skipping`);
+      continue;
+    }
+
+    const existingRewritePaths = new Map();
+    for (const storeId of product.storeIds) {
+      const baseUrl = storeBaseUrls.get(storeId);
+      if (!baseUrl) {
+        console.warn(`No STORE_BASE_URLS entry for store_id=${storeId}, skipping check`);
+        continue;
+      }
+      const suffix = await fetchUrlSuffix(String(storeId));
+      const expectedPath = `${product.urlKey}${suffix}`;
+      const resolved = await pathResolves(baseUrl, expectedPath);
+      existingRewritePaths.set(storeId, resolved ? new Set([expectedPath]) : new Set());
+    }
+
+    const defaultSuffix = ".html";
+    const missing = isUrlRewriteMissing(product, defaultSuffix, existingRewritePaths);
+
+    for (const gap of missing) {
+      console.warn(`Missing url_rewrite: sku=${gap.sku} store_id=${gap.storeId} expected_path=${gap.expectedPath}`);
+      flagged++;
+    }
+
+    if (missing.length) {
+      console.log(`${DRY_RUN ? "Would PUT" : "PUTting"} sku=${sku} website_ids=${JSON.stringify(product.storeIds)} (duplicated workaround)`);
+      if (!DRY_RUN) await repairWithDuplicatedWebsiteIds(sku, product.storeIds);
+    }
+  }
+
+  console.log(`Done. ${flagged} missing rewrite(s) found.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which SKU and store pairs get reported as missing a rewrite in front of a real storefront. Because <code>is_url_rewrite_missing</code> is pure, the test needs no network and no Magento store. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_url_rewrite_missing.py</div>
+      <pre><code class="language-python">from url_rewrite_missing import is_url_rewrite_missing
+
+
+def product(**over):
+    base = {"sku": "GREEN-SHIRT", "urlKey": "green-shirt", "storeIds": [1]}
+    base.update(over)
+    return base
+
+
+def test_no_gap_when_expected_path_already_known():
+    existing = {1: {"green-shirt.html"}}
+    result = is_url_rewrite_missing(product(), ".html", existing)
+    assert result == []
+
+
+def test_flags_missing_when_store_has_no_matching_path():
+    existing = {1: set()}
+    result = is_url_rewrite_missing(product(), ".html", existing)
+    assert result == [{"sku": "GREEN-SHIRT", "storeId": 1, "expectedPath": "green-shirt.html"}]
+
+
+def test_flags_missing_when_store_id_absent_from_map():
+    existing = {}
+    result = is_url_rewrite_missing(product(), ".html", existing)
+    assert result == [{"sku": "GREEN-SHIRT", "storeId": 1, "expectedPath": "green-shirt.html"}]
+
+
+def test_checks_every_store_the_product_belongs_to():
+    p = product(storeIds=[1, 2])
+    existing = {1: {"green-shirt.html"}, 2: set()}
+    result = is_url_rewrite_missing(p, ".html", existing)
+    assert result == [{"sku": "GREEN-SHIRT", "storeId": 2, "expectedPath": "green-shirt.html"}]
+
+
+def test_no_stores_means_no_gaps():
+    p = product(storeIds=[])
+    result = is_url_rewrite_missing(p, ".html", {})
+    assert result == []
+
+
+def test_respects_a_custom_suffix():
+    existing = {1: {"green-shirt.htm"}}
+    result = is_url_rewrite_missing(product(), ".htm", existing)
+    assert result == []
+
+
+def test_wrong_suffix_in_existing_paths_is_still_a_gap():
+    existing = {1: {"green-shirt.htm"}}
+    result = is_url_rewrite_missing(product(), ".html", existing)
+    assert result == [{"sku": "GREEN-SHIRT", "storeId": 1, "expectedPath": "green-shirt.html"}]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">url-rewrite-missing.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isUrlRewriteMissing } from "./url-rewrite-missing.js";
+
+const product = (over = {}) => ({ sku: "GREEN-SHIRT", urlKey: "green-shirt", storeIds: [1], ...over });
+
+test("no gap when expected path already known", () => {
+  const existing = new Map([[1, new Set(["green-shirt.html"])]]);
+  assert.deepEqual(isUrlRewriteMissing(product(), ".html", existing), []);
+});
+
+test("flags missing when store has no matching path", () => {
+  const existing = new Map([[1, new Set()]]);
+  assert.deepEqual(isUrlRewriteMissing(product(), ".html", existing), [
+    { sku: "GREEN-SHIRT", storeId: 1, expectedPath: "green-shirt.html" },
+  ]);
+});
+
+test("flags missing when store id absent from map", () => {
+  const existing = new Map();
+  assert.deepEqual(isUrlRewriteMissing(product(), ".html", existing), [
+    { sku: "GREEN-SHIRT", storeId: 1, expectedPath: "green-shirt.html" },
+  ]);
+});
+
+test("checks every store the product belongs to", () => {
+  const p = product({ storeIds: [1, 2] });
+  const existing = new Map([[1, new Set(["green-shirt.html"])], [2, new Set()]]);
+  assert.deepEqual(isUrlRewriteMissing(p, ".html", existing), [
+    { sku: "GREEN-SHIRT", storeId: 2, expectedPath: "green-shirt.html" },
+  ]);
+});
+
+test("no stores means no gaps", () => {
+  const p = product({ storeIds: [] });
+  assert.deepEqual(isUrlRewriteMissing(p, ".html", new Map()), []);
+});
+
+test("respects a custom suffix", () => {
+  const existing = new Map([[1, new Set(["green-shirt.htm"])]]);
+  assert.deepEqual(isUrlRewriteMissing(product(), ".htm", existing), []);
+});
+
+test("wrong suffix in existing paths is still a gap", () => {
+  const existing = new Map([[1, new Set(["green-shirt.htm"])]]);
+  assert.deepEqual(isUrlRewriteMissing(product(), ".html", existing), [
+    { sku: "GREEN-SHIRT", storeId: 1, expectedPath: "green-shirt.html" },
+  ]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Single-store mode</span>
+      <h4>A repriced product quietly lost its page</h4>
+      <p>A single-store shop updated a batch of products through a nightly script that called <code>PUT /V1/products/{sku}</code> for pricing changes only, never touching <code>url_key</code>. A few weeks later, support tickets started coming in about specific product pages 404ing, the exact shape reported in <code>magento/magento2</code> issue #25190. Nothing in the update script's logs showed an error, because there was not one to show.</p>
+      <p>Running the detection script against the affected SKUs confirmed the expected request_path 404d on the storefront while the product itself was enabled and in stock. The re-save workaround with duplicated <code>website_ids</code> regenerated the missing rows, and the team added the check to their post-deploy script going forward.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Duplicate in admin</span>
+      <h4>A duplicated seasonal variant never got a URL</h4>
+      <p>A merchandiser duplicated a bestselling product in the admin grid to create a seasonal variant, changed the SKU and a few attributes, and published it. Marketing linked to it in an email campaign the same day, matching the pattern in <code>magento/magento2</code> issue #33884, and the link 404d for every recipient.</p>
+      <p>Because the duplicate's save ran through the same broken store scope resolution as any other save, it had zero <code>url_rewrite</code> rows from creation. The team resaved the product through the Admin UI, which uses a different code path unaffected by the bug, and the URL resolved immediately. The detection script now runs against newly duplicated SKUs before they are linked anywhere.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs against your recently edited or duplicated SKUs, a missing <code>url_rewrite</code> row shows up as a clear report with the SKU, the store id, and the exact path that 404s, instead of a support ticket days later. Nothing is written to the table directly, so there is never a collision risk, and the documented workaround gives whoever runs the fix a precise, safe action instead of a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does editing or duplicating a product not create a url_rewrite row?</summary>
+      <p>Magento regenerates url_rewrite rows for a saved product through ProductProcessUrlRewriteSavingObserver, which relies on Product::getStoreIds() to know which stores to write rows for. In single-store mode, and especially when the save comes from PUT /V1/products/{sku} rather than the admin form, getStoreIds() mishandles website_ids and resolves the wrong or an empty store scope, so the generator is called with nothing to write. No exception is thrown and the API still returns 200 OK, so the missing rewrite goes unnoticed until the product URL 404s.</p>
+    </details>
+    <details>
+      <summary>Can I just call an API to regenerate the missing url_rewrite row?</summary>
+      <p>There is no public REST endpoint to insert or regenerate a url_rewrite row directly, and writing to the table by hand risks a URL_REWRITE_REQUEST_PATH_STORE_ID collision with an existing row. The documented workaround is to resave the product over REST with extension_attributes.website_ids intentionally duplicated, for example [1, 1], which forces getStoreIds() down a code path that resolves correctly, or to resave the product through the Admin UI, which uses a different, unaffected code path.</p>
+    </details>
+    <details>
+      <summary>Does duplicating a product in Magento copy its URL rewrite?</summary>
+      <p>No. A duplicated product is a new entity with its own entity_id, and ProductRepository::save() for that duplicate runs through the same ProductProcessUrlRewriteSavingObserver and the same getStoreIds() resolution as any other save. When that resolution is wrong, the duplicate ends up with no url_rewrite row at all, so its product page 404s until it is resaved correctly.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/magento/">Browse all Magento field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>magento/magento2: URL rewrites are not generated when editing or duplicating a product. <a href="https://github.com/magento/magento2/issues/33884" rel="noopener">github.com/magento/magento2/issues/33884</a></li>
+      <li>magento/magento2: REST API Product update url_key does not re-generate url_rewrites. <a href="https://github.com/magento/magento2/issues/30316" rel="noopener">github.com/magento/magento2/issues/30316</a></li>
+      <li>magento/magento2: URL rewrites are not being generated when Single-Store Mode is enabled. <a href="https://github.com/magento/magento2/issues/25190" rel="noopener">github.com/magento/magento2/issues/25190</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce: Product URL Rewrites documentation. <a href="https://experienceleague.adobe.com/en/docs/commerce-admin/marketing/seo/url-rewrites/url-rewrite-product" rel="noopener">experienceleague.adobe.com url-rewrite-product</a></li>
+      <li>Adobe Commerce/Magento REST API: Products endpoint reference. <a href="https://developer.adobe.com/commerce/webapi/rest/tutorials/orders-search-with-searchcriteria/" rel="noopener">developer.adobe.com orders-search-with-searchcriteria</a></li>
+      <li>Adobe Commerce Web API: store views and store config quick reference. <a href="https://developer.adobe.com/commerce/webapi/rest/quick-reference/" rel="noopener">developer.adobe.com quick-reference</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento catalog data, URL rewrites, cron, or MSI stock that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear your 404s?</h3>
+    <p>If this saved you a broken product link or a confusing afternoon staring at a save that returned 200 OK for nothing, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>

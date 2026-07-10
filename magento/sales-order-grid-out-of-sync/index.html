@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sales Order Grid Permanently Out of Sync With sales_order</title>
+<meta name="description" content="Orders exist and are correct in sales_order, but the admin grid shows them wrong, stale, or not at all. Learn why Magento's async grid indexing has a documented watermark race, how to detect the drift over REST, and how to build a report-only Python or Node.js script for it.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/sales-order-grid-out-of-sync/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Sales Order Grid Permanently Out of Sync With sales_order">
+<meta property="og:description" content="Why the async order grid indexer permanently skips some orders, how to diff sales_order against sales_order_grid over REST, and a safe Python or Node.js script that flags the drift for a targeted reindex.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/sales-order-grid-out-of-sync/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/sales-order-grid-out-of-sync/#article","headline":"Sales Order Grid Permanently Out of Sync With sales_order","description":"Why the async order grid indexer permanently skips some orders due to a watermark race, how to diff sales_order against sales_order_grid over REST, and a safe Python or Node.js script that flags the drift for a targeted reindex.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/sales-order-grid-out-of-sync/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders and Grid Sync","keywords":"Magento sales_order_grid out of sync, asynchronous grid indexing, dev/grid/async_indexing, indexer:reindex sales_order_grid, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Sales order grid permanently out of sync with sales_order","item":"https://www.allanninal.dev/magento/sales-order-grid-out-of-sync/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does an order show correctly in the API but wrong or missing in the Magento admin grid?","acceptedAnswer":{"@type":"Answer","text":"The admin order grid reads from a separate table, sales_order_grid, that is only kept in sync with the real sales_order table by a scheduled cron job when asynchronous grid indexing is enabled. A documented race condition lets that cron job advance its sync watermark past an order's updated_at while that order's grid row write is still in flight or fails, and once the watermark moves past it, the order is never picked up again. sales_order itself is always correct because the REST API and checkout write to it directly."}},{"@type":"Question","name":"Can I fix a missing or stale sales_order_grid row through the REST API?","acceptedAnswer":{"@type":"Answer","text":"No. There is no public REST endpoint that rebuilds a single order's grid row. The real fix is a CLI command, bin/magento indexer:reindex sales_order_grid, or triggering the admin Update by Schedule cron. A script can only detect the drift by comparing sales_order against what the grid-backed list endpoint returns, and then report which entity_id values need that reindex."}},{"@type":"Question","name":"What is the watermark race that causes orders to permanently disappear from the grid?","acceptedAnswer":{"@type":"Answer","text":"Each async grid indexing cron run reads a cached watermark, syncs sales_order rows updated since that point, and then advances the watermark. If one order's grid row write is still in flight, fails, or the cron is killed mid batch, but the cron run still advances the watermark past that order's updated_at, the order's timestamp is now permanently below the new floor. Every later cron cycle only looks forward from the watermark, so that order is skipped forever unless it is updated again or reindexed directly."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Orders and Grid Sync</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Orders and Grid Sync</p>
+    <h1>Sales order grid permanently out of sync with sales_order</h1>
+    <p class="lead">Support asks about an order that the customer swears they placed. You look it up with the REST API and there it is, entity_id, correct status, correct total, sitting right there in sales_order. But the admin order grid does not show it, or shows it stuck on an old status with a stale total. The order was never lost. The grid, a separate table that a cron job is supposed to keep in sync, just stopped picking it up, and a documented race condition means it may never pick it up again on its own. Here is why that happens and a small script that finds exactly which orders drifted.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Orders REST API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>When Stores &gt; Configuration &gt; Advanced &gt; Developer &gt; Grid Settings has Asynchronous Indexing enabled (<code>dev/grid/async_indexing=1</code>), orders are written to <code>sales_order</code> immediately, but the admin grid reads from <code>sales_order_grid</code>, a copy that a scheduled cron job fills in later within a window bounded by a cached watermark on <code>updated_at</code>. A documented race, <a href="https://github.com/magento/magento2/issues/40803" rel="noopener">magento/magento2 issue #40803</a>, lets one cron run advance that watermark past an order's <code>updated_at</code> while the order's grid row write is still in flight or fails. Because the watermark's cache is refreshed every cycle, that order's timestamp stays permanently below the new floor and is never synced again. The same pipeline can also drop rows if cron is killed mid-batch or the grid re-save throws. There is no REST endpoint to rebuild a single grid row, so the safe move is to diff <code>sales_order</code> against what the grid-backed list endpoint returns, and report exactly which <code>entity_id</code> values need <code>bin/magento indexer:reindex sales_order_grid</code>. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>The admin order grid is not a live view of <code>sales_order</code>. It is a denormalized copy, <code>sales_order_grid</code>, built so the grid can filter and sort quickly without joining half a dozen tables on every page load. When an order is created or changes, checkout and the REST API write straight to <code>sales_order</code>. The grid table only gets that same update through a separate step.</p>
+  <p>With synchronous grid indexing, that separate step happens in the same request, so it is slow but never falls behind. Asynchronous grid indexing, enabled with <code>dev/grid/async_indexing=1</code>, trades that for speed. The order save returns immediately, and a scheduled cron job comes along afterward, looks at what changed since the last time it ran, and copies those changes into <code>sales_order_grid</code>. That cron job tracks its own progress with a cached watermark on <code>updated_at</code>, essentially "I have already synced everything up to this timestamp."</p>
+  <p>The problem is that watermark does not wait for every row in its own batch to actually finish writing before it advances. If one order's grid write is still in flight, or throws partway through, for example because of missing customer or address data, the cron run can still move the watermark forward past that order's <code>updated_at</code>. The next cron cycle only looks at rows updated after the new watermark, so an order sitting just behind it is invisible to every future run. It is not that the order is slow to sync. It is permanently below the floor cron now starts from, and cron never looks backward on its own.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. An order is saved to sales_order immediately, the async grid indexing cron job is supposed to copy it into sales_order_grid, but that order's row write is still in flight when the cron run advances its watermark past the order's updated_at, so the order is permanently skipped from the grid.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Order saved</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">written to sales_order</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="160" height="66" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="298" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b1a10">Grid cron runs</text>
+      <text x="298" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">row write in flight</text>
+      <line x1="381" y1="103" x2="440" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">watermark advances anyway</text>
+      <rect x="443" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Order below floor</text>
+      <text x="523" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b584c">updated_at &lt; watermark</text>
+      <rect x="628" y="70" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Grid never</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">shows it again</text>
+      <line x1="606" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="90" y1="136" x2="90" y2="168" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="10" y="170" width="235" height="50" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="127" y="191" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">sales_order stays correct</text>
+      <text x="127" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">REST API sees it fine</text>
+    </svg>
+    <figcaption>sales_order is never wrong. The grid copy just stopped being told about this one order, and the cron watermark that tracks progress moved past it for good.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>The store has Stores &gt; Configuration &gt; Advanced &gt; Developer &gt; Grid Settings set to Asynchronous Indexing (<code>dev/grid/async_indexing=1</code>), so grid rows are only ever written by cron, never inline with the order save.</li>
+    <li>The documented race in <a href="https://github.com/magento/magento2/issues/40803" rel="noopener">magento/magento2 issue #40803</a>: the cron's cached sync watermark on <code>updated_at</code> advances past an order whose grid row write was still in flight or failed in that same batch, and every later cron cycle only looks forward from that watermark.</li>
+    <li>The cron process is killed mid-batch, by a crash, a timeout, or a deployment restarting PHP-FPM or the queue consumer, leaving some rows in the batch never written to <code>sales_order_grid</code> at all.</li>
+    <li>The grid re-save throws partway through, for example missing customer or address data referenced by the order, so that one order's row is skipped while the rest of the batch, and the watermark, move on without it.</li>
+    <li>A related but distinct failure mode covered in <a href="https://github.com/magento/magento2/issues/36334" rel="noopener">issue #36334</a>: auto-invoiced orders under async processing can also desync between the order and its derived grid state.</li>
+  </ul>
+  <p>Store owners usually notice this the same way: an order that unmistakably exists, confirmed by email, by payment gateway, by the customer, simply is not in the admin grid, or is there with a status and total that stopped updating days ago. See the citations at the end for the exact issue threads and forum posts.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>sales_order_grid</code> is a database table with no REST endpoint of its own, and there is no public API to force a rebuild of a single order's grid row. What the REST API does expose is two different views of the same order: <code>GET /V1/orders/{id}</code>, which always reads <code>sales_order</code> directly, and a <code>searchCriteria</code> filter on <code>entity_id</code> against the list endpoint, which is what the grid-backed admin list effectively surfaces. Diffing those two views over the same set of ids is the only way to prove drift from the outside, and it is exactly what a script can do safely, since it never has to guess at cron internals.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not try to patch <code>sales_order_grid</code> directly over the API, because there is no safe public way to do that. Instead we add a job that pulls the entity source of truth, cross checks every id against the grid-backed list view, classifies each drift by type, and reports the exact <code>entity_id</code> values that need a targeted <code>indexer:reindex sales_order_grid</code>, leaving the actual repair to the CLI where it belongs.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job pulls orders updated since a point in time from the entity source of truth, cross checks each id against the grid backed list view, classifies drift as missing from grid, stale status, or stale total, and reports FLAG_REINDEX for drifted ids so an operator can run indexer:reindex sales_order_grid.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">GET /V1/orders</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">updated_at gteq since</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Cross check per id</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">GET /orders/{id} vs list</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Drift found</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">and due?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report OK</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="613" y="185" width="142" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">FLAG_REINDEX</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">operator runs indexer:reindex</text>
+      <path d="M695,138 C715,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports drifted entity_id values. It never tries to write sales_order_grid itself, because the real fix runs on the CLI.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>Authenticate the same way as any other Magento REST client. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export SYNC_SINCE="2026-07-01 00:00:00"
+export WATERMARK="2026-07-09 00:00:00"
+export DRY_RUN="true"   # report-only either way, this only affects log verbosity</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export SYNC_SINCE="2026-07-01 00:00:00"
+export WATERMARK="2026-07-09 00:00:00"
+export DRY_RUN="true"   // report-only either way, this only affects log verbosity</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the entity source of truth, then the grid-backed view per id</h3>
+      <p>First page through <code>GET /rest/V1/orders</code> filtered by <code>updated_at gteq &lt;since&gt;</code>, collecting <code>entity_id</code>, <code>increment_id</code>, <code>status</code>, <code>updated_at</code>, and <code>grand_total</code> for every item, since this always reads <code>sales_order</code>. Then for each id, call <code>GET /rest/V1/orders/{id}</code> for the direct entity read, and separately query the list endpoint filtered by <code>entity_id eq</code> to see what the grid-backed admin list surfaces for that same id. Any id missing from that filtered result, or disagreeing on status or total, is a candidate for drift.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def entity_orders_since(since, page_size=200, current_page=1):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+        "searchCriteria[filterGroups][0][filters][0][value]": since,
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": current_page,
+    }
+    return magento_get("/orders", params)["items"]
+
+
+def grid_view_for_id(entity_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "entity_id",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[filterGroups][0][filters][0][value]": entity_id,
+    }
+    items = magento_get("/orders", params)["items"]
+    return items[0] if items else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function entityOrdersSince(since, pageSize = 200, currentPage = 1) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+    "searchCriteria[filterGroups][0][filters][0][value]": since,
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": currentPage,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items;
+}
+
+async function gridViewForId(entityId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "entity_id",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[filterGroups][0][filters][0][value]": entityId,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items[0] || null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the entity row, the grid row, or null, and the current watermark, and returns a drift type plus an action. A pure function like this is easy to read and easy to test, which we do later. A null grid row older than the watermark is the watermark-race signature, an order old enough that it should have synced but never did. A null grid row newer than the watermark is simply not due yet. A present grid row that disagrees on status or total is stale and needs the same reindex.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def classify_order_sync(entity_row, grid_row, watermark):
+    entity_id = entity_row["entityId"]
+
+    if grid_row is None:
+        if entity_row["updatedAt"] &lt;= watermark:
+            return {"entityId": entity_id, "driftType": "MISSING_FROM_GRID", "action": "FLAG_REINDEX"}
+        return {"entityId": entity_id, "driftType": "OK", "action": "NONE"}
+
+    if grid_row["status"] != entity_row["status"]:
+        return {"entityId": entity_id, "driftType": "STALE_STATUS", "action": "FLAG_REINDEX"}
+
+    if grid_row["grandTotal"] != entity_row["grandTotal"]:
+        return {"entityId": entity_id, "driftType": "STALE_TOTAL", "action": "FLAG_REINDEX"}
+
+    return {"entityId": entity_id, "driftType": "OK", "action": "NONE"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function classifyOrderSync(entityRow, gridRow, watermark) {
+  const entityId = entityRow.entityId;
+
+  if (gridRow === null) {
+    if (entityRow.updatedAt &lt;= watermark) {
+      return { entityId, driftType: "MISSING_FROM_GRID", action: "FLAG_REINDEX" };
+    }
+    return { entityId, driftType: "OK", action: "NONE" };
+  }
+
+  if (gridRow.status !== entityRow.status) {
+    return { entityId, driftType: "STALE_STATUS", action: "FLAG_REINDEX" };
+  }
+
+  if (gridRow.grandTotal !== entityRow.grandTotal) {
+    return { entityId, driftType: "STALE_TOTAL", action: "FLAG_REINDEX" };
+  }
+
+  return { entityId, driftType: "OK", action: "NONE" };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report by default, never fake a repair</h3>
+      <p>The output is a structured report per drifted <code>entity_id</code>, its <code>increment_id</code>, last-known-good entity fields, and the drift type. There is no code path in this script that touches <code>sales_order_grid</code>, because there is no safe REST way to do that. The recommended repair is always <code>bin/magento indexer:reindex sales_order_grid</code> for exactly the flagged ids, or the admin Update by Schedule cron.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>An explicit, opt-in nudge, off by default</h3>
+      <p>Only if <code>DRY_RUN=false</code> and an explicit allowlist of ids is supplied does the script attempt a benign nudge: a no-op <code>PUT /V1/orders/{id}/comments</code> with a system comment, which bumps <code>updated_at</code> and lets the async cron re-pick the row on its next cycle. This is logged, rate-limited, and skipped by default, since the correct fix is still the CLI reindex.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never writes to <code>sales_order_grid</code> and never marks an order paid, shipped, or invoiced. <code>DRY_RUN</code> defaults to true and only report mode ever runs unattended. The nudge path requires both <code>DRY_RUN=false</code> and an explicit id allowlist, and even then it only adds a system comment, nothing else.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pulls the entity source of truth, cross checks the grid-backed view per id, classifies drift with the pure function, and prints a structured report. It never writes to <code>sales_order_grid</code>, so it is safe to run again and again.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/sales-order-grid-out-of-sync" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_grid_sync_drift.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 sales_order_grid rows that fell out of sync with sales_order.
+
+With asynchronous grid indexing (dev/grid/async_indexing=1), orders are written
+to sales_order immediately but only copied into sales_order_grid by a scheduled
+cron job bounded by a cached watermark on updated_at. A documented race
+(magento/magento2 issue #40803) lets a cron run advance that watermark past an
+order whose grid row write was still in flight or failed, permanently skipping
+it. sales_order_grid has no REST endpoint and there is no public API to force a
+single order's grid row rebuild, so this only reports the drift. Run on a
+schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_grid_sync_drift")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+SYNC_SINCE = os.environ.get("SYNC_SINCE", "2026-01-01 00:00:00")
+WATERMARK = os.environ.get("WATERMARK", "2026-01-01 00:00:00")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+NUDGE_ALLOWLIST = {
+    s.strip() for s in os.environ.get("NUDGE_ALLOWLIST", "").split(",") if s.strip()
+}
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def magento_put(path, payload):
+    r = requests.put(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        json=payload,
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def entity_orders_since(since, page_size=200, current_page=1):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+        "searchCriteria[filterGroups][0][filters][0][value]": since,
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": current_page,
+    }
+    return magento_get("/orders", params)["items"]
+
+
+def grid_view_for_id(entity_id):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "entity_id",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[filterGroups][0][filters][0][value]": entity_id,
+    }
+    items = magento_get("/orders", params)["items"]
+    return items[0] if items else None
+
+
+def normalize_order(item):
+    return {
+        "entityId": item.get("entity_id"),
+        "incrementId": item.get("increment_id"),
+        "status": item.get("status"),
+        "updatedAt": item.get("updated_at"),
+        "grandTotal": item.get("grand_total"),
+    }
+
+
+def classify_order_sync(entity_row, grid_row, watermark):
+    entity_id = entity_row["entityId"]
+
+    if grid_row is None:
+        if entity_row["updatedAt"] &lt;= watermark:
+            return {"entityId": entity_id, "driftType": "MISSING_FROM_GRID", "action": "FLAG_REINDEX"}
+        return {"entityId": entity_id, "driftType": "OK", "action": "NONE"}
+
+    if grid_row["status"] != entity_row["status"]:
+        return {"entityId": entity_id, "driftType": "STALE_STATUS", "action": "FLAG_REINDEX"}
+
+    if grid_row["grandTotal"] != entity_row["grandTotal"]:
+        return {"entityId": entity_id, "driftType": "STALE_TOTAL", "action": "FLAG_REINDEX"}
+
+    return {"entityId": entity_id, "driftType": "OK", "action": "NONE"}
+
+
+def nudge_order(entity_id):
+    """No-op comment PUT that bumps updated_at so async cron can re-pick the row."""
+    payload = {
+        "statusHistory": {
+            "comment": "Reconciler: no-op comment to refresh updated_at for grid re-sync.",
+            "isCustomerNotified": False,
+            "isVisibleOnFront": False,
+        }
+    }
+    return magento_put(f"/orders/{entity_id}/comments", payload)
+
+
+def run():
+    raw_entities = entity_orders_since(SYNC_SINCE)
+    entities = [normalize_order(item) for item in raw_entities]
+
+    drifted = []
+    for entity_row in entities:
+        raw_grid = grid_view_for_id(entity_row["entityId"])
+        grid_row = normalize_order(raw_grid) if raw_grid else None
+        result = classify_order_sync(entity_row, grid_row, WATERMARK)
+        if result["action"] == "FLAG_REINDEX":
+            drifted.append({**result, "incrementId": entity_row["incrementId"], "lastKnownGood": entity_row})
+
+    for d in drifted:
+        log.warning(
+            "Order %s (id %s) drifted: %s.",
+            d["incrementId"], d["entityId"], d["driftType"],
+        )
+
+    if drifted:
+        ids = ",".join(str(d["entityId"]) for d in drifted)
+        log.error(
+            "%d order(s) out of sync with sales_order_grid. Run: "
+            "bin/magento indexer:reindex sales_order_grid  (affected ids: %s)",
+            len(drifted), ids,
+        )
+    else:
+        log.info("Done. No drift found between sales_order and sales_order_grid.")
+
+    if not DRY_RUN and NUDGE_ALLOWLIST:
+        for d in drifted:
+            if str(d["entityId"]) in NUDGE_ALLOWLIST:
+                log.warning("Nudging order %s to bump updated_at for re-sync.", d["entityId"])
+                nudge_order(d["entityId"])
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-grid-sync-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 sales_order_grid rows that fell out of sync with sales_order.
+ *
+ * With asynchronous grid indexing (dev/grid/async_indexing=1), orders are written
+ * to sales_order immediately but only copied into sales_order_grid by a scheduled
+ * cron job bounded by a cached watermark on updated_at. A documented race
+ * (magento/magento2 issue #40803) lets a cron run advance that watermark past an
+ * order whose grid row write was still in flight or failed, permanently skipping
+ * it. sales_order_grid has no REST endpoint and there is no public API to force a
+ * single order's grid row rebuild, so this only reports the drift. Run on a
+ * schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/magento/sales-order-grid-out-of-sync/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const SYNC_SINCE = process.env.SYNC_SINCE || "2026-01-01 00:00:00";
+const WATERMARK = process.env.WATERMARK || "2026-01-01 00:00:00";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const NUDGE_ALLOWLIST = new Set(
+  (process.env.NUDGE_ALLOWLIST || "").split(",").map((s) => s.trim()).filter(Boolean)
+);
+
+export function classifyOrderSync(entityRow, gridRow, watermark) {
+  const entityId = entityRow.entityId;
+
+  if (gridRow === null) {
+    if (entityRow.updatedAt &lt;= watermark) {
+      return { entityId, driftType: "MISSING_FROM_GRID", action: "FLAG_REINDEX" };
+    }
+    return { entityId, driftType: "OK", action: "NONE" };
+  }
+
+  if (gridRow.status !== entityRow.status) {
+    return { entityId, driftType: "STALE_STATUS", action: "FLAG_REINDEX" };
+  }
+
+  if (gridRow.grandTotal !== entityRow.grandTotal) {
+    return { entityId, driftType: "STALE_TOTAL", action: "FLAG_REINDEX" };
+  }
+
+  return { entityId, driftType: "OK", action: "NONE" };
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function magentoPut(path, payload) {
+  const res = await fetch(`${MAGENTO_URL}/rest/V1${path}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+async function entityOrdersSince(since, pageSize = 200, currentPage = 1) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "updated_at",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+    "searchCriteria[filterGroups][0][filters][0][value]": since,
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": currentPage,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items;
+}
+
+async function gridViewForId(entityId) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "entity_id",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    "searchCriteria[filterGroups][0][filters][0][value]": entityId,
+  };
+  const data = await magentoGet("/orders", params);
+  return data.items[0] || null;
+}
+
+function normalizeOrder(item) {
+  return {
+    entityId: item.entity_id,
+    incrementId: item.increment_id,
+    status: item.status,
+    updatedAt: item.updated_at,
+    grandTotal: item.grand_total,
+  };
+}
+
+async function nudgeOrder(entityId) {
+  const payload = {
+    statusHistory: {
+      comment: "Reconciler: no-op comment to refresh updated_at for grid re-sync.",
+      isCustomerNotified: false,
+      isVisibleOnFront: false,
+    },
+  };
+  return magentoPut(`/orders/${entityId}/comments`, payload);
+}
+
+export async function run() {
+  const rawEntities = await entityOrdersSince(SYNC_SINCE);
+  const entities = rawEntities.map(normalizeOrder);
+
+  const drifted = [];
+  for (const entityRow of entities) {
+    const rawGrid = await gridViewForId(entityRow.entityId);
+    const gridRow = rawGrid ? normalizeOrder(rawGrid) : null;
+    const result = classifyOrderSync(entityRow, gridRow, WATERMARK);
+    if (result.action === "FLAG_REINDEX") {
+      drifted.push({ ...result, incrementId: entityRow.incrementId, lastKnownGood: entityRow });
+    }
+  }
+
+  for (const d of drifted) {
+    console.warn(`Order ${d.incrementId} (id ${d.entityId}) drifted: ${d.driftType}.`);
+  }
+
+  if (drifted.length) {
+    const ids = drifted.map((d) => d.entityId).join(",");
+    console.error(
+      `${drifted.length} order(s) out of sync with sales_order_grid. Run: ` +
+      `bin/magento indexer:reindex sales_order_grid  (affected ids: ${ids})`
+    );
+  } else {
+    console.log("Done. No drift found between sales_order and sales_order_grid.");
+  }
+
+  if (!DRY_RUN &amp;&amp; NUDGE_ALLOWLIST.size) {
+    for (const d of drifted) {
+      if (NUDGE_ALLOWLIST.has(String(d.entityId))) {
+        console.warn(`Nudging order ${d.entityId} to bump updated_at for re-sync.`);
+        await nudgeOrder(d.entityId);
+      }
+    }
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classification rule is the part most worth testing, because it decides whether an order gets flagged for reindex. Because we kept <code>classify_order_sync</code> pure, the test needs no network and no Magento store. It just feeds in plain fixture rows for each branch and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_grid_sync_classify.py</div>
+      <pre><code class="language-python">from flag_grid_sync_drift import classify_order_sync
+
+WATERMARK = "2026-07-10 00:00:00"
+
+
+def entity(**over):
+    base = {
+        "entityId": 501,
+        "incrementId": "100000501",
+        "status": "processing",
+        "updatedAt": "2026-07-09 12:00:00",
+        "grandTotal": 129.99,
+    }
+    base.update(over)
+    return base
+
+
+def grid(**over):
+    base = {
+        "entityId": 501,
+        "incrementId": "100000501",
+        "status": "processing",
+        "updatedAt": "2026-07-09 12:00:00",
+        "grandTotal": 129.99,
+    }
+    base.update(over)
+    return base
+
+
+def test_missing_and_due_is_flagged():
+    result = classify_order_sync(entity(), None, WATERMARK)
+    assert result["driftType"] == "MISSING_FROM_GRID"
+    assert result["action"] == "FLAG_REINDEX"
+
+
+def test_missing_but_not_due_is_ok():
+    result = classify_order_sync(entity(updatedAt="2026-07-10 08:00:00"), None, WATERMARK)
+    assert result["driftType"] == "OK"
+    assert result["action"] == "NONE"
+
+
+def test_status_drift_is_flagged():
+    result = classify_order_sync(entity(), grid(status="pending"), WATERMARK)
+    assert result["driftType"] == "STALE_STATUS"
+    assert result["action"] == "FLAG_REINDEX"
+
+
+def test_total_drift_is_flagged():
+    result = classify_order_sync(entity(), grid(grandTotal=89.99), WATERMARK)
+    assert result["driftType"] == "STALE_TOTAL"
+    assert result["action"] == "FLAG_REINDEX"
+
+
+def test_matched_rows_are_ok():
+    result = classify_order_sync(entity(), grid(), WATERMARK)
+    assert result["driftType"] == "OK"
+    assert result["action"] == "NONE"
+
+
+def test_entity_id_is_preserved_in_result():
+    result = classify_order_sync(entity(entityId=777), None, WATERMARK)
+    assert result["entityId"] == 777
+
+
+def test_exactly_at_watermark_is_flagged():
+    result = classify_order_sync(entity(updatedAt=WATERMARK), None, WATERMARK)
+    assert result["driftType"] == "MISSING_FROM_GRID"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">grid-sync-classify.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyOrderSync } from "./flag-grid-sync-drift.js";
+
+const WATERMARK = "2026-07-10 00:00:00";
+
+const entity = (over = {}) =&gt; ({
+  entityId: 501,
+  incrementId: "100000501",
+  status: "processing",
+  updatedAt: "2026-07-09 12:00:00",
+  grandTotal: 129.99,
+  ...over,
+});
+
+const grid = (over = {}) =&gt; ({
+  entityId: 501,
+  incrementId: "100000501",
+  status: "processing",
+  updatedAt: "2026-07-09 12:00:00",
+  grandTotal: 129.99,
+  ...over,
+});
+
+test("missing and due is flagged", () =&gt; {
+  const result = classifyOrderSync(entity(), null, WATERMARK);
+  assert.equal(result.driftType, "MISSING_FROM_GRID");
+  assert.equal(result.action, "FLAG_REINDEX");
+});
+
+test("missing but not due is ok", () =&gt; {
+  const result = classifyOrderSync(entity({ updatedAt: "2026-07-10 08:00:00" }), null, WATERMARK);
+  assert.equal(result.driftType, "OK");
+  assert.equal(result.action, "NONE");
+});
+
+test("status drift is flagged", () =&gt; {
+  const result = classifyOrderSync(entity(), grid({ status: "pending" }), WATERMARK);
+  assert.equal(result.driftType, "STALE_STATUS");
+  assert.equal(result.action, "FLAG_REINDEX");
+});
+
+test("total drift is flagged", () =&gt; {
+  const result = classifyOrderSync(entity(), grid({ grandTotal: 89.99 }), WATERMARK);
+  assert.equal(result.driftType, "STALE_TOTAL");
+  assert.equal(result.action, "FLAG_REINDEX");
+});
+
+test("matched rows are ok", () =&gt; {
+  const result = classifyOrderSync(entity(), grid(), WATERMARK);
+  assert.equal(result.driftType, "OK");
+  assert.equal(result.action, "NONE");
+});
+
+test("entity id is preserved in result", () =&gt; {
+  const result = classifyOrderSync(entity({ entityId: 777 }), null, WATERMARK);
+  assert.equal(result.entityId, 777);
+});
+
+test("exactly at watermark is flagged", () =&gt; {
+  const result = classifyOrderSync(entity({ updatedAt: WATERMARK }), null, WATERMARK);
+  assert.equal(result.driftType, "MISSING_FROM_GRID");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Missing from grid</span>
+      <h4>The order support could not find</h4>
+      <p>A mid-size store had asynchronous grid indexing on for months without issue, until a spike in checkout traffic overlapped with a deployment restart. A handful of orders placed in that narrow window were confirmed by the payment gateway and by customer emails, but simply were not in the admin grid days later. Support searched by increment id and found nothing, then escalated it as a lost order.</p>
+      <p>The reconciliation job, run against the entity source of truth and cross checked per id, flagged exactly those orders as <code>MISSING_FROM_GRID</code>, each one older than the watermark and never present in the grid-backed list. A targeted <code>bin/magento indexer:reindex sales_order_grid</code> brought every one of them back into the grid within minutes, with no data loss, since <code>sales_order</code> had been correct the whole time.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Stale status</span>
+      <h4>The grid that stopped believing an order shipped</h4>
+      <p>An order moved from processing to complete after its shipment was created, and the REST API reflected that immediately. The admin grid, though, kept showing it as processing for over a week, which meant it kept appearing on a report of orders awaiting fulfillment that a warehouse team checked every morning.</p>
+      <p>The script's per-id cross check caught the mismatch as <code>STALE_STATUS</code>, comparing the grid row's status against the direct entity read for the same id. Reindexing the flagged id resolved it, and the team added the job as a daily check so a stale status in the grid never sits unnoticed for a week again.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a permanently skipped or stale grid row is caught within one polling cycle instead of surviving as a support mystery. The report carries the exact <code>entity_id</code> values affected, the drift type, and the last-known-good entity fields, so whoever responds can run <code>bin/magento indexer:reindex sales_order_grid</code> for precisely those ids rather than a full store-wide reindex or a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does an order show correctly in the API but wrong or missing in the Magento admin grid?</summary>
+      <p>The admin order grid reads from a separate table, sales_order_grid, that is only kept in sync with the real sales_order table by a scheduled cron job when asynchronous grid indexing is enabled. A documented race condition lets that cron job advance its sync watermark past an order's updated_at while that order's grid row write is still in flight or fails, and once the watermark moves past it, the order is never picked up again. sales_order itself is always correct because the REST API and checkout write to it directly.</p>
+    </details>
+    <details>
+      <summary>Can I fix a missing or stale sales_order_grid row through the REST API?</summary>
+      <p>No. There is no public REST endpoint that rebuilds a single order's grid row. The real fix is a CLI command, bin/magento indexer:reindex sales_order_grid, or triggering the admin Update by Schedule cron. A script can only detect the drift by comparing sales_order against what the grid-backed list endpoint returns, and then report which entity_id values need that reindex.</p>
+    </details>
+    <details>
+      <summary>What is the watermark race that causes orders to permanently disappear from the grid?</summary>
+      <p>Each async grid indexing cron run reads a cached watermark, syncs sales_order rows updated since that point, and then advances the watermark. If one order's grid row write is still in flight, fails, or the cron is killed mid batch, but the cron run still advances the watermark past that order's updated_at, the order's timestamp is now permanently below the new floor. Every later cron cycle only looks forward from the watermark, so that order is skipped forever unless it is updated again or reindexed directly.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: bug, async sales order grid sync permanently skips orders due to watermark race condition. <a href="https://github.com/magento/magento2/issues/40803" rel="noopener">github.com/magento/magento2/issues/40803</a></li>
+      <li>GitHub Issue: fix best practice "Asynchronous order data processing" for auto invoiced orders. <a href="https://github.com/magento/magento2/issues/36334" rel="noopener">github.com/magento/magento2/issues/36334</a></li>
+      <li>Magento Forums: some orders not appearing in order grid. <a href="https://community.magento.com/t5/Magento-2-x-Technical-Issues/Some-orders-not-appearing-in-order-grid/td-p/513767" rel="noopener">community.magento.com some orders not appearing in order grid</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce: configuration best practices for order processing. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/implementation-playbook/best-practices/maintenance/order-processing-configuration" rel="noopener">experienceleague.adobe.com order processing configuration</a></li>
+      <li>Adobe Commerce: manage the indexers. <a href="https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/manage-indexers" rel="noopener">experienceleague.adobe.com manage indexers</a></li>
+      <li>Adobe Commerce: search using REST endpoints. <a href="https://developer.adobe.com/commerce/webapi/rest/use-rest/performing-searches" rel="noopener">developer.adobe.com performing searches</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce orders, cron, catalog data, or inventory that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this find an order support could not?</h3>
+    <p>If this saved you a confusing support escalation or a full store-wide reindex you did not need, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>
