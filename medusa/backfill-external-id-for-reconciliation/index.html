@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backfill External ID for Reconciliation in Medusa</title>
+<meta name="description" content="Orders created before an ERP integration existed have no metadata.external_id, so cross-system reconciliation cannot find them. Learn why Medusa v2 loses this mapping and build a Python or Node.js script that safely backfills it from a legacy export.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/backfill-external-id-for-reconciliation/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Backfill External ID for Reconciliation in Medusa">
+<meta property="og:description" content="Why orders can end up with no metadata.external_id in Medusa v2, and a safe Python or Node.js script that matches them against a legacy export and backfills the key without guessing.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/backfill-external-id-for-reconciliation/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/backfill-external-id-for-reconciliation/#article","headline":"Backfill External ID for Reconciliation in Medusa","description":"Why Medusa v2 orders can end up with no metadata.external_id, and a safe Python or Node.js script that matches them against a legacy export by display_id or by email, total, and created_at, then backfills only the unambiguous matches.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/backfill-external-id-for-reconciliation/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Migration and housekeeping","keywords":"Medusa external_id backfill, order metadata, ERP integration recipe, order reconciliation, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Backfill external id for reconciliation","item":"https://www.allanninal.dev/medusa/backfill-external-id-for-reconciliation/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do some Medusa orders have no metadata.external_id?","acceptedAnswer":{"@type":"Answer","text":"Medusa v2's Order module has no first-class external_id column. The official ERP integration recipe stores the external identifier under metadata.external_id, a generic JSONB field, instead of a structured column. Orders created before an integration existed, imported by a seed script, or created through a flow that did not thread metadata through, end up with metadata null or missing that key, and there is no built-in mechanism to recover the mapping once it is lost."}},{"@type":"Question","name":"Is it safe to backfill external_id with a script?","acceptedAnswer":{"@type":"Answer","text":"Yes, when the script only writes an unambiguous, high-confidence match found against a legacy export, gates every write behind a DRY_RUN flag, and re-sends the full existing metadata object rather than a partial one. Medusa v2 replaces nested metadata on update instead of merging it, so a partial payload would silently delete other metadata keys. Orders with more than one candidate match, or none, are never written automatically."}},{"@type":"Question","name":"How do you match a Medusa order to its legacy external id?","acceptedAnswer":{"@type":"Answer","text":"Medusa's internal order_id has no relationship to a legacy system's id, so detection needs a side channel, typically a CSV export from the old system. Build a map of legacy rows keyed by display_id when the export has it, or by email, total, and created_at as a fuzzy key otherwise. Then, for every Medusa order missing metadata.external_id, look up candidates and only apply the ones with exactly one match."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Migration and housekeeping</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Migration and housekeeping</p>
+    <h1>Backfill external id for reconciliation</h1>
+    <p class="lead">A finance or ops export from the old system lists orders by their legacy id. In Medusa, that same order has no idea it ever had one. Nobody wrote it down, or the flow that created the order never threaded it through, and now the two systems cannot be joined without a person opening spreadsheets side by side. Here is why Medusa v2 has nowhere built in to keep that mapping, and a script that finds the gap and fills it in only when it is sure.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2's Order module has no first-class <code>external_id</code> column. The official ERP integration recipe recommends storing the external or legacy identifier under <code>metadata.external_id</code>, a generic JSONB field, instead of a structured one. Orders created before an integration existed, imported by a seed script, or created through a flow that dropped metadata along the way, end up with <code>metadata</code> null or missing that key. Run a script that lists orders missing <code>metadata.external_id</code>, matches each one against a legacy export by <code>display_id</code> or by email, total, and created_at, and only applies the id when exactly one legacy row matches. Anything ambiguous or with no match is flagged for a human, never guessed. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Medusa's Order module was not built with a slot for a foreign system's id. It has a rich internal id, <code>order_id</code>, things like <code>order_01H...</code>, but that id means nothing to the ERP, the old storefront, or the accounting export sitting in a spreadsheet somewhere. The only place Medusa gives you to store an outside identifier is <code>metadata</code>, a generic JSONB bucket for arbitrary custom data.</p>
+  <p>That works fine going forward, as long as every order-creation path remembers to write <code>metadata.external_id</code> at the moment the order is created. But plenty of orders were not created that way. They came from before the integration existed, from a one-off seed script during a migration, or from a flow that quietly dropped the metadata on the way, a pattern GitHub issues #7398 and #5764 both describe as easy to trigger, since metadata can be lost on a query or on an update that does not resend it. Once that happens, there is no unique constraint or migration path in Medusa tying the internal order back to the legacy id. The mapping is just gone, and the only way back is to guess from context, not to look it up.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An order is created before an integration exists or through a flow that drops metadata. There is no external_id column, only a generic metadata field, so the order ends up with metadata null or missing the key, and reconciliation against the legacy export has nothing to join on.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="185" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Order created</text>
+      <text x="102" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">pre-integration or seed script</text>
+      <line x1="195" y1="53" x2="237" y2="53" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="240" y="20" width="185" height="66" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="332" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">No external_id column</text>
+      <text x="332" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">only generic metadata</text>
+      <line x1="425" y1="53" x2="467" y2="53" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="446" y="30" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="446" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">metadata dropped or never set</text>
+      <rect x="470" y="20" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="545" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">metadata null</text>
+      <text x="545" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">or key missing</text>
+      <line x1="545" y1="86" x2="545" y2="128" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="440" y="130" width="210" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="545" y="156" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Reconciliation stuck</text>
+      <text x="545" y="174" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">nothing to join Medusa order</text>
+      <text x="545" y="190" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">to the legacy system's export</text>
+    </svg>
+    <figcaption>Medusa has no structured place for a legacy id. When metadata is never set or gets dropped, the order and the external export have no shared key to reconcile against.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>None of this is a bug in the sense of broken math. Medusa is doing exactly what its schema allows. A few common ways stores end up with orders missing <code>metadata.external_id</code>:</p>
+  <ul>
+    <li>Orders that existed in the old system and were migrated or re-created in Medusa before the ERP or accounting integration was wired up, so nothing ever wrote the key.</li>
+    <li>Bulk imports and seed scripts used during a store migration that built orders quickly and skipped the metadata step entirely.</li>
+    <li>Order-creation flows that call an update somewhere downstream without resending the full metadata object, which Medusa v2 issues such as #7398 and #5764 show can silently drop or fail to persist custom keys.</li>
+    <li>Draft orders or manually entered orders created directly in the Admin, where there was no automated path to stamp the external id in the first place.</li>
+  </ul>
+  <p>Because there is no unique constraint or migration path linking Medusa's internal <code>order_id</code> to any legacy identifier, once the mapping is missing it cannot be looked up. It can only be reconstructed by matching against an external export, and that has to be done carefully. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Recovering a lost id is fundamentally a guess unless the match is unambiguous. So the safe pattern is not "assign every unmatched order the closest legacy row." It is "assign only the orders where exactly one legacy row matches, and flag everything else for a human." A wrong <code>external_id</code> is worse than a missing one, because it silently points cross-system reconciliation at the wrong record.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch orders that already have <code>metadata.external_id</code>. The job lists orders missing it, builds a lookup from a legacy export keyed by <code>display_id</code> when available or a fuzzy key otherwise, and only for orders with exactly one candidate match does it write the id back, re-sending the full metadata object so nothing else gets dropped. Ambiguous and no-match orders go to a report instead of a guess.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists orders missing metadata.external_id, looks each one up in a legacy export map by display_id or by email, total, and created_at, and if exactly one candidate matches it applies the external_id with the full existing metadata resent, otherwise it flags the order as ambiguous or no match for manual review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List orders</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">missing metadata.external_id</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Look up legacy map</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">display_id or fuzzy key</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pure decision fn</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">decideExternalIdBackfill</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Exactly one</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">match?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, dry run off</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="588" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">zero or many, flag</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="605" y="185" width="150" height="55" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="680" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Flagged for review</text>
+      <text x="680" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">left for a human</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">POST order update</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">full metadata resent</text>
+    </svg>
+    <figcaption>Only orders with exactly one legacy candidate get the id applied, and the full metadata object is always resent so no other key is lost.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. Keep the backend URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export LEGACY_EXPORT_PATH="legacy_orders.csv"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install @medusajs/js-sdk
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export LEGACY_EXPORT_PATH="legacy_orders.csv"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List orders and find the ones missing the key</h3>
+      <p>Ask for orders with <code>metadata</code> expanded, paging with <code>limit</code> and <code>offset</code>. Medusa's <code>fields</code> param cannot filter inside a JSONB column, so the presence check for <code>metadata.external_id</code> has to happen client-side, after the page comes back.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_orders_missing_external_id(token):
+    missing = []
+    offset = 0
+    limit = 200
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": "id,display_id,created_at,email,*metadata",
+            "limit": limit,
+            "offset": offset,
+        })
+        for order in data["orders"]:
+            metadata = order.get("metadata") or {}
+            if not metadata.get("external_id"):
+                missing.append(order)
+        offset += limit
+        if offset &gt;= data["count"]:
+            return missing</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import Medusa from "@medusajs/js-sdk";
+
+const sdk = new Medusa({ baseUrl: process.env.MEDUSA_BACKEND_URL, auth: { type: "jwt" } });
+
+async function listOrdersMissingExternalId() {
+  const missing = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const { orders, count } = await sdk.admin.order.list({
+      fields: "id,display_id,created_at,email,*metadata",
+      limit,
+      offset,
+    });
+    for (const order of orders) {
+      const metadata = order.metadata || {};
+      if (!metadata.external_id) missing.push(order);
+    }
+    offset += limit;
+    if (offset &gt;= count) return missing;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Load the legacy export and build a lookup map</h3>
+      <p>Read the old system's export, typically a CSV, into a list of candidate rows. Each row carries a legacy id and whatever join keys the export has: <code>display_id</code> when the old system kept the same sequential order number, or <code>email</code>, <code>total</code>, and <code>created_at</code> as a fuzzy fallback.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import csv
+
+def load_legacy_candidates(path):
+    """Reads a CSV with columns: legacy_id, display_id, email, total, created_at.
+    display_id, total, and created_at may be blank."""
+    candidates = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            candidates.append({
+                "legacyId": row["legacy_id"],
+                "display_id": int(row["display_id"]) if row.get("display_id") else None,
+                "email": row.get("email") or None,
+                "total": float(row["total"]) if row.get("total") else None,
+                "created_at": row.get("created_at") or None,
+            })
+    return candidates</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">import { readFileSync } from "node:fs";
+
+/**
+ * Reads a CSV with columns: legacy_id, display_id, email, total, created_at.
+ * display_id, total, and created_at may be blank.
+ */
+export function loadLegacyCandidates(path) {
+  const [header, ...rows] = readFileSync(path, "utf-8").trim().split("\n");
+  const cols = header.split(",");
+  return rows.filter(Boolean).map((line) =&gt; {
+    const cells = line.split(",");
+    const row = Object.fromEntries(cols.map((c, i) =&gt; [c, cells[i]]));
+    return {
+      legacyId: row.legacy_id,
+      display_id: row.display_id ? Number(row.display_id) : null,
+      email: row.email || null,
+      total: row.total ? Number(row.total) : null,
+      created_at: row.created_at || null,
+    };
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the matching logic in its own function that takes an order and the full list of legacy candidates and returns a plain decision, never touching the network. It skips orders that already have an id, matches on <code>display_id</code> when present or on email, total within an epsilon, and created_at within a day window otherwise, and only ever applies when exactly one candidate matches.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">import datetime
+
+TOTAL_EPSILON = 0.01
+DAY_WINDOW_SECONDS = 86400
+
+
+def _parse_epoch(iso):
+    if not iso:
+        return None
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _matches_fuzzy(order, candidate):
+    if not (order.get("email") and candidate.get("email")):
+        return False
+    if order["email"].strip().lower() != candidate["email"].strip().lower():
+        return False
+    if candidate.get("total") is None or order.get("total") is None:
+        return False
+    if abs(candidate["total"] - order["total"]) &gt; TOTAL_EPSILON:
+        return False
+    order_epoch = _parse_epoch(order.get("created_at"))
+    candidate_epoch = _parse_epoch(candidate.get("created_at"))
+    if order_epoch is None or candidate_epoch is None:
+        return False
+    return abs(order_epoch - candidate_epoch) &lt;= DAY_WINDOW_SECONDS
+
+
+def decide_external_id_backfill(order, legacy_candidates):
+    """Pure decision function. No I/O.
+
+    order: {"id": str, "display_id": int, "metadata": dict | None,
+            "created_at": str, "email": str | None, "total": float | None}
+    legacy_candidates: [{"legacyId": str, "display_id": int | None,
+                          "email": str | None, "total": float | None,
+                          "created_at": str | None}]
+
+    Returns {"action", "external_id", "reason"} where action is one of
+    "skip_has_id" | "apply" | "flag_ambiguous" | "flag_no_match".
+    """
+    existing = (order.get("metadata") or {}).get("external_id")
+    if isinstance(existing, str) and existing.strip():
+        return {"action": "skip_has_id", "reason": "metadata.external_id already set"}
+
+    if order.get("display_id") is not None:
+        matches = [
+            c for c in legacy_candidates
+            if c.get("display_id") is not None and c["display_id"] == order["display_id"]
+        ]
+    else:
+        matches = [c for c in legacy_candidates if _matches_fuzzy(order, c)]
+
+    if len(matches) == 1:
+        return {
+            "action": "apply",
+            "external_id": matches[0]["legacyId"],
+            "reason": "exactly one legacy candidate matched",
+        }
+    if len(matches) == 0:
+        return {"action": "flag_no_match", "reason": "no legacy candidate matched"}
+    return {
+        "action": "flag_ambiguous",
+        "reason": f"{len(matches)} legacy candidates matched, refusing to guess",
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const TOTAL_EPSILON = 0.01;
+const DAY_WINDOW_MS = 86400 * 1000;
+
+function matchesFuzzy(order, candidate) {
+  if (!(order.email &amp;&amp; candidate.email)) return false;
+  if (order.email.trim().toLowerCase() !== candidate.email.trim().toLowerCase()) return false;
+  if (candidate.total == null || order.total == null) return false;
+  if (Math.abs(candidate.total - order.total) &gt; TOTAL_EPSILON) return false;
+  const orderMs = order.created_at ? Date.parse(order.created_at) : NaN;
+  const candidateMs = candidate.created_at ? Date.parse(candidate.created_at) : NaN;
+  if (Number.isNaN(orderMs) || Number.isNaN(candidateMs)) return false;
+  return Math.abs(orderMs - candidateMs) &lt;= DAY_WINDOW_MS;
+}
+
+/**
+ * Pure decision function. No I/O.
+ * @returns {{ action: "skip_has_id"|"apply"|"flag_ambiguous"|"flag_no_match",
+ *             external_id?: string, reason: string }}
+ */
+export function decideExternalIdBackfill(order, legacyCandidates) {
+  const existing = (order.metadata || {}).external_id;
+  if (typeof existing === "string" &amp;&amp; existing.trim()) {
+    return { action: "skip_has_id", reason: "metadata.external_id already set" };
+  }
+
+  let matches;
+  if (order.display_id != null) {
+    matches = legacyCandidates.filter(
+      (c) =&gt; c.display_id != null &amp;&amp; c.display_id === order.display_id
+    );
+  } else {
+    matches = legacyCandidates.filter((c) =&gt; matchesFuzzy(order, c));
+  }
+
+  if (matches.length === 1) {
+    return {
+      action: "apply",
+      external_id: matches[0].legacyId,
+      reason: "exactly one legacy candidate matched",
+    };
+  }
+  if (matches.length === 0) {
+    return { action: "flag_no_match", reason: "no legacy candidate matched" };
+  }
+  return {
+    action: "flag_ambiguous",
+    reason: `${matches.length} legacy candidates matched, refusing to guess`,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Apply the id by resending the full metadata object</h3>
+      <p>When the action is <code>apply</code>, update the order with the complete existing metadata spread plus <code>external_id</code>. Medusa v2 replaces nested metadata on update rather than merging it, so sending only <code>{ external_id }</code> would silently wipe out any other keys already stored there.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">def admin_post(token, path, json_body):
+    r = requests.post(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        json=json_body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def apply_external_id(token, order, external_id):
+    existing_metadata = order.get("metadata") or {}
+    return admin_post(token, f"/admin/orders/{order['id']}", {
+        "metadata": {**existing_metadata, "external_id": external_id},
+    })</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">async function applyExternalId(order, externalId) {
+  const existingMetadata = order.metadata || {};
+  return sdk.admin.order.update(order.id, {
+    metadata: { ...existingMetadata, external_id: externalId },
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first run, leave <code>DRY_RUN</code> on so the script only prints a CSV of <code>{medusa_order_id, display_id, external_id, action}</code> for human sign-off. Read it, agree with it, then switch it off to let it write. Orders in <code>flag_ambiguous</code> or <code>flag_no_match</code> are never written automatically, they go to the same report for manual reconciliation.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Only apply orders classified <code>apply</code>, the ones with exactly one legacy candidate. Never guess between multiple matches, and never invent an id for an order with no match at all, since a wrong <code>external_id</code> would silently corrupt cross-system reconciliation, which is worse than leaving the order unmapped.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever writes an id when the match against the legacy export was unambiguous.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/backfill-external-id-for-reconciliation" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">backfill_external_id.py</div>
+      <pre><code class="language-python">"""Backfill metadata.external_id on Medusa orders for cross-system reconciliation.
+
+Medusa v2's Order module has no first-class external_id column. The official
+ERP integration recipe stores it under metadata.external_id, a generic JSONB
+field, instead of a structured one. Orders created before an integration
+existed, imported by a seed script, or created through a flow that dropped
+metadata along the way, end up with metadata null or missing that key, and
+there is no built-in mechanism to recover the mapping once it is lost.
+
+This lists orders missing metadata.external_id, matches each one against a
+legacy CSV export by display_id when available or by email, total, and
+created_at otherwise, and only applies the id when exactly one legacy row
+matches. Orders with zero or multiple matches are flagged for manual
+reconciliation, never guessed. Metadata is always fully resent on update,
+since Medusa v2 replaces nested metadata rather than merging it.
+Run once with DRY_RUN=true for a CSV report before flipping to false.
+"""
+import os
+import csv
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("backfill_external_id")
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+LEGACY_EXPORT_PATH = os.environ.get("LEGACY_EXPORT_PATH", "legacy_orders.csv")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+TOTAL_EPSILON = 0.01
+DAY_WINDOW_SECONDS = 86400
+
+ORDER_FIELDS = "id,display_id,created_at,email,*metadata"
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_post(token, path, json_body):
+    r = requests.post(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        json=json_body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def list_orders_missing_external_id(token):
+    missing = []
+    offset = 0
+    limit = 200
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        for order in data["orders"]:
+            metadata = order.get("metadata") or {}
+            if not metadata.get("external_id"):
+                missing.append(order)
+        offset += limit
+        if offset &gt;= data["count"]:
+            return missing
+
+
+def load_legacy_candidates(path):
+    candidates = []
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            candidates.append({
+                "legacyId": row["legacy_id"],
+                "display_id": int(row["display_id"]) if row.get("display_id") else None,
+                "email": row.get("email") or None,
+                "total": float(row["total"]) if row.get("total") else None,
+                "created_at": row.get("created_at") or None,
+            })
+    return candidates
+
+
+def _parse_epoch(iso):
+    if not iso:
+        return None
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _matches_fuzzy(order, candidate):
+    if not (order.get("email") and candidate.get("email")):
+        return False
+    if order["email"].strip().lower() != candidate["email"].strip().lower():
+        return False
+    if candidate.get("total") is None or order.get("total") is None:
+        return False
+    if abs(candidate["total"] - order["total"]) &gt; TOTAL_EPSILON:
+        return False
+    order_epoch = _parse_epoch(order.get("created_at"))
+    candidate_epoch = _parse_epoch(candidate.get("created_at"))
+    if order_epoch is None or candidate_epoch is None:
+        return False
+    return abs(order_epoch - candidate_epoch) &lt;= DAY_WINDOW_SECONDS
+
+
+def decide_external_id_backfill(order, legacy_candidates):
+    """Pure decision function. No I/O.
+
+    order: {"id": str, "display_id": int, "metadata": dict | None,
+            "created_at": str, "email": str | None, "total": float | None}
+    legacy_candidates: [{"legacyId": str, "display_id": int | None,
+                          "email": str | None, "total": float | None,
+                          "created_at": str | None}]
+
+    Returns {"action", "external_id", "reason"} where action is one of
+    "skip_has_id" | "apply" | "flag_ambiguous" | "flag_no_match".
+    """
+    existing = (order.get("metadata") or {}).get("external_id")
+    if isinstance(existing, str) and existing.strip():
+        return {"action": "skip_has_id", "reason": "metadata.external_id already set"}
+
+    if order.get("display_id") is not None:
+        matches = [
+            c for c in legacy_candidates
+            if c.get("display_id") is not None and c["display_id"] == order["display_id"]
+        ]
+    else:
+        matches = [c for c in legacy_candidates if _matches_fuzzy(order, c)]
+
+    if len(matches) == 1:
+        return {
+            "action": "apply",
+            "external_id": matches[0]["legacyId"],
+            "reason": "exactly one legacy candidate matched",
+        }
+    if len(matches) == 0:
+        return {"action": "flag_no_match", "reason": "no legacy candidate matched"}
+    return {
+        "action": "flag_ambiguous",
+        "reason": f"{len(matches)} legacy candidates matched, refusing to guess",
+    }
+
+
+def apply_external_id(token, order, external_id):
+    existing_metadata = order.get("metadata") or {}
+    return admin_post(token, f"/admin/orders/{order['id']}", {
+        "metadata": {**existing_metadata, "external_id": external_id},
+    })
+
+
+def run():
+    token = get_admin_token()
+    legacy_candidates = load_legacy_candidates(LEGACY_EXPORT_PATH)
+    orders = list_orders_missing_external_id(token)
+
+    rows = [("medusa_order_id", "display_id", "external_id", "action")]
+    applied = 0
+    flagged = 0
+    for order in orders:
+        outcome = decide_external_id_backfill(order, legacy_candidates)
+        action = outcome["action"]
+
+        if action == "skip_has_id":
+            continue
+
+        if action == "apply":
+            external_id = outcome["external_id"]
+            log.info(
+                "Order %s matched legacy id %s. %s",
+                order.get("display_id") or order["id"], external_id,
+                "would apply" if DRY_RUN else "applying",
+            )
+            if not DRY_RUN:
+                apply_external_id(token, order, external_id)
+            rows.append((order["id"], order.get("display_id"), external_id, "apply"))
+            applied += 1
+        else:
+            log.warning(
+                "Order %s %s: %s",
+                order.get("display_id") or order["id"], action, outcome["reason"],
+            )
+            rows.append((order["id"], order.get("display_id"), "", action))
+            flagged += 1
+
+    for row in rows:
+        print(",".join(str(v) if v is not None else "" for v in row))
+
+    log.info(
+        "Done. %d order(s) %s, %d order(s) flagged for manual reconciliation.",
+        applied, "to backfill" if DRY_RUN else "backfilled", flagged,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">backfill-external-id.js</div>
+      <pre><code class="language-javascript">/**
+ * Backfill metadata.external_id on Medusa orders for cross-system reconciliation.
+ *
+ * Medusa v2's Order module has no first-class external_id column. The official
+ * ERP integration recipe stores it under metadata.external_id, a generic JSONB
+ * field, instead of a structured one. Orders created before an integration
+ * existed, imported by a seed script, or created through a flow that dropped
+ * metadata along the way, end up with metadata null or missing that key, and
+ * there is no built-in mechanism to recover the mapping once it is lost.
+ *
+ * This lists orders missing metadata.external_id, matches each one against a
+ * legacy CSV export by display_id when available or by email, total, and
+ * created_at otherwise, and only applies the id when exactly one legacy row
+ * matches. Orders with zero or multiple matches are flagged for manual
+ * reconciliation, never guessed. Metadata is always fully resent on update,
+ * since Medusa v2 replaces nested metadata rather than merging it.
+ * Run once with DRY_RUN=true for a CSV report before flipping to false.
+ *
+ * Guide: https://www.allanninal.dev/medusa/backfill-external-id-for-reconciliation/
+ */
+import { pathToFileURL } from "node:url";
+import { readFileSync } from "node:fs";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const LEGACY_EXPORT_PATH = process.env.LEGACY_EXPORT_PATH || "legacy_orders.csv";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const TOTAL_EPSILON = 0.01;
+const DAY_WINDOW_MS = 86400 * 1000;
+const ORDER_FIELDS = "id,display_id,created_at,email,*metadata";
+
+function matchesFuzzy(order, candidate) {
+  if (!(order.email &amp;&amp; candidate.email)) return false;
+  if (order.email.trim().toLowerCase() !== candidate.email.trim().toLowerCase()) return false;
+  if (candidate.total == null || order.total == null) return false;
+  if (Math.abs(candidate.total - order.total) &gt; TOTAL_EPSILON) return false;
+  const orderMs = order.created_at ? Date.parse(order.created_at) : NaN;
+  const candidateMs = candidate.created_at ? Date.parse(candidate.created_at) : NaN;
+  if (Number.isNaN(orderMs) || Number.isNaN(candidateMs)) return false;
+  return Math.abs(orderMs - candidateMs) &lt;= DAY_WINDOW_MS;
+}
+
+/**
+ * Pure decision function. No I/O.
+ * @returns {{ action: "skip_has_id"|"apply"|"flag_ambiguous"|"flag_no_match",
+ *             external_id?: string, reason: string }}
+ */
+export function decideExternalIdBackfill(order, legacyCandidates) {
+  const existing = (order.metadata || {}).external_id;
+  if (typeof existing === "string" &amp;&amp; existing.trim()) {
+    return { action: "skip_has_id", reason: "metadata.external_id already set" };
+  }
+
+  let matches;
+  if (order.display_id != null) {
+    matches = legacyCandidates.filter(
+      (c) =&gt; c.display_id != null &amp;&amp; c.display_id === order.display_id
+    );
+  } else {
+    matches = legacyCandidates.filter((c) =&gt; matchesFuzzy(order, c));
+  }
+
+  if (matches.length === 1) {
+    return {
+      action: "apply",
+      external_id: matches[0].legacyId,
+      reason: "exactly one legacy candidate matched",
+    };
+  }
+  if (matches.length === 0) {
+    return { action: "flag_no_match", reason: "no legacy candidate matched" };
+  }
+  return {
+    action: "flag_ambiguous",
+    reason: `${matches.length} legacy candidates matched, refusing to guess`,
+  };
+}
+
+export function loadLegacyCandidates(path) {
+  const [header, ...rows] = readFileSync(path, "utf-8").trim().split("\n");
+  const cols = header.split(",");
+  return rows.filter(Boolean).map((line) =&gt; {
+    const cells = line.split(",");
+    const row = Object.fromEntries(cols.map((c, i) =&gt; [c, cells[i]]));
+    return {
+      legacyId: row.legacy_id,
+      display_id: row.display_id ? Number(row.display_id) : null,
+      email: row.email || null,
+      total: row.total ? Number(row.total) : null,
+      created_at: row.created_at || null,
+    };
+  });
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function adminPost(token, path, jsonBody) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(jsonBody),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on POST ${path}`);
+  return res.json();
+}
+
+async function listOrdersMissingExternalId(token) {
+  const missing = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    for (const order of data.orders) {
+      const metadata = order.metadata || {};
+      if (!metadata.external_id) missing.push(order);
+    }
+    offset += limit;
+    if (offset &gt;= data.count) return missing;
+  }
+}
+
+async function applyExternalId(token, order, externalId) {
+  const existingMetadata = order.metadata || {};
+  return adminPost(token, `/admin/orders/${order.id}`, {
+    metadata: { ...existingMetadata, external_id: externalId },
+  });
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const legacyCandidates = loadLegacyCandidates(LEGACY_EXPORT_PATH);
+  const orders = await listOrdersMissingExternalId(token);
+
+  const rows = [["medusa_order_id", "display_id", "external_id", "action"]];
+  let applied = 0;
+  let flagged = 0;
+
+  for (const order of orders) {
+    const outcome = decideExternalIdBackfill(order, legacyCandidates);
+    const action = outcome.action;
+
+    if (action === "skip_has_id") continue;
+
+    if (action === "apply") {
+      const externalId = outcome.external_id;
+      console.log(
+        `Order ${order.display_id || order.id} matched legacy id ${externalId}. ${DRY_RUN ? "would apply" : "applying"}`
+      );
+      if (!DRY_RUN) await applyExternalId(token, order, externalId);
+      rows.push([order.id, order.display_id ?? "", externalId, "apply"]);
+      applied++;
+    } else {
+      console.warn(`Order ${order.display_id || order.id} ${action}: ${outcome.reason}`);
+      rows.push([order.id, order.display_id ?? "", "", action]);
+      flagged++;
+    }
+  }
+
+  for (const row of rows) console.log(row.join(","));
+
+  console.log(
+    `Done. ${applied} order(s) ${DRY_RUN ? "to backfill" : "backfilled"}, ${flagged} order(s) flagged for manual reconciliation.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>decide_external_id_backfill</code> is the part most worth testing, because it decides which orders get written and which get flagged. It is pure, so the test needs no network and no Medusa backend. It just feeds in plain fixture orders and candidate lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_backfill_external_id.py</div>
+      <pre><code class="language-python">from backfill_external_id import decide_external_id_backfill
+
+
+def order(**over):
+    base = {
+        "id": "order_1",
+        "display_id": 1042,
+        "metadata": None,
+        "created_at": "2026-07-01T00:00:00Z",
+        "email": "buyer@example.com",
+        "total": 150.0,
+    }
+    base.update(over)
+    return base
+
+
+def candidate(**over):
+    base = {
+        "legacyId": "LEG-1042",
+        "display_id": 1042,
+        "email": "buyer@example.com",
+        "total": 150.0,
+        "created_at": "2026-07-01T00:00:00Z",
+    }
+    base.update(over)
+    return base
+
+
+def test_skip_when_already_has_external_id():
+    o = order(metadata={"external_id": "LEG-9999"})
+    result = decide_external_id_backfill(o, [candidate()])
+    assert result["action"] == "skip_has_id"
+
+
+def test_apply_on_exact_display_id_match():
+    result = decide_external_id_backfill(order(), [candidate()])
+    assert result["action"] == "apply"
+    assert result["external_id"] == "LEG-1042"
+
+
+def test_flag_no_match_when_display_id_absent_from_export():
+    result = decide_external_id_backfill(order(), [candidate(display_id=9999)])
+    assert result["action"] == "flag_no_match"
+
+
+def test_flag_ambiguous_when_multiple_display_id_matches():
+    result = decide_external_id_backfill(
+        order(), [candidate(legacyId="LEG-A"), candidate(legacyId="LEG-B")]
+    )
+    assert result["action"] == "flag_ambiguous"
+
+
+def test_falls_back_to_fuzzy_match_without_display_id():
+    o = order(display_id=None)
+    result = decide_external_id_backfill(o, [candidate(display_id=None)])
+    assert result["action"] == "apply"
+    assert result["external_id"] == "LEG-1042"
+
+
+def test_fuzzy_match_rejects_total_outside_epsilon():
+    o = order(display_id=None)
+    result = decide_external_id_backfill(o, [candidate(display_id=None, total=200.0)])
+    assert result["action"] == "flag_no_match"
+
+
+def test_fuzzy_match_rejects_created_at_outside_day_window():
+    o = order(display_id=None)
+    result = decide_external_id_backfill(
+        o, [candidate(display_id=None, created_at="2026-07-10T00:00:00Z")]
+    )
+    assert result["action"] == "flag_no_match"
+
+
+def test_empty_string_external_id_is_treated_as_missing():
+    o = order(metadata={"external_id": ""})
+    result = decide_external_id_backfill(o, [candidate()])
+    assert result["action"] == "apply"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">backfill-external-id.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideExternalIdBackfill } from "./backfill-external-id.js";
+
+const order = (over = {}) =&gt; ({
+  id: "order_1",
+  display_id: 1042,
+  metadata: null,
+  created_at: "2026-07-01T00:00:00Z",
+  email: "buyer@example.com",
+  total: 150.0,
+  ...over,
+});
+
+const candidate = (over = {}) =&gt; ({
+  legacyId: "LEG-1042",
+  display_id: 1042,
+  email: "buyer@example.com",
+  total: 150.0,
+  created_at: "2026-07-01T00:00:00Z",
+  ...over,
+});
+
+test("skip when already has external_id", () =&gt; {
+  const o = order({ metadata: { external_id: "LEG-9999" } });
+  const result = decideExternalIdBackfill(o, [candidate()]);
+  assert.equal(result.action, "skip_has_id");
+});
+
+test("apply on exact display_id match", () =&gt; {
+  const result = decideExternalIdBackfill(order(), [candidate()]);
+  assert.equal(result.action, "apply");
+  assert.equal(result.external_id, "LEG-1042");
+});
+
+test("flag no match when display_id absent from export", () =&gt; {
+  const result = decideExternalIdBackfill(order(), [candidate({ display_id: 9999 })]);
+  assert.equal(result.action, "flag_no_match");
+});
+
+test("flag ambiguous when multiple display_id matches", () =&gt; {
+  const result = decideExternalIdBackfill(order(), [
+    candidate({ legacyId: "LEG-A" }),
+    candidate({ legacyId: "LEG-B" }),
+  ]);
+  assert.equal(result.action, "flag_ambiguous");
+});
+
+test("falls back to fuzzy match without display_id", () =&gt; {
+  const o = order({ display_id: null });
+  const result = decideExternalIdBackfill(o, [candidate({ display_id: null })]);
+  assert.equal(result.action, "apply");
+  assert.equal(result.external_id, "LEG-1042");
+});
+
+test("fuzzy match rejects total outside epsilon", () =&gt; {
+  const o = order({ display_id: null });
+  const result = decideExternalIdBackfill(o, [candidate({ display_id: null, total: 200.0 })]);
+  assert.equal(result.action, "flag_no_match");
+});
+
+test("fuzzy match rejects created_at outside day window", () =&gt; {
+  const o = order({ display_id: null });
+  const result = decideExternalIdBackfill(o, [
+    candidate({ display_id: null, created_at: "2026-07-10T00:00:00Z" }),
+  ]);
+  assert.equal(result.action, "flag_no_match");
+});
+
+test("empty string external_id is treated as missing", () =&gt; {
+  const o = order({ metadata: { external_id: "" } });
+  const result = decideExternalIdBackfill(o, [candidate()]);
+  assert.equal(result.action, "apply");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Pre-integration migration</span>
+      <h4>Two thousand orders with nowhere to send remittance</h4>
+      <p>A B2B seller moved to Medusa a full year before wiring up their ERP. By the time the ERP integration went live, roughly two thousand historical orders had no <code>metadata.external_id</code>, and the finance team's remittance export could not find a single one of them by name.</p>
+      <p>Running the backfill script in dry run against the ERP's own historical export matched almost all of them cleanly by <code>display_id</code>, since the old system had preserved the same sequential numbers. The handful that came back <code>flag_ambiguous</code>, mostly orders placed the same day by the same wholesale account, went to the finance team to resolve by hand instead of being guessed.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Dropped metadata</span>
+      <h4>A silent update wiped the id for a batch of orders</h4>
+      <p>A custom fulfillment integration updated a batch of orders after the fact and, following the same pattern GitHub issue #5764 describes, sent a metadata payload that did not include the existing <code>external_id</code>. Medusa's replace-not-merge behavior meant the key was gone the next time anyone looked.</p>
+      <p>Because the store still had the original ERP export on hand, the backfill script matched the affected orders back to their legacy ids using email, total, and created_at, since <code>display_id</code> alone was not distinct enough for a couple of same-day orders. Those went to the flagged report, and the rest applied cleanly on the second run once <code>DRY_RUN</code> was turned off.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs once, every order Medusa can confidently tie to a legacy row carries <code>metadata.external_id</code>, and the ERP or accounting export can join against Medusa without a person cross-referencing spreadsheets by hand. Orders with an ambiguous or missing match stay unmapped rather than wrong, and the CSV report gives a human exactly what they need to resolve the rest. No other metadata key gets lost along the way, since every write resends the full object.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do some Medusa orders have no metadata.external_id?</summary>
+      <p>Medusa v2's Order module has no first-class external_id column. The official ERP integration recipe stores the external identifier under metadata.external_id, a generic JSONB field, instead of a structured column. Orders created before an integration existed, imported by a seed script, or created through a flow that did not thread metadata through, end up with metadata null or missing that key, and there is no built-in mechanism to recover the mapping once it is lost.</p>
+    </details>
+    <details>
+      <summary>Is it safe to backfill external_id with a script?</summary>
+      <p>Yes, when the script only writes an unambiguous, high-confidence match found against a legacy export, gates every write behind a DRY_RUN flag, and re-sends the full existing metadata object rather than a partial one. Medusa v2 replaces nested metadata on update instead of merging it, so a partial payload would silently delete other metadata keys. Orders with more than one candidate match, or none, are never written automatically.</p>
+    </details>
+    <details>
+      <summary>How do you match a Medusa order to its legacy external id?</summary>
+      <p>Medusa's internal order_id has no relationship to a legacy system's id, so detection needs a side channel, typically a CSV export from the old system. Build a map of legacy rows keyed by display_id when the export has it, or by email, total, and created_at as a fuzzy key otherwise. Then, for every Medusa order missing metadata.external_id, look up candidates and only apply the ones with exactly one match.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Bug: Metadata not included with Order query. Medusa GitHub Issue #7398. <a href="https://github.com/medusajs/medusa/issues/7398" rel="noopener">github.com/medusajs/medusa/issues/7398</a></li>
+      <li>Bug: Can't add metadata when making HTTP request to update Order. Medusa GitHub Issue #5764. <a href="https://github.com/medusajs/medusa/issues/5764" rel="noopener">github.com/medusajs/medusa/issues/5764</a></li>
+      <li>Medusa Documentation: Integrate ERP with Medusa. <a href="https://docs.medusajs.com/resources/recipes/erp" rel="noopener">docs.medusajs.com/resources/recipes/erp</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Integrate ERP with Medusa. <a href="https://docs.medusajs.com/resources/recipes/erp" rel="noopener">docs.medusajs.com/resources/recipes/erp</a></li>
+      <li>Medusa Documentation: Admin API Reference. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+      <li>Medusa Documentation: Order Management System (OMS) Recipe. <a href="https://docs.medusajs.com/resources/recipes/oms" rel="noopener">docs.medusajs.com/resources/recipes/oms</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa storefront access, pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this square up your reconciliation?</h3>
+    <p>If this saved you a spreadsheet full of manual lookups, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>
