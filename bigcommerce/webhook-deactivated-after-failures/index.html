@@ -1,0 +1,1023 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a BigCommerce Webhook Deactivated After Failures</title>
+<meta name="description" content="A BigCommerce webhook silently stopped firing after repeated non-2xx responses, and no error ever reached the store admin. Learn why is_active flips to false and build a Python or Node.js script that finds and safely repairs it.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/webhook-deactivated-after-failures/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a BigCommerce Webhook Deactivated After Failures">
+<meta property="og:description" content="Why BigCommerce sets is_active to false on a webhook after repeated failures, and a safe Python or Node.js script that detects and repairs the gap.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/webhook-deactivated-after-failures/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/webhook-deactivated-after-failures/#article","headline":"Fix a BigCommerce Webhook Deactivated After Failures","description":"Why BigCommerce sets is_active to false on a webhook after repeated non-2xx deliveries, and a safe Python or Node.js script that detects the gap against /v3/hooks and repairs it with a health check before reactivating or recreating.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/webhook-deactivated-after-failures/","image":"https://www.allanninal.dev/og-image.png","articleSection":"BigCommerce webhooks","keywords":"BigCommerce webhook deactivated, is_active false, v3 hooks, webhook retry, webhook reconciliation, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Webhook deactivated after failures","item":"https://www.allanninal.dev/bigcommerce/webhook-deactivated-after-failures/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my BigCommerce webhook stop firing?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce retries a failed delivery, any response that is not HTTP 2xx, including timeouts and TLS errors, with exponential backoff for up to 11 attempts spanning roughly 48 hours. If your destination never returns a 2xx in that window, BigCommerce sets is_active to false on that hook and emails the address registered for the app. A webhook can also be auto deactivated after 90 days with zero triggered events."}},{"@type":"Question","name":"How do I know if a BigCommerce webhook was deactivated?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce does not expose a delivery attempt or failure log through the API, and nothing surfaces in the storefront or admin. You have to explicitly poll GET /v3/hooks and check is_active on every hook, or diff the live set against the scope and destination pairs your app is supposed to own to catch one that went missing entirely."}},{"@type":"Question","name":"Is it safe to just flip is_active back to true?","acceptedAnswer":{"@type":"Answer","text":"Not blindly. If the destination is still broken, reactivating restarts a flood of failing callbacks against it. Send a health check to the destination first and only call PUT /v3/hooks/{id} with is_active true once it responds 2xx. If the hook is missing entirely you cannot undelete it, you have to POST a new one, which gets a new id."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Webhooks</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Webhooks</p>
+    <h1>Webhook deactivated after failures</h1>
+    <p class="lead">Order and cart events used to show up in your app right away. Now an ERP sync is stale, or a fulfillment queue is empty, and nobody can say why. Nothing errored in the store admin. The webhook just quietly stopped. BigCommerce gave up retrying it a while back, flipped it off, and emailed an address nobody was watching. Here is why that happens and a small script that finds the deactivated or missing hooks and repairs them without flooding a still-broken destination.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce v3 Hooks API</span>
+      <span class="chip">Safe by default (health check before reactivate)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce retries a failed webhook delivery, any response that is not HTTP 2xx, including timeouts and TLS errors, with exponential backoff for up to 11 attempts spanning roughly 48 hours. If your destination never returns a 2xx in that window, BigCommerce sets <code>is_active</code> to <code>false</code> on that hook and emails the app's registered address, permanently pausing delivery until someone notices. A hook can also be auto deactivated after 90 days with zero triggered events. Run a small Python or Node.js script that lists every hook with <code>GET /v3/hooks</code>, diffs it against your app's expected scope and destination pairs, health checks the destination, then reactivates with <code>PUT /v3/hooks/{id}</code> or recreates a missing hook with <code>POST /v3/hooks</code>. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce webhooks are fire and forget from the store's point of view. When an order, product, or cart event happens, BigCommerce POSTs it to your registered destination and expects a 2xx response back. If your endpoint is down, slow, redeploying, or returns a 500, that single delivery fails, and BigCommerce retries it on a backoff schedule for up to about 11 attempts over roughly two days.</p>
+  <p>The trouble starts when the destination never recovers inside that window. After the last retry fails, BigCommerce does not keep trying forever. It sets <code>is_active</code> to <code>false</code> on that hook record and sends an email to whatever address is registered for the app. If nobody is reading that inbox, or the message lands in a spam folder, the hook just stays off. There is no error in the merchant's storefront, nothing in the BigCommerce admin calls it out, and the API does not expose a delivery attempt or failure log you could check after the fact. The event gap is invisible until a downstream system, an ERP sync, an inventory feed, a fulfillment queue, is found to be stale.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A store event fires, BigCommerce retries delivery with backoff for up to 11 attempts across about 48 hours, the destination never returns a 2xx, so BigCommerce sets is_active to false and emails the app, while the merchant sees nothing.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55607a"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="150" height="64" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="47" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Order event</text>
+      <text x="85" y="65" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">fires in the store</text>
+      <line x1="163" y1="52" x2="202" y2="52" stroke="#55607a" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="205" y="20" width="190" height="64" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="300" y="47" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Retries with backoff</text>
+      <text x="300" y="65" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">up to 11 tries, ~48h</text>
+      <line x1="398" y1="52" x2="460" y2="52" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="429" y="34" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="429" y="80" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">never a 2xx</text>
+      <rect x="463" y="20" width="180" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="553" y="47" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">is_active = false</text>
+      <text x="553" y="65" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">hook permanently paused</text>
+      <line x1="85" y1="84" x2="85" y2="120" stroke="#55607a" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="122" width="255" height="64" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="137" y="149" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Email sent to app</text>
+      <text x="137" y="167" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">nobody is reading it</text>
+      <rect x="463" y="122" width="180" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="553" y="149" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">No error surfaces</text>
+      <text x="553" y="167" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">admin and storefront silent</text>
+      <line x1="268" y1="154" x2="450" y2="154" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5"></line>
+      <text x="360" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f" font-weight="700">no attempt log via API</text>
+      <rect x="240" y="196" width="280" height="30" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="216" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Downstream system found stale, days later</text>
+    </svg>
+    <figcaption>The retries and the deactivation both happen quietly. The only trace is an email and a flipped flag, neither of which surfaces where a merchant would look.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The webhook dispatcher and the app's destination are two independent systems, and nothing forces someone to notice when the link between them breaks. A few common ways stores end up with a dead hook:</p>
+  <ul>
+    <li>The app's endpoint goes down during a deploy, a host migration, or an expired TLS certificate, and stays down long enough that all 11 retry attempts across roughly 48 hours land on a non-2xx response or a timeout.</li>
+    <li>The destination briefly returns 5xx or 429 under load for the exact window BigCommerce is retrying, so every attempt fails even though the service is generally healthy.</li>
+    <li>The hook simply never fires for 90 days, for example a low-traffic scope like <code>store/cart/abandoned</code> on a quiet store, and BigCommerce auto deactivates it for inactivity rather than failure.</li>
+    <li>The notification email about the deactivation goes to an address that changed, is unmonitored, or is filtered as noise, so the one signal BigCommerce does send never reaches a person who can act.</li>
+  </ul>
+  <p>This is a common source of confusion because BigCommerce does not expose a delivery attempt or failure log through the API. You cannot ask "why did this fail" the way you can for many other platforms. The only way to know a hook is off, or missing entirely after a past cleanup, is to explicitly poll <code>GET /v3/hooks</code> and check <code>is_active</code>, and the only way to know why it failed is to look at your own app's inbound request log, not a BigCommerce endpoint. See the citations at the end for the exact references.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A deactivated hook does not tell you whether the destination is fixed yet. So the safe pattern is not "flip every inactive hook back on." It is "confirm the destination is healthy first, then reactivate, and treat a completely missing hook as a fresh creation, never an undelete." We do that with a synthetic health check before any <code>PUT</code>, and a plain <code>POST /v3/hooks</code> for anything that vanished, because BigCommerce assigns a brand new id and the old one is gone for good.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch live order processing. We add a job that lists the hooks BigCommerce actually has, compares that against the scope and destination pairs the app is supposed to own, and splits the gaps into two buckets: hooks that exist but are inactive, and hooks that are missing entirely. Inactive hooks get a health check before they are turned back on. Missing hooks get recreated from scratch.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists live hooks from the API, diffs them against the desired manifest of scope and destination pairs, and for each gap either health checks and reactivates an inactive hook or recreates a missing one, otherwise it leaves healthy hooks alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">GET /v3/hooks</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">the live set</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="355" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Diff vs desired</text>
+      <text x="355" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">scope + destination</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="585,106 672,138 585,170 498,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="585" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">Inactive,</text>
+      <text x="585" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">missing, or</text>
+      <text x="585" y="156" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">healthy?</text>
+      <text x="675" y="118" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">inactive</text>
+      <line x1="672" y1="130" x2="700" y2="118" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="88" width="132" height="42" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="107" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Health check then</text>
+      <text x="684" y="121" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">PUT is_active true</text>
+      <text x="675" y="158" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">missing</text>
+      <line x1="672" y1="146" x2="700" y2="158" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="146" width="132" height="42" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="165" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">POST /v3/hooks</text>
+      <text x="684" y="179" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">new id assigned</text>
+      <text x="595" y="210" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a" font-weight="700">healthy, leave it</text>
+      <line x1="585" y1="170" x2="585" y2="225" stroke="#55607a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>The script only ever reactivates a hook after a fresh health check, and it never assumes a missing hook can be undeleted, only recreated.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a BigCommerce API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, and generate a token with the Webhooks scope, read and write. Keep the store hash and the token in environment variables, never in the file. Set your app's expected manifest of scope and destination pairs alongside it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+export WEBHOOK_DESTINATION="https://app.example.com/webhooks/bigcommerce"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+export WEBHOOK_DESTINATION="https://app.example.com/webhooks/bigcommerce"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the BigCommerce REST API</h3>
+      <p>Every call carries your token in the <code>X-Auth-Token</code> header against <code>https://api.bigcommerce.com/stores/{store_hash}/</code>. A small helper sends the request, raises on a non-2xx response, and returns the parsed body. We reuse this helper to list hooks, reactivate one, and recreate a missing one.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/"
+
+def bc(method, path, **kwargs):
+    r = requests.request(
+        method, BASE + path.lstrip("/"),
+        headers={"X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json"},
+        timeout=30, **kwargs,
+    )
+    r.raise_for_status()
+    return r.json() if r.content else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/`;
+
+async function bc(method, path, body) {
+  const res = await fetch(BASE + path.replace(/^\//, ""), {
+    method,
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List every registered hook, paginated</h3>
+      <p>Call <code>GET /v3/hooks</code> and walk <code>meta.pagination</code> until there is no next page. Read back <code>id</code>, <code>scope</code>, <code>destination</code>, and <code>is_active</code> for each hook, since those four fields are everything the decision function needs.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def list_hooks():
+    page = 1
+    hooks = []
+    while True:
+        body = bc("GET", f"/v3/hooks?page={page}&limit=50")
+        rows = (body or {}).get("data", [])
+        if not rows:
+            return hooks
+        for row in rows:
+            hooks.append({
+                "id": row["id"],
+                "scope": row["scope"],
+                "destination": row["destination"],
+                "is_active": bool(row["is_active"]),
+            })
+        pagination = (body.get("meta") or {}).get("pagination") or {}
+        if page >= pagination.get("total_pages", page):
+            return hooks
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function listHooks() {
+  let page = 1;
+  const hooks = [];
+  while (true) {
+    const body = await bc("GET", `/v3/hooks?page=${page}&limit=50`);
+    const rows = (body || {}).data || [];
+    if (rows.length === 0) return hooks;
+    for (const row of rows) {
+      hooks.push({
+        id: row.id,
+        scope: row.scope,
+        destination: row.destination,
+        is_active: Boolean(row.is_active),
+      });
+    }
+    const pagination = (body.meta || {}).pagination || {};
+    if (page >= (pagination.total_pages || page)) return hooks;
+    page++;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the reconciliation in its own function that takes the desired manifest and the live hooks and returns three plain arrays: hooks to reactivate, entries to recreate, and hooks to leave alone. It never mutates the input, and it preserves the order of the desired list so tests stay deterministic. A pure function like this needs no network to test, which we do later.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def plan_webhook_reconciliation(desired, live):
+    """Pure decision function. No network calls.
+
+    desired: list of {"scope": str, "destination": str, "is_active": bool, "headers": dict|None}
+    live: list of {"id": int, "scope": str, "destination": str, "is_active": bool}
+    returns: {"toReactivate": [id], "toRecreate": [desired entry], "toLeave": [id]}
+    """
+    by_key = {f"{h['scope']}::{h['destination']}": h for h in live}
+    to_reactivate, to_recreate, to_leave = [], [], []
+    for entry in desired:
+        key = f"{entry['scope']}::{entry['destination']}"
+        match = by_key.get(key)
+        if match is None:
+            to_recreate.append(entry)
+        elif match["is_active"]:
+            to_leave.append(match["id"])
+        else:
+            to_reactivate.append(match["id"])
+    return {"toReactivate": to_reactivate, "toRecreate": to_recreate, "toLeave": to_leave}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">/**
+ * Pure decision function. No network calls.
+ * desired: Array<{ scope, destination, is_active, headers? }>
+ * live: Array<{ id, scope, destination, is_active }>
+ * returns: { toReactivate: number[], toRecreate: desired[], toLeave: number[] }
+ */
+export function planWebhookReconciliation(desired, live) {
+  const byKey = new Map(live.map((h) =&gt; [`${h.scope}::${h.destination}`, h]));
+  const toReactivate = [];
+  const toRecreate = [];
+  const toLeave = [];
+  for (const entry of desired) {
+    const key = `${entry.scope}::${entry.destination}`;
+    const match = byKey.get(key);
+    if (!match) {
+      toRecreate.push(entry);
+    } else if (match.is_active) {
+      toLeave.push(match.id);
+    } else {
+      toReactivate.push(match.id);
+    }
+  }
+  return { toReactivate, toRecreate, toLeave };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Health check, then reactivate or recreate</h3>
+      <p>For every id in <code>toReactivate</code>, send a lightweight GET to the destination first. Only call <code>PUT /v3/hooks/{id}</code> with <code>{"is_active": true}</code> if it answers 2xx, otherwise a still-broken destination just starts failing all over again. For every entry in <code>toRecreate</code>, call <code>POST /v3/hooks</code> to create it fresh, and remember the old id is gone for good, there is no undelete. Always keep the destination HTTPS only, since BigCommerce webhooks only support HTTPS on port 443.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def destination_is_healthy(destination):
+    try:
+        r = requests.get(destination, timeout=10)
+        return 200 <= r.status_code < 300
+    except requests.RequestException:
+        return False
+
+def reactivate_hook(hook_id):
+    body = bc("PUT", f"/v3/hooks/{hook_id}", json={"is_active": True})
+    return (body or {}).get("data", {})
+
+def recreate_hook(entry):
+    payload = {
+        "scope": entry["scope"],
+        "destination": entry["destination"],
+        "is_active": True,
+        "headers": entry.get("headers") or {},
+    }
+    body = bc("POST", "/v3/hooks", json=payload)
+    return (body or {}).get("data", {})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function destinationIsHealthy(destination) {
+  try {
+    const res = await fetch(destination, { method: "GET" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function reactivateHook(hookId) {
+  const body = await bc("PUT", `/v3/hooks/${hookId}`, { is_active: true });
+  return (body || {}).data || {};
+}
+
+async function recreateHook(entry) {
+  const payload = {
+    scope: entry.scope,
+    destination: entry.destination,
+    is_active: true,
+    headers: entry.headers || {},
+  };
+  const body = await bc("POST", "/v3/hooks", payload);
+  return (body || {}).data || {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard, then re-verify</h3>
+      <p>The loop lists the live hooks, runs the pure plan against your desired manifest, then walks each bucket. Leave <code>DRY_RUN=true</code> on the first runs so the script only logs what it would do. After any live <code>PUT</code> or <code>POST</code>, re-GET the hook to confirm <code>is_active</code> is now <code>true</code> and store the new id so your app's local registry stays in sync. Run it on a schedule, for example once an hour, since BigCommerce gives you no other signal that a hook went dark.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never call <code>PUT /v3/hooks/{id}</code> with <code>is_active: true</code> without a fresh health check against the destination first, and never assume a hook missing from <code>GET /v3/hooks</code> can be restored, only recreated with a new id.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only ever writes <code>is_active</code> or a fresh hook, never anything else.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/webhook-deactivated-after-failures" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_webhooks.py</div>
+      <pre><code class="language-python">"""Find and safely repair BigCommerce webhooks deactivated after failures.
+
+BigCommerce retries a failed delivery, any response that is not HTTP 2xx,
+with exponential backoff for up to 11 attempts spanning roughly 48 hours.
+If the destination never returns a 2xx in that window, BigCommerce sets
+is_active to false on that hook and emails the app's registered address,
+permanently pausing delivery. A hook can also be auto deactivated after
+90 days of zero triggered events. This lists every hook with GET /v3/hooks,
+diffs it against a desired manifest of scope and destination pairs, health
+checks the destination before reactivating, and recreates anything missing
+entirely. Run on a schedule. Safe to run again and again.
+"""
+import os
+import json
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_webhooks")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/"
+DESIRED_MANIFEST = os.environ.get("DESIRED_WEBHOOKS_JSON", "[]")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def bc(method, path, **kwargs):
+    r = requests.request(
+        method, BASE + path.lstrip("/"),
+        headers={"X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json"},
+        timeout=30, **kwargs,
+    )
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+
+def plan_webhook_reconciliation(desired, live):
+    """Pure decision function. No network calls.
+
+    desired: list of {"scope": str, "destination": str, "is_active": bool, "headers": dict|None}
+    live: list of {"id": int, "scope": str, "destination": str, "is_active": bool}
+    returns: {"toReactivate": [id], "toRecreate": [desired entry], "toLeave": [id]}
+    """
+    by_key = {f"{h['scope']}::{h['destination']}": h for h in live}
+    to_reactivate, to_recreate, to_leave = [], [], []
+    for entry in desired:
+        key = f"{entry['scope']}::{entry['destination']}"
+        match = by_key.get(key)
+        if match is None:
+            to_recreate.append(entry)
+        elif match["is_active"]:
+            to_leave.append(match["id"])
+        else:
+            to_reactivate.append(match["id"])
+    return {"toReactivate": to_reactivate, "toRecreate": to_recreate, "toLeave": to_leave}
+
+
+def list_hooks():
+    page = 1
+    hooks = []
+    while True:
+        body = bc("GET", f"/v3/hooks?page={page}&limit=50")
+        rows = (body or {}).get("data", [])
+        if not rows:
+            return hooks
+        for row in rows:
+            hooks.append({
+                "id": row["id"],
+                "scope": row["scope"],
+                "destination": row["destination"],
+                "is_active": bool(row["is_active"]),
+            })
+        pagination = (body.get("meta") or {}).get("pagination") or {}
+        if page >= pagination.get("total_pages", page):
+            return hooks
+        page += 1
+
+
+def get_hook(hook_id):
+    body = bc("GET", f"/v3/hooks/{hook_id}")
+    return (body or {}).get("data", {})
+
+
+def destination_is_healthy(destination):
+    if not destination.lower().startswith("https://"):
+        return False
+    try:
+        r = requests.get(destination, timeout=10)
+        return 200 <= r.status_code < 300
+    except requests.RequestException:
+        return False
+
+
+def reactivate_hook(hook_id):
+    body = bc("PUT", f"/v3/hooks/{hook_id}", json={"is_active": True})
+    return (body or {}).get("data", {})
+
+
+def recreate_hook(entry):
+    payload = {
+        "scope": entry["scope"],
+        "destination": entry["destination"],
+        "is_active": True,
+        "headers": entry.get("headers") or {},
+    }
+    body = bc("POST", "/v3/hooks", json=payload)
+    return (body or {}).get("data", {})
+
+
+def run():
+    desired = json.loads(DESIRED_MANIFEST)
+    live = list_hooks()
+    plan = plan_webhook_reconciliation(desired, live)
+
+    reactivated, recreated, skipped = 0, 0, 0
+
+    for hook_id in plan["toReactivate"]:
+        hook = next((h for h in live if h["id"] == hook_id), None)
+        destination = hook["destination"] if hook else None
+        healthy = bool(destination) and destination_is_healthy(destination)
+        if not healthy:
+            log.warning("Hook %s destination not healthy yet, skipping reactivation.", hook_id)
+            skipped += 1
+            continue
+        log.info("Hook %s healthy. %s", hook_id, "would reactivate" if DRY_RUN else "reactivating")
+        if not DRY_RUN:
+            reactivate_hook(hook_id)
+            confirmed = get_hook(hook_id)
+            if not confirmed.get("is_active"):
+                raise RuntimeError(f"Hook {hook_id} did not confirm active after PUT")
+        reactivated += 1
+
+    for entry in plan["toRecreate"]:
+        if not entry["destination"].lower().startswith("https://"):
+            log.warning("Refusing to recreate non-HTTPS destination %s", entry["destination"])
+            skipped += 1
+            continue
+        log.info("Missing hook for %s %s. %s", entry["scope"], entry["destination"],
+                  "would recreate" if DRY_RUN else "recreating")
+        if not DRY_RUN:
+            created = recreate_hook(entry)
+            new_id = created.get("id")
+            confirmed = get_hook(new_id) if new_id else {}
+            if not confirmed.get("is_active"):
+                raise RuntimeError(f"New hook for {entry['scope']} did not confirm active")
+        recreated += 1
+
+    log.info("Done. %d to reactivate, %d to recreate, %d skipped, %d already healthy.",
+              reactivated, recreated, skipped, len(plan["toLeave"]))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-webhooks.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and safely repair BigCommerce webhooks deactivated after failures.
+ *
+ * BigCommerce retries a failed delivery, any response that is not HTTP 2xx,
+ * with exponential backoff for up to 11 attempts spanning roughly 48 hours.
+ * If the destination never returns a 2xx in that window, BigCommerce sets
+ * is_active to false on that hook and emails the app's registered address,
+ * permanently pausing delivery. A hook can also be auto deactivated after
+ * 90 days of zero triggered events. This lists every hook with GET /v3/hooks,
+ * diffs it against a desired manifest of scope and destination pairs, health
+ * checks the destination before reactivating, and recreates anything missing
+ * entirely. Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/webhook-deactivated-after-failures/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example";
+const TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "dummy_token";
+const BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/`;
+const DESIRED_MANIFEST = process.env.DESIRED_WEBHOOKS_JSON || "[]";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+/**
+ * Pure decision function. No network calls.
+ * desired: Array<{ scope, destination, is_active, headers? }>
+ * live: Array<{ id, scope, destination, is_active }>
+ * returns: { toReactivate: number[], toRecreate: desired[], toLeave: number[] }
+ */
+export function planWebhookReconciliation(desired, live) {
+  const byKey = new Map(live.map((h) => [`${h.scope}::${h.destination}`, h]));
+  const toReactivate = [];
+  const toRecreate = [];
+  const toLeave = [];
+  for (const entry of desired) {
+    const key = `${entry.scope}::${entry.destination}`;
+    const match = byKey.get(key);
+    if (!match) {
+      toRecreate.push(entry);
+    } else if (match.is_active) {
+      toLeave.push(match.id);
+    } else {
+      toReactivate.push(match.id);
+    }
+  }
+  return { toReactivate, toRecreate, toLeave };
+}
+
+async function bc(method, path, body) {
+  const res = await fetch(BASE + path.replace(/^\//, ""), {
+    method,
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function listHooks() {
+  let page = 1;
+  const hooks = [];
+  while (true) {
+    const body = await bc("GET", `/v3/hooks?page=${page}&limit=50`);
+    const rows = (body || {}).data || [];
+    if (rows.length === 0) return hooks;
+    for (const row of rows) {
+      hooks.push({
+        id: row.id,
+        scope: row.scope,
+        destination: row.destination,
+        is_active: Boolean(row.is_active),
+      });
+    }
+    const pagination = (body.meta || {}).pagination || {};
+    if (page >= (pagination.total_pages || page)) return hooks;
+    page++;
+  }
+}
+
+async function getHook(hookId) {
+  const body = await bc("GET", `/v3/hooks/${hookId}`);
+  return (body || {}).data || {};
+}
+
+async function destinationIsHealthy(destination) {
+  if (!destination.toLowerCase().startsWith("https://")) return false;
+  try {
+    const res = await fetch(destination, { method: "GET" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function reactivateHook(hookId) {
+  const body = await bc("PUT", `/v3/hooks/${hookId}`, { is_active: true });
+  return (body || {}).data || {};
+}
+
+async function recreateHook(entry) {
+  const payload = {
+    scope: entry.scope,
+    destination: entry.destination,
+    is_active: true,
+    headers: entry.headers || {},
+  };
+  const body = await bc("POST", "/v3/hooks", payload);
+  return (body || {}).data || {};
+}
+
+export async function run() {
+  const desired = JSON.parse(DESIRED_MANIFEST);
+  const live = await listHooks();
+  const plan = planWebhookReconciliation(desired, live);
+
+  let reactivated = 0;
+  let recreated = 0;
+  let skipped = 0;
+
+  for (const hookId of plan.toReactivate) {
+    const hook = live.find((h) => h.id === hookId);
+    const destination = hook ? hook.destination : null;
+    const healthy = Boolean(destination) && (await destinationIsHealthy(destination));
+    if (!healthy) {
+      console.warn(`Hook ${hookId} destination not healthy yet, skipping reactivation.`);
+      skipped++;
+      continue;
+    }
+    console.log(`Hook ${hookId} healthy. ${DRY_RUN ? "would reactivate" : "reactivating"}`);
+    if (!DRY_RUN) {
+      await reactivateHook(hookId);
+      const confirmed = await getHook(hookId);
+      if (!confirmed.is_active) throw new Error(`Hook ${hookId} did not confirm active after PUT`);
+    }
+    reactivated++;
+  }
+
+  for (const entry of plan.toRecreate) {
+    if (!entry.destination.toLowerCase().startsWith("https://")) {
+      console.warn(`Refusing to recreate non-HTTPS destination ${entry.destination}`);
+      skipped++;
+      continue;
+    }
+    console.log(`Missing hook for ${entry.scope} ${entry.destination}. ${DRY_RUN ? "would recreate" : "recreating"}`);
+    if (!DRY_RUN) {
+      const created = await recreateHook(entry);
+      const confirmed = created.id ? await getHook(created.id) : {};
+      if (!confirmed.is_active) throw new Error(`New hook for ${entry.scope} did not confirm active`);
+    }
+    recreated++;
+  }
+
+  console.log(`Done. ${reactivated} to reactivate, ${recreated} to recreate, ${skipped} skipped, ${plan.toLeave.length} already healthy.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The reconciliation rule is the part most worth testing, because it decides which hooks get reactivated, which get recreated, and which are left alone. Because we kept <code>plan_webhook_reconciliation</code> pure, no I/O at all, the test needs no network and no BigCommerce store. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_webhook_plan.py</div>
+      <pre><code class="language-python">from reconcile_webhooks import plan_webhook_reconciliation
+
+
+def desired_entry(scope="store/order/created", destination="https://app.example.com/hooks", **over):
+    base = {"scope": scope, "destination": destination, "is_active": True, "headers": {}}
+    base.update(over)
+    return base
+
+
+def live_hook(hook_id, scope="store/order/created", destination="https://app.example.com/hooks", is_active=True):
+    return {"id": hook_id, "scope": scope, "destination": destination, "is_active": is_active}
+
+
+def test_healthy_hook_is_left_alone():
+    plan = plan_webhook_reconciliation([desired_entry()], [live_hook(1)])
+    assert plan == {"toReactivate": [], "toRecreate": [], "toLeave": [1]}
+
+
+def test_inactive_hook_goes_to_reactivate():
+    plan = plan_webhook_reconciliation([desired_entry()], [live_hook(1, is_active=False)])
+    assert plan["toReactivate"] == [1]
+    assert plan["toRecreate"] == []
+    assert plan["toLeave"] == []
+
+
+def test_missing_hook_goes_to_recreate():
+    plan = plan_webhook_reconciliation([desired_entry()], [])
+    assert plan["toRecreate"] == [desired_entry()]
+    assert plan["toReactivate"] == []
+    assert plan["toLeave"] == []
+
+
+def test_mixed_manifest_preserves_desired_order():
+    desired = [
+        desired_entry(scope="store/order/created"),
+        desired_entry(scope="store/product/updated", destination="https://app.example.com/hooks"),
+        desired_entry(scope="store/cart/abandoned", destination="https://app.example.com/hooks"),
+    ]
+    live = [
+        live_hook(1, scope="store/order/created", is_active=True),
+        live_hook(2, scope="store/product/updated", is_active=False),
+    ]
+    plan = plan_webhook_reconciliation(desired, live)
+    assert plan["toLeave"] == [1]
+    assert plan["toReactivate"] == [2]
+    assert plan["toRecreate"] == [desired_entry(scope="store/cart/abandoned", destination="https://app.example.com/hooks")]
+
+
+def test_does_not_mutate_inputs():
+    desired = [desired_entry()]
+    live = [live_hook(1, is_active=False)]
+    desired_copy = [dict(d) for d in desired]
+    live_copy = [dict(h) for h in live]
+    plan_webhook_reconciliation(desired, live)
+    assert desired == desired_copy
+    assert live == live_copy
+
+
+def test_different_destination_same_scope_counts_as_missing():
+    plan = plan_webhook_reconciliation(
+        [desired_entry(destination="https://app.example.com/new-hooks")],
+        [live_hook(1, destination="https://app.example.com/old-hooks")],
+    )
+    assert plan["toRecreate"] == [desired_entry(destination="https://app.example.com/new-hooks")]
+    assert plan["toReactivate"] == []
+    assert plan["toLeave"] == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">webhook-plan.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { planWebhookReconciliation } from "./reconcile-webhooks.js";
+
+const desiredEntry = (over = {}) => ({
+  scope: "store/order/created",
+  destination: "https://app.example.com/hooks",
+  is_active: true,
+  headers: {},
+  ...over,
+});
+
+const liveHook = (id, over = {}) => ({
+  id,
+  scope: "store/order/created",
+  destination: "https://app.example.com/hooks",
+  is_active: true,
+  ...over,
+});
+
+test("healthy hook is left alone", () =&gt; {
+  const plan = planWebhookReconciliation([desiredEntry()], [liveHook(1)]);
+  assert.deepEqual(plan, { toReactivate: [], toRecreate: [], toLeave: [1] });
+});
+
+test("inactive hook goes to reactivate", () =&gt; {
+  const plan = planWebhookReconciliation([desiredEntry()], [liveHook(1, { is_active: false })]);
+  assert.deepEqual(plan.toReactivate, [1]);
+  assert.deepEqual(plan.toRecreate, []);
+  assert.deepEqual(plan.toLeave, []);
+});
+
+test("missing hook goes to recreate", () =&gt; {
+  const plan = planWebhookReconciliation([desiredEntry()], []);
+  assert.deepEqual(plan.toRecreate, [desiredEntry()]);
+  assert.deepEqual(plan.toReactivate, []);
+  assert.deepEqual(plan.toLeave, []);
+});
+
+test("mixed manifest preserves desired order", () =&gt; {
+  const desired = [
+    desiredEntry({ scope: "store/order/created" }),
+    desiredEntry({ scope: "store/product/updated" }),
+    desiredEntry({ scope: "store/cart/abandoned" }),
+  ];
+  const live = [
+    liveHook(1, { scope: "store/order/created", is_active: true }),
+    liveHook(2, { scope: "store/product/updated", is_active: false }),
+  ];
+  const plan = planWebhookReconciliation(desired, live);
+  assert.deepEqual(plan.toLeave, [1]);
+  assert.deepEqual(plan.toReactivate, [2]);
+  assert.deepEqual(plan.toRecreate, [desiredEntry({ scope: "store/cart/abandoned" })]);
+});
+
+test("does not mutate inputs", () =&gt; {
+  const desired = [desiredEntry()];
+  const live = [liveHook(1, { is_active: false })];
+  const desiredCopy = JSON.parse(JSON.stringify(desired));
+  const liveCopy = JSON.parse(JSON.stringify(live));
+  planWebhookReconciliation(desired, live);
+  assert.deepEqual(desired, desiredCopy);
+  assert.deepEqual(live, liveCopy);
+});
+
+test("different destination same scope counts as missing", () =&gt; {
+  const plan = planWebhookReconciliation(
+    [desiredEntry({ destination: "https://app.example.com/new-hooks" })],
+    [liveHook(1, { destination: "https://app.example.com/old-hooks" })],
+  );
+  assert.deepEqual(plan.toRecreate, [desiredEntry({ destination: "https://app.example.com/new-hooks" })]);
+  assert.deepEqual(plan.toReactivate, []);
+  assert.deepEqual(plan.toLeave, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Deploy outage</span>
+      <h4>The fulfillment app that missed a whole weekend</h4>
+      <p>A fulfillment integration's endpoint went down during a Friday afternoon deploy and stayed broken through the weekend because the on-call rotation was thin. BigCommerce retried every order event for about 48 hours, never got a 2xx, and quietly set the hook's <code>is_active</code> to <code>false</code>. The deactivation email went to a shared inbox nobody checked until Monday.</p>
+      <p>By the time someone noticed orders were not flowing into the warehouse system, three days of order events were gone for good, since BigCommerce does not replay history. Running the reconciliation job hourly now means a dead hook gets caught, health checked, and turned back on within the hour instead of over a long weekend.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Cleanup accident</span>
+      <h4>The hook that vanished during an app migration</h4>
+      <p>A merchant migrating between two versions of an app had an old install's hooks cleaned up as part of the process, but one scope, <code>store/product/updated</code>, was never recreated on the new install. There was no error, the app just stopped hearing about price and inventory changes, and a sync job downstream slowly drifted out of date with the storefront.</p>
+      <p>Diffing <code>GET /v3/hooks</code> against the app's expected manifest caught the gap immediately, since the scope and destination pair was completely absent from the live response. The script recreated it with <code>POST /v3/hooks</code>, and the new id was written back into the app's own registry so nothing had to be found by hand again.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a webhook going quiet is caught within one reconciliation cycle instead of when a downstream system is found stale days later. Every reactivation is preceded by a real health check against the destination, so the fix never restarts a flood of failures against something still broken. Every recreated hook gets its new id written back into your own registry, so BigCommerce's habit of never truly undeleting a hook stops being a surprise.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my BigCommerce webhook stop firing?</summary>
+      <p>BigCommerce retries a failed delivery, any response that is not HTTP 2xx, including timeouts and TLS errors, with exponential backoff for up to 11 attempts spanning roughly 48 hours. If your destination never returns a 2xx in that window, BigCommerce sets is_active to false on that hook and emails the address registered for the app. A webhook can also be auto deactivated after 90 days with zero triggered events.</p>
+    </details>
+    <details>
+      <summary>How do I know if a BigCommerce webhook was deactivated?</summary>
+      <p>BigCommerce does not expose a delivery attempt or failure log through the API, and nothing surfaces in the storefront or admin. You have to explicitly poll GET /v3/hooks and check is_active on every hook, or diff the live set against the scope and destination pairs your app is supposed to own to catch one that went missing entirely.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just flip is_active back to true?</summary>
+      <p>Not blindly. If the destination is still broken, reactivating restarts a flood of failing callbacks against it. Send a health check to the destination first and only call PUT /v3/hooks/{id} with is_active true once it responds 2xx. If the hook is missing entirely you cannot undelete it, you have to POST a new one, which gets a new id.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/transactions-total-mismatch/">Shopify orders whose transactions total does not match</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: Webhooks Overview. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks" rel="noopener">developer.bigcommerce.com/docs/integrations/webhooks</a></li>
+      <li>BigCommerce Docs: Webhooks Overview, retry and deactivation behavior. <a href="https://docs.bigcommerce.com/developer/docs/integrations/webhooks/overview" rel="noopener">docs.bigcommerce.com/developer/docs/integrations/webhooks/overview</a></li>
+      <li>BigCommerce Community: How to avoid webhook deactivation. <a href="https://support.bigcommerce.com/s/question/0D54O00006SyE1pSAF/how-to-avoid-webhooks-deactivation-it-happens-periodically?language=en_US" rel="noopener">support.bigcommerce.com webhook deactivation question</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Webhooks v3 API Reference. <a href="https://developer.bigcommerce.com/docs/rest-management/webhooks" rel="noopener">developer.bigcommerce.com/docs/rest-management/webhooks</a></li>
+      <li>BigCommerce Developer Center: Webhooks Tutorial, Store Management API. <a href="https://developer.bigcommerce.com/api-docs/store-management/webhooks/tutorial" rel="noopener">developer.bigcommerce.com/api-docs/store-management/webhooks/tutorial</a></li>
+      <li>BigCommerce Docs: Webhooks v3 REST API Reference. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/integrations/webhooks" rel="noopener">docs.bigcommerce.com/developer/api-reference/rest/integrations/webhooks</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, inventory, webhooks, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a dead webhook?</h3>
+    <p>If this saved you a stale ERP sync or a silent order gap, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
