@@ -1,0 +1,1002 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delayed Flow Does Not Trigger on Payment Failed in Shopware 6</title>
+<meta name="description" content="A Flow Builder flow with a delay on order_transaction.state.state_enter for failed never fires, while the same flow works instantly without the delay. Learn why StorableFlow re-checks conditions against stale state at resume time, and build a Python or Node.js script that flags the missed ones.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/delayed-flow-not-triggered-on-failed/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Delayed Flow Does Not Trigger on Payment Failed in Shopware 6">
+<meta property="og:description" content="Why a delayed Flow Builder action on order_transaction.state.state_enter for failed can silently never fire, and a Python or Node.js script that finds the missed ones so a human can follow up.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/delayed-flow-not-triggered-on-failed/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/delayed-flow-not-triggered-on-failed/#article","headline":"Delayed Flow Does Not Trigger on Payment Failed in Shopware 6","description":"Why a delayed Flow Builder action on order_transaction.state.state_enter for failed can silently never fire, because StorableFlow rebuilds the flow from scratch at resume time and re-checks conditions against the current, not the original, state. A Python or Node.js script that flags the missed executions so a human can follow up.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/delayed-flow-not-triggered-on-failed/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Order State Machine","keywords":"Shopware 6 Flow Builder delay, delayed flow action not triggered, order_transaction.state.state_enter, failed payment flow, StorableFlow, flow_execution, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Delayed flow does not trigger on payment failed transition","item":"https://www.allanninal.dev/shopware/delayed-flow-not-triggered-on-failed/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my delayed Flow Builder action never run when payment fails?","acceptedAnswer":{"@type":"Answer","text":"Shopware's Flow Builder delay is implemented with a StorableFlow: only scalar ids are stored while the flow waits, and at resume time the flow is rebuilt from scratch and every condition is re-checked against the current database state, not the state that fired the trigger. If the transaction moved on in the meantime, for example a retried payment succeeded or the order was cancelled, the failed condition no longer matches and the delayed action is silently skipped."}},{"@type":"Question","name":"How do I find orders where the delayed action was missed?","acceptedAnswer":{"@type":"Answer","text":"List order-transaction records in the failed state, then for each one search flow_execution filtered by orderId. A healthy delayed action shows a row that finished before its scheduled time. A transaction with no matching finished execution well past the delay window is a miss worth flagging for a human to review."}},{"@type":"Question","name":"Can I just re-trigger the flow automatically once I find a miss?","acceptedAnswer":{"@type":"Answer","text":"Do not force it by rewriting state. The transaction's failed status is correct and there is no supported Admin API endpoint to re-queue a specific flow_execution record. The safe path is to flag the affected orders for a human, or, if automation is required, call the flow's own action directly, such as sending the mail template, behind an explicit DRY_RUN=false confirmation, and never PATCH stateId or replay the state transition."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Order State Machine</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Order State Machine</p>
+    <h1>Delayed flow does not trigger on payment failed transition</h1>
+    <p class="lead">You built a Flow Builder flow on <code>order_transaction.state.state_enter</code> for <code>failed</code>, added a delay so the customer gets a grace period before the follow up email goes out, tested it without the delay and it worked fine. With the delay in place, it just never fires. No error in the log, nothing in Flow Builder's own history that looks broken. The payment really did fail, and the merchant never found out. Here is why the delay breaks the flow, and a script that finds every order this has already happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Shopware's Flow Builder delay is built on a <code>StorableFlow</code>: when an action is delayed, only scalar ids are saved as a <code>flow_execution</code> row, and at resume time the flow is rebuilt from scratch by reloading the order, the transaction, and the rules straight from the database. Every condition is re-checked against that fresh, current state, not the state that fired the trigger in the first place. If the transaction has moved on by the time the delay elapses, a retried payment succeeded, the order got cancelled, or a queue race means the reload runs a beat before the state change is fully committed, the "payment status is failed" condition no longer matches and the delayed action is skipped without any error surfacing anywhere. This is tracked in the community as <code>shopware/shopware#11971</code> and <code>#4510</code>. You cannot safely force a re-trigger by rewriting the transaction's state. Full detection code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A normal flow reacts to an event as it happens. The trigger fires, the flow reads whatever it needs off the event, checks its conditions, and runs its actions right away, all against the same moment in time. That is why the same flow works perfectly the instant you remove the delay.</p>
+  <p>A delayed action cannot work that way, because Shopware is not going to keep a PHP process alive for hours waiting on a timer. Instead it saves a small record describing what to resume and when, and lets the request finish. Later, a background worker picks that record back up and rebuilds the whole flow from scratch, which means it goes back to the database and asks it what the order and the transaction look like right now. If "right now" disagrees with "back when the trigger fired," the flow quietly follows the new answer, and the customer never gets the notification the merchant was counting on.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. A payment fails and the flow condition matches at trigger time. The action is delayed, so a flow_execution row with scalar ids is stored. When the delay elapses, the flow is rebuilt from the database, the transaction state is reloaded fresh, and if it no longer says failed the condition fails to match and the action is silently skipped.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Payment fails</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">state_enter: failed</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="110" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Condition matches</text>
+      <text x="110" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">at trigger time, delay queued</text>
+      <line x1="213" y1="138" x2="255" y2="138" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="258" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="350" y="130" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">flow_execution stored</text>
+      <text x="350" y="147" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">only scalar ids, no snapshot</text>
+      <line x1="446" y1="138" x2="481" y2="138" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="463" y="96" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="484" y="108" width="165" height="60" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="566" y="130" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Rebuilt from DB</text>
+      <text x="566" y="147" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">state reloaded fresh</text>
+      <line x1="652" y1="138" x2="686" y2="138" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="10" y="196" width="740" height="34" rx="8" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="380" y="218" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">If the state changed since, "failed" no longer matches. Action silently skipped, nothing errors.</text>
+    </svg>
+    <figcaption>The delay window is where the flow loses its grip on the original moment. It resumes against whatever the database says now, not what it said when the trigger fired.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Shopware's Flow Builder implements delayed actions with a <code>StorableFlow</code>, a design documented in its own ADR. Only scalar identifiers, order id, transaction id, and similar, are persisted for a delayed step, not a frozen copy of the order or transaction. When the delay elapses, <code>FlowFactory::restore()</code> rebuilds the flow entirely from those ids, reloading the order, the transaction, and the rules fresh from the database and re-evaluating every condition against whatever that fresh read shows. A few concrete ways this bites:</p>
+  <ul>
+    <li>The customer retries the payment and it succeeds before the delay elapses. The transaction is no longer <code>failed</code> by the time the flow resumes, so the "payment status is failed" condition fails to match and the delayed action never runs, even though it correctly matched when the trigger first fired.</li>
+    <li>The order gets cancelled in the meantime, which can move the transaction through its own state changes, again leaving the condition unable to match the state it was written to expect.</li>
+    <li>A race in queue processing where the delayed message is picked up and the flow rebuilt a moment before the <code>state_machine_state</code> transition write and its related indexing are fully committed, so the reload reads a transaction that has not actually settled into <code>failed</code> yet.</li>
+    <li>A separate and unrelated cause that gets mistaken for the same bug: a mail action aborting because a template variable it needs is missing. Shopware support has flagged this as a distinct failure mode worth ruling out before you assume every miss is the state re-check issue.</li>
+  </ul>
+  <p>Community reports (<code>shopware/shopware#11971</code> and <code>#4510</code>) confirm this is reproducible: the exact same flow fires instantly and correctly with no delay, and silently skips once a delay is added. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A delayed flow is not "the same trigger, just later." It is a fresh re-evaluation of the current database state using only the ids it was given. The transaction's <code>failed</code> status at the time you are investigating is correct and must never be rewritten just to force a re-match. The only thing worth automating here is detection: finding failed transactions that are past their expected delay window with no completed <code>flow_execution</code> row, and handing that list to a human, because Shopware gives you no supported endpoint to re-queue or replay a specific delayed execution.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch the transaction's state and we never try to re-run the state transition to trick Flow Builder into re-firing. The script lists transactions sitting in <code>failed</code>, checks each one's <code>flow_execution</code> ledger for a completed row, cross-checks that the flow is still active and really targets this event, and reports every genuine miss so a human can manually resend the notification or re-run the flow from the Administration.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. List order transactions in the failed state. For each one, search flow_execution by orderId and confirm the flow is active and targets the failed event. If a completed execution exists, everything is fine. If it is missing or stuck past the delay window, flag it for a human to manually resend the action, never patch state or replay the transition.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0891b2"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">List failed transactions</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">stateMachineState = failed</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="120" y="130" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Search flow_execution</text>
+      <text x="120" y="147" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">by orderId, check flow</text>
+      <text x="120" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">is active and matches event</text>
+      <line x1="233" y1="140" x2="267" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="360,106 450,140 360,174 270,140" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="360" y="135" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">Completed</text>
+      <text x="360" y="150" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">execution?</text>
+      <text x="365" y="98" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#0891b2" font-weight="700">yes, healthy</text>
+      <line x1="390" y1="106" x2="390" y2="30" stroke="#0891b2" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="323" y="8" width="135" height="30" rx="8" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="390" y="27" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#0f2830">No action needed</text>
+      <text x="420" y="200" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">no, missed or stuck</text>
+      <line x1="360" y1="174" x2="360" y2="206" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="255" y="208" width="210" height="36" rx="9" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="360" y="230" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">Flag {order, flow, action}</text>
+      <line x1="465" y1="226" x2="500" y2="226" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="503" y="208" width="240" height="36" rx="9" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="623" y="230" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Human resends the action</text>
+    </svg>
+    <figcaption>Detection only. The transaction's failed status is never rewritten, and any remediation goes through the flow's own action, gated by a human decision and DRY_RUN.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create an integration in Shopware under Settings, System, Integrations, and note its access key id and secret key. Exchange them for a bearer token with <code>POST /api/oauth/token</code> using <code>grant_type: client_credentials</code>. Keep the shop URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and call the Admin API</h3>
+      <p>A small helper gets a bearer token once, then sends every request with <code>Authorization: Bearer &lt;token&gt;</code> and <code>Accept: application/json</code>. We reuse it for the transaction search, the <code>flow_execution</code> search, and the flow definition check.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api_search(entity, token, body):
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/{entity}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiSearch(entity, token, body) {
+  const res = await fetch(`${SHOPWARE_URL}/api/search/${entity}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${entity} search`);
+  const data = await res.json();
+  return data.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List transactions sitting in failed</h3>
+      <p>Search <code>order-transaction</code> for the <code>failed</code> state, with the order association loaded so we have the order id and number ready for reporting. Sort by <code>updatedAt</code> descending so the most recent failures come first.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def failed_transactions(token, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "stateMachineState.technicalName", "value": "failed"}],
+        "associations": {"stateMachineState": {}, "order": {}},
+        "sort": [{"field": "updatedAt", "order": "DESC"}],
+        "total-count-mode": 1,
+    }
+    return api_search("order-transaction", token, body)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function failedTransactions(token, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equals", field: "stateMachineState.technicalName", value: "failed" }],
+    associations: { stateMachineState: {}, order: {} },
+    sort: [{ field: "updatedAt", order: "DESC" }],
+    "total-count-mode": 1,
+  };
+  return apiSearch("order-transaction", token, body);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision entirely separate from the network calls. Given the transaction's state and when it entered that state, the flow's definition, the list of <code>flow_execution</code> rows for that order, and the current time, decide whether the delayed action was missed. This takes no I/O, so it is trivial to test with fixed clock values around the boundary.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">import datetime
+
+TARGET_STATE = "failed"
+STATE_ENTER_EVENT = "order_transaction.state.state_enter"
+
+def _epoch(iso):
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+def is_delayed_flow_missed(transaction, flow, executions, now):
+    if not flow.get("active"):
+        return False
+    if flow.get("eventName") != STATE_ENTER_EVENT:
+        return False
+    if transaction.get("stateTechnicalName") != TARGET_STATE:
+        return False
+
+    state_entered_at = _epoch(transaction["stateEnteredAt"])
+    due_at = state_entered_at + flow.get("delaySeconds", 0)
+    now_epoch = _epoch(now) if isinstance(now, str) else now
+    if now_epoch < due_at:
+        return False
+
+    if not executions:
+        return True
+
+    for execution in executions:
+        created_at = _epoch(execution["createdAt"])
+        if execution.get("finishedAt") is not None and created_at >= state_entered_at:
+            return False
+    return True</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const TARGET_STATE = "failed";
+const STATE_ENTER_EVENT = "order_transaction.state.state_enter";
+
+function toEpoch(value) {
+  return typeof value === "number" ? value : Date.parse(value) / 1000;
+}
+
+export function isDelayedFlowMissed(transaction, flow, executions, now) {
+  if (!flow.active) return false;
+  if (flow.eventName !== STATE_ENTER_EVENT) return false;
+  if (transaction.stateTechnicalName !== TARGET_STATE) return false;
+
+  const stateEnteredAt = toEpoch(transaction.stateEnteredAt);
+  const dueAt = stateEnteredAt + (flow.delaySeconds || 0);
+  const nowEpoch = toEpoch(now);
+  if (nowEpoch < dueAt) return false;
+
+  if (!executions.length) return true;
+
+  const hasCompleted = executions.some(
+    (e) => e.finishedAt !== null &amp;&amp; e.finishedAt !== undefined &amp;&amp; toEpoch(e.createdAt) >= stateEnteredAt
+  );
+  return !hasCompleted;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Check the flow_execution ledger and the flow definition</h3>
+      <p>For each failed transaction, search <code>flow-execution</code> by <code>orderId</code> to see whether the delayed action ever completed, and confirm the flow itself is active and really targets this state enter event, rather than assuming a disabled or misconfigured flow is the same bug.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def executions_for_order(token, order_id):
+    body = {
+        "filter": [{"type": "equals", "field": "orderId", "value": order_id}],
+        "associations": {"flow": {}},
+        "sort": [{"field": "createdAt", "order": "DESC"}],
+    }
+    return api_search("flow-execution", token, body)
+
+def flows_for_event(token, event_name):
+    body = {
+        "filter": [{"type": "equals", "field": "eventName", "value": event_name}],
+    }
+    return api_search("flow", token, body)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function executionsForOrder(token, orderId) {
+  const body = {
+    filter: [{ type: "equals", field: "orderId", value: orderId }],
+    associations: { flow: {} },
+    sort: [{ field: "createdAt", order: "DESC" }],
+  };
+  return apiSearch("flow-execution", token, body);
+}
+
+async function flowsForEvent(token, eventName) {
+  const body = {
+    filter: [{ type: "equals", field: "eventName", value: eventName }],
+  };
+  return apiSearch("flow", token, body);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: list failed transactions, pull the matching flow and its executions, run the pure decision function, and collect every miss into a report of <code>{orderNumber, orderTransactionId, flowId, failedAt, expectedActionType}</code>. Nothing here ever writes to the order or the transaction. If <code>DRY_RUN</code> is off, the only allowed write is calling the flow's own action directly, such as resending the mail template, never a state PATCH or a replayed transition.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never PATCH <code>stateId</code> and never replay the state transition to force a re-trigger. This script only reports. If you wire up automated remediation later, gate it behind an explicit <code>DRY_RUN=false</code>, have it call the flow's action directly, and log every action taken for audit.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists failed transactions, checks each one's <code>flow_execution</code> history and the flow's own definition, classifies with the pure function, and reports every genuine miss, respecting <code>DRY_RUN</code> and never writing to order state.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/delayed-flow-not-triggered-on-failed" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_missed_delayed_flow.py</div>
+      <pre><code class="language-python">"""Flag Shopware 6 orders where a delayed Flow Builder action never fired
+after the order_transaction moved to failed, without ever rewriting state.
+
+Flow Builder's delay is implemented with a StorableFlow: only scalar ids are stored
+while a delayed step waits, and at resume time FlowFactory::restore() rebuilds the
+flow from scratch, reloading the order, transaction, and rules fresh from the
+database and re-checking every condition against that current state, not the state
+that fired the trigger. If the transaction has moved on by the time the delay
+elapses, the condition no longer matches and the action is silently skipped
+(shopware/shopware#11971, #4510).
+
+This never PATCHes stateId and never replays the state transition to force a
+re-trigger. It only detects genuine misses and reports them for a human to follow
+up on, for example by resending the flow's mail action by hand. Run on a schedule.
+Safe to run again and again, it never writes to order or transaction state.
+"""
+import os
+import datetime
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_missed_delayed_flow")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+GRACE_SECONDS = float(os.environ.get("GRACE_SECONDS", "300"))
+
+TARGET_STATE = "failed"
+STATE_ENTER_EVENT = "order_transaction.state.state_enter"
+
+
+def _epoch(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def is_delayed_flow_missed(transaction, flow, executions, now):
+    """Pure decision. No I/O. All inputs are passed in."""
+    if not flow.get("active"):
+        return False
+    if flow.get("eventName") != STATE_ENTER_EVENT:
+        return False
+    if transaction.get("stateTechnicalName") != TARGET_STATE:
+        return False
+
+    state_entered_at = _epoch(transaction["stateEnteredAt"])
+    due_at = state_entered_at + flow.get("delaySeconds", 0)
+    now_epoch = _epoch(now)
+    if now_epoch < due_at:
+        return False
+
+    if not executions:
+        return True
+
+    for execution in executions:
+        created_at = _epoch(execution["createdAt"])
+        if execution.get("finishedAt") is not None and created_at >= state_entered_at:
+            return False
+    return True
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def api_search(entity, token, body):
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/{entity}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def failed_transactions(token, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "stateMachineState.technicalName", "value": TARGET_STATE}],
+        "associations": {"stateMachineState": {}, "order": {}},
+        "sort": [{"field": "updatedAt", "order": "DESC"}],
+        "total-count-mode": 1,
+    }
+    return api_search("order-transaction", token, body)
+
+
+def executions_for_order(token, order_id):
+    body = {
+        "filter": [{"type": "equals", "field": "orderId", "value": order_id}],
+        "associations": {"flow": {}},
+        "sort": [{"field": "createdAt", "order": "DESC"}],
+    }
+    return api_search("flow-execution", token, body)
+
+
+def flows_for_event(token, event_name):
+    body = {
+        "filter": [{"type": "equals", "field": "eventName", "value": event_name}],
+    }
+    return api_search("flow", token, body)
+
+
+def run():
+    token = get_token()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_epoch = _epoch(now)
+
+    candidate_flows = flows_for_event(token, STATE_ENTER_EVENT)
+    if not candidate_flows:
+        log.info("No active flow targets %s. Nothing to check.", STATE_ENTER_EVENT)
+        return
+
+    flagged = []
+    for transaction in failed_transactions(token):
+        order = transaction.get("order") or {}
+        order_id = transaction.get("orderId")
+        transaction_snapshot = {
+            "stateTechnicalName": (transaction.get("stateMachineState") or {}).get("technicalName"),
+            "stateEnteredAt": transaction["updatedAt"],
+        }
+
+        executions = executions_for_order(token, order_id) if order_id else []
+
+        for flow in candidate_flows:
+            flow_snapshot = {
+                "active": flow.get("active", False),
+                "eventName": flow.get("eventName"),
+                "delaySeconds": GRACE_SECONDS,
+            }
+            if is_delayed_flow_missed(transaction_snapshot, flow_snapshot, executions, now_epoch):
+                flagged.append({
+                    "orderNumber": order.get("orderNumber"),
+                    "orderTransactionId": transaction["id"],
+                    "flowId": flow["id"],
+                    "failedAt": transaction_snapshot["stateEnteredAt"],
+                    "expectedActionType": "mail_send (or the flow's configured action)",
+                })
+
+    if not flagged:
+        log.info("Done. No missed delayed flow actions found.")
+        return
+
+    for item in flagged:
+        log.warning(
+            "Order %s: transaction %s failed at %s, flow %s never completed. %s",
+            item["orderNumber"], item["orderTransactionId"], item["failedAt"], item["flowId"],
+            "would flag for manual follow up" if DRY_RUN else "flagged for manual follow up",
+        )
+
+    log.info("Done. %d order(s) with a missed delayed flow action %s.",
+              len(flagged), "to review" if DRY_RUN else "reported")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-missed-delayed-flow.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Shopware 6 orders where a delayed Flow Builder action never fired
+ * after the order_transaction moved to failed, without ever rewriting state.
+ *
+ * Flow Builder's delay is implemented with a StorableFlow: only scalar ids are stored
+ * while a delayed step waits, and at resume time FlowFactory::restore() rebuilds the
+ * flow from scratch, reloading the order, transaction, and rules fresh from the
+ * database and re-checking every condition against that current state, not the state
+ * that fired the trigger. If the transaction has moved on by the time the delay
+ * elapses, the condition no longer matches and the action is silently skipped
+ * (shopware/shopware#11971, #4510).
+ *
+ * This never PATCHes stateId and never replays the state transition to force a
+ * re-trigger. It only detects genuine misses and reports them for a human to follow
+ * up on, for example by resending the flow's mail action by hand. Run on a schedule.
+ * Safe to run again and again, it never writes to order or transaction state.
+ *
+ * Guide: https://www.allanninal.dev/shopware/delayed-flow-not-triggered-on-failed/
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://example.test").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "dummy-client-id";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "dummy-secret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const GRACE_SECONDS = Number(process.env.GRACE_SECONDS || 300);
+
+const TARGET_STATE = "failed";
+const STATE_ENTER_EVENT = "order_transaction.state.state_enter";
+
+function toEpoch(value) {
+  return typeof value === "number" ? value : Date.parse(value) / 1000;
+}
+
+export function isDelayedFlowMissed(transaction, flow, executions, now) {
+  if (!flow.active) return false;
+  if (flow.eventName !== STATE_ENTER_EVENT) return false;
+  if (transaction.stateTechnicalName !== TARGET_STATE) return false;
+
+  const stateEnteredAt = toEpoch(transaction.stateEnteredAt);
+  const dueAt = stateEnteredAt + (flow.delaySeconds || 0);
+  const nowEpoch = toEpoch(now);
+  if (nowEpoch < dueAt) return false;
+
+  if (!executions.length) return true;
+
+  const hasCompleted = executions.some(
+    (e) => e.finishedAt !== null &amp;&amp; e.finishedAt !== undefined &amp;&amp; toEpoch(e.createdAt) >= stateEnteredAt
+  );
+  return !hasCompleted;
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiSearch(entity, token, body) {
+  const res = await fetch(`${SHOPWARE_URL}/api/search/${entity}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${entity} search`);
+  const data = await res.json();
+  return data.data;
+}
+
+async function failedTransactions(token, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equals", field: "stateMachineState.technicalName", value: TARGET_STATE }],
+    associations: { stateMachineState: {}, order: {} },
+    sort: [{ field: "updatedAt", order: "DESC" }],
+    "total-count-mode": 1,
+  };
+  return apiSearch("order-transaction", token, body);
+}
+
+async function executionsForOrder(token, orderId) {
+  const body = {
+    filter: [{ type: "equals", field: "orderId", value: orderId }],
+    associations: { flow: {} },
+    sort: [{ field: "createdAt", order: "DESC" }],
+  };
+  return apiSearch("flow-execution", token, body);
+}
+
+async function flowsForEvent(token, eventName) {
+  const body = {
+    filter: [{ type: "equals", field: "eventName", value: eventName }],
+  };
+  return apiSearch("flow", token, body);
+}
+
+export async function run() {
+  const token = await getToken();
+  const now = new Date().toISOString();
+  const nowEpoch = toEpoch(now);
+
+  const candidateFlows = await flowsForEvent(token, STATE_ENTER_EVENT);
+  if (!candidateFlows.length) {
+    console.log(`No active flow targets ${STATE_ENTER_EVENT}. Nothing to check.`);
+    return;
+  }
+
+  const transactions = await failedTransactions(token);
+  const flagged = [];
+
+  for (const transaction of transactions) {
+    const order = transaction.order || {};
+    const orderId = transaction.orderId;
+    const transactionSnapshot = {
+      stateTechnicalName: transaction.stateMachineState?.technicalName,
+      stateEnteredAt: transaction.updatedAt,
+    };
+
+    const executions = orderId ? await executionsForOrder(token, orderId) : [];
+
+    for (const flow of candidateFlows) {
+      const flowSnapshot = {
+        active: flow.active ?? false,
+        eventName: flow.eventName,
+        delaySeconds: GRACE_SECONDS,
+      };
+      if (isDelayedFlowMissed(transactionSnapshot, flowSnapshot, executions, nowEpoch)) {
+        flagged.push({
+          orderNumber: order.orderNumber,
+          orderTransactionId: transaction.id,
+          flowId: flow.id,
+          failedAt: transactionSnapshot.stateEnteredAt,
+          expectedActionType: "mail_send (or the flow's configured action)",
+        });
+      }
+    }
+  }
+
+  if (!flagged.length) {
+    console.log("Done. No missed delayed flow actions found.");
+    return;
+  }
+
+  for (const item of flagged) {
+    console.warn(
+      `Order ${item.orderNumber}: transaction ${item.orderTransactionId} failed at ${item.failedAt}, flow ${item.flowId} never completed. ${DRY_RUN ? "would flag for manual follow up" : "flagged for manual follow up"}`
+    );
+  }
+
+  console.log(`Done. ${flagged.length} order(s) with a missed delayed flow action ${DRY_RUN ? "to review" : "reported"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which orders get reported as a missed delayed action. Because <code>is_delayed_flow_missed</code> is pure and takes a fixed clock value, the test needs no network and no live Shopware store, and covers the due-at boundary directly.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_delayed_flow_decision.py</div>
+      <pre><code class="language-python">from flag_missed_delayed_flow import is_delayed_flow_missed, _epoch
+
+NOW = _epoch("2026-07-10T00:10:00Z")  # 10 minutes after state entered
+
+
+def transaction(**over):
+    base = {"stateTechnicalName": "failed", "stateEnteredAt": "2026-07-10T00:00:00Z"}
+    base.update(over)
+    return base
+
+
+def flow(**over):
+    base = {"active": True, "eventName": "order_transaction.state.state_enter", "delaySeconds": 300}
+    base.update(over)
+    return base
+
+
+def test_missed_when_no_executions_and_due():
+    assert is_delayed_flow_missed(transaction(), flow(), [], NOW) is True
+
+
+def test_not_missed_when_flow_inactive():
+    assert is_delayed_flow_missed(transaction(), flow(active=False), [], NOW) is False
+
+
+def test_not_missed_when_event_name_does_not_match():
+    assert is_delayed_flow_missed(transaction(), flow(eventName="order.state.state_enter"), [], NOW) is False
+
+
+def test_not_missed_when_transaction_state_does_not_match():
+    assert is_delayed_flow_missed(transaction(stateTechnicalName="paid"), flow(), [], NOW) is False
+
+
+def test_not_missed_when_not_due_yet():
+    early_now = _epoch("2026-07-10T00:01:00Z")  # only 1 minute in, delay is 300s
+    assert is_delayed_flow_missed(transaction(), flow(), [], early_now) is False
+
+
+def test_not_missed_when_a_completed_execution_exists():
+    executions = [{"createdAt": "2026-07-10T00:00:05Z", "finishedAt": "2026-07-10T00:00:10Z"}]
+    assert is_delayed_flow_missed(transaction(), flow(), executions, NOW) is False
+
+
+def test_missed_when_execution_is_stuck_unfinished():
+    executions = [{"createdAt": "2026-07-10T00:00:05Z", "finishedAt": None}]
+    assert is_delayed_flow_missed(transaction(), flow(), executions, NOW) is True
+
+
+def test_not_missed_when_completed_execution_predates_state_enter():
+    # a finished execution from before this state_enter does not count
+    executions = [{"createdAt": "2026-07-09T23:00:00Z", "finishedAt": "2026-07-09T23:00:05Z"}]
+    assert is_delayed_flow_missed(transaction(), flow(), executions, NOW) is True
+
+
+def test_exactly_at_due_at_is_checked():
+    exactly_due = _epoch("2026-07-10T00:05:00Z")
+    assert is_delayed_flow_missed(transaction(), flow(), [], exactly_due) is True</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">delayed-flow-decision.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isDelayedFlowMissed } from "./flag-missed-delayed-flow.js";
+
+const NOW = Date.parse("2026-07-10T00:10:00Z") / 1000;
+
+const transaction = (over = {}) => ({
+  stateTechnicalName: "failed",
+  stateEnteredAt: "2026-07-10T00:00:00Z",
+  ...over,
+});
+
+const flow = (over = {}) => ({
+  active: true,
+  eventName: "order_transaction.state.state_enter",
+  delaySeconds: 300,
+  ...over,
+});
+
+test("missed when no executions and due", () => {
+  assert.equal(isDelayedFlowMissed(transaction(), flow(), [], NOW), true);
+});
+
+test("not missed when flow inactive", () => {
+  assert.equal(isDelayedFlowMissed(transaction(), flow({ active: false }), [], NOW), false);
+});
+
+test("not missed when event name does not match", () => {
+  assert.equal(isDelayedFlowMissed(transaction(), flow({ eventName: "order.state.state_enter" }), [], NOW), false);
+});
+
+test("not missed when transaction state does not match", () => {
+  assert.equal(isDelayedFlowMissed(transaction({ stateTechnicalName: "paid" }), flow(), [], NOW), false);
+});
+
+test("not missed when not due yet", () => {
+  const earlyNow = Date.parse("2026-07-10T00:01:00Z") / 1000;
+  assert.equal(isDelayedFlowMissed(transaction(), flow(), [], earlyNow), false);
+});
+
+test("not missed when a completed execution exists", () => {
+  const executions = [{ createdAt: "2026-07-10T00:00:05Z", finishedAt: "2026-07-10T00:00:10Z" }];
+  assert.equal(isDelayedFlowMissed(transaction(), flow(), executions, NOW), false);
+});
+
+test("missed when execution is stuck unfinished", () => {
+  const executions = [{ createdAt: "2026-07-10T00:00:05Z", finishedAt: null }];
+  assert.equal(isDelayedFlowMissed(transaction(), flow(), executions, NOW), true);
+});
+
+test("not missed when completed execution predates state enter", () => {
+  const executions = [{ createdAt: "2026-07-09T23:00:00Z", finishedAt: "2026-07-09T23:00:05Z" }];
+  assert.equal(isDelayedFlowMissed(transaction(), flow(), executions, NOW), true);
+});
+
+test("exactly at due_at is checked", () => {
+  const exactlyDue = Date.parse("2026-07-10T00:05:00Z") / 1000;
+  assert.equal(isDelayedFlowMissed(transaction(), flow(), [], exactlyDue), true);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Retried payment</span>
+      <h4>The follow up email that never went out</h4>
+      <p>A store used a delayed flow to wait fifteen minutes after a payment failed before emailing the customer a link to retry, giving the payment provider's own retry logic a chance to succeed first without spamming a customer whose card just had a temporary hiccup. Support started noticing customers who had paid successfully on a second attempt, but never got the original heads up email either, which was fine for them, and a separate group of customers whose payment genuinely stayed failed and who also never heard anything.</p>
+      <p>Running the detection script in dry run turned up the second group immediately: transactions still sitting in <code>failed</code> for over an hour, no completed <code>flow_execution</code> row, and a flow that was confirmed active and correctly targeting <code>order_transaction.state.state_enter</code>. Support could then manually resend the retry email to that exact list instead of guessing at a wider batch.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Queue race</span>
+      <h4>The batch of failures from a payment provider outage</h4>
+      <p>During a short outage at a payment provider, a burst of transactions failed within the same few minutes, and the delayed flow that was supposed to notify the merchant's operations inbox seemed to fire for some orders and not others with no obvious pattern. The team's first guess was a bug in the mail template.</p>
+      <p>The script's report showed the affected orders all had a real <code>flow_execution</code> row that stayed unfinished, consistent with the queue processing the resume events during the same burst that was also slowing down state writes. None of the underlying transactions had actually changed state, so it was a stuck queued execution rather than a stale-condition miss, and the team manually re-ran the flow for that batch from the Administration instead of touching any order data.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a missed delayed flow action stops being invisible. Every failed transaction past its delay window with no completed execution shows up in a clear list with the order number, the transaction id, the flow id, and when it failed, ready for a human to manually resend the notification or re-run the flow. Nothing here ever rewrites the transaction's state or replays the transition, so the fix can never make the order's history say something that did not happen.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my delayed Flow Builder action never run when payment fails?</summary>
+      <p>Shopware's Flow Builder delay is implemented with a StorableFlow: only scalar ids are stored while the flow waits, and at resume time the flow is rebuilt from scratch and every condition is re-checked against the current database state, not the state that fired the trigger. If the transaction moved on in the meantime, for example a retried payment succeeded or the order was cancelled, the failed condition no longer matches and the delayed action is silently skipped.</p>
+    </details>
+    <details>
+      <summary>How do I find orders where the delayed action was missed?</summary>
+      <p>List order-transaction records in the failed state, then for each one search flow_execution filtered by orderId. A healthy delayed action shows a row that finished before its scheduled time. A transaction with no matching finished execution well past the delay window is a miss worth flagging for a human to review.</p>
+    </details>
+    <details>
+      <summary>Can I just re-trigger the flow automatically once I find a miss?</summary>
+      <p>Do not force it by rewriting state. The transaction's failed status is correct and there is no supported Admin API endpoint to re-queue a specific flow_execution record. The safe path is to flag the affected orders for a human, or, if automation is required, call the flow's own action directly, such as sending the mail template, behind an explicit DRY_RUN=false confirmation, and never PATCH stateId or replay the state transition.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopware/">Browse all Shopware field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Delayed flow does not trigger when payment status fails (shopware/shopware #11971). <a href="https://github.com/shopware/shopware/issues/11971" rel="noopener">github.com/shopware/shopware/issues/11971</a></li>
+      <li>Flow Builder, "Exit status" as a trigger and a "delay" not working (shopware/shopware #4510). <a href="https://github.com/shopware/shopware/issues/4510" rel="noopener">github.com/shopware/shopware/issues/4510</a></li>
+      <li>Shopware 6 Features: Flow Builder delayed actions. <a href="https://docs.shopware.com/en/shopware-6-en/features/delayed-flow-actions" rel="noopener">docs.shopware.com/en/shopware-6-en/features/delayed-flow-actions</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>ADR: Adding the StorableFlow instead of the FlowEvent for implementing the flow DelayAction in Flow Builder. <a href="https://developer.shopware.com/docs/resources/references/adr/2022-07-21-adding-the-storable-flow-to-implement-delay-action-in-flow-builder.html" rel="noopener">developer.shopware.com StorableFlow ADR</a></li>
+      <li>Shopware Developer Documentation: Flow concept. <a href="https://developer.shopware.com/docs/concepts/framework/flow-concept.html" rel="noopener">developer.shopware.com/docs/concepts/framework/flow-concept.html</a></li>
+      <li>Shopware Developer Documentation: Using the State Machine. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html" rel="noopener">developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware orders, payments, Flow Builder, or the message queue that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this explain a flow that went quiet?</h3>
+    <p>If this saved you from chasing a phantom bug in your mail templates, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>

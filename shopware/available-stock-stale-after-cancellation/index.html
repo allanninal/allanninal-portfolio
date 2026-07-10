@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>availableStock Not Restored After Order Cancellation in Shopware 6</title>
+<meta name="description" content="A cancelled Shopware 6 order still shows the old, lower availableStock on the product right after the cancel call, because the recompute runs async on the message queue. Learn why and build a Python or Node.js script that finds and safely re-syncs the stale products.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/available-stock-stale-after-cancellation/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="availableStock Not Restored After Order Cancellation in Shopware 6">
+<meta property="og:description" content="Why cancelling a Shopware 6 order does not instantly free the stock it held, and a Python or Node.js script that finds and safely re-syncs the stale availableStock values.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/available-stock-stale-after-cancellation/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/available-stock-stale-after-cancellation/#article","headline":"availableStock Not Restored After Order Cancellation in Shopware 6","description":"Why cancelling a Shopware 6 order does not instantly free the stock it held, because the availableStock recompute is dispatched as an async message rather than run inside the cancel request, and a Python or Node.js script that finds and safely re-syncs the stale values.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/available-stock-stale-after-cancellation/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory and Stock","keywords":"Shopware 6 availableStock stale, order cancellation, StockUpdater, message queue, messenger:consume, product.availableStock, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"availableStock not restored after order cancellation","item":"https://www.allanninal.dev/shopware/available-stock-stale-after-cancellation/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does availableStock stay low right after I cancel a Shopware 6 order?","acceptedAnswer":{"@type":"Answer","text":"Cancelling an order through the state machine tells StockUpdater to release the reserved quantity, but the recompute of availableStock is dispatched as an async message rather than applied inside the cancel request. Until the message queue worker processes that message, the Admin API keeps returning the pre-cancellation availableStock even though the order already shows stateMachineState.technicalName equal to cancelled."}},{"@type":"Question","name":"Is it safe to PATCH availableStock back to the expected value?","acceptedAnswer":{"@type":"Answer","text":"Yes. availableStock is a derived cache field with no independent ledger meaning, it only exists as stock minus the open reservations. Overwriting it with the correctly recomputed value has the same effect as StockUpdater's own queued message being consumed, so a guarded PATCH is safe as long as the recompute logic matches Shopware's own definition of an open order."}},{"@type":"Question","name":"How do I stop this from happening again instead of just reconciling after the fact?","acceptedAnswer":{"@type":"Answer","text":"Make sure messenger:consume is running continuously as a supervised worker process, not only through the admin worker in the browser, and keep an eye on queue depth with the scheduled_task and message queue monitoring in the Shopware Administration. The reconciler in this guide is a safety net for when the worker stalls or falls behind, not a replacement for keeping the worker healthy."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Inventory and Stock</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory and Stock</p>
+    <h1>availableStock not restored after order cancellation</h1>
+    <p class="lead">A customer's order gets cancelled. The line items are gone, the order clearly shows <code>cancelled</code>, and the stock those items were holding should be free again. But the product still reads the old, lower <code>availableStock</code>, sometimes for minutes, sometimes until someone notices the storefront is refusing to sell units that are actually free. Nothing is broken forever, the number is just behind, because the recompute that frees the stock does not run inside the cancel request itself.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Shopware 6 does not recompute <code>product.availableStock</code> synchronously inside the order-cancel request. Calling <code>POST /api/_action/order/{id}/state/cancel</code> does trigger <code>StockUpdater</code> to release the line item's reserved quantity, but the actual recalculation of <code>availableStock</code>, stock minus the sum of quantities from orders still in an open state, is dispatched as an async message and only applied once the message queue worker (<code>messenger:consume</code>) processes it. If that worker is stalled or backlogged, or you read the product immediately after cancelling, the Admin API still returns the pre-cancellation <code>availableStock</code> even though the order already shows <code>stateMachineState.technicalName</code> equal to <code>cancelled</code>. The fix is a small reconciler: list recently cancelled orders, recompute what <code>availableStock</code> should be for every product they touched, and PATCH only the products where the live value disagrees with the recomputed one. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When an order is placed, Shopware subtracts its line item quantities from each product's <code>availableStock</code> so the storefront cannot oversell stock that is already spoken for. When an order is cancelled, that reservation should come back. The state machine transition is instant, the order flips to <code>cancelled</code> the moment the API call returns.</p>
+  <p>The stock number is not that fast. Releasing a reservation means Shopware has to walk back through every order still counted as open for that product and recompute <code>availableStock</code> from scratch, and that recompute is not something Shopware does inline on the request that cancelled the order. It hands the work off to the message queue as an async message and moves on. If a worker process is consuming that queue promptly, the gap closes in a second or two and nobody notices. If the worker is stalled, restarting, or simply backlogged with other work, the gap can sit there far longer, and any client reading the product in that window sees stock that is wrong in the pessimistic direction: lower than what is truly available.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An order-cancel API call flips the order state to cancelled instantly and triggers StockUpdater to release the reservation, but the availableStock recompute is only an async message on the queue. Until a worker processes that message, the product still reports the old, lower availableStock.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">POST .../state/cancel</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">order flips instantly</text>
+      <line x1="197" y1="50" x2="240" y2="50" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="243" y="20" width="200" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="343" y="42" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">StockUpdater releases</text>
+      <text x="343" y="58" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">the reservation</text>
+      <text x="343" y="74" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">dispatches an async message</text>
+      <line x1="443" y1="50" x2="487" y2="50" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="465" y="15" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="490" y="20" width="150" height="60" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="565" y="42" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Not applied yet</text>
+      <text x="565" y="58" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">message queued, waiting</text>
+      <rect x="10" y="150" width="290" height="56" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="155" y="173" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">messenger:consume worker</text>
+      <text x="155" y="190" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">stalled, restarting, or backlogged</text>
+      <line x1="565" y1="80" x2="335" y2="140" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="300" y1="178" x2="452" y2="178" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="455" y="150" width="290" height="56" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="600" y="173" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">availableStock still stale</text>
+      <text x="600" y="190" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">reads low even though order is cancelled</text>
+    </svg>
+    <figcaption>The order state machine transition is instant. The availableStock recompute is not, because it waits on the message queue worker to consume a queued message.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The cancel transition and the stock recompute are two different pieces of work that Shopware deliberately does not couple into one synchronous request. A few things make the gap visible in practice:</p>
+  <ul>
+    <li>The cancel state-machine transition, <code>POST /api/_action/order/{id}/state/cancel</code>, only writes the order's state. Freeing the stock the order held is a side effect handled by <code>StockUpdater</code>, and that side effect is dispatched as a message, not executed inline.</li>
+    <li>Background work like this only runs when something is consuming the queue. If the store relies solely on the admin worker that runs while someone has the Administration open in a browser tab, closing that tab pauses the queue and the recompute never happens until it reopens.</li>
+    <li>A supervised <code>messenger:consume</code> process can fall behind during a traffic spike, a deploy, or a slow message earlier in the queue, so even a healthy setup has a window where cancelled orders have not yet had their stock released.</li>
+    <li>Any client, script, or integration that reads <code>product.availableStock</code> immediately after calling the cancel transition is reading a value that has not caught up yet, and there is nothing in the cancel response itself that warns you the number is about to change.</li>
+  </ul>
+  <p>This is a known rough edge in how Shopware 6 separates state changes from derived stock recomputation. The Shopware GitHub issue tracker and community forum both describe availableStock not updating promptly after order events, and Shopware's own stock refactoring discussion acknowledges the earlier model needed a rewrite for exactly this kind of staleness. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>availableStock</code> is a derived cache field with no independent ledger meaning of its own. It only ever means stock minus the sum of quantities from orders still in an open state. That makes it safe to recompute and overwrite directly, because doing so has exactly the same effect as StockUpdater's own queued message finally being consumed. The fix is not to touch the order or the state machine at all. It is to recompute the number Shopware itself would produce, and write it, for the specific products a cancellation just affected.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch order state. The script lists orders that are already <code>cancelled</code>, collects the products their line items referenced, recomputes each product's expected <code>availableStock</code> from its physical stock and the quantities still open on other orders, and PATCHes only the products where the live value disagrees with that recomputed one.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists cancelled orders, collects the products their line items touched, recomputes the expected availableStock from stock minus open reservations, checks whether the live value needs an update, and if so patches the product, otherwise leaves it alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0891b2"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="92" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Scheduled job</text>
+      <text x="92" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">runs on a timer</text>
+      <line x1="92" y1="80" x2="92" y2="106" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="200" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="110" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">List cancelled orders</text>
+      <text x="110" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">stateMachineState.</text>
+      <text x="110" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">technicalName = cancelled</text>
+      <line x1="210" y1="140" x2="252" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="255" y="108" width="185" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="347" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Recompute expected</text>
+      <text x="347" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">stock minus open</text>
+      <text x="347" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">reservations</text>
+      <line x1="440" y1="140" x2="482" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,140 575,174 488,140" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="575" y="135" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">Live value</text>
+      <text x="575" y="150" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">disagrees?</text>
+      <text x="665" y="130" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="140" x2="690" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="210" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">already correct, leave it</text>
+      <line x1="575" y1="174" x2="575" y2="215" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">PATCH product</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#4a5b62">availableStock re-synced</text>
+      <path d="M690,140 C710,140 684,150 684,183" fill="none" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Only products where the live availableStock disagrees with the recomputed value get written. Everything already correct is left exactly as it is.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create an integration in Shopware under Settings, System, Integrations, and note its access key id and secret key. Exchange them for a bearer token with <code>POST /api/oauth/token</code> using <code>grant_type: client_credentials</code>. Keep the shop URL and the credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and call the Admin API</h3>
+      <p>A small helper gets a bearer token once, then sends every request with <code>Authorization: Bearer &lt;token&gt;</code> and <code>Accept: application/json</code>. We reuse it for every search and for the PATCH call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiPost(path, token, body = {}) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${path}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List recently cancelled orders and their products</h3>
+      <p>Search <code>order</code> for <code>stateMachineState.technicalName</code> equals <code>cancelled</code>, with associations for <code>lineItems</code> and <code>lineItems.product</code>, then collect the distinct <code>productId</code> values the cancelled orders touched.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def search_cancelled_orders(token, limit=200):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "stateMachineState.technicalName", "value": "cancelled"}],
+        "associations": {"lineItems": {"associations": {"product": {}}}},
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+def product_ids_from_cancelled_orders(orders):
+    ids = set()
+    for order in orders:
+        for line_item in order.get("lineItems") or []:
+            product_id = line_item.get("productId")
+            if product_id:
+                ids.add(product_id)
+    return ids</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function searchCancelledOrders(token, limit = 200) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equals", field: "stateMachineState.technicalName", value: "cancelled" }],
+    associations: { lineItems: { associations: { product: {} } } },
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order search`);
+  const data = await res.json();
+  return data.data;
+}
+
+function productIdsFromCancelledOrders(orders) {
+  const ids = new Set();
+  for (const order of orders) {
+    for (const lineItem of order.lineItems || []) {
+      if (lineItem.productId) ids.add(lineItem.productId);
+    }
+  }
+  return ids;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the comparison separate from any network call. Given a product's <code>stock</code> and <code>availableStock</code>, plus the summed quantity of that product still held by orders that are not cancelled, decide the expected <code>availableStock</code> and whether the live value needs an update. Nothing here talks to the network, so it is trivial to test with fixture rows.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_available_stock_correction(product, open_reservation_qty_for_product):
+    expected = max(product["stock"] - open_reservation_qty_for_product, 0)
+    needs_update = expected != product["availableStock"]
+    return {
+        "productId": product["id"],
+        "needsUpdate": needs_update,
+        "currentAvailableStock": product["availableStock"],
+        "expectedAvailableStock": expected,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideAvailableStockCorrection(product, openReservationQtyForProduct) {
+  const expected = Math.max(product.stock - openReservationQtyForProduct, 0);
+  const needsUpdate = expected !== product.availableStock;
+  return {
+    productId: product.id,
+    needsUpdate,
+    currentAvailableStock: product.availableStock,
+    expectedAvailableStock: expected,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Compute the open reservation quantity per product</h3>
+      <p>For each suspect product id, search <code>order-line-item</code> filtered by <code>productId</code> equals the product and <code>order.stateMachineState.technicalName</code> not-equals <code>cancelled</code>, and sum the quantities. That sum is exactly what <code>StockUpdater</code> itself would subtract from <code>stock</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">def open_reservation_qty(token, product_id, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [
+            {"type": "equals", "field": "productId", "value": product_id},
+            {"type": "not", "queries": [
+                {"type": "equals", "field": "order.stateMachineState.technicalName", "value": "cancelled"}
+            ]},
+        ],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order-line-item",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    line_items = r.json()["data"]
+    return sum(item.get("quantity", 0) for item in line_items)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">async function openReservationQty(token, productId, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [
+      { type: "equals", field: "productId", value: productId },
+      { type: "not", queries: [
+        { type: "equals", field: "order.stateMachineState.technicalName", value: "cancelled" },
+      ] },
+    ],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order-line-item`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order-line-item search`);
+  const data = await res.json();
+  return (data.data || []).reduce((sum, item) => sum + (item.quantity || 0), 0);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Re-sync only the products that disagree, never touch order state</h3>
+      <p>When <code>needsUpdate</code> is true, call <code>PATCH /api/product/{id}</code> with <code>availableStock</code> set to the recomputed expected value. This is safe precisely because <code>availableStock</code> is a cache, not a ledger, so writing the correct value is indistinguishable from letting the queued message finally run.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def patch_available_stock(token, product_id, expected_available_stock):
+    r = requests.patch(
+        f"{SHOPWARE_URL}/api/product/{product_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json={"availableStock": expected_available_stock},
+        timeout=30,
+    )
+    r.raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function patchAvailableStock(token, productId, expectedAvailableStock) {
+  const res = await fetch(`${SHOPWARE_URL}/api/product/${productId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ availableStock: expectedAvailableStock }),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product patch`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">7</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. For each product a cancelled order touched, fetch its live stock and availableStock, compute the open reservation quantity from every non-cancelled order, run the pure decision function, and only PATCH when it says the live value is stale.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never write to <code>stateId</code> or any order field, this reconciler only ever touches <code>availableStock</code> on the product. Start with <code>DRY_RUN=true</code>, review the exact list of products it would patch and the diff between current and expected, and only let it write once you trust the list.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists cancelled orders and the products they touched, recomputes each product's expected availableStock with the pure function, and patches only the products where the live value disagrees, respecting <code>DRY_RUN</code>.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/available-stock-stale-after-cancellation" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_available_stock_after_cancel.py</div>
+      <pre><code class="language-python">"""Reconcile Shopware 6 availableStock that stays stale right after an order
+is cancelled, without ever touching order state or stateId.
+
+Cancelling an order through the state machine (POST /api/_action/order/{id}/
+state/cancel) triggers StockUpdater to release the reserved quantity, but the
+recompute of availableStock is dispatched as an async message and only
+applied once the message queue worker (messenger:consume) processes it. If
+that worker is stalled or backlogged, the Admin API keeps returning the
+pre-cancellation availableStock even though the order already shows
+stateMachineState.technicalName equal to cancelled.
+
+Lists recently cancelled orders, collects the products their line items
+referenced, recomputes each product's expected availableStock from stock
+minus the quantities still open on non-cancelled orders, and PATCHes only the
+products where the live value disagrees. Run on a schedule, gated by
+DRY_RUN. Safe to run again and again, because availableStock is a derived
+cache field with no independent ledger meaning.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_available_stock_after_cancel")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def decide_available_stock_correction(product, open_reservation_qty_for_product):
+    """Pure decision. No I/O. Takes plain numeric fields and returns a comparison."""
+    expected = max(product["stock"] - open_reservation_qty_for_product, 0)
+    needs_update = expected != product["availableStock"]
+    return {
+        "productId": product["id"],
+        "needsUpdate": needs_update,
+        "currentAvailableStock": product["availableStock"],
+        "expectedAvailableStock": expected,
+    }
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def search_cancelled_orders(token, limit=200):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "stateMachineState.technicalName", "value": "cancelled"}],
+        "associations": {"lineItems": {"associations": {"product": {}}}},
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def product_ids_from_cancelled_orders(orders):
+    ids = set()
+    for order in orders:
+        for line_item in order.get("lineItems") or []:
+            product_id = line_item.get("productId")
+            if product_id:
+                ids.add(product_id)
+    return ids
+
+
+def get_product(token, product_id):
+    r = requests.get(
+        f"{SHOPWARE_URL}/api/product/{product_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()["data"]
+    attrs = data.get("attributes", data)
+    return {"id": product_id, "stock": attrs["stock"], "availableStock": attrs["availableStock"]}
+
+
+def open_reservation_qty(token, product_id, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [
+            {"type": "equals", "field": "productId", "value": product_id},
+            {"type": "not", "queries": [
+                {"type": "equals", "field": "order.stateMachineState.technicalName", "value": "cancelled"}
+            ]},
+        ],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order-line-item",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    line_items = r.json()["data"]
+    return sum(item.get("quantity", 0) for item in line_items)
+
+
+def patch_available_stock(token, product_id, expected_available_stock):
+    r = requests.patch(
+        f"{SHOPWARE_URL}/api/product/{product_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json={"availableStock": expected_available_stock},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def run():
+    token = get_token()
+    cancelled_orders = search_cancelled_orders(token)
+    product_ids = product_ids_from_cancelled_orders(cancelled_orders)
+    log.info("Found %d cancelled order(s) touching %d distinct product(s).", len(cancelled_orders), len(product_ids))
+
+    fixed = 0
+    for product_id in product_ids:
+        product = get_product(token, product_id)
+        reserved_qty = open_reservation_qty(token, product_id)
+        result = decide_available_stock_correction(product, reserved_qty)
+
+        if not result["needsUpdate"]:
+            continue
+
+        log.info(
+            "Product %s stale. current=%s expected=%s %s",
+            product_id, result["currentAvailableStock"], result["expectedAvailableStock"],
+            "would patch" if DRY_RUN else "patching",
+        )
+        if not DRY_RUN:
+            patch_available_stock(token, product_id, result["expectedAvailableStock"])
+        fixed += 1
+
+    log.info("Done. %d product(s) %s.", fixed, "to patch" if DRY_RUN else "patched")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-available-stock-after-cancel.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile Shopware 6 availableStock that stays stale right after an order
+ * is cancelled, without ever touching order state or stateId.
+ *
+ * Cancelling an order through the state machine (POST /api/_action/order/{id}/
+ * state/cancel) triggers StockUpdater to release the reserved quantity, but
+ * the recompute of availableStock is dispatched as an async message and only
+ * applied once the message queue worker (messenger:consume) processes it. If
+ * that worker is stalled or backlogged, the Admin API keeps returning the
+ * pre-cancellation availableStock even though the order already shows
+ * stateMachineState.technicalName equal to cancelled.
+ *
+ * Lists recently cancelled orders, collects the products their line items
+ * referenced, recomputes each product's expected availableStock from stock
+ * minus the quantities still open on non-cancelled orders, and PATCHes only
+ * the products where the live value disagrees. Run on a schedule, gated by
+ * DRY_RUN. Safe to run again and again, because availableStock is a derived
+ * cache field with no independent ledger meaning.
+ *
+ * Guide: https://www.allanninal.dev/shopware/available-stock-stale-after-cancellation/
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://example.test").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "dummy-client-id";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "dummy-secret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decideAvailableStockCorrection(product, openReservationQtyForProduct) {
+  const expected = Math.max(product.stock - openReservationQtyForProduct, 0);
+  const needsUpdate = expected !== product.availableStock;
+  return {
+    productId: product.id,
+    needsUpdate,
+    currentAvailableStock: product.availableStock,
+    expectedAvailableStock: expected,
+  };
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function searchCancelledOrders(token, limit = 200) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equals", field: "stateMachineState.technicalName", value: "cancelled" }],
+    associations: { lineItems: { associations: { product: {} } } },
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order search`);
+  const data = await res.json();
+  return data.data;
+}
+
+function productIdsFromCancelledOrders(orders) {
+  const ids = new Set();
+  for (const order of orders) {
+    for (const lineItem of order.lineItems || []) {
+      if (lineItem.productId) ids.add(lineItem.productId);
+    }
+  }
+  return ids;
+}
+
+async function getProduct(token, productId) {
+  const res = await fetch(`${SHOPWARE_URL}/api/product/${productId}`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product get`);
+  const body = await res.json();
+  const attrs = body.data.attributes || body.data;
+  return { id: productId, stock: attrs.stock, availableStock: attrs.availableStock };
+}
+
+async function openReservationQty(token, productId, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [
+      { type: "equals", field: "productId", value: productId },
+      { type: "not", queries: [
+        { type: "equals", field: "order.stateMachineState.technicalName", value: "cancelled" },
+      ] },
+    ],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order-line-item`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order-line-item search`);
+  const data = await res.json();
+  return (data.data || []).reduce((sum, item) => sum + (item.quantity || 0), 0);
+}
+
+async function patchAvailableStock(token, productId, expectedAvailableStock) {
+  const res = await fetch(`${SHOPWARE_URL}/api/product/${productId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ availableStock: expectedAvailableStock }),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product patch`);
+}
+
+export async function run() {
+  const token = await getToken();
+  const cancelledOrders = await searchCancelledOrders(token);
+  const productIds = productIdsFromCancelledOrders(cancelledOrders);
+  console.log(`Found ${cancelledOrders.length} cancelled order(s) touching ${productIds.size} distinct product(s).`);
+
+  let fixed = 0;
+  for (const productId of productIds) {
+    const product = await getProduct(token, productId);
+    const reservedQty = await openReservationQty(token, productId);
+    const result = decideAvailableStockCorrection(product, reservedQty);
+
+    if (!result.needsUpdate) continue;
+
+    console.log(
+      `Product ${productId} stale. current=${result.currentAvailableStock} expected=${result.expectedAvailableStock} ${DRY_RUN ? "would patch" : "patching"}`
+    );
+    if (!DRY_RUN) await patchAvailableStock(token, productId, result.expectedAvailableStock);
+    fixed++;
+  }
+
+  console.log(`Done. ${fixed} product(s) ${DRY_RUN ? "to patch" : "patched"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The comparison rule is the part most worth testing, because it decides which products get written to. Because <code>decide_available_stock_correction</code> is pure and takes only plain numeric fields, the test needs no network, no Shopware store, and no message queue.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_available_stock_correction.py</div>
+      <pre><code class="language-python">from reconcile_available_stock_after_cancel import decide_available_stock_correction
+
+
+def product(**over):
+    base = {"id": "prod-1", "stock": 100, "availableStock": 100}
+    base.update(over)
+    return base
+
+
+def test_no_update_when_already_correct():
+    result = decide_available_stock_correction(product(availableStock=80), 20)
+    assert result["needsUpdate"] is False
+    assert result["expectedAvailableStock"] == 80
+
+
+def test_needs_update_when_stale_after_cancellation():
+    # 20 was reserved, but the order was cancelled, so nothing should be held.
+    result = decide_available_stock_correction(product(availableStock=80), 0)
+    assert result["needsUpdate"] is True
+    assert result["expectedAvailableStock"] == 100
+    assert result["currentAvailableStock"] == 80
+
+
+def test_expected_never_goes_below_zero():
+    result = decide_available_stock_correction(product(stock=5, availableStock=5), 20)
+    assert result["expectedAvailableStock"] == 0
+    assert result["needsUpdate"] is True
+
+
+def test_returns_product_id():
+    result = decide_available_stock_correction(product(id="prod-42"), 0)
+    assert result["productId"] == "prod-42"
+
+
+def test_no_update_when_reservation_matches_gap():
+    result = decide_available_stock_correction(product(stock=50, availableStock=30), 20)
+    assert result["needsUpdate"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide-available-stock-correction.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideAvailableStockCorrection } from "./reconcile-available-stock-after-cancel.js";
+
+const product = (over = {}) => ({ id: "prod-1", stock: 100, availableStock: 100, ...over });
+
+test("no update when already correct", () => {
+  const result = decideAvailableStockCorrection(product({ availableStock: 80 }), 20);
+  assert.equal(result.needsUpdate, false);
+  assert.equal(result.expectedAvailableStock, 80);
+});
+
+test("needs update when stale after cancellation", () => {
+  const result = decideAvailableStockCorrection(product({ availableStock: 80 }), 0);
+  assert.equal(result.needsUpdate, true);
+  assert.equal(result.expectedAvailableStock, 100);
+  assert.equal(result.currentAvailableStock, 80);
+});
+
+test("expected never goes below zero", () => {
+  const result = decideAvailableStockCorrection(product({ stock: 5, availableStock: 5 }), 20);
+  assert.equal(result.expectedAvailableStock, 0);
+  assert.equal(result.needsUpdate, true);
+});
+
+test("returns product id", () => {
+  const result = decideAvailableStockCorrection(product({ id: "prod-42" }), 0);
+  assert.equal(result.productId, "prod-42");
+});
+
+test("no update when reservation matches gap", () => {
+  const result = decideAvailableStockCorrection(product({ stock: 50, availableStock: 30 }), 20);
+  assert.equal(result.needsUpdate, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash sale retailer</span>
+      <h4>Bulk cancellations after a mispriced drop</h4>
+      <p>A streetwear store ran a flash sale with a pricing bug that let a batch of orders through at the wrong price. Support cancelled around three hundred orders in one afternoon to unwind the mistake. Within minutes, the top sizes of the affected product still showed as sold out on the storefront, even though every one of those orders was already <code>cancelled</code> in the Administration.</p>
+      <p>The message queue worker had fallen behind during the sale's traffic spike and was still catching up on the earlier order-placed messages before it could even get to the cancellations. Running the reconciler in dry run showed the exact products still holding stale reservations. Patching just those closed the gap immediately, without waiting for the worker to grind through its backlog.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Marketplace integration</span>
+      <h4>A returns app that reads stock right after cancelling</h4>
+      <p>A store's returns and cancellation app calls the cancel transition, then immediately re-fetches the product to show the customer service rep the updated stock count. Reps kept reporting that the number displayed was wrong, always the old, lower figure, right after a cancellation went through.</p>
+      <p>The team added the reconciler as a scheduled job running every few minutes, so any gap between a cancellation and the queue catching up closes quickly on its own. They also fixed the app to stop trusting an immediate re-fetch as truth, but the reconciler remained as the safety net for whenever the worker is slow.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a cancelled order's stock comes back quickly even when the message queue worker is slow or stalled, because the reconciler recomputes and re-syncs exactly the products that need it. No order state is ever touched, only the cached number that Shopware's own indexer would eventually produce anyway. Keep an eye on why the queue fell behind in the first place, since this reconciler is a safety net, not a substitute for a healthy worker.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does availableStock stay low right after I cancel a Shopware 6 order?</summary>
+      <p>Cancelling an order through the state machine tells StockUpdater to release the reserved quantity, but the recompute of availableStock is dispatched as an async message rather than applied inside the cancel request. Until the message queue worker processes that message, the Admin API keeps returning the pre-cancellation availableStock even though the order already shows stateMachineState.technicalName equal to cancelled.</p>
+    </details>
+    <details>
+      <summary>Is it safe to PATCH availableStock back to the expected value?</summary>
+      <p>Yes. availableStock is a derived cache field with no independent ledger meaning, it only exists as stock minus the open reservations. Overwriting it with the correctly recomputed value has the same effect as StockUpdater's own queued message being consumed, so a guarded PATCH is safe as long as the recompute logic matches Shopware's own definition of an open order.</p>
+    </details>
+    <details>
+      <summary>How do I stop this from happening again instead of just reconciling after the fact?</summary>
+      <p>Make sure messenger:consume is running continuously as a supervised worker process, not only through the admin worker in the browser, and keep an eye on queue depth with the scheduled_task and message queue monitoring in the Shopware Administration. The reconciler in this guide is a safety net for when the worker stalls or falls behind, not a replacement for keeping the worker healthy.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/shopware/">Browse all Shopware field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Product availableStock doesn't update, shopware/shopware Issue #3449. <a href="https://github.com/shopware/shopware/issues/3449" rel="noopener">github.com/shopware/shopware/issues/3449</a></li>
+      <li>Stock storage refactoring, shopware/shopware Discussion #3172. <a href="https://github.com/shopware/shopware/discussions/3172" rel="noopener">github.com/shopware/shopware/discussions/3172</a></li>
+      <li>Demystifying the StockUpdater, Shopware Community Forum. <a href="https://forum.shopware.com/t/demystifying-the-stockupdater/70474" rel="noopener">forum.shopware.com/t/demystifying-the-stockupdater/70474</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Developer Documentation: Available stock improvements ADR. <a href="https://developer.shopware.com/docs/resources/references/adr/2022-03-25-available-stock.html" rel="noopener">developer.shopware.com/docs/resources/references/adr/2022-03-25-available-stock.html</a></li>
+      <li>Shopware Developer Documentation: Stock Manipulation API ADR. <a href="https://developer.shopware.com/docs/resources/references/adr/2023-05-15-stock-api.html" rel="noopener">developer.shopware.com/docs/resources/references/adr/2023-05-15-stock-api.html</a></li>
+      <li>Shopware Developer Documentation: Stock Configuration. <a href="https://developer.shopware.com/docs/guides/hosting/configurations/shopware/stock.html" rel="noopener">developer.shopware.com/docs/guides/hosting/configurations/shopware/stock.html</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware orders, inventory, the state machine, or the message queue that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this fix your stock numbers?</h3>
+    <p>If this saved you a confused support ticket about stock that was actually free, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>

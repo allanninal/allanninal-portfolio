@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payment State History Not Updated After Switching Payment Method in Shopware 6</title>
+<meta name="description" content="After a failed PayPal payment, a Shopware 6 customer picks a different payment method, but order_transaction never gets a matching state_machine_history row and flow triggers never fire. Learn why and build a Python or Node.js script that detects the gap.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/payment-method-switch-history-gap/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Payment State History Not Updated After Switching Payment Method in Shopware 6">
+<meta property="og:description" content="Why changing payment method after a failed payment leaves order_transaction and state_machine_history out of sync in Shopware 6, and a Python or Node.js script that finds and reports the gap.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/payment-method-switch-history-gap/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/payment-method-switch-history-gap/#article","headline":"Payment State History Not Updated After Switching Payment Method in Shopware 6","description":"After a failed payment at an external provider, a Shopware 6 customer switches to a different payment method. The order transaction's paymentMethodId changes, but the state machine transition and its state_machine_history row are often skipped, so the transaction's state and its audit trail fall out of sync and flow triggers never fire.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/payment-method-switch-history-gap/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Order State Machine","keywords":"Shopware 6 payment method switch, order_transaction state_machine_history, OrderTransactionStateHandler, changePaymentMethod, orderChangePayment, Payment status changed flow trigger, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Payment state history not updated after switching payment method","item":"https://www.allanninal.dev/shopware/payment-method-switch-history-gap/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Shopware 6 not log a state_machine_history row after a customer switches payment method?","acceptedAnswer":{"@type":"Answer","text":"When a payment fails at an external provider and the customer picks a different payment method, the change payment method route updates paymentMethodId on the order and order_transaction and can create a new order_transaction record, but it does not always reliably drive a state machine transition through OrderTransactionStateHandler. Because no transition event fires, no row is written to state_machine_history, so the transaction's current state and its audit trail fall out of sync."}},{"@type":"Question","name":"Is it safe to auto-fix the missing state_machine_history row with a script?","acceptedAnswer":{"@type":"Answer","text":"Not fully automatically, because there is no single correct target state. The right transition, such as reopen, process, or paid, depends on what the customer actually did after switching payment method, which cannot be reconstructed from state alone. Treat it as a flag and report tool, and only fire a corrective transition under a DRY_RUN guard with an explicit confirm step for the clear case of a stale terminal-ish state on a transaction whose order is still open."}},{"@type":"Question","name":"Why can I not just PATCH order_transaction.stateId to fix the mismatch?","acceptedAnswer":{"@type":"Answer","text":"Shopware write protects stateId for the crud scope on every state machine backed entity, so a direct PATCH is rejected, and even if it were not, patching the column directly would still skip writing a state_machine_history row. The only supported way to both move stateId and record the missing history entry is a transition action, such as POST /api/_action/order-transaction/{id}/state/reopen, which runs through the StateMachineRegistry."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Order State Machine</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Order State Machine</p>
+    <h1>Payment state history not updated after switching payment method post-failure</h1>
+    <p class="lead">A customer's card is declined at PayPal, or the external provider times out, and the checkout lets them pick a different payment method to try again. The order goes on to get paid, or it does not, but the audit trail never says so. The order_transaction's stateMachineState and its state_machine_history rows fall out of sync, flow-builder's "Payment status changed" trigger never fires, and nobody can reconstruct what happened just from looking at the history table. Here is why Shopware 6 leaves that gap and a small script that finds it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Shopware 6, when a payment fails at an external provider such as PayPal, the order_transaction is left in a state like <code>open</code>, <code>cancelled</code>, or <code>reminded</code>, and the checkout's change payment method flow (<code>SalesChannel\OrderService::orderChangePayment</code>, the storefront <code>changePaymentMethod</code> route) lets the customer choose a different payment method. That flow updates <code>paymentMethodId</code> on the order and order_transaction, and can create a new order_transaction row, but it does not always reliably drive a transition through <code>OrderTransactionStateHandler</code>. No transition event means no <code>state_machine_history</code> row gets written, so the transaction's current <code>stateMachineState</code> and its history trail disagree, and flow-builder triggers such as "Payment status changed" never fire. This is a confirmed bug, tracked as shopware/shopware issue #7330. Search order-transaction for candidates still sitting on <code>open</code>, <code>cancelled</code>, <code>reminded</code>, or <code>failed</code>, pull each one's state_machine_history, and flag anything with no history, a stale last entry, or a newer sibling transaction with no transition of its own. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Shopware's checkout is built so that every meaningful change to an order_transaction is supposed to leave a trail. The state machine moves the transaction from one named state to another, such as <code>open</code> to <code>paid</code>, and every one of those moves is meant to write a row into <code>state_machine_history</code> recording the from state, the to state, and when it happened. Flow-builder listens for exactly those transition events to fire triggers like "Payment status changed".</p>
+  <p>The change payment method path breaks that assumption. When a payment fails at PayPal or another external provider, the transaction is left in whatever state the failure produced, and the customer is offered a chance to pick a different payment method and try again. That action goes through <code>orderChangePayment</code>, and its job is really just to change which payment method the order will use next. It updates <code>paymentMethodId</code> on the order, and depending on the version and the payment method, it can create a brand new order_transaction row for the retried payment. What it does not reliably do is call the state machine transition that would move the transaction's state forward and, as a side effect, record the history row that proves it happened. The state can end up updated on the entity while the audit trail says nothing changed, or a second order_transaction can exist for the same order with no transition ever recorded against it at all.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. A payment fails at PayPal, the customer switches payment method, the paymentMethodId changes on the transaction, but no state machine transition runs, so no state_machine_history row is written and the transaction's state and history fall out of sync.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="15" width="170" height="56" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="95" y="38" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">PayPal payment</text>
+      <text x="95" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">fails or times out</text>
+      <line x1="183" y1="43" x2="222" y2="43" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="225" y="15" width="180" height="56" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="315" y="38" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Customer switches</text>
+      <text x="315" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">payment method</text>
+      <line x1="408" y1="43" x2="447" y2="43" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="450" y="15" width="180" height="56" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="540" y="38" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">paymentMethodId</text>
+      <text x="540" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">updated on transaction</text>
+      <line x1="540" y1="71" x2="540" y2="106" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="600" y="95" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="440" y="108" width="200" height="56" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="540" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">No transition called</text>
+      <text x="540" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">OrderTransactionStateHandler skipped</text>
+      <line x1="440" y1="136" x2="230" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="30" y="122" width="200" height="56" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="130" y="145" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">No state_machine_history row</text>
+      <text x="130" y="162" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">audit trail stays silent</text>
+      <rect x="255" y="196" width="250" height="34" rx="8" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="380" y="217" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#0f2830">"Payment status changed" flow never fires</text>
+      <line x1="130" y1="178" x2="240" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>The transaction's payment method changes, but the state machine transition that should record it in state_machine_history is skipped, so the state and the audit trail disagree and flow triggers stay silent.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The change payment method action was designed to answer one question, which payment method should this order use, not to fully drive the state machine through every possible outcome of a retried payment. A few common ways stores end up with the gap:</p>
+  <ul>
+    <li>A customer's PayPal payment fails and leaves the transaction on <code>open</code>, <code>cancelled</code>, or <code>reminded</code>, then the customer picks a new payment method through the storefront's <code>changePaymentMethod</code> route or its admin equivalent, which changes <code>paymentMethodId</code> without transitioning the state.</li>
+    <li>The change payment method call creates a second order_transaction row for the same order rather than reusing the first, so the order now has multiple transactions and the newest one never gets its own transition or history entry.</li>
+    <li>The transaction's <code>stateId</code> ends up moved, for example by a later manual admin action, but the change happens outside a code path that goes through <code>OrderTransactionStateHandler</code>, so <code>updatedAt</code> advances with no corresponding <code>state_machine_history</code> row.</li>
+    <li>Flow-builder automations that key off "Payment status changed" silently stop firing for these orders, because the trigger only listens for the transition event, and there was none to hear.</li>
+  </ul>
+  <p>This is confirmed as a real bug in Shopware's own tracker, and it sits next to a related report of missing history entries for the paid transition specifically. Neither is a one-off plugin issue. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no single correct fix to apply blindly here, because the right target state depends on what the customer actually did after switching payment method, and that cannot be reconstructed from the transaction's current state alone. So the safe move is to detect and report the gap rather than guess at a repair. A transaction only qualifies for the clearer, DRY_RUN-guarded corrective path when the order itself is still open and the transaction is stuck on a stale terminal-ish state like <code>cancelled</code> or <code>failed</code>, in which case the safe repair is the same one Shopware's own UI would use: a state machine transition action, never a direct write to <code>stateId</code>.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch <code>stateId</code>, and we never guess at what a customer's retried payment resolved to. The script searches order-transaction for candidates in <code>open</code>, <code>cancelled</code>, <code>reminded</code>, or <code>failed</code>, pulls each one's state_machine_history, and groups by order to catch the multi-transaction case. Anything with no history, a stale last entry, or a newer sibling transaction missing its own transition gets flagged. Nothing is written unless a human confirms it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job pulls candidate order transactions, fetches state_machine_history for each, groups by order, and flags any transaction with no history, a stale last entry, or a newer sibling transaction with no transition, otherwise it reports no gap.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0891b2"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="112" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Search candidates</text>
+      <text x="112" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">open, cancelled, reminded,</text>
+      <text x="112" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">failed order-transactions</text>
+      <line x1="215" y1="140" x2="257" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="350" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Fetch history</text>
+      <text x="350" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">state-machine-history per</text>
+      <text x="350" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">transaction, group by order</text>
+      <line x1="440" y1="140" x2="482" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,140 575,174 488,140" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="575" y="135" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">Gap found?</text>
+      <text x="575" y="150" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">no history / stale / multi-tx</text>
+      <text x="665" y="130" font-family="sans-serif" font-size="10.5" fill="#b9791a" font-weight="700">yes</text>
+      <line x1="662" y1="140" x2="690" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="205" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">no, all in sync</text>
+      <line x1="575" y1="174" x2="575" y2="210" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#fbf3e3" stroke="#b9791a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#b9791a">Flag and report</text>
+      <text x="684" y="224" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">DRY_RUN before any write</text>
+      <path d="M690,140 C710,140 684,150 684,183" fill="none" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only flags what it can prove from state and history. A corrective transition is never fired without a DRY_RUN pass and an explicit confirm.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create an integration in Shopware under Settings, System, Integrations, and note its access key id and secret key. Exchange them for a bearer token with <code>POST /api/oauth/token</code> using <code>grant_type: client_credentials</code>. Keep the shop URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and call the Admin API</h3>
+      <p>A small helper gets a bearer token once, then sends every request with <code>Authorization: Bearer &lt;token&gt;</code> and <code>Accept: application/json</code>. We reuse it for both search requests and, later, for the guarded transition action call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiPost(path, token, body = {}) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${path}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Find candidate transactions and their history</h3>
+      <p>Search <code>order-transaction</code> for anything sitting on <code>open</code>, <code>cancelled</code>, <code>reminded</code>, or <code>failed</code>, with the <code>order</code> and <code>stateMachineState</code> associations. For every candidate, pull its <code>state-machine-history</code> rows filtered by <code>entityId.id</code> and <code>entityName</code>, oldest first.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">CANDIDATE_STATES = ["open", "cancelled", "reminded", "failed"]
+
+def search_candidate_transactions(token, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equalsAny", "field": "stateMachineState.technicalName", "value": CANDIDATE_STATES}],
+        "associations": {"order": {}, "stateMachineState": {}},
+        "sort": [{"field": "createdAt", "order": "DESC"}],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order-transaction",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+def fetch_history(token, transaction_id):
+    body = {
+        "filter": [
+            {"type": "equals", "field": "entityId.id", "value": transaction_id},
+            {"type": "equals", "field": "entityName", "value": "order_transaction"},
+        ],
+        "sort": [{"field": "createdAt", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/state-machine-history",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const CANDIDATE_STATES = ["open", "cancelled", "reminded", "failed"];
+
+async function searchCandidateTransactions(token, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equalsAny", field: "stateMachineState.technicalName", value: CANDIDATE_STATES }],
+    associations: { order: {}, stateMachineState: {} },
+    sort: [{ field: "createdAt", order: "DESC" }],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order-transaction`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order-transaction search`);
+  const data = await res.json();
+  return data.data;
+}
+
+async function fetchHistory(token, transactionId) {
+  const body = {
+    filter: [
+      { type: "equals", field: "entityId.id", value: transactionId },
+      { type: "equals", field: "entityName", value: "order_transaction" },
+    ],
+    sort: [{ field: "createdAt", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/state-machine-history`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on state-machine-history search`);
+  const data = await res.json();
+  return data.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision separate from any network call. Group transactions by <code>orderId</code>, then for each one check three things against its history: is there no history at all, does the last history entry disagree with the current <code>stateId</code>, and if the order has multiple transactions, does the newest one have no history entry created after it. Nothing here talks to the network, so it is trivial to test with fixture arrays and maps.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from collections import defaultdict
+
+def find_history_gaps(transactions, history_by_transaction_id):
+    by_order = defaultdict(list)
+    for tx in transactions:
+        by_order[tx["orderId"]].append(tx)
+
+    gaps = []
+    for order_id, txs in by_order.items():
+        txs_sorted = sorted(txs, key=lambda t: t["createdAt"])
+        newest = txs_sorted[-1]
+        multi = len(txs_sorted) > 1
+
+        for tx in txs_sorted:
+            history = history_by_transaction_id.get(tx["id"]) or []
+
+            if not history:
+                gaps.append({"transactionId": tx["id"], "orderId": order_id, "reason": "no_history"})
+                continue
+
+            last_entry = history[-1]
+            if last_entry["toStateId"] != tx["stateId"]:
+                gaps.append({"transactionId": tx["id"], "orderId": order_id, "reason": "stale_state"})
+                continue
+
+            if multi and tx["id"] == newest["id"]:
+                has_transition_after_creation = any(h["createdAt"] > tx["createdAt"] for h in history)
+                if not has_transition_after_creation:
+                    gaps.append({"transactionId": tx["id"], "orderId": order_id, "reason": "multi_transaction_no_transition"})
+
+    return gaps</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findHistoryGaps(transactions, historyByTransactionId) {
+  const byOrder = new Map();
+  for (const tx of transactions) {
+    if (!byOrder.has(tx.orderId)) byOrder.set(tx.orderId, []);
+    byOrder.get(tx.orderId).push(tx);
+  }
+
+  const gaps = [];
+  for (const [orderId, txs] of byOrder) {
+    const txsSorted = [...txs].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const newest = txsSorted[txsSorted.length - 1];
+    const multi = txsSorted.length > 1;
+
+    for (const tx of txsSorted) {
+      const history = historyByTransactionId.get(tx.id) || [];
+
+      if (history.length === 0) {
+        gaps.push({ transactionId: tx.id, orderId, reason: "no_history" });
+        continue;
+      }
+
+      const lastEntry = history[history.length - 1];
+      if (lastEntry.toStateId !== tx.stateId) {
+        gaps.push({ transactionId: tx.id, orderId, reason: "stale_state" });
+        continue;
+      }
+
+      if (multi && tx.id === newest.id) {
+        const hasTransitionAfterCreation = history.some((h) => h.createdAt > tx.createdAt);
+        if (!hasTransitionAfterCreation) {
+          gaps.push({ transactionId: tx.id, orderId, reason: "multi_transaction_no_transition" });
+        }
+      }
+    }
+  }
+
+  return gaps;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report first, repair only under a confirm flag</h3>
+      <p>By default the script only logs the flagged gaps. For the one clear repair case, a transaction stuck on a stale terminal-ish state while its order is still open, we compute the available transition from Shopware's own state machine and call the transition action, never a PATCH of <code>stateId</code>. That call both moves the state and writes the missing history row. It only runs when <code>DRY_RUN</code> is false and an explicit confirm flag is set.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def transition_route(transaction_id, transition):
+    return f"/api/_action/order-transaction/{transaction_id}/state/{transition}"
+
+def run_transition(token, transaction_id, transition):
+    return api_post(transition_route(transaction_id, transition), token, body={})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">function transitionRoute(transactionId, transition) {
+  return `/api/_action/order-transaction/${transactionId}/state/${transition}`;
+}
+
+async function runTransition(token, transactionId, transition) {
+  return apiPost(transitionRoute(transactionId, transition), token, {});
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop authenticates, searches candidates, fetches history for each, runs <code>find_history_gaps</code>, and logs every gap it finds. Reads happen either way, so the report is always available. Writes never happen unless <code>DRY_RUN</code> is explicitly off and <code>CONFIRM_REPAIR</code> is explicitly set.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never patch <code>stateId</code>, and never assume a target state for a transaction you cannot fully reconstruct. Start with <code>DRY_RUN=true</code>, review every flagged gap, and only enable a corrective transition for the narrow case this script actually understands. Everything else stays a report for a human to read.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, searches order-transaction for candidates, fetches state_machine_history for each one, flags gaps with the pure function, and only ever transitions state through the state machine action, gated by <code>DRY_RUN</code>.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/payment-method-switch-history-gap" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_history_gaps.py</div>
+      <pre><code class="language-python">"""Flag Shopware 6 order-transactions whose state_machine_history fell out of
+sync with their current state after a customer switched payment method
+following a failed payment, without ever patching stateId directly.
+
+When a payment fails at an external provider and the customer picks a different
+payment method, the change payment method flow updates paymentMethodId and can
+create a new order_transaction, but it does not always reliably drive a state
+machine transition. No transition means no state_machine_history row, so the
+transaction's current state and its audit trail disagree.
+
+Searches order-transaction for candidates still open, cancelled, reminded, or
+failed, fetches each one's state_machine_history, and flags a gap when there is
+no history, the last history entry disagrees with the current state, or the
+newest transaction on a multi-transaction order has no transition of its own.
+Reports by default. Only runs a corrective transition when DRY_RUN is false and
+CONFIRM_REPAIR is explicitly set. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_history_gaps")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+CONFIRM_REPAIR = os.environ.get("CONFIRM_REPAIR", "false").lower() == "true"
+
+CANDIDATE_STATES = ["open", "cancelled", "reminded", "failed"]
+STALE_TERMINAL_STATES = {"cancelled", "failed"}
+
+
+def find_history_gaps(transactions, history_by_transaction_id):
+    """Pure decision. No I/O. Takes plain arrays and a map, returns plain gaps."""
+    by_order = {}
+    for tx in transactions:
+        by_order.setdefault(tx["orderId"], []).append(tx)
+
+    gaps = []
+    for order_id, txs in by_order.items():
+        txs_sorted = sorted(txs, key=lambda t: t["createdAt"])
+        newest = txs_sorted[-1]
+        multi = len(txs_sorted) > 1
+
+        for tx in txs_sorted:
+            history = history_by_transaction_id.get(tx["id"]) or []
+
+            if not history:
+                gaps.append({"transactionId": tx["id"], "orderId": order_id, "reason": "no_history"})
+                continue
+
+            last_entry = history[-1]
+            if last_entry["toStateId"] != tx["stateId"]:
+                gaps.append({"transactionId": tx["id"], "orderId": order_id, "reason": "stale_state"})
+                continue
+
+            if multi and tx["id"] == newest["id"]:
+                has_transition_after_creation = any(h["createdAt"] > tx["createdAt"] for h in history)
+                if not has_transition_after_creation:
+                    gaps.append({"transactionId": tx["id"], "orderId": order_id, "reason": "multi_transaction_no_transition"})
+
+    return gaps
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def search_candidate_transactions(token, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equalsAny", "field": "stateMachineState.technicalName", "value": CANDIDATE_STATES}],
+        "associations": {"order": {}, "stateMachineState": {}},
+        "sort": [{"field": "createdAt", "order": "DESC"}],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order-transaction",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def fetch_history(token, transaction_id):
+    body = {
+        "filter": [
+            {"type": "equals", "field": "entityId.id", "value": transaction_id},
+            {"type": "equals", "field": "entityName", "value": "order_transaction"},
+        ],
+        "sort": [{"field": "createdAt", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/state-machine-history",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def run_transition(token, transaction_id, transition):
+    return api_post(f"/api/_action/order-transaction/{transaction_id}/state/{transition}", token, body={})
+
+
+def run():
+    token = get_token()
+    candidates = search_candidate_transactions(token)
+
+    transactions = [
+        {
+            "id": tx["id"],
+            "orderId": tx["orderId"],
+            "paymentMethodId": tx.get("paymentMethodId"),
+            "stateId": tx["stateId"],
+            "technicalName": (tx.get("stateMachineState") or {}).get("technicalName"),
+            "createdAt": tx["createdAt"],
+            "updatedAt": tx.get("updatedAt") or tx["createdAt"],
+        }
+        for tx in candidates
+    ]
+
+    history_by_transaction_id = {}
+    for tx in transactions:
+        history = fetch_history(token, tx["id"])
+        history_by_transaction_id[tx["id"]] = [
+            {"toStateId": h["toStateId"], "createdAt": h["createdAt"]} for h in history
+        ]
+
+    gaps = find_history_gaps(transactions, history_by_transaction_id)
+    by_id = {tx["id"]: tx for tx in transactions}
+
+    repaired = 0
+    for gap in gaps:
+        tx = by_id[gap["transactionId"]]
+        log.warning(
+            "Gap: order %s, transaction %s, reason=%s, state=%s",
+            gap["orderId"], gap["transactionId"], gap["reason"], tx["technicalName"],
+        )
+
+        eligible_for_repair = tx["technicalName"] in STALE_TERMINAL_STATES and gap["reason"] in (
+            "stale_state", "multi_transaction_no_transition",
+        )
+        if not eligible_for_repair:
+            continue
+
+        transition = "reopen"
+        log.info(
+            "Repair candidate: transaction %s. %s transition '%s'",
+            tx["id"], "would run" if (DRY_RUN or not CONFIRM_REPAIR) else "running", transition,
+        )
+        if not DRY_RUN and CONFIRM_REPAIR:
+            run_transition(token, tx["id"], transition)
+            repaired += 1
+
+    log.info("Done. %d gap(s) flagged, %d repaired.", len(gaps), repaired)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-history-gaps.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Shopware 6 order-transactions whose state_machine_history fell out of
+ * sync with their current state after a customer switched payment method
+ * following a failed payment, without ever patching stateId directly.
+ *
+ * When a payment fails at an external provider and the customer picks a different
+ * payment method, the change payment method flow updates paymentMethodId and can
+ * create a new order_transaction, but it does not always reliably drive a state
+ * machine transition. No transition means no state_machine_history row, so the
+ * transaction's current state and its audit trail disagree.
+ *
+ * Searches order-transaction for candidates still open, cancelled, reminded, or
+ * failed, fetches each one's state_machine_history, and flags a gap when there is
+ * no history, the last history entry disagrees with the current state, or the
+ * newest transaction on a multi-transaction order has no transition of its own.
+ * Reports by default. Only runs a corrective transition when DRY_RUN is false and
+ * CONFIRM_REPAIR is explicitly set. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/shopware/payment-method-switch-history-gap/
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://example.test").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "dummy-client-id";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "dummy-secret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const CONFIRM_REPAIR = (process.env.CONFIRM_REPAIR || "false").toLowerCase() === "true";
+
+const CANDIDATE_STATES = ["open", "cancelled", "reminded", "failed"];
+const STALE_TERMINAL_STATES = new Set(["cancelled", "failed"]);
+
+export function findHistoryGaps(transactions, historyByTransactionId) {
+  const byOrder = new Map();
+  for (const tx of transactions) {
+    if (!byOrder.has(tx.orderId)) byOrder.set(tx.orderId, []);
+    byOrder.get(tx.orderId).push(tx);
+  }
+
+  const gaps = [];
+  for (const [orderId, txs] of byOrder) {
+    const txsSorted = [...txs].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const newest = txsSorted[txsSorted.length - 1];
+    const multi = txsSorted.length > 1;
+
+    for (const tx of txsSorted) {
+      const history = historyByTransactionId.get(tx.id) || [];
+
+      if (history.length === 0) {
+        gaps.push({ transactionId: tx.id, orderId, reason: "no_history" });
+        continue;
+      }
+
+      const lastEntry = history[history.length - 1];
+      if (lastEntry.toStateId !== tx.stateId) {
+        gaps.push({ transactionId: tx.id, orderId, reason: "stale_state" });
+        continue;
+      }
+
+      if (multi && tx.id === newest.id) {
+        const hasTransitionAfterCreation = history.some((h) => h.createdAt > tx.createdAt);
+        if (!hasTransitionAfterCreation) {
+          gaps.push({ transactionId: tx.id, orderId, reason: "multi_transaction_no_transition" });
+        }
+      }
+    }
+  }
+
+  return gaps;
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiPost(path, token, body = {}) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${path}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function searchCandidateTransactions(token, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equalsAny", field: "stateMachineState.technicalName", value: CANDIDATE_STATES }],
+    associations: { order: {}, stateMachineState: {} },
+    sort: [{ field: "createdAt", order: "DESC" }],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order-transaction`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order-transaction search`);
+  const data = await res.json();
+  return data.data;
+}
+
+async function fetchHistory(token, transactionId) {
+  const body = {
+    filter: [
+      { type: "equals", field: "entityId.id", value: transactionId },
+      { type: "equals", field: "entityName", value: "order_transaction" },
+    ],
+    sort: [{ field: "createdAt", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/state-machine-history`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on state-machine-history search`);
+  const data = await res.json();
+  return data.data;
+}
+
+async function runTransition(token, transactionId, transition) {
+  return apiPost(`/api/_action/order-transaction/${transactionId}/state/${transition}`, token, {});
+}
+
+export async function run() {
+  const token = await getToken();
+  const candidates = await searchCandidateTransactions(token);
+
+  const transactions = candidates.map((tx) => ({
+    id: tx.id,
+    orderId: tx.orderId,
+    paymentMethodId: tx.paymentMethodId,
+    stateId: tx.stateId,
+    technicalName: tx.stateMachineState?.technicalName,
+    createdAt: tx.createdAt,
+    updatedAt: tx.updatedAt || tx.createdAt,
+  }));
+
+  const historyByTransactionId = new Map();
+  for (const tx of transactions) {
+    const history = await fetchHistory(token, tx.id);
+    historyByTransactionId.set(
+      tx.id,
+      history.map((h) => ({ toStateId: h.toStateId, createdAt: h.createdAt }))
+    );
+  }
+
+  const gaps = findHistoryGaps(transactions, historyByTransactionId);
+  const byId = new Map(transactions.map((tx) => [tx.id, tx]));
+
+  let repaired = 0;
+  for (const gap of gaps) {
+    const tx = byId.get(gap.transactionId);
+    console.warn(`Gap: order ${gap.orderId}, transaction ${gap.transactionId}, reason=${gap.reason}, state=${tx.technicalName}`);
+
+    const eligibleForRepair =
+      STALE_TERMINAL_STATES.has(tx.technicalName) &&
+      (gap.reason === "stale_state" || gap.reason === "multi_transaction_no_transition");
+    if (!eligibleForRepair) continue;
+
+    const transition = "reopen";
+    console.log(`Repair candidate: transaction ${tx.id}. ${DRY_RUN || !CONFIRM_REPAIR ? "would run" : "running"} transition '${transition}'`);
+    if (!DRY_RUN && CONFIRM_REPAIR) {
+      await runTransition(token, tx.id, transition);
+      repaired++;
+    }
+  }
+
+  console.log(`Done. ${gaps.length} gap(s) flagged, ${repaired} repaired.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which transactions get reported, and eventually which ones qualify for a guarded repair. Because <code>find_history_gaps</code> is pure and takes plain arrays and a map, the test needs no network and no Shopware store.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_payment_history_gaps.py</div>
+      <pre><code class="language-python">from flag_history_gaps import find_history_gaps
+
+
+def tx(**over):
+    base = {
+        "id": "tx-1", "orderId": "order-1", "paymentMethodId": "pm-1",
+        "stateId": "state-open", "createdAt": "2026-07-10T10:00:00Z", "updatedAt": "2026-07-10T10:00:00Z",
+    }
+    base.update(over)
+    return base
+
+
+def test_no_gap_when_history_matches_current_state():
+    history = {"tx-1": [{"toStateId": "state-open", "createdAt": "2026-07-10T10:00:01Z"}]}
+    assert find_history_gaps([tx()], history) == []
+
+
+def test_no_history_is_flagged():
+    result = find_history_gaps([tx()], {})
+    assert result == [{"transactionId": "tx-1", "orderId": "order-1", "reason": "no_history"}]
+
+
+def test_stale_last_history_entry_is_flagged():
+    history = {"tx-1": [{"toStateId": "state-cancelled", "createdAt": "2026-07-10T09:00:00Z"}]}
+    result = find_history_gaps([tx(stateId="state-open")], history)
+    assert result == [{"transactionId": "tx-1", "orderId": "order-1", "reason": "stale_state"}]
+
+
+def test_multi_transaction_newest_without_transition_is_flagged():
+    older = tx(id="tx-old", createdAt="2026-07-10T09:00:00Z", stateId="state-cancelled")
+    newest = tx(id="tx-new", createdAt="2026-07-10T11:00:00Z", stateId="state-open")
+    history = {
+        "tx-old": [{"toStateId": "state-cancelled", "createdAt": "2026-07-10T09:00:01Z"}],
+        "tx-new": [{"toStateId": "state-open", "createdAt": "2026-07-10T10:00:00Z"}],  # before creation
+    }
+    result = find_history_gaps([older, newest], history)
+    assert {"transactionId": "tx-new", "orderId": "order-1", "reason": "stale_state"} in result
+
+
+def test_multi_transaction_with_transition_after_creation_is_clean():
+    older = tx(id="tx-old", createdAt="2026-07-10T09:00:00Z", stateId="state-cancelled")
+    newest = tx(id="tx-new", createdAt="2026-07-10T11:00:00Z", stateId="state-open")
+    history = {
+        "tx-old": [{"toStateId": "state-cancelled", "createdAt": "2026-07-10T09:00:01Z"}],
+        "tx-new": [{"toStateId": "state-open", "createdAt": "2026-07-10T11:00:01Z"}],  # after creation
+    }
+    result = find_history_gaps([older, newest], history)
+    assert result == []
+
+
+def test_single_transaction_ignores_multi_transaction_rule():
+    history = {"tx-1": [{"toStateId": "state-open", "createdAt": "2026-07-10T10:00:01Z"}]}
+    result = find_history_gaps([tx()], history)
+    assert result == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">payment-history-gaps.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findHistoryGaps } from "./flag-history-gaps.js";
+
+const tx = (over = {}) => ({
+  id: "tx-1", orderId: "order-1", paymentMethodId: "pm-1",
+  stateId: "state-open", createdAt: "2026-07-10T10:00:00Z", updatedAt: "2026-07-10T10:00:00Z",
+  ...over,
+});
+
+test("no gap when history matches current state", () => {
+  const history = new Map([["tx-1", [{ toStateId: "state-open", createdAt: "2026-07-10T10:00:01Z" }]]]);
+  assert.deepEqual(findHistoryGaps([tx()], history), []);
+});
+
+test("no history is flagged", () => {
+  const result = findHistoryGaps([tx()], new Map());
+  assert.deepEqual(result, [{ transactionId: "tx-1", orderId: "order-1", reason: "no_history" }]);
+});
+
+test("stale last history entry is flagged", () => {
+  const history = new Map([["tx-1", [{ toStateId: "state-cancelled", createdAt: "2026-07-10T09:00:00Z" }]]]);
+  const result = findHistoryGaps([tx({ stateId: "state-open" })], history);
+  assert.deepEqual(result, [{ transactionId: "tx-1", orderId: "order-1", reason: "stale_state" }]);
+});
+
+test("multi transaction newest without transition is flagged", () => {
+  const older = tx({ id: "tx-old", createdAt: "2026-07-10T09:00:00Z", stateId: "state-cancelled" });
+  const newest = tx({ id: "tx-new", createdAt: "2026-07-10T11:00:00Z", stateId: "state-open" });
+  const history = new Map([
+    ["tx-old", [{ toStateId: "state-cancelled", createdAt: "2026-07-10T09:00:01Z" }]],
+    ["tx-new", [{ toStateId: "state-open", createdAt: "2026-07-10T10:00:00Z" }]], // before creation
+  ]);
+  const result = findHistoryGaps([older, newest], history);
+  assert.ok(result.some((g) => g.transactionId === "tx-new" && g.reason === "stale_state"));
+});
+
+test("multi transaction with transition after creation is clean", () => {
+  const older = tx({ id: "tx-old", createdAt: "2026-07-10T09:00:00Z", stateId: "state-cancelled" });
+  const newest = tx({ id: "tx-new", createdAt: "2026-07-10T11:00:00Z", stateId: "state-open" });
+  const history = new Map([
+    ["tx-old", [{ toStateId: "state-cancelled", createdAt: "2026-07-10T09:00:01Z" }]],
+    ["tx-new", [{ toStateId: "state-open", createdAt: "2026-07-10T11:00:01Z" }]], // after creation
+  ]);
+  const result = findHistoryGaps([older, newest], history);
+  assert.deepEqual(result, []);
+});
+
+test("single transaction ignores multi transaction rule", () => {
+  const history = new Map([["tx-1", [{ toStateId: "state-open", createdAt: "2026-07-10T10:00:01Z" }]]]);
+  const result = findHistoryGaps([tx()], history);
+  assert.deepEqual(result, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">PayPal retry</span>
+      <h4>The support ticket that flow-builder never saw</h4>
+      <p>A subscription box store had a flow set up to email a discount code whenever "Payment status changed" fired for a failed payment, hoping to win the customer back. A support agent noticed a customer who had failed at PayPal, switched to SEPA, and paid successfully days later, yet never got the follow-up email and the order looked stuck in the admin timeline.</p>
+      <p>Running the detector against order-transaction turned up dozens of transactions with no state_machine_history row at all, all from the same change payment method path. The team could not safely guess what each one resolved to, so they used the report to manually verify each order's real status against the payment provider before touching anything.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Multiple transactions per order</span>
+      <h4>Two order_transaction rows, one order, one silent gap</h4>
+      <p>A B2B store noticed the admin order screen sometimes showed a payment status that did not match what finance expected. Investigating one order showed two order_transaction rows: the first from a failed card payment stuck on <code>cancelled</code>, and a second from the customer's retry with a bank transfer, which itself had no history rows younger than its own creation timestamp.</p>
+      <p>The multi-transaction rule in the pure function caught exactly this shape. The store used the flagged list to identify which orders needed a manual look, and reserved the DRY_RUN-guarded repair only for the handful where the newest transaction's order was clearly still open and the older transaction was cleanly stuck on a terminal state.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, the gap between what an order_transaction's state says and what its history proves stops being invisible. Every candidate gets checked against its own audit trail, multi-transaction orders get the extra scrutiny they need, and nothing gets pushed through a guessed transition. The narrow, DRY_RUN-guarded repair only ever applies to the one case this script can actually reason about, so a report never quietly turns into a wrong write.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Shopware 6 not log a state_machine_history row after a customer switches payment method?</summary>
+      <p>When a payment fails at an external provider and the customer picks a different payment method, the change payment method route updates paymentMethodId on the order and order_transaction and can create a new order_transaction record, but it does not always reliably drive a state machine transition through OrderTransactionStateHandler. Because no transition event fires, no row is written to state_machine_history, so the transaction's current state and its audit trail fall out of sync.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-fix the missing state_machine_history row with a script?</summary>
+      <p>Not fully automatically, because there is no single correct target state. The right transition, such as reopen, process, or paid, depends on what the customer actually did after switching payment method, which cannot be reconstructed from state alone. Treat it as a flag and report tool, and only fire a corrective transition under a DRY_RUN guard with an explicit confirm step for the clear case of a stale terminal-ish state on a transaction whose order is still open.</p>
+    </details>
+    <details>
+      <summary>Why can I not just PATCH order_transaction.stateId to fix the mismatch?</summary>
+      <p>Shopware write protects stateId for the crud scope on every state machine backed entity, so a direct PATCH is rejected, and even if it were not, patching the column directly would still skip writing a state_machine_history row. The only supported way to both move stateId and record the missing history entry is a transition action, such as POST /api/_action/order-transaction/{id}/state/reopen, which runs through the StateMachineRegistry.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/shopware/">Browse all Shopware field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Payment history not set correctly when customer changes payment method after failed payment with external payment method (shopware/shopware #7330). <a href="https://github.com/shopware/shopware/issues/7330" rel="noopener">github.com/shopware/shopware/issues/7330</a></li>
+      <li>Shopware Developer Documentation: Using the State Machine. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html" rel="noopener">developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html</a></li>
+      <li>Missing state_machine_transition "paid" for some order_transaction transitions (shopware/shopware #5795). <a href="https://github.com/shopware/shopware/issues/5795" rel="noopener">github.com/shopware/shopware/issues/5795</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Admin API: Order Management. <a href="https://shopware.stoplight.io/docs/admin-api/fdd24cc76f22d-order-management" rel="noopener">shopware.stoplight.io/docs/admin-api/fdd24cc76f22d-order-management</a></li>
+      <li>Shopware Admin API: OrderTransaction. <a href="https://shopware.stoplight.io/docs/admin-api/01f2ced432963-order-transaction" rel="noopener">shopware.stoplight.io/docs/admin-api/01f2ced432963-order-transaction</a></li>
+      <li>Shopware Developer Documentation: Using the State Machine. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html" rel="noopener">developer.shopware.com/docs/guides/plugins/plugins/checkout/order/using-the-state-machine.html</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware orders, payments, the state machine, or the message queue that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up a payment history mystery?</h3>
+    <p>If this saved you a confusing support ticket or a flow that quietly stopped firing, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>

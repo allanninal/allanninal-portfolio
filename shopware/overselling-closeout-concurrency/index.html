@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overselling of Closeout Items Under Concurrent Checkout in Shopware 6</title>
+<meta name="description" content="Two shoppers check out the same closeout SKU at the same instant and both orders go through, driving Shopware 6 availableStock below zero. Learn why the non-atomic stock check causes this and build a Python or Node.js script that finds the oversold orders in FIFO order.">
+<link rel="canonical" href="https://www.allanninal.dev/shopware/overselling-closeout-concurrency/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Overselling of Closeout Items Under Concurrent Checkout in Shopware 6">
+<meta property="og:description" content="Why two concurrent checkouts for the same closeout SKU can both pass validation and both commit, and a Python or Node.js script that finds the oversold orders in FIFO order.">
+<meta property="og:url" content="https://www.allanninal.dev/shopware/overselling-closeout-concurrency/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopware/assets/shopware.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopware/overselling-closeout-concurrency/#article","headline":"Overselling of Closeout Items Under Concurrent Checkout in Shopware 6","description":"Two concurrent checkouts for the same closeout SKU can both read the same pre-decrement availableStock, both pass validation, and both commit, because the check and the write are two separate non-atomic steps. A Python or Node.js script that finds the affected products and classifies the oversold orders in FIFO order.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopware/overselling-closeout-concurrency/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory and Stock","keywords":"Shopware 6 overselling, closeout stock, isCloseout, availableStock, StockUpdater, race condition, concurrent checkout, AbstractStockStorage, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/shopware/"},{"@type":"ListItem","position":2,"name":"Overselling of closeout items under concurrent checkout","item":"https://www.allanninal.dev/shopware/overselling-closeout-concurrency/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Shopware 6 oversell a closeout item during a traffic spike?","acceptedAnswer":{"@type":"Answer","text":"availableStock is stock minus the quantities on open orders, and the legacy StockUpdater recalculates and writes that value with a plain SQL update rather than a single atomic conditional decrement guarded by a row lock across the whole check-then-write span. When two checkouts for the same closeout SKU happen close together, both can read the same pre-decrement availableStock, both pass the stock check, and both commit, pushing availableStock below zero."}},{"@type":"Question","name":"Is it safe to just PATCH availableStock back to zero once I find the oversold product?","acceptedAnswer":{"@type":"Answer","text":"It is safe once you have identified which paid order or orders are the actual oversold excess, because that is a business decision about which customer loses their order. The script in this guide only reports the FIFO classification and logs the PATCH and cancel calls it would make. It never fixes stock or cancels an order automatically, and every write is gated behind DRY_RUN."}},{"@type":"Question","name":"How do I decide which paid orders are legitimate and which are the oversell?","acceptedAnswer":{"@type":"Answer","text":"Sort the paid orders for the affected product chronologically by paid timestamp, then walk them in that order accumulating quantity against the physical stock at the moment the closeout was activated. Every order that fits within that stock is fulfillable. The first order that would push the running total over the stock, and every order after it, is the oversold excess. This is the same FIFO rule the allocateFifoStock function in this guide implements as a pure function."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopware/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopware</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopware/">Field notes</a> / Inventory and Stock</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory and Stock</p>
+    <h1>Overselling of closeout items under concurrent checkout</h1>
+    <p class="lead">A closeout item, marked <code>isCloseout</code> because there is no restock coming, has exactly three left. Then a sale email goes out, or the product lands on a deal site, and within the same second two or three shoppers all hit checkout. Every one of them sees the item in stock. Every one of them gets a confirmation email. But there were only three units, and now <code>availableStock</code> reads negative and someone paid for a unit that does not exist. Here is why Shopware lets this happen and a small script that finds it and tells you exactly which paid order is the unfulfillable one.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Shopware 6, <code>product.availableStock</code> is derived as <code>stock</code> minus the sum of quantities on open, uncancelled orders, and the legacy <code>StockUpdater</code> recalculates and writes that value with a plain SQL update per checkout, not a single atomic conditional decrement guarded by a row lock across the whole check-then-write span. The "is there enough stock" read and the order-placement write happen as separate steps in the request lifecycle, so two concurrent checkouts for the same closeout SKU can both read the same pre-decrement value, both pass validation, and both commit. <code>availableStock</code> (and eventually <code>stock</code>) goes below zero. The fix here is not to auto-cancel anyone. It is a reconciler that finds every closeout product with negative stock, pulls the paid orders that reference it in chronological order, and runs them through a pure FIFO allocation function that tells you precisely which order is fulfillable and which is the oversold excess, so a human can make the actual business call. Full code, tests, and sources are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every checkout in Shopware asks the same question before it lets an order through: is there enough stock left. For a normal product that restocks, being a little wrong for a moment is rarely a disaster. For a closeout item, <code>isCloseout</code> true and no restock expected, being wrong means selling something that will never exist to fulfill.</p>
+  <p>The trouble is in how that question gets answered and when. <code>availableStock</code> is read once to decide if the checkout can proceed, and the order is written in a later step of the same request lifecycle. Those are two separate operations, not one atomic one. If two shoppers reach that read at close to the same moment, both see the same number, both see enough stock, and both go on to place an order. Only after both orders exist does anyone recompute <code>availableStock</code>, and by then it is too late, the number is negative and one of those two orders cannot actually be filled.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Two checkouts for the same closeout SKU both read the same availableStock at the same time, both pass the stock check, and both commit an order, driving availableStock below zero.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a5b62"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="15" width="210" height="52" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="115" y="36" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Checkout A reads</text>
+      <text x="115" y="53" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">availableStock = 1</text>
+      <rect x="10" y="90" width="210" height="52" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="115" y="111" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Checkout B reads</text>
+      <text x="115" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">availableStock = 1</text>
+      <text x="250" y="72" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">=</text>
+      <text x="250" y="90" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">same value, same moment</text>
+      <line x1="220" y1="41" x2="290" y2="41" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="220" y1="116" x2="290" y2="116" stroke="#4a5b62" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="293" y="15" width="170" height="52" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="378" y="36" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">A passes check</text>
+      <text x="378" y="53" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">order A placed</text>
+      <rect x="293" y="90" width="170" height="52" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="378" y="111" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">B passes check</text>
+      <text x="378" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">order B placed</text>
+      <line x1="463" y1="41" x2="500" y2="80" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <line x1="463" y1="116" x2="500" y2="90" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="503" y="60" width="230" height="60" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="618" y="83" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Both orders committed</text>
+      <text x="618" y="100" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">recompute runs too late</text>
+      <line x1="618" y1="120" x2="618" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="503" y="153" width="230" height="60" rx="10" fill="#fbeaea" stroke="#cf4b3f"></rect>
+      <text x="618" y="177" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">availableStock = -1</text>
+      <text x="618" y="195" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">one order cannot ship</text>
+    </svg>
+    <figcaption>The read and the write are two separate steps. Two checkouts landing between them both see stock available, and both commit.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is not a bug unique to one storefront theme or a misconfigured plugin. It is a structural property of how Shopware 6 tracks stock. A few things make it concrete:</p>
+  <ul>
+    <li><code>availableStock</code> is a derived, cached number, <code>stock</code> minus the sum of quantities on every order still counted as open. It is not a running counter that gets decremented atomically the instant a checkout claims a unit.</li>
+    <li>The legacy <code>StockUpdater</code> recalculates that derived value and writes it with a plain SQL update per checkout. There is no single atomic conditional decrement, the kind of "subtract only if the result stays at or above zero" statement guarded by a row lock spanning the entire check-then-write span, so two writes racing each other can both succeed.</li>
+    <li>The "is there enough stock" check and the "place this order" write are separate steps in the request lifecycle, not one transaction. A window exists between them, and under enough concurrent load that window is wide enough for two checkouts to both fall inside it.</li>
+    <li>Closeout items make the consequence worse than usual. <code>isCloseout</code> means there is no restock coming, so an oversold unit is not a delay, it is a promise Shopware made that cannot be kept.</li>
+  </ul>
+  <p>Shopware's own <code>6.5</code> "Stock storage refactoring" discussion and the "Available stock improvements" ADR both acknowledge this dual-value, non-realtime design as the source of exactly this kind of inconsistency, and the platform has since shipped an opt-in <code>AbstractStockStorage</code> system specifically to close the gap. A parallel real-world case, the voucher redemption race in GitHub issue #11245, shows the identical non-atomic check-then-act pattern biting a different code path under the same kind of concurrent checkout load. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Once two orders have both committed against a closeout item that only had stock for one, there is no script that can safely undo that on its own. Cancelling a paid order is not a stock correction, it is telling a real customer they do not get what they paid for, and deciding which customer that is belongs to a human, not automation. What a script can safely do is the detection and the math: find every closeout product sitting at negative stock, pull its paid orders in the order they actually paid, and run them through one pure function that tells you, in FIFO order, which orders fit inside the original stock and which do not. That turns "we have a mess" into "here is exactly one order number to make a decision about."</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never force-cancel anything and we never write to an order automatically. The script finds closeout products with negative <code>availableStock</code>, pulls the paid orders that reference each one in chronological order, and classifies them with a pure FIFO function. Only after a human confirms which order or orders will be cancelled does the script, still gated by <code>DRY_RUN</code>, log the corrective PATCH and state transition calls it would make.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job searches for closeout products with negative availableStock, pulls the paid orders for each one in chronological order, runs them through the pure FIFO allocation function, and if there is an oversold order it reports it for human confirmation before any dry run guarded repair call.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0891b2"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e3f8fc" stroke="#a5dfeb"></rect>
+      <text x="92" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#0f2830">Scheduled job</text>
+      <text x="92" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">runs on a timer</text>
+      <line x1="92" y1="80" x2="92" y2="106" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="200" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="110" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Find closeout products</text>
+      <text x="110" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">isCloseout=true and</text>
+      <text x="110" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">availableStock &lt; 0</text>
+      <line x1="210" y1="140" x2="252" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="255" y="108" width="185" height="64" rx="10" fill="#fff" stroke="#a5dfeb"></rect>
+      <text x="347" y="132" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#0f2830">Pull paid orders</text>
+      <text x="347" y="149" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">sorted by paid</text>
+      <text x="347" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4a5b62">timestamp, FIFO</text>
+      <line x1="440" y1="140" x2="482" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,140 575,174 488,140" fill="#e3f8fc" stroke="#a5dfeb"></polygon>
+      <text x="575" y="135" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#0f2830">Deficit &gt; 0?</text>
+      <text x="575" y="150" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4a5b62">allocateFifoStock</text>
+      <text x="665" y="130" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="140" x2="690" y2="140" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="210" font-family="sans-serif" font-size="10.5" fill="#4a5b62" font-weight="700">no deficit, leave it</text>
+      <line x1="575" y1="174" x2="575" y2="215" stroke="#4a5b62" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Report oversold</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#4a5b62">human confirms, then</text>
+      <text x="684" y="234" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#4a5b62">DRY_RUN guarded PATCH</text>
+      <path d="M690,140 C710,140 684,150 684,183" fill="none" stroke="#0891b2" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only reports which order is the oversold excess. Cancelling it, and correcting stock back to zero, both wait on a human confirming the call.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create an integration in Shopware under Settings, System, Integrations, and note its access key id and secret key. Exchange them for a bearer token with <code>POST /api/oauth/token</code> using <code>grant_type: client_credentials</code>. Keep the shop URL and the credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   # start safe, change to false to log the repair intent</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPWARE_URL="https://yourstore.example.com"
+export SHOPWARE_CLIENT_ID="SWIAXXXXXXXXXXXXXXXXXXXXXX"
+export SHOPWARE_CLIENT_SECRET="..."
+export DRY_RUN="true"   // start safe, change to false to log the repair intent</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and call the Admin API</h3>
+      <p>A small helper gets a bearer token once, then sends every request with <code>Authorization: Bearer &lt;token&gt;</code> and <code>Accept: application/json</code>. We reuse it for every search and for the guarded PATCH and state-transition calls.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOPWARE_URL = (process.env.SHOPWARE_URL || "").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID;
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET;
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiPost(path, token, body = {}) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${path}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Find closeout products sitting at negative stock</h3>
+      <p>Search <code>product</code> for <code>isCloseout</code> equals true and <code>availableStock</code> less than zero. If the range filter is not supported on a given version, page through <code>isCloseout=true</code> products and filter client-side on <code>availableStock &lt; 0</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def search_negative_closeout_products(token, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [
+            {"type": "equals", "field": "isCloseout", "value": True},
+            {"type": "range", "field": "availableStock", "parameters": {"lt": 0}},
+        ],
+        "associations": {"orderLineItems": {}},
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/product",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function searchNegativeCloseoutProducts(token, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [
+      { type: "equals", field: "isCloseout", value: true },
+      { type: "range", field: "availableStock", parameters: { lt: 0 } },
+    ],
+    associations: { orderLineItems: {} },
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/product`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product search`);
+  const data = await res.json();
+  return data.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Pull the chronological order queue for each product</h3>
+      <p>For each affected <code>product.id</code>, search <code>order-line-item</code> filtered by <code>productId</code>, with the <code>order</code> and <code>order.transactions</code> associations, sorted by <code>order.orderDateTime</code> ascending. Then keep only the line items whose order has a transaction in a <code>paid</code> or <code>paid_partially</code> state, read from <code>stateMachineState.technicalName</code>. Those are the binding claims on the unit.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">PAID_STATES = {"paid", "paid_partially"}
+
+def search_order_line_items_for_product(token, product_id, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "productId", "value": product_id}],
+        "associations": {"order": {"associations": {"transactions": {}}}},
+        "sort": [{"field": "order.orderDateTime", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order-line-item",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+def is_paid_order(order):
+    transactions = order.get("transactions") or []
+    return any(
+        (t.get("stateMachineState") or {}).get("technicalName") in PAID_STATES
+        for t in transactions
+    )
+
+def paid_orders_queue(line_items):
+    queue = []
+    for item in line_items:
+        order = item.get("order") or {}
+        if not is_paid_order(order):
+            continue
+        queue.append({
+            "orderId": order.get("id"),
+            "quantity": item.get("quantity", 0),
+            "paidAt": order.get("orderDateTime"),
+        })
+    return queue</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">const PAID_STATES = new Set(["paid", "paid_partially"]);
+
+async function searchOrderLineItemsForProduct(token, productId, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equals", field: "productId", value: productId }],
+    associations: { order: { associations: { transactions: {} } } },
+    sort: [{ field: "order.orderDateTime", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order-line-item`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order-line-item search`);
+  const data = await res.json();
+  return data.data;
+}
+
+function isPaidOrder(order) {
+  const transactions = order.transactions || [];
+  return transactions.some((t) => PAID_STATES.has(t.stateMachineState?.technicalName));
+}
+
+function paidOrdersQueue(lineItems) {
+  const queue = [];
+  for (const item of lineItems) {
+    const order = item.order || {};
+    if (!isPaidOrder(order)) continue;
+    queue.push({ orderId: order.id, quantity: item.quantity || 0, paidAt: order.orderDateTime });
+  }
+  return queue;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the FIFO allocation separate from any network call. Given the physical stock at closeout activation and the list of paid orders, sort by <code>paidAt</code> ascending, tie-break by <code>orderId</code> for determinism, then walk the list accumulating quantity. Every order that fits stays fulfillable. The first order that would push the running total over the stock, and everything after it, becomes the oversold excess. Nothing here talks to the network, so it is trivial to test with fixture data.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def allocate_fifo_stock(initial_stock, paid_orders):
+    ordered = sorted(paid_orders, key=lambda o: (o["paidAt"], o["orderId"]))
+
+    fulfillable = []
+    oversold = []
+    running_total = 0
+    over_limit = False
+
+    for order in ordered:
+        running_total += order["quantity"]
+        if not over_limit and running_total <= initial_stock:
+            fulfillable.append(order["orderId"])
+        else:
+            over_limit = True
+            oversold.append(order["orderId"])
+
+    total_quantity = sum(o["quantity"] for o in paid_orders)
+    deficit = max(0, total_quantity - initial_stock)
+
+    return {"fulfillable": fulfillable, "oversold": oversold, "deficit": deficit}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function allocateFifoStock(initialStock, paidOrders) {
+  const ordered = [...paidOrders].sort((a, b) => {
+    if (a.paidAt < b.paidAt) return -1;
+    if (a.paidAt > b.paidAt) return 1;
+    return a.orderId < b.orderId ? -1 : a.orderId > b.orderId ? 1 : 0;
+  });
+
+  const fulfillable = [];
+  const oversold = [];
+  let runningTotal = 0;
+  let overLimit = false;
+
+  for (const order of ordered) {
+    runningTotal += order.quantity;
+    if (!overLimit &amp;&amp; runningTotal <= initialStock) {
+      fulfillable.push(order.orderId);
+    } else {
+      overLimit = true;
+      oversold.push(order.orderId);
+    }
+  }
+
+  const totalQuantity = paidOrders.reduce((sum, o) => sum + o.quantity, 0);
+  const deficit = Math.max(0, totalQuantity - initialStock);
+
+  return { fulfillable, oversold, deficit };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report only, never auto-repair</h3>
+      <p>When <code>oversold</code> is not empty, log the classification and stop. The only writes this script ever makes, and only when a human has confirmed which order or orders will be cancelled, are a <code>DRY_RUN</code> guarded <code>PATCH /api/product/{id}</code> that corrects <code>availableStock</code> back to zero, never negative, and, per confirmed order, <code>POST /api/_action/order/{orderId}/state/cancel</code> followed by <code>POST /api/_action/order_transaction/{transactionId}/state/cancel</code> or <code>/refund</code> if already captured. Both are gated behind the same flag, and both only log the intended call while <code>DRY_RUN</code> is true.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def correct_available_stock(token, product_id, dry_run):
+    if dry_run:
+        log.info("DRY_RUN: would PATCH product %s availableStock to 0", product_id)
+        return
+    r = requests.patch(
+        f"{SHOPWARE_URL}/api/product/{product_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json={"availableStock": 0},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+def cancel_confirmed_order(token, order_id, transaction_id, dry_run, already_captured=False):
+    if dry_run:
+        log.info("DRY_RUN: would cancel order %s and its transaction %s", order_id, transaction_id)
+        return
+    api_post(f"/api/_action/order/{order_id}/state/cancel", token)
+    transition = "refund" if already_captured else "cancel"
+    api_post(f"/api/_action/order_transaction/{transaction_id}/state/{transition}", token)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function correctAvailableStock(token, productId, dryRun) {
+  if (dryRun) {
+    console.log(`DRY_RUN: would PATCH product ${productId} availableStock to 0`);
+    return;
+  }
+  const res = await fetch(`${SHOPWARE_URL}/api/product/${productId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ availableStock: 0 }),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product patch`);
+}
+
+async function cancelConfirmedOrder(token, orderId, transactionId, dryRun, alreadyCaptured = false) {
+  if (dryRun) {
+    console.log(`DRY_RUN: would cancel order ${orderId} and its transaction ${transactionId}`);
+    return;
+  }
+  await apiPost(`/api/_action/order/${orderId}/state/cancel`, token);
+  const transition = alreadyCaptured ? "refund" : "cancel";
+  await apiPost(`/api/_action/order_transaction/${transactionId}/state/${transition}`, token);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">7</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. For each negative-stock closeout product, pull its paid orders in chronological order, run <code>allocateFifoStock</code>, and log the classification. The repair calls only ever run against orders a human has separately confirmed, and even then only once <code>DRY_RUN</code> is explicitly set to false.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never auto-cancels or auto-refunds. It reports which paid order is the oversold excess and leaves the decision to a human. Only PATCH the product's stock, and only cancel or refund a specific order, after that decision is made, and always start with <code>DRY_RUN=true</code> so the first thing you see is the intended calls, not their effects.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, finds closeout products with negative stock, pulls each one's paid orders in FIFO order, classifies them with the pure function, and logs the guarded repair calls it would make, respecting <code>DRY_RUN</code> throughout.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopware-fixes/tree/main/overselling-closeout-concurrency" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopware-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_overselling_closeout.py</div>
+      <pre><code class="language-python">"""Find Shopware 6 closeout products oversold under concurrent checkout, and
+classify their paid orders in FIFO order, without ever auto-cancelling or
+auto-refunding a customer's order.
+
+availableStock is stock minus the sum of quantities on open orders, and the
+legacy StockUpdater recalculates and writes it with a plain SQL update per
+checkout rather than one atomic conditional decrement guarded by a row lock
+across the whole check-then-write span. Two concurrent checkouts for the same
+closeout SKU (isCloseout=true, no restock expected) can both read the same
+pre-decrement value, both pass validation, and both commit, driving
+availableStock below zero.
+
+This script finds every closeout product sitting at negative availableStock,
+pulls the paid orders that reference it in chronological order, and runs them
+through allocate_fifo_stock, a pure function, to identify which order(s) are
+legitimately fulfillable and which are the unfulfillable oversell. Report
+only. All writes (the availableStock correction and any order cancel or
+refund) are gated behind DRY_RUN, default true, and only ever run against
+orders a human has separately confirmed.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_overselling_closeout")
+
+SHOPWARE_URL = os.environ["SHOPWARE_URL"].rstrip("/")
+CLIENT_ID = os.environ["SHOPWARE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SHOPWARE_CLIENT_SECRET"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+PAID_STATES = {"paid", "paid_partially"}
+
+
+def allocate_fifo_stock(initial_stock, paid_orders):
+    """Pure decision. No I/O. Classifies paid orders against physical stock."""
+    ordered = sorted(paid_orders, key=lambda o: (o["paidAt"], o["orderId"]))
+
+    fulfillable = []
+    oversold = []
+    running_total = 0
+    over_limit = False
+
+    for order in ordered:
+        running_total += order["quantity"]
+        if not over_limit and running_total <= initial_stock:
+            fulfillable.append(order["orderId"])
+        else:
+            over_limit = True
+            oversold.append(order["orderId"])
+
+    total_quantity = sum(o["quantity"] for o in paid_orders)
+    deficit = max(0, total_quantity - initial_stock)
+
+    return {"fulfillable": fulfillable, "oversold": oversold, "deficit": deficit}
+
+
+def get_token():
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/oauth/token",
+        json={"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def api_post(path, token, body=None):
+    r = requests.post(
+        f"{SHOPWARE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def search_negative_closeout_products(token, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [
+            {"type": "equals", "field": "isCloseout", "value": True},
+            {"type": "range", "field": "availableStock", "parameters": {"lt": 0}},
+        ],
+        "associations": {"orderLineItems": {}},
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/product",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+def is_paid_order(order):
+    transactions = order.get("transactions") or []
+    return any(
+        (t.get("stateMachineState") or {}).get("technicalName") in PAID_STATES
+        for t in transactions
+    )
+
+
+def paid_orders_queue(token, product_id, limit=500):
+    body = {
+        "page": 1,
+        "limit": limit,
+        "filter": [{"type": "equals", "field": "productId", "value": product_id}],
+        "associations": {"order": {"associations": {"transactions": {}}}},
+        "sort": [{"field": "order.orderDateTime", "order": "ASC"}],
+        "total-count-mode": 1,
+    }
+    r = requests.post(
+        f"{SHOPWARE_URL}/api/search/order-line-item",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    line_items = r.json()["data"]
+
+    queue = []
+    for item in line_items:
+        order = item.get("order") or {}
+        if not is_paid_order(order):
+            continue
+        queue.append({
+            "orderId": order.get("id"),
+            "quantity": item.get("quantity", 0),
+            "paidAt": order.get("orderDateTime"),
+        })
+    return queue
+
+
+def correct_available_stock(token, product_id):
+    if DRY_RUN:
+        log.info("DRY_RUN: would PATCH product %s availableStock to 0", product_id)
+        return
+    r = requests.patch(
+        f"{SHOPWARE_URL}/api/product/{product_id}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"},
+        json={"availableStock": 0},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def cancel_confirmed_order(token, order_id, transaction_id, already_captured=False):
+    if DRY_RUN:
+        log.info("DRY_RUN: would cancel order %s and its transaction %s", order_id, transaction_id)
+        return
+    api_post(f"/api/_action/order/{order_id}/state/cancel", token)
+    transition = "refund" if already_captured else "cancel"
+    api_post(f"/api/_action/order_transaction/{transaction_id}/state/{transition}", token)
+
+
+def run():
+    token = get_token()
+    products = search_negative_closeout_products(token)
+    log.info("Found %d closeout product(s) with negative availableStock.", len(products))
+
+    for product in products:
+        attrs = product.get("attributes", product)
+        product_id = product.get("id") or attrs.get("id")
+        stock = attrs.get("stock", 0)
+
+        paid_orders = paid_orders_queue(token, product_id)
+        result = allocate_fifo_stock(stock, paid_orders)
+
+        log.info(
+            "Product %s: %d fulfillable, %d oversold, deficit=%d",
+            product_id, len(result["fulfillable"]), len(result["oversold"]), result["deficit"],
+        )
+        if result["oversold"]:
+            log.warning(
+                "Product %s has oversold order(s) needing a human decision: %s",
+                product_id, result["oversold"],
+            )
+            # Corrective action only proceeds once a human has confirmed which
+            # order(s) above are the ones being cancelled. Nothing here does
+            # that automatically. correct_available_stock(token, product_id)
+            # and cancel_confirmed_order(...) are logged-only under DRY_RUN and
+            # are meant to be invoked explicitly, per order, after that
+            # confirmation, not looped over automatically.
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-overselling-closeout.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Shopware 6 closeout products oversold under concurrent checkout, and
+ * classify their paid orders in FIFO order, without ever auto-cancelling or
+ * auto-refunding a customer's order.
+ *
+ * availableStock is stock minus the sum of quantities on open orders, and the
+ * legacy StockUpdater recalculates and writes it with a plain SQL update per
+ * checkout rather than one atomic conditional decrement guarded by a row lock
+ * across the whole check-then-write span. Two concurrent checkouts for the
+ * same closeout SKU (isCloseout=true, no restock expected) can both read the
+ * same pre-decrement value, both pass validation, and both commit, driving
+ * availableStock below zero.
+ *
+ * This script finds every closeout product sitting at negative availableStock,
+ * pulls the paid orders that reference it in chronological order, and runs
+ * them through allocateFifoStock, a pure function, to identify which order(s)
+ * are legitimately fulfillable and which are the unfulfillable oversell.
+ * Report only. All writes are gated behind DRY_RUN, default true, and only
+ * ever run against orders a human has separately confirmed.
+ *
+ * Guide: https://www.allanninal.dev/shopware/overselling-closeout-concurrency/
+ */
+import { pathToFileURL } from "node:url";
+
+const SHOPWARE_URL = (process.env.SHOPWARE_URL || "https://example.test").replace(/\/$/, "");
+const CLIENT_ID = process.env.SHOPWARE_CLIENT_ID || "dummy-client-id";
+const CLIENT_SECRET = process.env.SHOPWARE_CLIENT_SECRET || "dummy-secret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const PAID_STATES = new Set(["paid", "paid_partially"]);
+
+export function allocateFifoStock(initialStock, paidOrders) {
+  const ordered = [...paidOrders].sort((a, b) => {
+    if (a.paidAt < b.paidAt) return -1;
+    if (a.paidAt > b.paidAt) return 1;
+    return a.orderId < b.orderId ? -1 : a.orderId > b.orderId ? 1 : 0;
+  });
+
+  const fulfillable = [];
+  const oversold = [];
+  let runningTotal = 0;
+  let overLimit = false;
+
+  for (const order of ordered) {
+    runningTotal += order.quantity;
+    if (!overLimit &amp;&amp; runningTotal <= initialStock) {
+      fulfillable.push(order.orderId);
+    } else {
+      overLimit = true;
+      oversold.push(order.orderId);
+    }
+  }
+
+  const totalQuantity = paidOrders.reduce((sum, o) => sum + o.quantity, 0);
+  const deficit = Math.max(0, totalQuantity - initialStock);
+
+  return { fulfillable, oversold, deficit };
+}
+
+async function getToken() {
+  const res = await fetch(`${SHOPWARE_URL}/api/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ grant_type: "client_credentials", client_id: CLIENT_ID, client_secret: CLIENT_SECRET }),
+  });
+  if (!res.ok) throw new Error(`Shopware auth ${res.status}`);
+  const body = await res.json();
+  return body.access_token;
+}
+
+async function apiPost(path, token, body = {}) {
+  const res = await fetch(`${SHOPWARE_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on ${path}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function searchNegativeCloseoutProducts(token, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [
+      { type: "equals", field: "isCloseout", value: true },
+      { type: "range", field: "availableStock", parameters: { lt: 0 } },
+    ],
+    associations: { orderLineItems: {} },
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/product`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product search`);
+  const data = await res.json();
+  return data.data;
+}
+
+function isPaidOrder(order) {
+  const transactions = order.transactions || [];
+  return transactions.some((t) => PAID_STATES.has(t.stateMachineState?.technicalName));
+}
+
+async function paidOrdersQueue(token, productId, limit = 500) {
+  const body = {
+    page: 1,
+    limit,
+    filter: [{ type: "equals", field: "productId", value: productId }],
+    associations: { order: { associations: { transactions: {} } } },
+    sort: [{ field: "order.orderDateTime", order: "ASC" }],
+    "total-count-mode": 1,
+  };
+  const res = await fetch(`${SHOPWARE_URL}/api/search/order-line-item`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on order-line-item search`);
+  const data = await res.json();
+  const lineItems = data.data || [];
+
+  const queue = [];
+  for (const item of lineItems) {
+    const order = item.order || {};
+    if (!isPaidOrder(order)) continue;
+    queue.push({ orderId: order.id, quantity: item.quantity || 0, paidAt: order.orderDateTime });
+  }
+  return queue;
+}
+
+async function correctAvailableStock(token, productId) {
+  if (DRY_RUN) {
+    console.log(`DRY_RUN: would PATCH product ${productId} availableStock to 0`);
+    return;
+  }
+  const res = await fetch(`${SHOPWARE_URL}/api/product/${productId}`, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ availableStock: 0 }),
+  });
+  if (!res.ok) throw new Error(`Shopware ${res.status} on product patch`);
+}
+
+async function cancelConfirmedOrder(token, orderId, transactionId, alreadyCaptured = false) {
+  if (DRY_RUN) {
+    console.log(`DRY_RUN: would cancel order ${orderId} and its transaction ${transactionId}`);
+    return;
+  }
+  await apiPost(`/api/_action/order/${orderId}/state/cancel`, token);
+  const transition = alreadyCaptured ? "refund" : "cancel";
+  await apiPost(`/api/_action/order_transaction/${transactionId}/state/${transition}`, token);
+}
+
+export async function run() {
+  const token = await getToken();
+  const products = await searchNegativeCloseoutProducts(token);
+  console.log(`Found ${products.length} closeout product(s) with negative availableStock.`);
+
+  for (const product of products) {
+    const attrs = product.attributes || product;
+    const productId = product.id || attrs.id;
+    const stock = attrs.stock || 0;
+
+    const paidOrders = await paidOrdersQueue(token, productId);
+    const result = allocateFifoStock(stock, paidOrders);
+
+    console.log(
+      `Product ${productId}: ${result.fulfillable.length} fulfillable, ${result.oversold.length} oversold, deficit=${result.deficit}`
+    );
+    if (result.oversold.length) {
+      console.warn(`Product ${productId} has oversold order(s) needing a human decision: ${result.oversold.join(", ")}`);
+      // Corrective action only proceeds once a human has confirmed which
+      // order(s) above are the ones being cancelled. Nothing here does that
+      // automatically. correctAvailableStock(token, productId) and
+      // cancelConfirmedOrder(...) are logged-only under DRY_RUN and are meant
+      // to be invoked explicitly, per order, after that confirmation, not
+      // looped over automatically.
+    }
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The FIFO allocation is the part most worth testing, because it decides which order gets reported as the oversold excess. Because <code>allocate_fifo_stock</code> is pure and takes only plain data, the test needs no network, no Shopware store, and no message queue.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_allocate_fifo_stock.py</div>
+      <pre><code class="language-python">from reconcile_overselling_closeout import allocate_fifo_stock
+
+
+def po(order_id, quantity, paid_at):
+    return {"orderId": order_id, "quantity": quantity, "paidAt": paid_at}
+
+
+def test_all_fulfillable_when_stock_covers_everything():
+    orders = [po("o1", 1, "2026-07-01T10:00:00Z"), po("o2", 1, "2026-07-01T10:00:01Z")]
+    result = allocate_fifo_stock(5, orders)
+    assert result["fulfillable"] == ["o1", "o2"]
+    assert result["oversold"] == []
+    assert result["deficit"] == 0
+
+
+def test_oversold_when_two_concurrent_checkouts_exceed_stock():
+    orders = [po("o1", 1, "2026-07-01T10:00:00.000Z"), po("o2", 1, "2026-07-01T10:00:00.001Z")]
+    result = allocate_fifo_stock(1, orders)
+    assert result["fulfillable"] == ["o1"]
+    assert result["oversold"] == ["o2"]
+    assert result["deficit"] == 1
+
+
+def test_tie_break_by_order_id_when_paid_at_matches():
+    orders = [po("o2", 1, "2026-07-01T10:00:00Z"), po("o1", 1, "2026-07-01T10:00:00Z")]
+    result = allocate_fifo_stock(1, orders)
+    assert result["fulfillable"] == ["o1"]
+    assert result["oversold"] == ["o2"]
+
+
+def test_deficit_never_negative_when_stock_exceeds_demand():
+    orders = [po("o1", 2, "2026-07-01T10:00:00Z")]
+    result = allocate_fifo_stock(10, orders)
+    assert result["deficit"] == 0
+
+
+def test_everything_after_first_overflow_is_oversold():
+    orders = [
+        po("o1", 2, "2026-07-01T10:00:00Z"),
+        po("o2", 2, "2026-07-01T10:00:01Z"),
+        po("o3", 1, "2026-07-01T10:00:02Z"),
+    ]
+    result = allocate_fifo_stock(3, orders)
+    assert result["fulfillable"] == ["o1"]
+    assert result["oversold"] == ["o2", "o3"]
+    assert result["deficit"] == 2
+
+
+def test_no_paid_orders_means_nothing_oversold():
+    result = allocate_fifo_stock(5, [])
+    assert result["fulfillable"] == []
+    assert result["oversold"] == []
+    assert result["deficit"] == 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">allocate-fifo-stock.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { allocateFifoStock } from "./reconcile-overselling-closeout.js";
+
+const po = (orderId, quantity, paidAt) => ({ orderId, quantity, paidAt });
+
+test("all fulfillable when stock covers everything", () => {
+  const orders = [po("o1", 1, "2026-07-01T10:00:00Z"), po("o2", 1, "2026-07-01T10:00:01Z")];
+  const result = allocateFifoStock(5, orders);
+  assert.deepEqual(result.fulfillable, ["o1", "o2"]);
+  assert.deepEqual(result.oversold, []);
+  assert.equal(result.deficit, 0);
+});
+
+test("oversold when two concurrent checkouts exceed stock", () => {
+  const orders = [po("o1", 1, "2026-07-01T10:00:00.000Z"), po("o2", 1, "2026-07-01T10:00:00.001Z")];
+  const result = allocateFifoStock(1, orders);
+  assert.deepEqual(result.fulfillable, ["o1"]);
+  assert.deepEqual(result.oversold, ["o2"]);
+  assert.equal(result.deficit, 1);
+});
+
+test("tie break by order id when paidAt matches", () => {
+  const orders = [po("o2", 1, "2026-07-01T10:00:00Z"), po("o1", 1, "2026-07-01T10:00:00Z")];
+  const result = allocateFifoStock(1, orders);
+  assert.deepEqual(result.fulfillable, ["o1"]);
+  assert.deepEqual(result.oversold, ["o2"]);
+});
+
+test("deficit never negative when stock exceeds demand", () => {
+  const orders = [po("o1", 2, "2026-07-01T10:00:00Z")];
+  const result = allocateFifoStock(10, orders);
+  assert.equal(result.deficit, 0);
+});
+
+test("everything after first overflow is oversold", () => {
+  const orders = [
+    po("o1", 2, "2026-07-01T10:00:00Z"),
+    po("o2", 2, "2026-07-01T10:00:01Z"),
+    po("o3", 1, "2026-07-01T10:00:02Z"),
+  ];
+  const result = allocateFifoStock(3, orders);
+  assert.deepEqual(result.fulfillable, ["o1"]);
+  assert.deepEqual(result.oversold, ["o2", "o3"]);
+  assert.equal(result.deficit, 2);
+});
+
+test("no paid orders means nothing oversold", () => {
+  const result = allocateFifoStock(5, []);
+  assert.deepEqual(result.fulfillable, []);
+  assert.deepEqual(result.oversold, []);
+  assert.equal(result.deficit, 0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash closeout</span>
+      <h4>Three units, a newsletter blast, and two paid orders</h4>
+      <p>A furniture store marked a discontinued lamp <code>isCloseout</code> with three units left, then sent it out in a closeout newsletter to twenty thousand subscribers. Within the first two minutes, four checkouts for that lamp had all read the same <code>availableStock</code> and all committed. <code>availableStock</code> settled at negative one, and support had no way to tell which of the four paid orders was the one that could not ship.</p>
+      <p>Running the reconciler found the product immediately, since <code>isCloseout=true</code> and <code>availableStock &lt; 0</code> is a narrow, cheap filter. <code>allocateFifoStock</code> sorted the four paid orders by their paid timestamp and named the exact order that arrived after the other three had already claimed the three units. Support reached out to that one customer specifically, offered a substitute item, and closed the ticket without guessing.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Marketplace sync</span>
+      <h4>A closeout SKU sold on two channels at once</h4>
+      <p>A sporting goods seller pushed the same closeout SKU to their own storefront and a marketplace integration that synced stock every few minutes rather than in real time. During the sync gap, both channels accepted orders against the same handful of remaining units, and Shopware ended up with paid orders arriving from two different sales channels within seconds of each other for a product with only one unit left.</p>
+      <p>The team ran the reconciler nightly across all closeout SKUs. When a deficit showed up, the FIFO classification gave them a clean, defensible answer for who ordered first regardless of which channel the order came through, and the team used that to decide who got the unit and who got a refund and an apology, a call the script never had to make on its own.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a closeout oversell stops being a mystery negative number and becomes a short, specific list: this product, this many units short, this exact order that cannot be fulfilled. The FIFO rule is deterministic and auditable, so the same input always produces the same answer, and the actual cancellation or refund still requires a person to look at the order and confirm it. The script's only job is to make that person's decision fast and unambiguous.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Shopware 6 oversell a closeout item during a traffic spike?</summary>
+      <p>availableStock is stock minus the quantities on open orders, and the legacy StockUpdater recalculates and writes that value with a plain SQL update rather than a single atomic conditional decrement guarded by a row lock across the whole check-then-write span. When two checkouts for the same closeout SKU happen close together, both can read the same pre-decrement availableStock, both pass the stock check, and both commit, pushing availableStock below zero.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just PATCH availableStock back to zero once I find the oversold product?</summary>
+      <p>It is safe once you have identified which paid order or orders are the actual oversold excess, because that is a business decision about which customer loses their order. The script in this guide only reports the FIFO classification and logs the PATCH and cancel calls it would make. It never fixes stock or cancels an order automatically, and every write is gated behind DRY_RUN.</p>
+    </details>
+    <details>
+      <summary>How do I decide which paid orders are legitimate and which are the oversell?</summary>
+      <p>Sort the paid orders for the affected product chronologically by paid timestamp, then walk them in that order accumulating quantity against the physical stock at the moment the closeout was activated. Every order that fits within that stock is fulfillable. The first order that would push the running total over the stock, and every order after it, is the oversold excess. This is the same FIFO rule the allocateFifoStock function in this guide implements as a pure function.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/shopware/">Browse all Shopware field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Stock storage refactoring, shopware/shopware Discussion #3172. <a href="https://github.com/shopware/shopware/discussions/3172" rel="noopener">github.com/shopware/shopware/discussions/3172</a></li>
+      <li>Race Condition in Shopware Voucher Submission, shopware/shopware Issue #11245. <a href="https://github.com/shopware/shopware/issues/11245" rel="noopener">github.com/shopware/shopware/issues/11245</a></li>
+      <li>Demystifying the StockUpdater, Shopware Community Forum. <a href="https://forum.shopware.com/t/demystifying-the-stockupdater/70474" rel="noopener">forum.shopware.com/t/demystifying-the-stockupdater/70474</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopware Developer Documentation: Available stock improvements ADR. <a href="https://developer.shopware.com/docs/resources/references/adr/2022-03-25-available-stock.html" rel="noopener">developer.shopware.com/docs/resources/references/adr/2022-03-25-available-stock.html</a></li>
+      <li>Shopware Developer Documentation: Stock Manipulation API ADR. <a href="https://developer.shopware.com/docs/resources/references/adr/2023-05-15-stock-api.html" rel="noopener">developer.shopware.com/docs/resources/references/adr/2023-05-15-stock-api.html</a></li>
+      <li>Shopware Developer Documentation: Implementing Your Own Stock Storage. <a href="https://developer.shopware.com/docs/guides/plugins/plugins/content/stock/implementing-your-own-stock-storage.html" rel="noopener">developer.shopware.com/docs/guides/plugins/plugins/content/stock/implementing-your-own-stock-storage.html</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopware orders, inventory, the state machine, or the message queue that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle an overselling mess?</h3>
+    <p>If this saved you a confusing negative stock number or an awkward call to a customer, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopware/">Back to all Shopware field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopware.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopware/assets/shopware.js" defer></script>
+</body>
+</html>
