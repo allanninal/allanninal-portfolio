@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Webhook Payloads That Are Never Actually Verified</title>
+<meta name="description" content="A BigCommerce webhook callback can be forged by anyone who finds the destination URL, because the hash field is not a documented, verifiable HMAC. Learn why webhook verification quietly fails and build a Python or Node.js check that trusts a shared secret header instead.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/webhook-payload-not-verified/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Webhook Payloads That Are Never Actually Verified">
+<meta property="og:description" content="Why the hash field on a BigCommerce webhook is not real verification, and a safe Python or Node.js check that trusts a shared secret header before any order or inventory mutation runs.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/webhook-payload-not-verified/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/webhook-payload-not-verified/#article","headline":"Fix BigCommerce Webhook Payloads That Are Never Actually Verified","description":"Why the hash field on a BigCommerce webhook callback is not a documented, verifiable HMAC, and a safe Python or Node.js check that trusts a shared secret header before any order or inventory mutation runs.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/webhook-payload-not-verified/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Webhooks","keywords":"BigCommerce webhook verification, hash field, shared secret header, headers hooks, X-Auth-Token, forged webhook, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Webhook payload not verified","item":"https://www.allanninal.dev/bigcommerce/webhook-payload-not-verified/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Does BigCommerce sign webhook payloads with an HMAC I can verify?","acceptedAnswer":{"@type":"Answer","text":"Not in the way some other platforms do. The payload includes a hash field, but BigCommerce has never published a supported formula for validating it, so its presence is not proof the request came from BigCommerce. The documented safeguard is the optional headers object you set when creating the hook with POST /v3/hooks, which BigCommerce echoes back on every callback as a shared secret."}},{"@type":"Question","name":"What happens if I never set a headers secret on my webhook?","acceptedAnswer":{"@type":"Answer","text":"Anyone who discovers your destination URL can POST a forged payload with a fake scope, data.id, and store_id, and your app will act on it as if BigCommerce sent it. There is nothing provisioned to check against, so GET /v3/hooks will show an empty or missing headers object and the request must be treated as untrusted."}},{"@type":"Question","name":"Is checking the shared secret header enough if I check it after processing the payload?","acceptedAnswer":{"@type":"Answer","text":"No. Verify-after-use is equivalent to no verification, because the order or inventory mutation already ran on unverified data by the time the check happens. The secret header comparison, done with constant-time equality, must run before any call that changes state, such as PUT /v2/orders/{id} or a V3 inventory adjustment."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Webhooks</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Webhooks</p>
+    <h1>Webhook payload not verified</h1>
+    <p class="lead">Your app registered a webhook, BigCommerce POSTs order and product events to the destination URL, and the handler trusts whatever body shows up. It looks fine until someone finds that URL and sends a payload of their own. BigCommerce webhook callbacks are not signed with a documented, verifiable HMAC the way some other platforms sign their webhooks, so a handler that trusts the JSON body without checking anything else has no real way to know the request came from BigCommerce at all. Here is why that gap exists and a small check that closes it with the one safeguard BigCommerce actually supports.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce Webhooks v3</span>
+      <span class="chip">Safe by default (verify before mutate)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce webhook callbacks include a <code>hash</code> field, but BigCommerce has never published a supported formula for validating it, so it is not real verification no matter how it looks. The actual documented safeguard is the optional <code>headers</code> object you can set when creating the hook with <code>POST /v3/hooks</code>. BigCommerce echoes that header back on every callback as a shared secret. If you never set it, or your handler never checks it before acting on the payload, anyone who finds your destination URL can POST a forged <code>scope</code>, <code>data.id</code>, and <code>store_id</code> that your app will treat as real. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A webhook is only useful if you can trust where it came from. Some platforms sign the payload with an HMAC computed from a secret only you and the platform know, so your handler can recompute that signature and compare it before doing anything. BigCommerce webhook callbacks do carry a <code>hash</code> field that looks like it might be that signature. It is described as a JSON and SHA hash of the body, but BigCommerce has never published the formula, the key, or a supported way to recompute and check it. Treating its presence as proof of anything is a guess, not verification.</p>
+  <p>What BigCommerce actually gives you is different and easy to miss. When you create a hook with <code>POST /v3/hooks</code>, you can pass a <code>headers</code> object, a set of header name and value pairs. BigCommerce stores that and sends the same headers back on every subsequent callback to that hook's <code>destination</code>. That is the shared secret mechanism. If a developer never sets <code>headers</code> when creating the hook, there is nothing to check, and the endpoint has to accept the body on faith. If the header is set but the handler never compares it, or compares it only after already acting on the payload, the protection exists on paper but never actually runs.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An attacker who finds the destination URL POSTs a forged payload with a fake scope and order id, the handler trusts the JSON body because there is no secret header configured or checked, and the forged request mutates the order or inventory.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55607a"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="170" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="95" y="47" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Attacker finds</text>
+      <text x="95" y="65" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">the destination URL</text>
+      <line x1="183" y1="52" x2="222" y2="52" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="225" y="20" width="180" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="315" y="47" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Forged POST</text>
+      <text x="315" y="65" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">fake scope, data.id</text>
+      <line x1="408" y1="52" x2="450" y2="52" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="429" y="34" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="429" y="80" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">no secret set or checked</text>
+      <rect x="453" y="20" width="180" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="543" y="47" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Handler trusts body</text>
+      <text x="543" y="65" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">hash field looks legit</text>
+      <line x1="95" y1="84" x2="95" y2="120" stroke="#55607a" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="122" width="255" height="64" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="137" y="149" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">GET /v3/hooks</text>
+      <text x="137" y="167" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">headers object empty</text>
+      <rect x="453" y="122" width="180" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="543" y="149" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">State mutated</text>
+      <text x="543" y="167" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">order or inventory changed</text>
+      <line x1="268" y1="154" x2="440" y2="154" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5"></line>
+      <text x="354" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f" font-weight="700">nothing to check</text>
+      <rect x="240" y="196" width="280" height="24" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="212" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">App acted on a payload it never verified</text>
+    </svg>
+    <figcaption>The hash field looks like proof of origin but is not one BigCommerce documents a way to check. Without a provisioned and enforced secret header, the endpoint has no way to tell a forged request from a real one.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Nothing in the delivery mechanism forces verification on you, and the payload itself invites the mistake. A few ordinary ways stores end up exposed:</p>
+  <ul>
+    <li>The hook was created with <code>POST /v3/hooks</code> and no <code>headers</code> object at all, so there is no shared secret provisioned for the endpoint to check against in the first place.</li>
+    <li>A developer sees the <code>hash</code> field in the payload, assumes it is an HMAC like other platforms use, and treats its mere presence as verification, even though BigCommerce publishes no formula to recompute or validate it.</li>
+    <li>A secret header was configured, but the receiver code reads and acts on <code>store_id</code>, <code>producer</code>, <code>scope</code>, <code>data.type</code>, and <code>data.id</code>, for example calling <code>PUT /v2/orders/{id}</code> to change <code>status_id</code> or a V3 inventory adjustment, before the header comparison ever runs.</li>
+    <li>The header check exists somewhere in the code, but the comparison is a plain string equality rather than constant-time, or it runs after the mutation instead of before it, so it protects nothing in practice.</li>
+  </ul>
+  <p>This is a common source of confusion because the payload looks self-verifying. Store owners and developers alike assume a hash field means BigCommerce is proving authenticity the way a signed webhook would, when the documented mechanism is really the header BigCommerce echoes back, and only if you asked for one. See the citations at the end for the exact references.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot make BigCommerce publish an HMAC formula it does not document, and you should not build trust on the <code>hash</code> field pretending it is one. The safe pattern is not "check that the payload has a hash." It is "provision a shared secret header on every hook, and reject any callback whose header does not match, before touching any data." We do that with a pure classification function that separates the decision from the HTTP handling, so the logic is easy to read and easy to test.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change anything about how BigCommerce delivers webhooks. We make sure every hook is created or updated with a <code>headers</code> secret, and we add a check in front of the handler that rejects any inbound request whose header does not match that secret, using constant-time comparison, before any order or inventory mutation runs.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. An inbound webhook POST is checked against the hook's configured secret header. If no secret was ever provisioned it is unverifiable. If the header does not match it is rejected. If it matches but the mutation already ran before the check it is rejected. Otherwise it is trusted and processing continues.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Inbound POST</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">headers, body</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Load hook config</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">GET /v3/hooks, headers</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="355" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Compare secret header</text>
+      <text x="355" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">constant-time equality</text>
+      <line x1="450" y1="138" x2="492" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="585,106 672,138 585,170 498,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="585" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Matches, before</text>
+      <text x="585" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">any mutation?</text>
+      <text x="675" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="672" y1="138" x2="700" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="588" y="198" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">no, reject</text>
+      <line x1="585" y1="170" x2="585" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">TRUSTED</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">mutation proceeds</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Only a request whose configured secret header matches, checked before any order or inventory mutation, reaches the business logic. Everything else is unverifiable, rejected, or flagged for having verified too late.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a BigCommerce API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, and generate a token with the Webhooks read and write scopes. Keep the store hash and the token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+export WEBHOOK_SECRET_HEADER_NAME="X-Webhook-Secret"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+export WEBHOOK_SECRET_HEADER_NAME="X-Webhook-Secret"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the BigCommerce REST API</h3>
+      <p>Every call carries your token in the <code>X-Auth-Token</code> header against <code>https://api.bigcommerce.com/stores/{store_hash}/</code>. A small helper sends the request, raises on a non-2xx response, and returns the parsed body. We reuse this helper to list and provision hooks.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/"
+
+def bc(method, path, **kwargs):
+    r = requests.request(
+        method, BASE + path.lstrip("/"),
+        headers={"X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json"},
+        timeout=30, **kwargs,
+    )
+    r.raise_for_status()
+    return r.json() if r.content else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/`;
+
+async function bc(method, path, body) {
+  const res = await fetch(BASE + path.replace(/^\//, ""), {
+    method,
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Find hooks with no secret provisioned</h3>
+      <p>Call <code>GET /v3/hooks</code> and check the <code>headers</code> field on each record. A hook whose <code>headers</code> is empty or missing has nothing configured to check against, so every callback to it must be treated as unverifiable no matter how trustworthy the body looks.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def all_hooks():
+    resp = bc("GET", "/v3/hooks?limit=250")
+    return (resp or {}).get("data", [])
+
+def hooks_missing_secret():
+    """Hooks with no headers object at all, meaning nothing was ever provisioned to check."""
+    return [h for h in all_hooks() if not h.get("headers")]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function allHooks() {
+  const resp = await bc("GET", "/v3/hooks?limit=250");
+  return resp?.data || [];
+}
+
+async function hooksMissingSecret() {
+  // Hooks with no headers object at all, meaning nothing was ever provisioned to check.
+  return (await allHooks()).filter((h) => !h.headers || Object.keys(h.headers).length === 0);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the trust decision in its own function that takes the hook's configured <code>headers</code> and the incoming request's headers, secret key name, and whether a mutation already ran before the check. It never touches the network. A pure function like this is easy to read and easy to test, which we do later.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">import hmac
+
+def classify_webhook_request(hook, incoming):
+    """hook: {"headers": {name: value, ...}} or {} if none configured.
+    incoming: {"headers": {...}, "secretKeyName": str, "mutationRanBeforeCheck": bool}
+    """
+    hook_headers = hook.get("headers") or {}
+    if not hook_headers:
+        return "UNVERIFIABLE_NO_SECRET"
+
+    key = incoming["secretKeyName"]
+    expected = hook_headers.get(key)
+    actual = (incoming.get("headers") or {}).get(key)
+    if expected is None or actual is None or not hmac.compare_digest(expected, actual):
+        return "REJECT_MISMATCH"
+
+    if incoming.get("mutationRanBeforeCheck"):
+        return "REJECT_USED_BEFORE_CHECK"
+
+    return "TRUSTED"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">import { timingSafeEqual } from "node:crypto";
+
+function constantTimeEqual(a, b) {
+  const bufA = Buffer.from(String(a), "utf8");
+  const bufB = Buffer.from(String(b), "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+export function classifyWebhookRequest(hook, incoming) {
+  const hookHeaders = hook.headers || {};
+  if (Object.keys(hookHeaders).length === 0) return "UNVERIFIABLE_NO_SECRET";
+
+  const key = incoming.secretKeyName;
+  const expected = hookHeaders[key];
+  const actual = (incoming.headers || {})[key];
+  if (expected == null || actual == null || !constantTimeEqual(expected, actual)) {
+    return "REJECT_MISMATCH";
+  }
+
+  if (incoming.mutationRanBeforeCheck) return "REJECT_USED_BEFORE_CHECK";
+
+  return "TRUSTED";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Provision the secret on hooks that are missing one</h3>
+      <p>For a hook whose <code>headers</code> is empty, generate a secret and set it with <code>PUT /v3/hooks/{id}</code> alongside <code>is_active: true</code>. Never silently rotate a secret that already exists, since that would break a receiver that already checks it correctly. Only fill the gap.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">import secrets
+
+def provision_secret(hook_id, header_name):
+    value = secrets.token_hex(32)
+    return bc("PUT", f"/v3/hooks/{hook_id}", json={
+        "headers": {header_name: value},
+        "is_active": True,
+    })</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">import { randomBytes } from "node:crypto";
+
+async function provisionSecret(hookId, headerName) {
+  const value = randomBytes(32).toString("hex");
+  return bc("PUT", `/v3/hooks/${hookId}`, {
+    headers: { [headerName]: value },
+    is_active: true,
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The scan job lists every hook, logs the ones missing a secret, and only writes a new one when <code>DRY_RUN</code> is off. Leave <code>DRY_RUN=true</code> on the first runs so it only reports which hook ids would be provisioned. The receiver-side check in step 4 is app code that always runs, and it must execute before any order or inventory mutation, not folded into the API scan job.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never overwrite a hook's existing <code>headers</code> secret without confirming it is actually missing, and always run the constant-time header comparison before any call that mutates state, such as <code>PUT /v2/orders/{id}</code> or a V3 inventory adjustment.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and keeps the trust decision as a pure, always-on check that never depends on the BigCommerce API being reachable.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/webhook-payload-not-verified" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">verify_webhook_secret.py</div>
+      <pre><code class="language-python">"""Classify BigCommerce webhook requests so a handler never trusts an unverified payload.
+
+BigCommerce webhook callbacks carry a hash field, but BigCommerce has never published
+a supported formula for validating it, so its presence is not real verification. The
+documented safeguard is the optional headers object you set when creating a hook with
+POST /v3/hooks, which BigCommerce echoes back on every callback as a shared secret.
+This scans hooks for a missing secret, provisions one when confirmed missing, and
+exposes a pure classification function a receiver can use before ever acting on the
+payload. Run the scan on a schedule. Safe to run again and again.
+"""
+import os
+import hmac
+import secrets
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("verify_webhook_secret")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/"
+HEADER_NAME = os.environ.get("WEBHOOK_SECRET_HEADER_NAME", "X-Webhook-Secret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def bc(method, path, **kwargs):
+    r = requests.request(
+        method, BASE + path.lstrip("/"),
+        headers={"X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json"},
+        timeout=30, **kwargs,
+    )
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+
+def classify_webhook_request(hook, incoming):
+    """Pure decision function. No network calls.
+
+    hook: {"headers": {name: value, ...}} or {} / missing if none configured
+    incoming: {"headers": {...}, "secretKeyName": str, "mutationRanBeforeCheck": bool}
+    """
+    hook_headers = hook.get("headers") or {}
+    if not hook_headers:
+        return "UNVERIFIABLE_NO_SECRET"
+
+    key = incoming["secretKeyName"]
+    expected = hook_headers.get(key)
+    actual = (incoming.get("headers") or {}).get(key)
+    if expected is None or actual is None or not hmac.compare_digest(expected, actual):
+        return "REJECT_MISMATCH"
+
+    if incoming.get("mutationRanBeforeCheck"):
+        return "REJECT_USED_BEFORE_CHECK"
+
+    return "TRUSTED"
+
+
+def all_hooks():
+    resp = bc("GET", "/v3/hooks?limit=250")
+    return (resp or {}).get("data", [])
+
+
+def hooks_missing_secret():
+    """Hooks with no headers object at all, meaning nothing was ever provisioned to check."""
+    return [h for h in all_hooks() if not h.get("headers")]
+
+
+def provision_secret(hook_id, header_name):
+    value = secrets.token_hex(32)
+    return bc("PUT", f"/v3/hooks/{hook_id}", json={
+        "headers": {header_name: value},
+        "is_active": True,
+    })
+
+
+def run():
+    fixed = 0
+    for hook in hooks_missing_secret():
+        log.warning(
+            "Hook %s scope=%s destination=%s has no secret header. %s",
+            hook.get("id"), hook.get("scope"), hook.get("destination"),
+            "would provision" if DRY_RUN else "provisioning",
+        )
+        if not DRY_RUN:
+            provision_secret(hook["id"], HEADER_NAME)
+        fixed += 1
+    log.info("Done. %d hook(s) %s.", fixed, "to provision" if DRY_RUN else "provisioned")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">verify-webhook-secret.js</div>
+      <pre><code class="language-javascript">/**
+ * Classify BigCommerce webhook requests so a handler never trusts an unverified payload.
+ *
+ * BigCommerce webhook callbacks carry a hash field, but BigCommerce has never published
+ * a supported formula for validating it, so its presence is not real verification. The
+ * documented safeguard is the optional headers object you set when creating a hook with
+ * POST /v3/hooks, which BigCommerce echoes back on every callback as a shared secret.
+ * This scans hooks for a missing secret, provisions one when confirmed missing, and
+ * exposes a pure classification function a receiver can use before ever acting on the
+ * payload. Run the scan on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/webhook-payload-not-verified/
+ */
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example";
+const TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "dummy_token";
+const BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/`;
+const HEADER_NAME = process.env.WEBHOOK_SECRET_HEADER_NAME || "X-Webhook-Secret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+function constantTimeEqual(a, b) {
+  const bufA = Buffer.from(String(a), "utf8");
+  const bufB = Buffer.from(String(b), "utf8");
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Pure decision function. No network calls.
+ * hook: { headers?: Record<string,string> } or {} if none configured
+ * incoming: { headers: Record<string,string>, secretKeyName: string, mutationRanBeforeCheck: boolean }
+ */
+export function classifyWebhookRequest(hook, incoming) {
+  const hookHeaders = hook.headers || {};
+  if (Object.keys(hookHeaders).length === 0) return "UNVERIFIABLE_NO_SECRET";
+
+  const key = incoming.secretKeyName;
+  const expected = hookHeaders[key];
+  const actual = (incoming.headers || {})[key];
+  if (expected == null || actual == null || !constantTimeEqual(expected, actual)) {
+    return "REJECT_MISMATCH";
+  }
+
+  if (incoming.mutationRanBeforeCheck) return "REJECT_USED_BEFORE_CHECK";
+
+  return "TRUSTED";
+}
+
+async function bc(method, path, body) {
+  const res = await fetch(BASE + path.replace(/^\//, ""), {
+    method,
+    headers: { "X-Auth-Token": TOKEN, "Content-Type": "application/json", "Accept": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function allHooks() {
+  const resp = await bc("GET", "/v3/hooks?limit=250");
+  return resp?.data || [];
+}
+
+async function hooksMissingSecret() {
+  return (await allHooks()).filter((h) => !h.headers || Object.keys(h.headers).length === 0);
+}
+
+async function provisionSecret(hookId, headerName) {
+  const value = randomBytes(32).toString("hex");
+  return bc("PUT", `/v3/hooks/${hookId}`, {
+    headers: { [headerName]: value },
+    is_active: true,
+  });
+}
+
+export async function run() {
+  let fixed = 0;
+  for (const hook of await hooksMissingSecret()) {
+    console.warn(
+      `Hook ${hook.id} scope=${hook.scope} destination=${hook.destination} has no secret header. ${DRY_RUN ? "would provision" : "provisioning"}`
+    );
+    if (!DRY_RUN) await provisionSecret(hook.id, HEADER_NAME);
+    fixed++;
+  }
+  console.log(`Done. ${fixed} hook(s) ${DRY_RUN ? "to provision" : "provisioned"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classification rule is the part most worth testing, because it decides whether an inbound request is allowed to reach any order or inventory mutation. Because we kept <code>classify_webhook_request</code> pure, no I/O at all, the test needs no network and no BigCommerce store. It just feeds in fixture objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_webhook_secret_check.py</div>
+      <pre><code class="language-python">from verify_webhook_secret import classify_webhook_request
+
+
+def hook(**over):
+    base = {"headers": {"X-Webhook-Secret": "correct-secret"}}
+    base.update(over)
+    return base
+
+
+def incoming(**over):
+    base = {"headers": {"X-Webhook-Secret": "correct-secret"}, "secretKeyName": "X-Webhook-Secret", "mutationRanBeforeCheck": False}
+    base.update(over)
+    return base
+
+
+def test_unverifiable_when_hook_has_no_headers():
+    assert classify_webhook_request({}, incoming()) == "UNVERIFIABLE_NO_SECRET"
+
+
+def test_unverifiable_when_hook_headers_empty():
+    assert classify_webhook_request(hook(headers={}), incoming()) == "UNVERIFIABLE_NO_SECRET"
+
+
+def test_reject_when_header_missing_from_request():
+    req = incoming(headers={})
+    assert classify_webhook_request(hook(), req) == "REJECT_MISMATCH"
+
+
+def test_reject_when_header_value_wrong():
+    req = incoming(headers={"X-Webhook-Secret": "forged-value"})
+    assert classify_webhook_request(hook(), req) == "REJECT_MISMATCH"
+
+
+def test_reject_when_mutation_ran_before_check():
+    req = incoming(mutationRanBeforeCheck=True)
+    assert classify_webhook_request(hook(), req) == "REJECT_USED_BEFORE_CHECK"
+
+
+def test_trusted_when_match_and_checked_first():
+    assert classify_webhook_request(hook(), incoming()) == "TRUSTED"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">webhook-secret-check.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyWebhookRequest } from "./verify-webhook-secret.js";
+
+const hook = (over = {}) => ({ headers: { "X-Webhook-Secret": "correct-secret" }, ...over });
+
+const incoming = (over = {}) => ({
+  headers: { "X-Webhook-Secret": "correct-secret" },
+  secretKeyName: "X-Webhook-Secret",
+  mutationRanBeforeCheck: false,
+  ...over,
+});
+
+test("unverifiable when hook has no headers", () =&gt; {
+  assert.equal(classifyWebhookRequest({}, incoming()), "UNVERIFIABLE_NO_SECRET");
+});
+
+test("unverifiable when hook headers empty", () =&gt; {
+  assert.equal(classifyWebhookRequest(hook({ headers: {} }), incoming()), "UNVERIFIABLE_NO_SECRET");
+});
+
+test("reject when header missing from request", () =&gt; {
+  const req = incoming({ headers: {} });
+  assert.equal(classifyWebhookRequest(hook(), req), "REJECT_MISMATCH");
+});
+
+test("reject when header value wrong", () =&gt; {
+  const req = incoming({ headers: { "X-Webhook-Secret": "forged-value" } });
+  assert.equal(classifyWebhookRequest(hook(), req), "REJECT_MISMATCH");
+});
+
+test("reject when mutation ran before check", () =&gt; {
+  const req = incoming({ mutationRanBeforeCheck: true });
+  assert.equal(classifyWebhookRequest(hook(), req), "REJECT_USED_BEFORE_CHECK");
+});
+
+test("trusted when match and checked first", () =&gt; {
+  assert.equal(classifyWebhookRequest(hook(), incoming()), "TRUSTED");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">No secret provisioned</span>
+      <h4>The fulfillment webhook anyone could call</h4>
+      <p>A merchant's fulfillment app registered a <code>store/order/created</code> hook during setup, but the install script never passed a <code>headers</code> object to <code>POST /v3/hooks</code>. The handler trusted every payload that arrived, including the <code>hash</code> field, treating it as if it proved the request came from BigCommerce. A routine security review found the destination URL was guessable from a public asset path, and there was nothing stopping a forged order id from triggering a shipment.</p>
+      <p>Running the hook scan surfaced the hook with an empty <code>headers</code> object immediately. The team provisioned a secret with <code>PUT /v3/hooks/{id}</code>, deployed the constant-time header check ahead of the fulfillment call, and confirmed with <code>GET /v3/hooks</code> that the secret was in place before closing the finding.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Checked too late</span>
+      <h4>The inventory sync that verified after it already wrote</h4>
+      <p>A different integration did set a secret header on its hook, and the receiver did check it, but the check ran after the handler had already parsed <code>data.id</code> and queued a V3 inventory adjustment on a background job. A malformed or forged request could still enqueue a bad adjustment before the mismatch was ever detected, since the work was already dispatched.</p>
+      <p>Reordering the handler so the constant-time comparison ran first, before the adjustment was queued, turned <code>REJECT_USED_BEFORE_CHECK</code> from a real risk into a state the code could no longer reach. Nothing about the BigCommerce side needed to change, only the order of operations in the receiver.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this is in place, every hook has a <code>headers</code> secret provisioned and confirmed, and the receiver rejects any request whose header does not match before it ever reads <code>data.id</code>, <code>scope</code>, or touches an order or inventory record. The <code>hash</code> field stays exactly what it is, informational, and the shared secret header is the one thing actually standing between your app and a forged payload.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Does BigCommerce sign webhook payloads with an HMAC I can verify?</summary>
+      <p>Not in the way some other platforms do. The payload includes a hash field, but BigCommerce has never published a supported formula for validating it, so its presence is not proof the request came from BigCommerce. The documented safeguard is the optional headers object you set when creating the hook with POST /v3/hooks, which BigCommerce echoes back on every callback as a shared secret.</p>
+    </details>
+    <details>
+      <summary>What happens if I never set a headers secret on my webhook?</summary>
+      <p>Anyone who discovers your destination URL can POST a forged payload with a fake scope, data.id, and store_id, and your app will act on it as if BigCommerce sent it. There is nothing provisioned to check against, so GET /v3/hooks will show an empty or missing headers object and the request must be treated as untrusted.</p>
+    </details>
+    <details>
+      <summary>Is checking the shared secret header enough if I check it after processing the payload?</summary>
+      <p>No. Verify-after-use is equivalent to no verification, because the order or inventory mutation already ran on unverified data by the time the check happens. The secret header comparison, done with constant-time equality, must run before any call that changes state, such as PUT /v2/orders/{id} or a V3 inventory adjustment.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+    <a href="/shopify/transactions-total-mismatch/">Shopify orders whose transactions total does not match</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: Webhooks Overview. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks" rel="noopener">developer.bigcommerce.com/docs/integrations/webhooks</a></li>
+      <li>BigCommerce Docs: Webhooks v3 API Reference. <a href="https://developer.bigcommerce.com/docs/rest-management/webhooks" rel="noopener">developer.bigcommerce.com/docs/rest-management/webhooks</a></li>
+      <li>BigCommerce Developer Blog (Medium): The Practitioner's Guide to BigCommerce Webhooks. <a href="https://medium.com/bigcommerce-developer-blog/the-practitioners-guide-to-bigcommerce-webhooks-affd16fb09be" rel="noopener">medium.com/bigcommerce-developer-blog the-practitioners-guide-to-bigcommerce-webhooks</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Docs (REST Management API Reference): Create a Webhook. <a href="https://developer.bigcommerce.com/docs/rest-management/webhooks" rel="noopener">developer.bigcommerce.com/docs/rest-management/webhooks</a></li>
+      <li>BigCommerce Developer Center: Webhooks Tutorial. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks/tutorial" rel="noopener">developer.bigcommerce.com/docs/integrations/webhooks/tutorial</a></li>
+      <li>BigCommerce Docs (REST Management API Reference): Orders API. <a href="https://developer.bigcommerce.com/docs/rest-management/orders" rel="noopener">developer.bigcommerce.com/docs/rest-management/orders</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, inventory, webhooks, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this close a gap in your webhook security?</h3>
+    <p>If this saved you from a forged payload or a nasty security review finding, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
