@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Shopify Dunning That Never Retries a Failed Charge</title>
+<meta name="description" content="A subscription charge failed and Shopify left it there. Learn why dunning does not retry on its own and build a Python or Node.js script that schedules safe, backed off retries with the Admin GraphQL API.">
+<link rel="canonical" href="https://www.allanninal.dev/shopify/dunning-never-retries-a-failed-charge/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Shopify Dunning That Never Retries a Failed Charge">
+<meta property="og:description" content="Why a failed subscription charge just sits there, and a safe Python or Node.js script that schedules backed off retries with subscriptionBillingAttemptCreate.">
+<meta property="og:url" content="https://www.allanninal.dev/shopify/dunning-never-retries-a-failed-charge/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopify/assets/shopify.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopify/dunning-never-retries-a-failed-charge/#article","headline":"Fix Shopify Dunning That Never Retries a Failed Charge","description":"Why a failed subscription charge just sits there, and a safe Python or Node.js script that schedules backed off retries with subscriptionBillingAttemptCreate on the Admin GraphQL API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopify/dunning-never-retries-a-failed-charge/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Subscriptions and billing","keywords":"Shopify dunning, failed subscription charge, subscriptionBillingAttemptCreate, lastPaymentStatus, billing retry backoff, Shopify Admin GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Shopify field notes","item":"https://www.allanninal.dev/shopify/"},{"@type":"ListItem","position":2,"name":"Dunning never retries a failed charge","item":"https://www.allanninal.dev/shopify/dunning-never-retries-a-failed-charge/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does not Shopify retry a failed subscription charge on its own?","acceptedAnswer":{"@type":"Answer","text":"Shopify records the outcome of a billing attempt on the subscription contract as lastPaymentStatus FAILED, but creating a new attempt is a separate action. Nothing in the base platform schedules that next attempt for you, so a contract can sit on FAILED indefinitely unless a script or app calls subscriptionBillingAttemptCreate again."}},{"@type":"Question","name":"Why use a backoff schedule instead of retrying every day?","acceptedAnswer":{"@type":"Answer","text":"A card that just failed because of insufficient funds or a bank flag is unlikely to succeed a minute later, and retrying too often looks like card testing to the bank and can get the payment method blocked. A schedule that waits longer between each attempt, such as 1, 3, then 7 days, gives the customer time to fix the problem while still recovering the charge automatically when possible."}},{"@type":"Question","name":"What happens after the maximum number of retries is reached?","acceptedAnswer":{"@type":"Answer","text":"The script stops creating automatic retries once the backoff schedule is exhausted and leaves the contract exactly as it is. That is deliberate. At that point the more useful move is a human step, such as an email asking the customer to update their card, rather than another automatic charge against a payment method that has already failed several times."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopify/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopify</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopify/">Field notes</a> / Subscriptions and billing</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Subscriptions and billing</p>
+    <h1>Dunning never retries a failed charge</h1>
+    <p class="lead">A customer's card declined, or the bank flagged the charge, or the gateway timed out for a second. Shopify marks the subscription contract's last payment as failed and moves on. Nothing tries the charge again. The subscription just sits there, unpaid, until a human happens to notice. Here is why that gap exists and a small script that retries failed charges on a safe backoff, so recoverable revenue actually gets recovered.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin GraphQL API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Shopify records a failed subscription charge as <code>lastPaymentStatus</code> FAILED on the contract, but it never schedules another attempt for you. Run a small Python or Node.js script that lists active contracts, reads each contract's own <code>billingAttempts</code> history to count how many times in a row it has failed and how long ago the last try was, and calls <code>subscriptionBillingAttemptCreate</code> again once the right number of days have passed on a backoff schedule of 1, 3, then 7 days. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When Shopify bills a subscription on schedule and the charge goes through, it creates an order and the contract carries on quietly. When the charge fails, Shopify records that outcome too, setting the contract's <code>lastPaymentStatus</code> to FAILED. That part works fine.</p>
+  <p>What does not happen automatically is a second try. Creating a billing attempt is its own action, separate from noticing that the last one failed. Nothing in the base platform watches a failed contract and decides on its own to attempt the charge again later. So a subscription that failed once, for a reason as ordinary as insufficient funds on payday, can sit unpaid for weeks, quietly leaking revenue that a simple retry would very likely have recovered.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A subscription charge fails, Shopify marks the contract lastPaymentStatus as failed, but nothing schedules another attempt, so the subscription sits unpaid.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a9a92"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="155" height="66" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="87" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14211d">Charge runs</text>
+      <text x="87" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">on billing day</text>
+      <line x1="168" y1="103" x2="210" y2="103" stroke="#8a9a92" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="213" y="70" width="160" height="66" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="293" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14211d">Card declines</text>
+      <text x="293" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">funds, bank, timeout</text>
+      <line x1="376" y1="103" x2="445" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">nothing retries it</text>
+      <rect x="448" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">lastPaymentStatus</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">FAILED, and stays that way</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Revenue</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">lost</text>
+      <line x1="611" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The charge failed once, Shopify recorded it, and then nothing happened. Recoverable revenue sits there until a human notices.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Shopify's subscription billing model separates two ideas that feel like one: recording what happened to an attempt, and deciding to make a new attempt. It does the first automatically and leaves the second entirely to apps and scripts. A few common ways stores end up with a pile of stuck contracts:</p>
+  <ul>
+    <li>A card is declined for an ordinary, temporary reason such as low balance around a pay cycle, and would very likely succeed a few days later, but nothing tries again.</li>
+    <li>A payment gateway has a brief outage or timeout during the billing run, failing charges that had nothing wrong with the card at all.</li>
+    <li>A store built its own retry logic once, ran it a few times too aggressively, and the payment processor flagged the repeated attempts as risky, so the team turned it off and never replaced it.</li>
+    <li>Merchants assume Shopify's dunning behaves like some subscription apps, which do retry automatically, not realizing that a plain subscription contract on the core platform does not.</li>
+  </ul>
+  <p>This is a common source of confusion for stores that migrated from an app with built-in dunning, or that never had a churn problem large enough to notice until the failed contracts added up. See the citations at the end for the exact docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A retry that fires the instant a charge fails, or that fires every single day, is not actually safer, it just looks busier. Repeated attempts in a short window read like card testing to a bank and can get a payment method blocked outright. The safe pattern is a backoff: wait longer between each attempt, cap the number of tries, and once the schedule is exhausted, stop and leave it for a human. We keep that decision in one pure function so it is easy to read and to test.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the billing run itself. We add a job that lists active subscription contracts, reads each one's own attempt history to see if the last payment failed and how long ago, and only fires a new billing attempt when the backoff schedule says it is due. Everything that already succeeded, or that has not waited long enough yet, or that has already used up its retries, is left untouched.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists active contracts, reads lastPaymentStatus and the billing attempt history, checks whether the backoff window has elapsed, then calls subscriptionBillingAttemptCreate, otherwise it skips the contract.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#008060"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">runs daily</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">List active contracts</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">status ACTIVE</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Read attempt history</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">lastPaymentStatus, billingAttempts</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#e5f4ef" stroke="#b9d8cc"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">Backoff window</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">elapsed?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#8a9a92" font-weight="700">no, skip</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Retry billing</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">new attempt is created</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only retries contracts whose backoff window has actually elapsed, and it stops once the schedule runs out.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create a custom app in your Shopify admin under Settings, Apps and sales channels, Develop apps. Give it the <code>read_own_subscription_contracts</code> and <code>write_own_subscription_contracts</code> scopes and install it to get an Admin API access token that starts with <code>shpat_</code>. Keep the token and the shop domain in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPIFY_SHOP="yourstore.myshopify.com"
+export SHOPIFY_ACCESS_TOKEN="shpat_..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPIFY_SHOP="yourstore.myshopify.com"
+export SHOPIFY_ACCESS_TOKEN="shpat_..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Admin GraphQL API</h3>
+      <p>Every call goes to one GraphQL endpoint with your token in the <code>X-Shopify-Access-Token</code> header. A small helper sends a query and returns the data, and raises if Shopify reports an error. We use this same helper to read contracts and to run the retry mutation.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOP = os.environ["SHOPIFY_SHOP"]
+TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+
+def gql(query, variables=None):
+    r = requests.post(
+        ENDPOINT,
+        json={"query": query, "variables": variables or {}},
+        headers={"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOP = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List active contracts and their attempt history</h3>
+      <p>Ask for active subscription contracts, and read back the fields the decision needs: <code>lastPaymentStatus</code>, and the ten most recent items in <code>billingAttempts</code>, newest first, each with <code>createdAt</code> and <code>completedAt</code>. A completed attempt succeeded and produced an order. We page through with a cursor so the job handles a large subscriber base.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">CONTRACTS_QUERY = """
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor, query: "status:ACTIVE") {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      lastPaymentStatus
+      billingAttempts(first: 10, reverse: true) {
+        nodes { id createdAt completedAt }
+      }
+    }
+  }
+}"""
+
+def failed_contracts():
+    cursor = None
+    while True:
+        data = gql(CONTRACTS_QUERY, {"cursor": cursor})["subscriptionContracts"]
+        for node in data["nodes"]:
+            yield node
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const CONTRACTS_QUERY = `
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor, query: "status:ACTIVE") {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      lastPaymentStatus
+      billingAttempts(first: 10, reverse: true) {
+        nodes { id createdAt completedAt }
+      }
+    }
+  }
+}`;
+
+async function* failedContracts() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(CONTRACTS_QUERY, { cursor })).subscriptionContracts;
+    for (const node of data.nodes) yield node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the backoff logic in its own function that takes a contract and the current time and returns true or false. First we count how many attempts in a row, most recent first, never completed, stopping at the first one that did. That count is how many times the contract has failed without a break. We only act while <code>lastPaymentStatus</code> is FAILED and the failure count is between one and the length of the backoff schedule. Then we compare the days elapsed since the most recent attempt against the wait time the schedule assigns to that retry number, 1 day for the first retry, 3 for the second, 7 for the third. A pure function like this needs no network to test, which we do later.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from datetime import datetime
+
+BACKOFF_SCHEDULE_DAYS = [1, 3, 7]
+MAX_RETRIES = len(BACKOFF_SCHEDULE_DAYS)
+
+def failed_attempt_count(billing_attempts):
+    count = 0
+    for attempt in billing_attempts or []:
+        if attempt.get("completedAt"):
+            break
+        count += 1
+    return count
+
+def days_between(earlier_iso, later_iso):
+    earlier = datetime.fromisoformat(earlier_iso.replace("Z", "+00:00"))
+    later = datetime.fromisoformat(later_iso.replace("Z", "+00:00"))
+    return (later - earlier).total_seconds() / 86400.0
+
+def retry_decision(contract, now_iso):
+    if contract.get("lastPaymentStatus") != "FAILED":
+        return False
+    attempts = contract.get("billingAttempts") or []
+    failed_count = failed_attempt_count(attempts)
+    if failed_count == 0 or failed_count > MAX_RETRIES:
+        return False
+    last_created_at = attempts[0].get("createdAt")
+    if not last_created_at:
+        return False
+    wait_days = BACKOFF_SCHEDULE_DAYS[failed_count - 1]
+    return days_between(last_created_at, now_iso) >= wait_days</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const BACKOFF_SCHEDULE_DAYS = [1, 3, 7];
+const MAX_RETRIES = BACKOFF_SCHEDULE_DAYS.length;
+
+export function failedAttemptCount(billingAttempts) {
+  let count = 0;
+  for (const attempt of billingAttempts || []) {
+    if (attempt.completedAt) break;
+    count += 1;
+  }
+  return count;
+}
+
+function daysBetween(earlierIso, laterIso) {
+  return (new Date(laterIso) - new Date(earlierIso)) / 86400000;
+}
+
+export function retryDecision(contract, nowIso) {
+  if (contract.lastPaymentStatus !== "FAILED") return false;
+  const attempts = contract.billingAttempts || [];
+  const failedCount = failedAttemptCount(attempts);
+  if (failedCount === 0 || failedCount > MAX_RETRIES) return false;
+  const lastCreatedAt = attempts[0] &amp;&amp; attempts[0].createdAt;
+  if (!lastCreatedAt) return false;
+  const waitDays = BACKOFF_SCHEDULE_DAYS[failedCount - 1];
+  return daysBetween(lastCreatedAt, nowIso) >= waitDays;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Fire the retry the way Shopify's own billing run would</h3>
+      <p>When a contract is due, call <code>subscriptionBillingAttemptCreate</code> with the contract id and a fresh idempotency key so a retried job never double charges the customer if it runs twice. Shopify processes the attempt the same way it processes a scheduled one. Always read back <code>userErrors</code>. If Shopify refuses, the error tells you why, and the script should stop on it rather than pretend it worked.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">RETRY_MUTATION = """
+mutation($contractId: ID!, $idempotencyKey: String!) {
+  subscriptionBillingAttemptCreate(
+    subscriptionContractId: $contractId
+    subscriptionBillingAttemptInput: { idempotencyKey: $idempotencyKey }
+  ) {
+    subscriptionBillingAttempt { id }
+    userErrors { field message }
+  }
+}"""
+
+def retry_billing(contract_id, idempotency_key):
+    result = gql(RETRY_MUTATION, {"contractId": contract_id, "idempotencyKey": idempotency_key})["subscriptionBillingAttemptCreate"]
+    if result["userErrors"]:
+        raise RuntimeError(result["userErrors"])
+    return result["subscriptionBillingAttempt"]["id"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">const RETRY_MUTATION = `
+mutation($contractId: ID!, $idempotencyKey: String!) {
+  subscriptionBillingAttemptCreate(
+    subscriptionContractId: $contractId
+    subscriptionBillingAttemptInput: { idempotencyKey: $idempotencyKey }
+  ) {
+    subscriptionBillingAttempt { id }
+    userErrors { field message }
+  }
+}`;
+
+async function retryBilling(contractId, idempotencyKey) {
+  const result = (await gql(RETRY_MUTATION, { contractId, idempotencyKey })).subscriptionBillingAttemptCreate;
+  if (result.userErrors.length) throw new Error(JSON.stringify(result.userErrors));
+  return result.subscriptionBillingAttempt.id;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports which contracts it would retry. Read the output, agree with it, then switch it off to let it write. Run it once a day, since the shortest step in the backoff schedule is a day anyway.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never shrink the backoff schedule to retry more than once a day. Firing repeated attempts in a short window can get a payment method flagged by the bank, which makes the whole problem worse, not better.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because a contract is only retried when its own backoff window has actually elapsed.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopify-fixes/tree/main/dunning-never-retries-a-failed-charge" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopify-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">retry_failed_billing.py</div>
+      <pre><code class="language-python">"""Retry Shopify subscription billing attempts that failed, on a safe backoff.
+
+Shopify records a failed charge as lastPaymentStatus FAILED on the contract, but
+nothing retries it on its own. This job finds active contracts whose last payment
+failed, reads the contract's own billingAttempts history to work out how long it
+has been failing, and creates a new billing attempt once the right number of days
+have passed, following a backoff schedule so it never hammers a card that just
+failed. Read the billing history, decide with a pure function, then only write
+(subscriptionBillingAttemptCreate) when it is due. Run on a schedule, for example
+daily. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("retry_failed_billing")
+
+SHOP = os.environ["SHOPIFY_SHOP"]
+TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+# Days to wait after the most recent attempt before trying again. The index in
+# this list is the retry number: the 1st retry waits 1 day, the 2nd waits 3
+# days, the 3rd waits 7 days. After that we stop retrying and leave the
+# contract for a human.
+BACKOFF_SCHEDULE_DAYS = [1, 3, 7]
+MAX_RETRIES = len(BACKOFF_SCHEDULE_DAYS)
+
+CONTRACTS_QUERY = """
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor, query: "status:ACTIVE") {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      lastPaymentStatus
+      customer { defaultEmailAddress { emailAddress } }
+      billingAttempts(first: 10, reverse: true) {
+        nodes { id createdAt completedAt }
+      }
+    }
+  }
+}"""
+
+RETRY_MUTATION = """
+mutation($contractId: ID!, $idempotencyKey: String!) {
+  subscriptionBillingAttemptCreate(
+    subscriptionContractId: $contractId
+    subscriptionBillingAttemptInput: { idempotencyKey: $idempotencyKey }
+  ) {
+    subscriptionBillingAttempt { id }
+    userErrors { field message }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        ENDPOINT,
+        json={"query": query, "variables": variables or {}},
+        headers={"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    return value.replace("Z", "+00:00")
+
+
+def failed_attempt_count(billing_attempts):
+    """How many attempts in a row, most recent first, never completed.
+
+    An attempt with completedAt set was successful and produced an order, so a
+    run of failures stops at the first completed attempt. billing_attempts must
+    already be ordered most recent first (reverse: true on the query).
+    """
+    count = 0
+    for attempt in billing_attempts or []:
+        if attempt.get("completedAt"):
+            break
+        count += 1
+    return count
+
+
+def days_between(earlier_iso, later_iso):
+    """Whole days between two ISO 8601 timestamps, later minus earlier."""
+    from datetime import datetime
+
+    earlier = datetime.fromisoformat(_parse_iso(earlier_iso))
+    later = datetime.fromisoformat(_parse_iso(later_iso))
+    return (later - earlier).total_seconds() / 86400.0
+
+
+def retry_decision(contract, now_iso):
+    """Pure decision: should we fire another billing attempt for this contract, right now?
+
+    Rules, in order:
+      1. Only contracts whose lastPaymentStatus is FAILED are candidates. A
+         contract that is paid up has nothing to retry.
+      2. We count the unbroken run of failed attempts from most recent
+         backwards. If that count is already at or beyond MAX_RETRIES, we stop
+         retrying automatically and leave it for a human.
+      3. We look at how many whole days have passed since the most recent
+         attempt. The schedule says how long to wait before the next retry
+         (schedule[failed_count - 1], since failed_count is 1-indexed by the
+         time we get here). If not enough days have passed yet, it is not due.
+      4. If there is no billing attempt history at all, there is nothing to
+         retry against, so we skip.
+
+    No I/O happens in this function, so it is fully unit testable.
+    """
+    if contract.get("lastPaymentStatus") != "FAILED":
+        return False
+
+    attempts = contract.get("billingAttempts") or []
+    failed_count = failed_attempt_count(attempts)
+    if failed_count == 0 or failed_count > MAX_RETRIES:
+        return False
+
+    last_attempt = attempts[0]
+    last_created_at = last_attempt.get("createdAt")
+    if not last_created_at:
+        return False
+
+    wait_days = BACKOFF_SCHEDULE_DAYS[failed_count - 1]
+    elapsed_days = days_between(last_created_at, now_iso)
+    return elapsed_days >= wait_days
+
+
+def failed_contracts():
+    cursor = None
+    while True:
+        data = gql(CONTRACTS_QUERY, {"cursor": cursor})["subscriptionContracts"]
+        for node in data["nodes"]:
+            yield node
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def retry_billing(contract_id, idempotency_key):
+    result = gql(RETRY_MUTATION, {"contractId": contract_id, "idempotencyKey": idempotency_key})[
+        "subscriptionBillingAttemptCreate"
+    ]
+    if result["userErrors"]:
+        raise RuntimeError(result["userErrors"])
+    return result["subscriptionBillingAttempt"]["id"]
+
+
+def run():
+    from datetime import datetime, timezone
+    import uuid
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    retried = 0
+    for contract in failed_contracts():
+        if not retry_decision(contract, now_iso):
+            continue
+        contract_id = contract["id"]
+        idempotency_key = f"dunning-retry-{contract_id.rsplit('/', 1)[-1]}-{uuid.uuid4().hex[:8]}"
+        log.info(
+            "Contract %s is due for a retry. %s",
+            contract_id,
+            "would retry" if DRY_RUN else "retrying",
+        )
+        if not DRY_RUN:
+            retry_billing(contract_id, idempotency_key)
+        retried += 1
+    log.info("Done. %d contract(s) %s.", retried, "to retry" if DRY_RUN else "retried")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">retry-failed-billing.js</div>
+      <pre><code class="language-javascript">/**
+ * Retry Shopify subscription billing attempts that failed, on a safe backoff.
+ *
+ * Shopify records a failed charge as lastPaymentStatus FAILED on the contract,
+ * but nothing retries it on its own. This job finds active contracts whose last
+ * payment failed, reads the contract's own billingAttempts history to work out
+ * how long it has been failing, and creates a new billing attempt once the right
+ * number of days have passed, following a backoff schedule so it never hammers a
+ * card that just failed. Run on a schedule, for example daily.
+ */
+import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+
+const SHOP = process.env.SHOPIFY_SHOP || "example.myshopify.com";
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || "shpat_dummy";
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+// Days to wait after the most recent attempt before trying again. The index in
+// this array is the retry number: the 1st retry waits 1 day, the 2nd waits 3
+// days, the 3rd waits 7 days. After that we stop retrying automatically.
+const BACKOFF_SCHEDULE_DAYS = [1, 3, 7];
+const MAX_RETRIES = BACKOFF_SCHEDULE_DAYS.length;
+
+export function failedAttemptCount(billingAttempts) {
+  let count = 0;
+  for (const attempt of billingAttempts || []) {
+    if (attempt.completedAt) break;
+    count += 1;
+  }
+  return count;
+}
+
+function daysBetween(earlierIso, laterIso) {
+  const earlier = new Date(earlierIso).getTime();
+  const later = new Date(laterIso).getTime();
+  return (later - earlier) / 86400000;
+}
+
+/**
+ * Pure decision: should we fire another billing attempt for this contract, right now?
+ *
+ * Rules, in order:
+ *   1. Only contracts whose lastPaymentStatus is FAILED are candidates.
+ *   2. We count the unbroken run of failed attempts from most recent backwards
+ *      (billingAttempts must already be ordered most recent first). If that
+ *      count is at or beyond MAX_RETRIES, we stop retrying automatically.
+ *   3. We look at how many whole days have passed since the most recent
+ *      attempt, and compare that against the schedule entry for this retry
+ *      number. If not enough days have passed, it is not due yet.
+ *   4. If there is no billing attempt history at all, there is nothing to
+ *      retry against, so we skip.
+ *
+ * No I/O happens in this function, so it is fully unit testable.
+ */
+export function retryDecision(contract, nowIso) {
+  if (contract.lastPaymentStatus !== "FAILED") return false;
+
+  const attempts = contract.billingAttempts || [];
+  const failedCount = failedAttemptCount(attempts);
+  if (failedCount === 0 || failedCount > MAX_RETRIES) return false;
+
+  const lastAttempt = attempts[0];
+  const lastCreatedAt = lastAttempt &amp;&amp; lastAttempt.createdAt;
+  if (!lastCreatedAt) return false;
+
+  const waitDays = BACKOFF_SCHEDULE_DAYS[failedCount - 1];
+  const elapsedDays = daysBetween(lastCreatedAt, nowIso);
+  return elapsedDays >= waitDays;
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const CONTRACTS_QUERY = `
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor, query: "status:ACTIVE") {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      lastPaymentStatus
+      customer { defaultEmailAddress { emailAddress } }
+      billingAttempts(first: 10, reverse: true) {
+        nodes { id createdAt completedAt }
+      }
+    }
+  }
+}`;
+
+const RETRY_MUTATION = `
+mutation($contractId: ID!, $idempotencyKey: String!) {
+  subscriptionBillingAttemptCreate(
+    subscriptionContractId: $contractId
+    subscriptionBillingAttemptInput: { idempotencyKey: $idempotencyKey }
+  ) {
+    subscriptionBillingAttempt { id }
+    userErrors { field message }
+  }
+}`;
+
+async function* failedContracts() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(CONTRACTS_QUERY, { cursor })).subscriptionContracts;
+    for (const node of data.nodes) yield node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function retryBilling(contractId, idempotencyKey) {
+  const result = (await gql(RETRY_MUTATION, { contractId, idempotencyKey })).subscriptionBillingAttemptCreate;
+  if (result.userErrors.length) throw new Error(JSON.stringify(result.userErrors));
+  return result.subscriptionBillingAttempt.id;
+}
+
+export async function run() {
+  const nowIso = new Date().toISOString();
+  let retried = 0;
+  for await (const contract of failedContracts()) {
+    if (!retryDecision(contract, nowIso)) continue;
+    const idempotencyKey = `dunning-retry-${contract.id.split("/").pop()}-${randomUUID().slice(0, 8)}`;
+    console.log(`Contract ${contract.id} is due for a retry. ${DRY_RUN ? "would retry" : "retrying"}`);
+    if (!DRY_RUN) await retryBilling(contract.id, idempotencyKey);
+    retried++;
+  }
+  console.log(`Done. ${retried} contract(s) ${DRY_RUN ? "to retry" : "retried"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The backoff decision is the part most worth testing, because it decides how aggressively a real customer's card gets charged. Because we kept <code>retry_decision</code> pure, the test needs no network and no Shopify account. It just feeds in plain objects and a fixed clock time, and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_dunning_retry_schedule.py</div>
+      <pre><code class="language-python">from retry_failed_billing import failed_attempt_count, retry_decision
+
+
+def attempt(created_at, completed_at=None):
+    return {"id": "gid://shopify/SubscriptionBillingAttempt/1", "createdAt": created_at, "completedAt": completed_at}
+
+
+def contract(**over):
+    base = {
+        "id": "gid://shopify/SubscriptionContract/1",
+        "lastPaymentStatus": "FAILED",
+        "billingAttempts": [attempt("2026-07-05T00:00:00+00:00")],
+    }
+    base.update(over)
+    return base
+
+
+def test_failed_attempt_count_stops_at_first_completed():
+    attempts = [
+        attempt("2026-07-05T00:00:00+00:00"),
+        attempt("2026-07-02T00:00:00+00:00"),
+        attempt("2026-06-20T00:00:00+00:00", completed_at="2026-06-20T00:05:00+00:00"),
+    ]
+    assert failed_attempt_count(attempts) == 2
+
+
+def test_no_retry_when_last_payment_not_failed():
+    assert retry_decision(contract(lastPaymentStatus="SUCCEEDED"), "2026-07-10T00:00:00+00:00") is False
+
+
+def test_no_retry_before_the_backoff_window():
+    c = contract(billingAttempts=[attempt("2026-07-09T20:00:00+00:00")])
+    assert retry_decision(c, "2026-07-10T00:00:00+00:00") is False
+
+
+def test_retry_once_first_backoff_window_elapses():
+    c = contract(billingAttempts=[attempt("2026-07-09T00:00:00+00:00")])
+    assert retry_decision(c, "2026-07-10T00:00:00+00:00") is True
+
+
+def test_no_retry_after_max_retries_exhausted():
+    attempts = [
+        attempt("2026-07-01T00:00:00+00:00"),
+        attempt("2026-06-28T00:00:00+00:00"),
+        attempt("2026-06-25T00:00:00+00:00"),
+        attempt("2026-06-20T00:00:00+00:00"),
+    ]
+    assert retry_decision(contract(billingAttempts=attempts), "2026-07-20T00:00:00+00:00") is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">dunning-retry.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { failedAttemptCount, retryDecision } from "./retry-failed-billing.js";
+
+const attempt = (createdAt, completedAt = null) => ({
+  id: "gid://shopify/SubscriptionBillingAttempt/1", createdAt, completedAt,
+});
+
+const contract = (over = {}) => ({
+  id: "gid://shopify/SubscriptionContract/1",
+  lastPaymentStatus: "FAILED",
+  billingAttempts: [attempt("2026-07-05T00:00:00Z")],
+  ...over,
+});
+
+test("failedAttemptCount stops at first completed", () =&gt; {
+  const attempts = [
+    attempt("2026-07-05T00:00:00Z"),
+    attempt("2026-07-02T00:00:00Z"),
+    attempt("2026-06-20T00:00:00Z", "2026-06-20T00:05:00Z"),
+  ];
+  assert.equal(failedAttemptCount(attempts), 2);
+});
+
+test("no retry when last payment not failed", () =&gt; {
+  assert.equal(retryDecision(contract({ lastPaymentStatus: "SUCCEEDED" }), "2026-07-10T00:00:00Z"), false);
+});
+
+test("no retry before the backoff window", () =&gt; {
+  const c = contract({ billingAttempts: [attempt("2026-07-09T20:00:00Z")] });
+  assert.equal(retryDecision(c, "2026-07-10T00:00:00Z"), false);
+});
+
+test("retry once first backoff window elapses", () =&gt; {
+  const c = contract({ billingAttempts: [attempt("2026-07-09T00:00:00Z")] });
+  assert.equal(retryDecision(c, "2026-07-10T00:00:00Z"), true);
+});
+
+test("no retry after max retries exhausted", () =&gt; {
+  const attempts = [
+    attempt("2026-07-01T00:00:00Z"),
+    attempt("2026-06-28T00:00:00Z"),
+    attempt("2026-06-25T00:00:00Z"),
+    attempt("2026-06-20T00:00:00Z"),
+  ];
+  const c = contract({ billingAttempts: attempts });
+  assert.equal(retryDecision(c, "2026-07-20T00:00:00Z"), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Payday declines</span>
+      <h4>The fitness app that lost members to a one day decline</h4>
+      <p>A membership app billed monthly on the first, and a chunk of declines every cycle were nothing more than a card sitting empty for a day or two around payday. With no retry, every one of those turned into a cancelled member the next time someone reviewed failed contracts by hand.</p>
+      <p>Now the job retries automatically after 1 day, then 3, then 7. Most of those payday declines succeed on the very first retry, and the members never even notice their subscription was at risk.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Gateway hiccup</span>
+      <h4>The box subscription hit by a five minute outage</h4>
+      <p>A subscription box service ran its monthly billing during a brief payment gateway outage. Dozens of otherwise healthy contracts failed in the same few minutes for a reason that had nothing to do with the customer's card.</p>
+      <p>The backoff job caught all of them on the next day's run, retried once, and recovered nearly the entire batch, instead of a support agent manually re-billing each account by hand.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a failed charge gets a fair, spaced out second, third, and fourth chance before anyone has to step in. Ordinary declines recover themselves, the payment method never gets hammered into a fraud flag, and once the schedule is exhausted the contract is left exactly where a human can decide what to do next, such as sending a card update email.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does not Shopify retry a failed subscription charge on its own?</summary>
+      <p>Shopify records the outcome of a billing attempt on the subscription contract as lastPaymentStatus FAILED, but creating a new attempt is a separate action. Nothing in the base platform schedules that next attempt for you, so a contract can sit on FAILED indefinitely unless a script or app calls subscriptionBillingAttemptCreate again.</p>
+    </details>
+    <details>
+      <summary>Why use a backoff schedule instead of retrying every day?</summary>
+      <p>A card that just failed because of insufficient funds or a bank flag is unlikely to succeed a minute later, and retrying too often looks like card testing to the bank and can get the payment method blocked. A schedule that waits longer between each attempt, such as 1, 3, then 7 days, gives the customer time to fix the problem while still recovering the charge automatically when possible.</p>
+    </details>
+    <details>
+      <summary>What happens after the maximum number of retries is reached?</summary>
+      <p>The script stops creating automatic retries once the backoff schedule is exhausted and leaves the contract exactly as it is. That is deliberate. At that point the more useful move is a human step, such as an email asking the customer to update their card, rather than another automatic charge against a payment method that has already failed several times.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/transactions-total-mismatch/">Transactions total does not match the order</a>
+    <a href="/shopify/">Browse all Shopify field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Shopify Admin GraphQL: the SubscriptionContract object, including lastPaymentStatus and billingAttempts. <a href="https://shopify.dev/docs/api/admin-graphql/latest/objects/SubscriptionContract" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/objects/SubscriptionContract</a></li>
+      <li>Shopify Help Center: managing subscriptions and understanding failed payments. <a href="https://help.shopify.com/en/manual/products/purchase-options/subscriptions" rel="noopener">help.shopify.com/en/manual/products/purchase-options/subscriptions</a></li>
+      <li>Shopify Community: subscription contracts that stay failed with no automatic retry. <a href="https://community.shopify.com/c/graphql-basics-and/bd-p/graphql-admin-api" rel="noopener">community.shopify.com graphql admin api</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopify Admin GraphQL: the <code>subscriptionBillingAttemptCreate</code> mutation. <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/subscriptionBillingAttemptCreate" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/mutations/subscriptionBillingAttemptCreate</a></li>
+      <li>Shopify Admin GraphQL: the SubscriptionBillingAttempt object, including createdAt and completedAt. <a href="https://shopify.dev/docs/api/admin-graphql/latest/objects/SubscriptionBillingAttempt" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/objects/SubscriptionBillingAttempt</a></li>
+      <li>Shopify Admin GraphQL: the <code>subscriptionContracts</code> query and its search syntax. <a href="https://shopify.dev/docs/api/admin-graphql/latest/queries/subscriptionContracts" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/queries/subscriptionContracts</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopify orders, payments, subscriptions, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this recover a failed charge?</h3>
+    <p>If this clawed back revenue that would have quietly slipped away, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopify/">Back to all Shopify field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopify.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopify/assets/shopify.js" defer></script>
+</body>
+</html>
