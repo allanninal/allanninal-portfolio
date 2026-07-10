@@ -1,0 +1,1047 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Shopify Duplicate Renewal Charges From Subscription Retries</title>
+<meta name="description" content="A retry with no idempotency key billed a subscriber twice for the same cycle. Learn why it happens and build a Python or Node.js job that finds the duplicate renewal orders and flags them for a refund review with the Admin GraphQL API.">
+<link rel="canonical" href="https://www.allanninal.dev/shopify/duplicate-renewal-charges/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Shopify Duplicate Renewal Charges From Subscription Retries">
+<meta property="og:description" content="Why a retry with no idempotency key bills a subscription contract twice for one cycle, and a safe Python or Node.js job that finds the duplicate and tags it for a refund review.">
+<meta property="og:url" content="https://www.allanninal.dev/shopify/duplicate-renewal-charges/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/shopify/assets/shopify.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/shopify/duplicate-renewal-charges/#article","headline":"Fix Shopify Duplicate Renewal Charges From Subscription Retries","description":"Why a retry with no idempotency key bills a subscription contract twice for one cycle, and a safe Python or Node.js job that finds the duplicate renewal order and flags it for a refund review with the Admin GraphQL API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/shopify/duplicate-renewal-charges/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Subscriptions and billing","keywords":"Shopify duplicate renewal charge, subscription billed twice, idempotency key, subscription contract, billing attempt, Shopify Admin GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Shopify field notes","item":"https://www.allanninal.dev/shopify/"},{"@type":"ListItem","position":2,"name":"Duplicate renewal charges","item":"https://www.allanninal.dev/shopify/duplicate-renewal-charges/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why was my subscriber billed twice for one renewal?","acceptedAnswer":{"@type":"Answer","text":"A renewal job retried a charge after a timeout or a redelivered webhook, and because the retry carried no idempotency key, Shopify had no way to tell it apart from a brand new charge, so it created a second billing attempt and a second order for the same billing cycle."}},{"@type":"Question","name":"What is an idempotency key and why does a renewal job need one?","acceptedAnswer":{"@type":"Answer","text":"An idempotency key is a value you generate once per intended charge and send with every attempt, including retries, so Shopify can recognize a retry as the same billing attempt instead of a new one. Shopify's own subscriptionBillingAttemptCreate mutation takes this key for exactly that reason."}},{"@type":"Question","name":"Is it safe to flag duplicate renewal charges with a script?","acceptedAnswer":{"@type":"Answer","text":"Yes, when the script only groups a contract's successful billing attempts by the day they landed on, only ever flags the attempts after the first one in that cycle, skips anything already tagged, and runs in dry run first so you can review the exact list before anything is refunded."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/shopify/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / shopify</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/build/">Build</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/shopify/">Field notes</a> / Subscriptions and billing</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Subscriptions and billing</p>
+    <h1>Shopify duplicate renewal charges from a retry with no idempotency key</h1>
+    <p class="lead">A renewal times out, or a webhook fires twice, so the caller retries the billing attempt. It generated a new idempotency key instead of reusing the old one, so Shopify treated the retry as a brand new sale. Now the subscriber has two orders and two successful charges for one billing cycle. Here is why a retry turns into a real duplicate and a small script that finds the extra charge on each contract and flags it for a refund review.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Admin GraphQL API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Duplicate renewal charges happen when a retry, whether from a timeout, a crashed worker, or a redelivered webhook, sends the same billing attempt through again without anything to tell Shopify it is the same attempt. Shopify's own <code>subscriptionBillingAttemptCreate</code> mutation takes an <code>idempotencyKey</code> for exactly this reason, generate one value per intended charge and send the same value on every retry, and Shopify will not create a second order for it. For charges that already slipped through, run a small Python or Node.js job that walks each subscription contract's recent billing attempts, groups the successful ones by the day they landed on, and tags every attempt after the first one in a cycle for a refund review. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A subscription renewal is not one call, it is a small pipeline. Something decides a contract is due, Shopify runs a billing attempt for that cycle, the attempt captures a payment, and on success it creates an order. Each of those steps can fail partway, and when it does, the natural response is to retry.</p>
+  <p>The trouble is that a retry only stays safe if Shopify can tell "try it again" apart from "charge them again." Shopify's billing attempt mutation takes an idempotency key for exactly this reason, but if the caller does not send the same key on the retry that it sent the first time, the two calls look like two separate intended charges. Shopify does what it is told, runs a second attempt, and the subscriber now has two successful charges and two orders for one renewal instead of one.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A renewal fires a billing attempt for a cycle, the response times out, the caller retries with a new idempotency key instead of the same one, and Shopify creates a second billing attempt and a second order for the same cycle.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a9a92"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Contract due</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">renewal for this cycle</text>
+      <line x1="170" y1="50" x2="212" y2="50" stroke="#8a9a92" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="215" y="20" width="150" height="60" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="290" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Billing attempt 1</text>
+      <text x="290" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">key A</text>
+      <line x1="365" y1="50" x2="407" y2="50" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="386" y="30" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="410" y="20" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="485" y="46" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Response times out</text>
+      <text x="485" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">caller cannot tell if it worked</text>
+      <line x1="485" y1="80" x2="485" y2="112" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="330" y="115" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="405" y="141" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Retries with key B</text>
+      <text x="405" y="158" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">not the same key</text>
+      <line x1="330" y1="145" x2="298" y2="145" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="140" y="115" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="215" y="141" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Second order</text>
+      <text x="215" y="158" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">looks brand new</text>
+      <line x1="140" y1="145" x2="98" y2="145" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="0" y="115" width="90" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="45" y="141" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Billed</text>
+      <text x="45" y="158" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">twice</text>
+    </svg>
+    <figcaption>Shopify cannot tell the retry apart from a fresh charge unless it carries the same idempotency key, so it runs a second billing attempt and creates a second order for the same cycle.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Every one of these starts the same way, a network or process failure hides whether the first attempt actually succeeded, and the retry generates a fresh key instead of reusing the one from before:</p>
+  <ul>
+    <li>A request to run the billing attempt times out on the caller's side after Shopify already completed it, so the job assumes it failed and retries with a newly generated key.</li>
+    <li>A worker process crashes or is redeployed mid job, between kicking off the attempt and recording that the cycle was billed, and the next run starts the cycle over with a new key.</li>
+    <li>A billing webhook gets redelivered, which is normal and expected, but the handler treats every delivery as a new instruction to bill instead of recognizing a repeat of the same event.</li>
+    <li>Two instances of the same scheduled job run at once during a deploy or a stuck queue, and both pick up the same due contract in the same window, each generating its own key.</li>
+  </ul>
+  <p>None of these are exotic. Timeouts, redeploys, and duplicate webhook deliveries happen to every store eventually. What turns them into a real duplicate charge is a key that changes on retry, an idempotency key only protects you if the same value is sent again, a new key on every attempt gives Shopify no way to recognize a repeat. See the citations at the end for the exact docs on idempotent requests and webhook delivery.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A retry is only safe if it carries the exact same idempotency key as the attempt it is retrying, generated once per intended charge and stored before the first call goes out, not regenerated on every attempt. For charges that already happened before that discipline was in place, a contract's billing attempts still carry enough information to reconstruct what went wrong, group the successful attempts by the day they landed on, and anything after the first attempt in that cycle is the duplicate, not a second legitimate sale.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch how renewals are billed today. We add a reconciler that walks each subscription contract's recent billing attempts, groups the successful ones by the day they landed on, and flags every attempt after the first one in a cycle as a duplicate. In dry run it only reports what it found. Once you trust the list, it tags the extra order with a review tag through <code>tagsAdd</code>, so a human can issue the refund with full context, and it never touches the first charge for the cycle.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists each subscription contract's recent billing attempts, groups the successful ones by the day they landed on, keeps the first attempt for each cycle, and tags every attempt after it for a refund review, otherwise it leaves the order alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#008060"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#e5f4ef" stroke="#b9d8cc"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">List billing attempts</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">per subscription contract</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#b9d8cc"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14211d">Group by billing day</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">originTime, per contract</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#e5f4ef" stroke="#b9d8cc"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">More than</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14211d">one attempt?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#8a9a92" font-weight="700">no, leave alone</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Keep first attempt,</text>
+      <text x="684" y="222" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">tag the rest</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#008060" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The reconciler only tags an order for review when the same contract already has an earlier successful attempt in the same billing cycle. The first attempt in a cycle is always left alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API access token</h3>
+      <p>Create a custom app in your Shopify admin under Settings, Apps and sales channels, Develop apps. Give it the <code>read_own_subscription_contracts</code> and <code>read_orders</code> scopes, plus <code>write_orders</code> if you plan to let a human act on the tag, and install it to get an Admin API access token that starts with <code>shpat_</code>. Keep the token and the shop domain in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SHOPIFY_SHOP="yourstore.myshopify.com"
+export SHOPIFY_ACCESS_TOKEN="shpat_..."
+export REVIEW_TAG="duplicate-renewal"
+export DRY_RUN="true"   # start safe, change to false to tag</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SHOPIFY_SHOP="yourstore.myshopify.com"
+export SHOPIFY_ACCESS_TOKEN="shpat_..."
+export REVIEW_TAG="duplicate-renewal"
+export DRY_RUN="true"   // start safe, change to false to tag</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Admin GraphQL API</h3>
+      <p>Every call goes to one GraphQL endpoint with your token in the <code>X-Shopify-Access-Token</code> header. A small helper sends a query and returns the data, and raises if Shopify reports an error. We use this same helper to read subscription contracts and to run the tagging mutation.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+SHOP = os.environ["SHOPIFY_SHOP"]
+TOKEN = os.environ["SHOPIFY_ACCESS_TOKEN"]
+API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+ENDPOINT = f"https://{SHOP}/admin/api/{API_VERSION}/graphql.json"
+
+def gql(query, variables=None):
+    r = requests.post(
+        ENDPOINT,
+        json={"query": query, "variables": variables or {}},
+        headers={"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const SHOP = process.env.SHOPIFY_SHOP;
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-01";
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: { "X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List each contract's billing attempts</h3>
+      <p>Ask for subscription contracts and, for each one, its most recent billing attempts, newest first. Read back what the decision needs: the <code>idempotencyKey</code> Shopify stored for the attempt, <code>originTime</code> for when it landed, and the order it produced with its tags and total. We page through contracts with a cursor so the job handles a large store.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">CONTRACTS_QUERY = """
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      billingAttempts(first: 20, reverse: true) {
+        nodes {
+          id
+          idempotencyKey
+          originTime
+          order { id name tags totalPriceSet { shopMoney { amount currencyCode } } }
+        }
+      }
+    }
+  }
+}"""
+
+def contracts():
+    cursor = None
+    while True:
+        data = gql(CONTRACTS_QUERY, {"cursor": cursor})["subscriptionContracts"]
+        for node in data["nodes"]:
+            yield node
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const CONTRACTS_QUERY = `
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      billingAttempts(first: 20, reverse: true) {
+        nodes {
+          id
+          idempotencyKey
+          originTime
+          order { id name tags totalPriceSet { shopMoney { amount currencyCode } } }
+        }
+      }
+    }
+  }
+}`;
+
+async function* contracts() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(CONTRACTS_QUERY, { cursor })).subscriptionContracts;
+    for (const node of data.nodes) yield node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Group attempts by the billing cycle they landed in</h3>
+      <p>An attempt's <code>originTime</code> is the anniversary date Shopify assigns it, so a retry that runs minutes or hours after the original still carries the same day. Truncating that timestamp to the day gives a stable cycle key without needing anything the caller has to invent. Only attempts that actually produced an order count as a real charge.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">cycle.py</div>
+      <pre><code class="language-python">def billing_cycle_key(attempt):
+    """The billing cycle an attempt belongs to, truncated to the day.
+
+    originTime is the anniversary date Shopify assigns to the attempt, so two
+    attempts for the same renewal share the same day even if one was a retry
+    made minutes or hours after the first.
+    """
+    origin = attempt.get("originTime") or ""
+    return origin[:10]
+
+
+def successful_attempts(attempts):
+    """Only attempts that produced a real order are charges worth counting."""
+    return [a for a in attempts if a.get("order") is not None]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">cycle.js</div>
+      <pre><code class="language-javascript">export function billingCycleKey(attempt) {
+  // originTime is the anniversary date Shopify assigns to the attempt, so two
+  // attempts for the same renewal share the same day even if one was a retry
+  // made minutes or hours after the first.
+  const origin = attempt.originTime || "";
+  return origin.slice(0, 10);
+}
+
+function successfulAttempts(attempts) {
+  // Only attempts that produced a real order are charges worth counting.
+  return (attempts || []).filter((a) => a.order != null);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes one contract, with its billing attempts already ordered oldest first, and returns which orders are duplicates. Within each cycle, the first attempt is the legitimate charge and every attempt after it is a duplicate, unless it is already tagged, in which case a previous run already caught it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def to_cents(amount):
+    return round(float(amount) * 100)
+
+
+def find_duplicate_orders(contract, review_tag):
+    """Pure decision function. No I/O.
+
+    Groups a contract's successful billing attempts by cycle. Within a cycle,
+    the first attempt (attempts must be passed oldest first) is the legitimate
+    charge and every attempt after it is a duplicate. Returns the order id,
+    name, and amount in cents for each duplicate that is not already tagged,
+    never the original charge.
+    """
+    attempts = successful_attempts(contract.get("billingAttempts") or [])
+    seen_cycles = set()
+    duplicates = []
+    for attempt in attempts:
+        cycle = billing_cycle_key(attempt)
+        order = attempt["order"]
+        if cycle not in seen_cycles:
+            seen_cycles.add(cycle)
+            continue
+        if review_tag in (order.get("tags") or []):
+            continue
+        amount = to_cents(order["totalPriceSet"]["shopMoney"]["amount"])
+        duplicates.append({"order_id": order["id"], "name": order["name"], "amount_cents": amount})
+    return duplicates</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function toCents(amount) {
+  return Math.round(parseFloat(amount) * 100);
+}
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * Groups a contract's successful billing attempts by cycle. Within a cycle,
+ * the first attempt (attempts must be passed oldest first) is the legitimate
+ * charge and every attempt after it is a duplicate. Returns the order id,
+ * name, and amount in cents for each duplicate that is not already tagged,
+ * never the original charge.
+ */
+export function findDuplicateOrders(contract, reviewTag) {
+  const attempts = successfulAttempts(contract.billingAttempts);
+  const seenCycles = new Set();
+  const duplicates = [];
+  for (const attempt of attempts) {
+    const cycle = billingCycleKey(attempt);
+    const order = attempt.order;
+    if (!seenCycles.has(cycle)) {
+      seenCycles.add(cycle);
+      continue;
+    }
+    if ((order.tags || []).includes(reviewTag)) continue;
+    const amount = toCents(order.totalPriceSet.shopMoney.amount);
+    duplicates.push({ orderId: order.id, name: order.name, amountCents: amount });
+  }
+  return duplicates;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Tag the duplicate and wire it together with a dry run guard</h3>
+      <p>When a duplicate is found, tag the order with <code>tagsAdd</code> so it surfaces in a saved search for someone to review and refund with full context, rather than refunding blind from a script. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the job only reports which orders it would tag. Read the output, agree with it, then switch it off to let it write. Run it on a schedule that matches how often renewals fire, for example once a day.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never tag the earliest attempt in a cycle, only the ones after it. The billing attempt that landed first was almost always the intended one, everything after it for the same contract and cycle is the retry that should not have billed.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever tags an order that is provably a later duplicate of an earlier billing attempt on the same contract and cycle.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/shopify-fixes/tree/main/duplicate-renewal-charges" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the shopify-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_duplicate_renewals.py</div>
+      <pre><code class="language-python">&quot;&quot;&quot;Find subscription renewals that got billed twice for the same cycle.
+
+A retry after a timeout or a webhook redelivered without an idempotency key can
+create a second successful billing attempt for a contract that already has one
+for the same cycle. Each attempt makes its own order and charges the card again,
+so the customer pays twice for one box. This walks each active subscription
+contract&#x27;s recent billing attempts, groups them by billing cycle (the anniversary
+date Shopify records on the attempt), flags every successful attempt after the
+first one in a cycle as a duplicate, and tags the extra order for a refund review
+with tagsAdd. Read only apart from the tag. Run on a schedule. Safe to run again
+and again.
+&quot;&quot;&quot;
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+log = logging.getLogger(&quot;find_duplicate_renewals&quot;)
+
+SHOP = os.environ[&quot;SHOPIFY_SHOP&quot;]
+TOKEN = os.environ[&quot;SHOPIFY_ACCESS_TOKEN&quot;]
+API_VERSION = os.environ.get(&quot;SHOPIFY_API_VERSION&quot;, &quot;2025-01&quot;)
+ENDPOINT = f&quot;https://{SHOP}/admin/api/{API_VERSION}/graphql.json&quot;
+REVIEW_TAG = os.environ.get(&quot;REVIEW_TAG&quot;, &quot;duplicate-renewal&quot;)
+DRY_RUN = os.environ.get(&quot;DRY_RUN&quot;, &quot;true&quot;).lower() == &quot;true&quot;
+
+CONTRACTS_QUERY = &quot;&quot;&quot;
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      billingAttempts(first: 20, reverse: true) {
+        nodes {
+          id
+          ready
+          idempotencyKey
+          originTime
+          order {
+            id
+            name
+            tags
+            totalPriceSet { shopMoney { amount currencyCode } }
+          }
+        }
+      }
+    }
+  }
+}&quot;&quot;&quot;
+
+TAGS_ADD = &quot;&quot;&quot;
+mutation($id: ID!, $tags: [String!]!) {
+  tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
+}&quot;&quot;&quot;
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        ENDPOINT,
+        json={&quot;query&quot;: query, &quot;variables&quot;: variables or {}},
+        headers={&quot;X-Shopify-Access-Token&quot;: TOKEN, &quot;Content-Type&quot;: &quot;application/json&quot;},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get(&quot;errors&quot;):
+        raise RuntimeError(body[&quot;errors&quot;])
+    return body[&quot;data&quot;]
+
+
+def to_cents(amount):
+    return round(float(amount) * 100)
+
+
+def billing_cycle_key(attempt):
+    &quot;&quot;&quot;The billing cycle an attempt belongs to, truncated to the day.
+
+    originTime is the anniversary date Shopify assigns to the attempt, so two
+    attempts for the same renewal share the same day even if one was a retry
+    made minutes or hours after the first.
+    &quot;&quot;&quot;
+    origin = attempt.get(&quot;originTime&quot;) or &quot;&quot;
+    return origin[:10]
+
+
+def successful_attempts(attempts):
+    &quot;&quot;&quot;Only attempts that produced a real order are charges worth counting.&quot;&quot;&quot;
+    return [a for a in attempts if a.get(&quot;order&quot;) is not None]
+
+
+def find_duplicate_orders(contract, review_tag):
+    &quot;&quot;&quot;Pure decision function. No I/O.
+
+    Groups a contract&#x27;s successful billing attempts by cycle. Within a cycle,
+    the first attempt (attempts must be passed oldest first) is the legitimate
+    charge and every attempt after it is a duplicate. Returns the order id,
+    name, and amount in cents for each duplicate that is not already tagged,
+    never the original charge.
+    &quot;&quot;&quot;
+    attempts = successful_attempts(contract.get(&quot;billingAttempts&quot;) or [])
+    seen_cycles = set()
+    duplicates = []
+    for attempt in attempts:
+        cycle = billing_cycle_key(attempt)
+        order = attempt[&quot;order&quot;]
+        if cycle not in seen_cycles:
+            seen_cycles.add(cycle)
+            continue
+        if review_tag in (order.get(&quot;tags&quot;) or []):
+            continue
+        amount = to_cents(order[&quot;totalPriceSet&quot;][&quot;shopMoney&quot;][&quot;amount&quot;])
+        duplicates.append({&quot;order_id&quot;: order[&quot;id&quot;], &quot;name&quot;: order[&quot;name&quot;], &quot;amount_cents&quot;: amount})
+    return duplicates
+
+
+def tag_for_review(order_id, review_tag):
+    result = gql(TAGS_ADD, {&quot;id&quot;: order_id, &quot;tags&quot;: [review_tag]})[&quot;tagsAdd&quot;]
+    if result[&quot;userErrors&quot;]:
+        raise RuntimeError(result[&quot;userErrors&quot;])
+
+
+def contracts():
+    cursor = None
+    while True:
+        data = gql(CONTRACTS_QUERY, {&quot;cursor&quot;: cursor})[&quot;subscriptionContracts&quot;]
+        for node in data[&quot;nodes&quot;]:
+            yield node
+        if not data[&quot;pageInfo&quot;][&quot;hasNextPage&quot;]:
+            return
+        cursor = data[&quot;pageInfo&quot;][&quot;endCursor&quot;]
+
+
+def run():
+    flagged = 0
+    for contract in contracts():
+        # billingAttempts comes back newest first, flip it so the earliest
+        # attempt in a cycle is treated as the original charge.
+        attempts = list(reversed(contract.get(&quot;billingAttempts&quot;, {}).get(&quot;nodes&quot;) or []))
+        ordered_contract = {**contract, &quot;billingAttempts&quot;: attempts}
+        for dup in find_duplicate_orders(ordered_contract, REVIEW_TAG):
+            log.warning(
+                &quot;Order %s is a duplicate renewal charge (%s cents). %s&quot;,
+                dup[&quot;name&quot;], dup[&quot;amount_cents&quot;], &quot;would tag&quot; if DRY_RUN else &quot;tagging&quot;,
+            )
+            if not DRY_RUN:
+                tag_for_review(dup[&quot;order_id&quot;], REVIEW_TAG)
+            flagged += 1
+    log.info(&quot;Done. %d order(s) %s.&quot;, flagged, &quot;to tag&quot; if DRY_RUN else &quot;tagged&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-duplicate-renewals.js</div>
+      <pre><code class="language-javascript">/**
+ * Find subscription renewals that got billed twice for the same cycle.
+ *
+ * A retry after a timeout or a webhook redelivered without an idempotency key
+ * can create a second successful billing attempt for a contract that already
+ * has one for the same cycle. Each attempt makes its own order and charges the
+ * card again, so the customer pays twice for one box. This walks each active
+ * subscription contract&#x27;s recent billing attempts, groups them by billing
+ * cycle (the anniversary date Shopify records on the attempt), flags every
+ * successful attempt after the first one in a cycle as a duplicate, and tags
+ * the extra order for a refund review with tagsAdd. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/shopify/duplicate-renewal-charges/
+ */
+import { pathToFileURL } from &quot;node:url&quot;;
+
+const SHOP = process.env.SHOPIFY_SHOP || &quot;example.myshopify.com&quot;;
+const TOKEN = process.env.SHOPIFY_ACCESS_TOKEN || &quot;shpat_dummy&quot;;
+const API_VERSION = process.env.SHOPIFY_API_VERSION || &quot;2025-01&quot;;
+const ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const REVIEW_TAG = process.env.REVIEW_TAG || &quot;duplicate-renewal&quot;;
+const DRY_RUN = (process.env.DRY_RUN || &quot;true&quot;).toLowerCase() === &quot;true&quot;;
+
+export function toCents(amount) {
+  return Math.round(parseFloat(amount) * 100);
+}
+
+export function billingCycleKey(attempt) {
+  // originTime is the anniversary date Shopify assigns to the attempt, so two
+  // attempts for the same renewal share the same day even if one was a retry
+  // made minutes or hours after the first.
+  const origin = attempt.originTime || &quot;&quot;;
+  return origin.slice(0, 10);
+}
+
+function successfulAttempts(attempts) {
+  // Only attempts that produced a real order are charges worth counting.
+  return (attempts || []).filter((a) =&gt; a.order != null);
+}
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * Groups a contract&#x27;s successful billing attempts by cycle. Within a cycle,
+ * the first attempt (attempts must be passed oldest first) is the legitimate
+ * charge and every attempt after it is a duplicate. Returns the order id,
+ * name, and amount in cents for each duplicate that is not already tagged,
+ * never the original charge.
+ */
+export function findDuplicateOrders(contract, reviewTag) {
+  const attempts = successfulAttempts(contract.billingAttempts);
+  const seenCycles = new Set();
+  const duplicates = [];
+  for (const attempt of attempts) {
+    const cycle = billingCycleKey(attempt);
+    const order = attempt.order;
+    if (!seenCycles.has(cycle)) {
+      seenCycles.add(cycle);
+      continue;
+    }
+    if ((order.tags || []).includes(reviewTag)) continue;
+    const amount = toCents(order.totalPriceSet.shopMoney.amount);
+    duplicates.push({ orderId: order.id, name: order.name, amountCents: amount });
+  }
+  return duplicates;
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(ENDPOINT, {
+    method: &quot;POST&quot;,
+    headers: { &quot;X-Shopify-Access-Token&quot;: TOKEN, &quot;Content-Type&quot;: &quot;application/json&quot; },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Shopify ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const CONTRACTS_QUERY = `
+query($cursor: String) {
+  subscriptionContracts(first: 25, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id
+      billingAttempts(first: 20, reverse: true) {
+        nodes {
+          id
+          ready
+          idempotencyKey
+          originTime
+          order {
+            id
+            name
+            tags
+            totalPriceSet { shopMoney { amount currencyCode } }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const TAGS_ADD = `
+mutation($id: ID!, $tags: [String!]!) {
+  tagsAdd(id: $id, tags: $tags) { node { id } userErrors { field message } }
+}`;
+
+async function* contracts() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(CONTRACTS_QUERY, { cursor })).subscriptionContracts;
+    for (const node of data.nodes) yield node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function tagForReview(orderId, reviewTag) {
+  const result = (await gql(TAGS_ADD, { id: orderId, tags: [reviewTag] })).tagsAdd;
+  if (result.userErrors.length) throw new Error(JSON.stringify(result.userErrors));
+}
+
+export async function run() {
+  let flagged = 0;
+  for await (const contract of contracts()) {
+    // billingAttempts comes back newest first, flip it so the earliest
+    // attempt in a cycle is treated as the original charge.
+    const attempts = [...(contract.billingAttempts?.nodes || [])].reverse();
+    const orderedContract = { ...contract, billingAttempts: attempts };
+    for (const dup of findDuplicateOrders(orderedContract, REVIEW_TAG)) {
+      console.warn(
+        `Order ${dup.name} is a duplicate renewal charge (${dup.amountCents} cents). ${DRY_RUN ? &quot;would tag&quot; : &quot;tagging&quot;}`
+      );
+      if (!DRY_RUN) await tagForReview(dup.orderId, REVIEW_TAG);
+      flagged++;
+    }
+  }
+  console.log(`Done. ${flagged} order(s) ${DRY_RUN ? &quot;to tag&quot; : &quot;tagged&quot;}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The grouping rule is the part most worth testing, because it decides which order gets tagged and which one stays untouched. Because we kept <code>find_duplicate_orders</code> pure and working entirely in cents, the test needs no network and no Shopify account. It just feeds in plain contract objects, oldest attempt first, and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_duplicate_renewal_cycles.py</div>
+      <pre><code class="language-python">from find_duplicate_renewals import find_duplicate_orders, billing_cycle_key, to_cents
+
+
+def attempt(order_id, name, origin, amount=&quot;29.00&quot;, tags=None):
+    return {
+        &quot;id&quot;: f&quot;gid://shopify/SubscriptionBillingAttempt/{order_id}&quot;,
+        &quot;ready&quot;: True,
+        &quot;idempotencyKey&quot;: f&quot;key-{order_id}&quot;,
+        &quot;originTime&quot;: origin,
+        &quot;order&quot;: {
+            &quot;id&quot;: f&quot;gid://shopify/Order/{order_id}&quot;,
+            &quot;name&quot;: name,
+            &quot;tags&quot;: tags or [],
+            &quot;totalPriceSet&quot;: {&quot;shopMoney&quot;: {&quot;amount&quot;: amount, &quot;currencyCode&quot;: &quot;USD&quot;}},
+        },
+    }
+
+
+def contract(attempts):
+    return {&quot;id&quot;: &quot;gid://shopify/SubscriptionContract/1&quot;, &quot;billingAttempts&quot;: attempts}
+
+
+def test_to_cents_rounds():
+    assert to_cents(&quot;29.00&quot;) == 2900
+    assert to_cents(&quot;9.99&quot;) == 999
+
+
+def test_billing_cycle_key_truncates_to_day():
+    a = attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;)
+    assert billing_cycle_key(a) == &quot;2026-07-01&quot;
+
+
+def test_no_duplicates_for_single_attempt_per_cycle():
+    c = contract([
+        attempt(1, &quot;#1001&quot;, &quot;2026-06-01T08:00:00Z&quot;),
+        attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+    ])
+    assert find_duplicate_orders(c, &quot;duplicate-renewal&quot;) == []
+
+
+def test_second_attempt_same_day_is_a_duplicate():
+    c = contract([
+        attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+        attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;),
+    ])
+    dups = find_duplicate_orders(c, &quot;duplicate-renewal&quot;)
+    assert len(dups) == 1
+    assert dups[0][&quot;order_id&quot;] == &quot;gid://shopify/Order/2&quot;
+    assert dups[0][&quot;amount_cents&quot;] == 2900
+
+
+def test_first_attempt_in_a_cycle_is_never_flagged():
+    c = contract([
+        attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+        attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;),
+        attempt(3, &quot;#1003&quot;, &quot;2026-07-01T09:00:00Z&quot;),
+    ])
+    dups = find_duplicate_orders(c, &quot;duplicate-renewal&quot;)
+    order_ids = [d[&quot;order_id&quot;] for d in dups]
+    assert &quot;gid://shopify/Order/1&quot; not in order_ids
+    assert len(dups) == 2
+
+
+def test_attempts_without_an_order_are_ignored():
+    failed = attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;)
+    failed[&quot;order&quot;] = None
+    ok = attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;)
+    c = contract([failed, ok])
+    assert find_duplicate_orders(c, &quot;duplicate-renewal&quot;) == []
+
+
+def test_already_tagged_duplicate_is_skipped():
+    c = contract([
+        attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+        attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;, tags=[&quot;duplicate-renewal&quot;]),
+    ])
+    assert find_duplicate_orders(c, &quot;duplicate-renewal&quot;) == []
+
+
+def test_different_cycles_are_each_allowed_one_charge():
+    c = contract([
+        attempt(1, &quot;#1001&quot;, &quot;2026-05-01T08:00:00Z&quot;),
+        attempt(2, &quot;#1002&quot;, &quot;2026-06-01T08:00:00Z&quot;),
+        attempt(3, &quot;#1003&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+    ])
+    assert find_duplicate_orders(c, &quot;duplicate-renewal&quot;) == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">duplicate-renewal.test.js</div>
+      <pre><code class="language-javascript">import { test } from &quot;node:test&quot;;
+import assert from &quot;node:assert/strict&quot;;
+import { findDuplicateOrders, billingCycleKey, toCents } from &quot;./find-duplicate-renewals.js&quot;;
+
+const attempt = (orderId, name, origin, { amount = &quot;29.00&quot;, tags = [] } = {}) =&gt; ({
+  id: `gid://shopify/SubscriptionBillingAttempt/${orderId}`,
+  ready: true,
+  idempotencyKey: `key-${orderId}`,
+  originTime: origin,
+  order: {
+    id: `gid://shopify/Order/${orderId}`,
+    name,
+    tags,
+    totalPriceSet: { shopMoney: { amount, currencyCode: &quot;USD&quot; } },
+  },
+});
+
+const contract = (attempts) =&gt; ({ id: &quot;gid://shopify/SubscriptionContract/1&quot;, billingAttempts: attempts });
+
+test(&quot;toCents rounds&quot;, () =&gt; {
+  assert.equal(toCents(&quot;29.00&quot;), 2900);
+  assert.equal(toCents(&quot;9.99&quot;), 999);
+});
+
+test(&quot;billingCycleKey truncates to day&quot;, () =&gt; {
+  assert.equal(billingCycleKey(attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;)), &quot;2026-07-01&quot;);
+});
+
+test(&quot;no duplicates for single attempt per cycle&quot;, () =&gt; {
+  const c = contract([
+    attempt(1, &quot;#1001&quot;, &quot;2026-06-01T08:00:00Z&quot;),
+    attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+  ]);
+  assert.deepEqual(findDuplicateOrders(c, &quot;duplicate-renewal&quot;), []);
+});
+
+test(&quot;second attempt same day is a duplicate&quot;, () =&gt; {
+  const c = contract([
+    attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+    attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;),
+  ]);
+  const dups = findDuplicateOrders(c, &quot;duplicate-renewal&quot;);
+  assert.equal(dups.length, 1);
+  assert.equal(dups[0].orderId, &quot;gid://shopify/Order/2&quot;);
+  assert.equal(dups[0].amountCents, 2900);
+});
+
+test(&quot;first attempt in a cycle is never flagged&quot;, () =&gt; {
+  const c = contract([
+    attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+    attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;),
+    attempt(3, &quot;#1003&quot;, &quot;2026-07-01T09:00:00Z&quot;),
+  ]);
+  const dups = findDuplicateOrders(c, &quot;duplicate-renewal&quot;);
+  const orderIds = dups.map((d) =&gt; d.orderId);
+  assert.equal(orderIds.includes(&quot;gid://shopify/Order/1&quot;), false);
+  assert.equal(dups.length, 2);
+});
+
+test(&quot;attempts without an order are ignored&quot;, () =&gt; {
+  const failed = attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;);
+  failed.order = null;
+  const ok = attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;);
+  const c = contract([failed, ok]);
+  assert.deepEqual(findDuplicateOrders(c, &quot;duplicate-renewal&quot;), []);
+});
+
+test(&quot;already tagged duplicate is skipped&quot;, () =&gt; {
+  const c = contract([
+    attempt(1, &quot;#1001&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+    attempt(2, &quot;#1002&quot;, &quot;2026-07-01T08:14:00Z&quot;, { tags: [&quot;duplicate-renewal&quot;] }),
+  ]);
+  assert.deepEqual(findDuplicateOrders(c, &quot;duplicate-renewal&quot;), []);
+});
+
+test(&quot;different cycles are each allowed one charge&quot;, () =&gt; {
+  const c = contract([
+    attempt(1, &quot;#1001&quot;, &quot;2026-05-01T08:00:00Z&quot;),
+    attempt(2, &quot;#1002&quot;, &quot;2026-06-01T08:00:00Z&quot;),
+    attempt(3, &quot;#1003&quot;, &quot;2026-07-01T08:00:00Z&quot;),
+  ]);
+  assert.deepEqual(findDuplicateOrders(c, &quot;duplicate-renewal&quot;), []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Timeout retry</span>
+      <h4>The billing worker that retried on a slow response</h4>
+      <p>A subscription app billed contracts nightly, and once a week the Shopify API answered slowly enough that the worker's own timeout fired first. The worker read that as a failure and started a new billing attempt with a freshly generated idempotency key, even though the first attempt had already gone through and created an order.</p>
+      <p>Running the reconciler over the last month of billing attempts made the pattern clear, one contract with two successful attempts for the same cycle five minutes apart. The team tagged the second order on each for review, issued the refunds by hand with full context, and fixed the worker to reuse the same key on any retry so it stopped happening.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Webhook redelivery</span>
+      <h4>The redeployed app that billed on every delivery</h4>
+      <p>An app handled a billing webhook by starting a new billing attempt every time the handler ran, with no memory of whether it had already billed that cycle. A deploy caused Shopify to redeliver a batch of recent webhooks, and every one of them triggered a fresh attempt for a cycle that was already paid.</p>
+      <p>The dry run report showed dozens of contracts each with three or four successful attempts for the same cycle, all within the same few minutes. After tagging and refunding the extras, the handler was changed to check for an existing attempt before starting a new one, so a redelivery becomes a no-op instead of a new bill.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a retry is just a retry again, it either recognizes the attempt it already made and stops, or it makes exactly one. Subscribers get billed once per cycle, the reconciler catches anything that slips through from before the fix, and no one has to explain a second charge on a support ticket. Keep the idempotency key stable across retries, that is what makes the whole thing hold.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why was my subscriber billed twice for one renewal?</summary>
+      <p>A renewal job retried a charge after a timeout or a redelivered webhook, and because the retry carried no idempotency key, Shopify had no way to tell it apart from a brand new charge, so it created a second billing attempt and a second order for the same billing cycle.</p>
+    </details>
+    <details>
+      <summary>What is an idempotency key and why does a renewal job need one?</summary>
+      <p>An idempotency key is a value you generate once per intended charge and send with every attempt, including retries, so Shopify can recognize a retry as the same billing attempt instead of a new one. Shopify's own subscriptionBillingAttemptCreate mutation takes this key for exactly that reason.</p>
+    </details>
+    <details>
+      <summary>Is it safe to flag duplicate renewal charges with a script?</summary>
+      <p>Yes, when the script only groups a contract's successful billing attempts by the day they landed on, only ever flags the attempts after the first one in that cycle, skips anything already tagged, and runs in dry run first so you can review the exact list before anything is refunded.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/transactions-total-mismatch/">Shopify transactions total does not match the order</a>
+    <a href="/shopify/">Browse all Shopify field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Shopify Dev: retry safety and rate limits on the Admin GraphQL API, why blind retries can duplicate a write. <a href="https://shopify.dev/docs/api/usage/rate-limits" rel="noopener">shopify.dev/docs/api/usage/rate-limits</a></li>
+      <li>Shopify Dev: webhooks can be delivered more than once, handlers must expect duplicates. <a href="https://shopify.dev/docs/apps/build/webhooks" rel="noopener">shopify.dev/docs/apps/build/webhooks</a></li>
+      <li>Shopify Help Center: how subscription billing cycles and orders are created. <a href="https://help.shopify.com/en/manual/products/purchase-options/subscriptions" rel="noopener">help.shopify.com/en/manual/products/purchase-options/subscriptions</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Shopify Admin GraphQL: the <code>subscriptionBillingAttemptCreate</code> mutation and its <code>idempotencyKey</code> input. <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/subscriptionBillingAttemptCreate" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/mutations/subscriptionBillingAttemptCreate</a></li>
+      <li>Shopify Admin GraphQL: the <code>SubscriptionContract</code> object and its <code>billingAttempts</code> connection. <a href="https://shopify.dev/docs/api/admin-graphql/latest/objects/SubscriptionContract" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/objects/SubscriptionContract</a></li>
+      <li>Shopify Admin GraphQL: the <code>tagsAdd</code> mutation. <a href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/tagsAdd" rel="noopener">shopify.dev/docs/api/admin-graphql/latest/mutations/tagsAdd</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Shopify orders, payments, subscriptions, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop a duplicate charge?</h3>
+    <p>If this saved a subscriber from a second charge or saved you a refund cleanup, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/shopify/">Back to all Shopify field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Shopify.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/shopify/assets/shopify.js" defer></script>
+</body>
+</html>
