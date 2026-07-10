@@ -1,0 +1,1004 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Saleor Manual Order Line Discounts Deleted on Recalculation</title>
+<meta name="description" content="A manual line discount is applied with orderLineDiscountUpdate, then a later mutation on the same draft order recalculates prices and the discount silently vanishes. Learn why it happens and build a Python or Node.js script that detects the loss and safely reports it for staff confirmation before restoring anything.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/manual-line-discount-deleted-on-recalculation/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Saleor Manual Order Line Discounts Deleted on Recalculation">
+<meta property="og:description" content="Why a manual orderLineDiscountUpdate discount can get wiped the next time an order recalculates its prices, and a safe Python or Node.js script that detects the loss and reports it rather than guessing a value to restore.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/manual-line-discount-deleted-on-recalculation/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/manual-line-discount-deleted-on-recalculation/#article","headline":"Fix Saleor Manual Order Line Discounts Deleted on Recalculation","description":"Why a manual orderLineDiscountUpdate discount can get wiped the next time an order recalculates its prices, and a safe Python or Node.js script that detects the loss and reports it rather than guessing a value to restore.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/manual-line-discount-deleted-on-recalculation/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders & Fulfillment","keywords":"Saleor manual discount deleted, orderLineDiscountUpdate, fetch_order_prices_if_expired, unitDiscount, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Manual order line discount deleted on recalculation","item":"https://www.allanninal.dev/saleor/manual-line-discount-deleted-on-recalculation/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my Saleor manual order line discount disappear?","acceptedAnswer":{"@type":"Answer","text":"Saleor recalculates draft and unconfirmed order prices lazily. Any mutation that touches the order, adding a line, updating a line, changing the shipping address or method, or applying a voucher, triggers a recalculation pass that re-derives each line's unit price from the undiscounted price plus whatever catalogue promotions and vouchers currently apply. A manually applied discount is supposed to override that, but if its flag or reason was not correctly carried through the update, the recalculation falls back to standard pricing and silently clears unit_discount_value and unit_discount_reason, with no error surfaced."}},{"@type":"Question","name":"Can I just restore the discount value I saw before the mutation ran?","acceptedAnswer":{"@type":"Answer","text":"Only with a human confirming it first. Blind auto-restore is unsafe because a legitimate price change, such as a product price update between your before and after snapshots, could make the old discount value wrong even though it looks like the same regression. Treat every detected loss as a flagged order and line to review, and only call orderLineDiscountUpdate again with the prior value once a person has confirmed nothing else changed in between."}},{"@type":"Question","name":"How do I detect that a manual line discount was silently deleted?","acceptedAnswer":{"@type":"Answer","text":"Snapshot every open order's lines before and after any mutation that can trigger recalculation, reading unitDiscount, unitDiscountType, unitDiscountValue, unitDiscountReason, unitPrice, and undiscountedUnitPrice. If a line had a positive unitDiscountValue or a non-null unitDiscountReason before and both are zero or null afterward, while unitPrice has moved back toward undiscountedUnitPrice, that is a silent deletion, not an intentional edit, and the order and line should be flagged."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Orders &amp; Fulfillment</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Orders &amp; Fulfillment</p>
+    <h1>Manual order line discount deleted on recalculation</h1>
+    <p class="lead">A staff member applies a manual discount to an order line with <code>orderLineDiscountUpdate</code>, the unit price drops, and everyone moves on. Then something else touches the same draft order, a new line, a shipping address, a voucher, and the price recalculates. The manual discount that was there a minute ago is gone, the line is back to its normal price, and nothing in the response ever said so. Here is why Saleor can silently drop a manual discount during recalculation and a script that catches it before the order ships at the wrong price.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Report only (no blind auto writes)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Saleor recalculates draft and unconfirmed order prices lazily, through <code>fetch_order_prices_if_expired</code>. Any mutation that touches the order, <code>orderLinesCreate</code>, <code>orderLineUpdate</code>, an <code>orderUpdate</code> that changes the shipping or billing address, an <code>orderShippingMethodUpdate</code>, or applying a voucher, can trigger that pass, which re-derives each line's unit price from the undiscounted price plus whatever catalogue promotions and vouchers currently apply. A manually applied line discount, stored as <code>unitDiscountType</code>, <code>unitDiscountValue</code>, and <code>unitDiscountReason</code> on the line, is supposed to take precedence over that. But if the manual flag was not correctly carried through the update, for example because the mutation rebuilt the line or ran before the address the recalculation keys off of existed, the pass falls back to standard pricing and clears the manual discount without any error. See <a href="https://github.com/saleor/saleor/issues/4675" rel="noopener">saleor/saleor#4675</a>. Run a small Python or Node.js script that snapshots every open order's lines before and after these mutations and flags any line where the manual discount silently disappeared. Full code, tests, and a human-confirmed restore guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A draft or unconfirmed order in Saleor is not a fixed price sheet. Every line's unit price is recomputed on demand, from the undiscounted price plus whatever catalogue promotions and vouchers currently apply to that channel and product. That recomputation only runs when something asks for it, which is any mutation that touches the order.</p>
+  <p>A manual discount applied through <code>orderLineDiscountUpdate</code> is meant to be the exception. It records a <code>valueType</code>, a <code>value</code>, and a <code>reason</code> directly on the line, and that should win over catalogue and voucher pricing every time the line is recalculated. In practice, if the mutation that follows rebuilds the line, changes the shipping context the recalculation depends on, or simply runs before the manual discount fields have fully settled, the recalculation pass falls back to standard pricing. The line's <code>unitDiscountValue</code> goes back to zero, <code>unitDiscountReason</code> goes back to null, and the unit price quietly returns to whatever catalogue and vouchers say it should be. Nothing in the mutation response mentions the line ever had a manual discount.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A staff member applies a manual line discount with orderLineDiscountUpdate, a later mutation touches the same order and triggers a lazy price recalculation, that pass falls back to catalogue and voucher pricing instead of respecting the manual discount, and the line comes back at full price with the discount silently cleared.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="76" width="175" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="97" y="99" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">orderLineDiscountUpdate</text>
+      <text x="97" y="117" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">unitDiscountValue &gt; 0</text>
+      <line x1="188" y1="109" x2="228" y2="109" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="231" y="76" width="185" height="66" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="323" y="99" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Another mutation runs</text>
+      <text x="323" y="117" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55603f">new line, address, voucher</text>
+      <line x1="419" y1="109" x2="459" y2="109" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="439" y="66" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="439" y="150" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">manual flag not carried through</text>
+      <rect x="462" y="76" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="542" y="99" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Prices recalculate</text>
+      <text x="542" y="117" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55603f">falls back to catalogue price</text>
+      <line x1="625" y1="109" x2="665" y2="109" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="668" y="76" width="82" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="709" y="102" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Discount</text>
+      <text x="709" y="119" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">wiped</text>
+    </svg>
+    <figcaption>The manual discount was applied on purpose. A later mutation recalculates the line without honoring it, and the line silently returns to full price.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>Draft and unconfirmed order prices are lazy. <code>fetch_order_prices_if_expired</code> re-derives each line's unit price from the undiscounted price plus whatever catalogue promotions and vouchers currently apply, and it can run as a side effect of almost any order mutation, not only ones you would expect to touch pricing.</li>
+    <li>A manual discount is supposed to take precedence over catalogue and voucher pricing during that recalculation, but the precedence depends on the manual flag and reason being correctly carried through whatever mutation triggered the pass. If the mutation rebuilt the line object, or changed context the recalculation keys off of, like the shipping address, before the manual discount fields were consistently attached, the fallback path wins instead.</li>
+    <li>None of this surfaces an error. The mutation that triggered the recalculation, <code>orderLinesCreate</code>, <code>orderLineUpdate</code>, <code>orderUpdate</code>, <code>orderShippingMethodUpdate</code>, or a voucher application, returns successfully. The only symptom is the line's <code>unitDiscountValue</code> and <code>unitDiscountReason</code> quietly reverting, see <a href="https://github.com/saleor/saleor/issues/4675" rel="noopener">saleor/saleor#4675</a>.</li>
+    <li>The same lazy pricing model has caused related confusion elsewhere, such as catalogue discounts staying applied after a sale is deleted (<a href="https://github.com/saleor/saleor/discussions/14617" rel="noopener">discussion #14617</a>) and the broader checkout price recalculation refactor tracked in <a href="https://github.com/saleor/saleor/issues/11887" rel="noopener">issue #11887</a>. Recalculation timing is a known sharp edge across the pricing pipeline, not a one-off bug in a single mutation.</li>
+  </ul>
+  <p>A merchant sees a discounted line at checkout confirmation time, or worse, after the order ships, and the order total no longer matches what the customer was promised. Support has to explain a price the store itself removed by accident.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Saleor gives you no supported mutation to "restore" a wiped discount, because it has no memory of what the discount used to be once the fields are cleared. That means the only safe fix is to keep your own snapshot from before the mutation ran, detect the loss by diffing it against a fresh read afterward, and never re-apply that old value automatically. A product price could have legitimately changed in between, and blindly restoring a stale discount could be just as wrong as losing it. Flag it, show a human the before and after, and only re-apply with their say-so.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script snapshots every open order's lines before you run any of the mutations known to trigger recalculation, then re-queries the same lines afterward. It compares the two: if a line had a manual discount before and does not have one after, that is a loss, not an intentional edit, and it gets flagged. Restoring the discount is never automatic. It only happens under an explicit dry-run-off flag, using the exact value captured in the snapshot, and only after a human has looked at the before and after and confirmed nothing else about the order changed in between.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script snapshots order lines before a mutation, runs the mutation, re-queries the lines after, checks whether a line's manual discount value or reason dropped to zero or null while unit price moved back toward undiscounted price, and if so flags the order and line for review, offering a human-confirmed restore via orderLineDiscountUpdate only when authorized, otherwise it does nothing.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Snapshot lines</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">before the mutation</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Run the mutation</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">re-query lines after</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Diff before and</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">after per line</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">Discount dropped</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">to zero or null?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">no, unchanged</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#55603f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Flag order and line,</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">restore only if human</text>
+      <text x="684" y="234" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">confirms and DRY_RUN=false</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script never guesses. It flags the exact order and line where the discount vanished and only re-applies the captured value once a person says to.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with order read and write access</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read and manage orders. Use the resulting app token as a Bearer token, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   # start safe, this script never blind-restores a discount</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   // start safe, this script never blind-restores a discount</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Snapshot every open order's lines</h3>
+      <p>Page through open (draft or unconfirmed) orders with the <code>orders</code> connection, and for each one read every line's <code>unitDiscount</code>, <code>unitDiscountType</code>, <code>unitDiscountValue</code>, <code>unitDiscountReason</code>, <code>unitPrice</code>, and <code>undiscountedUnitPrice</code>. Keep this snapshot before you run any mutation that might trigger a recalculation, then take a second snapshot afterward with the same query, fresh from the API.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_LINES_QUERY = """
+query($id: ID!) {
+  order(id: $id) {
+    id
+    status
+    lines {
+      id
+      productName
+      unitDiscount { amount currency }
+      unitDiscountType
+      unitDiscountValue
+      unitDiscountReason
+      undiscountedUnitPrice { gross { amount } }
+      unitPrice { gross { amount } }
+      isPriceOverridden
+    }
+  }
+}"""
+
+def snapshot_order_lines(order_id):
+    order = gql(ORDER_LINES_QUERY, {"id": order_id})["order"]
+    return {
+        line["id"]: {
+            "productName": line["productName"],
+            "unitDiscountType": line["unitDiscountType"],
+            "unitDiscountValue": line["unitDiscountValue"] or 0,
+            "unitDiscountReason": line["unitDiscountReason"],
+            "unitPriceGrossAmount": line["unitPrice"]["gross"]["amount"],
+            "undiscountedUnitPriceGrossAmount": line["undiscountedUnitPrice"]["gross"]["amount"],
+        }
+        for line in order["lines"]
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_LINES_QUERY = `
+query($id: ID!) {
+  order(id: $id) {
+    id
+    status
+    lines {
+      id
+      productName
+      unitDiscount { amount currency }
+      unitDiscountType
+      unitDiscountValue
+      unitDiscountReason
+      undiscountedUnitPrice { gross { amount } }
+      unitPrice { gross { amount } }
+      isPriceOverridden
+    }
+  }
+}`;
+
+async function snapshotOrderLines(orderId) {
+  const order = (await gql(ORDER_LINES_QUERY, { id: orderId })).order;
+  const snapshot = {};
+  for (const line of order.lines) {
+    snapshot[line.id] = {
+      productName: line.productName,
+      unitDiscountType: line.unitDiscountType,
+      unitDiscountValue: line.unitDiscountValue || 0,
+      unitDiscountReason: line.unitDiscountReason,
+      unitPriceGrossAmount: line.unitPrice.gross.amount,
+      undiscountedUnitPriceGrossAmount: line.undiscountedUnitPrice.gross.amount,
+    };
+  }
+  return snapshot;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a line's before and after snapshot and returns whether the discount was lost, whether to flag it, and, only when lost, the exact input needed to restore it. It is pure: no network, no database, just two plain objects in and a decision record out, which makes it trivial to test.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_discount_loss(before, after):
+    had_discount = before["unitDiscountValue"] > 0 or bool(before["unitDiscountReason"])
+    lost_value = after["unitDiscountValue"] == 0
+    lost_reason = not after["unitDiscountReason"]
+
+    lost = had_discount and lost_value and lost_reason
+
+    if not lost:
+        return {"lost": False, "shouldFlag": False, "restoreInput": None}
+
+    restore_input = {
+        "valueType": before["unitDiscountType"],
+        "value": before["unitDiscountValue"],
+        "reason": before["unitDiscountReason"],
+    }
+    return {"lost": True, "shouldFlag": True, "restoreInput": restore_input}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideDiscountLoss(before, after) {
+  const hadDiscount = before.unitDiscountValue > 0 || Boolean(before.unitDiscountReason);
+  const lostValue = after.unitDiscountValue === 0;
+  const lostReason = !after.unitDiscountReason;
+
+  const lost = hadDiscount &amp;&amp; lostValue &amp;&amp; lostReason;
+
+  if (!lost) {
+    return { lost: false, shouldFlag: false, restoreInput: null };
+  }
+
+  const restoreInput = {
+    valueType: before.unitDiscountType,
+    value: before.unitDiscountValue,
+    reason: before.unitDiscountReason,
+  };
+  return { lost: true, shouldFlag: true, restoreInput };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Run the recalculation-triggering mutation, then re-snapshot</h3>
+      <p>Call whatever mutation you need, <code>orderLinesCreate</code>, <code>orderLineUpdate</code>, an address change through <code>orderUpdate</code>, <code>orderShippingMethodUpdate</code>, or a voucher application, and immediately re-query the same order's lines. Compare every line id that existed in the before snapshot against its entry in the after snapshot using <code>decide_discount_loss</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag.py</div>
+      <pre><code class="language-python">def flag_losses(order_id, before, after):
+    flagged = []
+    for line_id, before_line in before.items():
+        after_line = after.get(line_id)
+        if after_line is None:
+            continue
+        decision = decide_discount_loss(before_line, after_line)
+        if decision["shouldFlag"]:
+            flagged.append({
+                "orderId": order_id,
+                "lineId": line_id,
+                "productName": before_line["productName"],
+                "before": before_line,
+                "after": after_line,
+                "restoreInput": decision["restoreInput"],
+            })
+    return flagged</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag.js</div>
+      <pre><code class="language-javascript">function flagLosses(orderId, before, after) {
+  const flagged = [];
+  for (const [lineId, beforeLine] of Object.entries(before)) {
+    const afterLine = after[lineId];
+    if (!afterLine) continue;
+    const decision = decideDiscountLoss(beforeLine, afterLine);
+    if (decision.shouldFlag) {
+      flagged.push({
+        orderId,
+        lineId,
+        productName: beforeLine.productName,
+        before: beforeLine,
+        after: afterLine,
+        restoreInput: decision.restoreInput,
+      });
+    }
+  }
+  return flagged;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Restore only under a human-confirmed, dry-run-off path</h3>
+      <p>Under <code>DRY_RUN=true</code>, the default, the script only reports the flagged order and line ids with their before and after discount values. It never calls a write mutation. When <code>DRY_RUN=false</code> and a human has looked at the report and confirmed nothing else legitimately changed the price in between, it re-applies the captured discount with <code>orderLineDiscountUpdate</code> using the exact <code>valueType</code>, <code>value</code>, and <code>reason</code> from the snapshot.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never auto-restore a discount the moment you detect it missing. A product price could have legitimately changed between your two snapshots, and re-applying a stale value could create a new, wrong discount rather than fixing anything. Flag it, show the before and after to a person, and only run the restore mutation with <code>DRY_RUN=false</code> once they say to.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, snapshots order lines before and after a recalculation-triggering mutation, flags any line whose manual discount silently disappeared, and only restores it, using the pure decision function's captured value, when a human has explicitly authorized the write.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/manual-line-discount-deleted-on-recalculation" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_discount_loss.py</div>
+      <pre><code class="language-python">"""Detect Saleor order lines whose manual discount silently disappears when
+the order's prices recalculate (saleor/saleor#4675).
+
+Draft and unconfirmed order prices are lazy: any mutation that touches the
+order, adding a line, updating a line, changing the shipping address or
+method, or applying a voucher, can trigger fetch_order_prices_if_expired,
+which re-derives each line's unit price from the undiscounted price plus
+whatever catalogue promotions and vouchers currently apply. A manual line
+discount applied through orderLineDiscountUpdate is supposed to take
+precedence over that, but if its flag was not carried through correctly,
+the recalculation falls back to standard pricing and clears
+unit_discount_value and unit_discount_reason without any error.
+
+This script never blind-restores a discount. Under DRY_RUN=true (the
+default) it only reports flagged order and line ids with their before and
+after values. When DRY_RUN=false and a human has confirmed the loss is a
+regression and not a legitimate price change, it re-applies the exact
+captured discount with orderLineDiscountUpdate. Safe to run again and
+again, since a line with no detected loss is never touched.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_discount_loss")
+
+API_URL = os.environ.get("SALEOR_API_URL", "https://store.saleor.cloud/graphql/")
+TOKEN = os.environ.get("SALEOR_AUTH_TOKEN", "dummy-token")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ORDER_LINES_QUERY = """
+query($id: ID!) {
+  order(id: $id) {
+    id
+    status
+    lines {
+      id
+      productName
+      unitDiscount { amount currency }
+      unitDiscountType
+      unitDiscountValue
+      unitDiscountReason
+      undiscountedUnitPrice { gross { amount } }
+      unitPrice { gross { amount } }
+      isPriceOverridden
+    }
+  }
+}"""
+
+RESTORE_DISCOUNT_MUTATION = """
+mutation($lineId: ID!, $input: OrderDiscountCommonInput!) {
+  orderLineDiscountUpdate(orderLineId: $lineId, input: $input) {
+    orderLine { id unitDiscountValue unitDiscountReason }
+    errors { field code message }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def decide_discount_loss(before, after):
+    had_discount = before["unitDiscountValue"] > 0 or bool(before["unitDiscountReason"])
+    lost_value = after["unitDiscountValue"] == 0
+    lost_reason = not after["unitDiscountReason"]
+
+    lost = had_discount and lost_value and lost_reason
+
+    if not lost:
+        return {"lost": False, "shouldFlag": False, "restoreInput": None}
+
+    restore_input = {
+        "valueType": before["unitDiscountType"],
+        "value": before["unitDiscountValue"],
+        "reason": before["unitDiscountReason"],
+    }
+    return {"lost": True, "shouldFlag": True, "restoreInput": restore_input}
+
+
+def snapshot_order_lines(order_id):
+    order = gql(ORDER_LINES_QUERY, {"id": order_id})["order"]
+    return {
+        line["id"]: {
+            "productName": line["productName"],
+            "unitDiscountType": line["unitDiscountType"],
+            "unitDiscountValue": line["unitDiscountValue"] or 0,
+            "unitDiscountReason": line["unitDiscountReason"],
+            "unitPriceGrossAmount": line["unitPrice"]["gross"]["amount"],
+            "undiscountedUnitPriceGrossAmount": line["undiscountedUnitPrice"]["gross"]["amount"],
+        }
+        for line in order["lines"]
+    }
+
+
+def flag_losses(order_id, before, after):
+    flagged = []
+    for line_id, before_line in before.items():
+        after_line = after.get(line_id)
+        if after_line is None:
+            continue
+        decision = decide_discount_loss(before_line, after_line)
+        if decision["shouldFlag"]:
+            flagged.append({
+                "orderId": order_id,
+                "lineId": line_id,
+                "productName": before_line["productName"],
+                "before": before_line,
+                "after": after_line,
+                "restoreInput": decision["restoreInput"],
+            })
+    return flagged
+
+
+def restore_discount(line_id, restore_input):
+    result = gql(RESTORE_DISCOUNT_MUTATION, {"lineId": line_id, "input": restore_input})["orderLineDiscountUpdate"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["orderLine"]
+
+
+def run(order_id, mutate_fn):
+    """mutate_fn is the caller-supplied function that performs the mutation
+    suspected of triggering recalculation, for example orderLinesCreate or
+    orderUpdate. It receives no arguments and its return value is ignored.
+    """
+    before = snapshot_order_lines(order_id)
+    mutate_fn()
+    after = snapshot_order_lines(order_id)
+
+    flagged = flag_losses(order_id, before, after)
+
+    for item in flagged:
+        log.warning(
+            "Order %s line %s (%s) lost its manual discount. before=%s after=%s",
+            item["orderId"], item["lineId"], item["productName"],
+            item["before"]["unitDiscountValue"], item["after"]["unitDiscountValue"],
+        )
+        if not DRY_RUN:
+            restore_discount(item["lineId"], item["restoreInput"])
+            log.info("Restored discount on line %s.", item["lineId"])
+
+    log.info("Done. %d line(s) flagged for a lost manual discount.", len(flagged))
+    return flagged
+
+
+if __name__ == "__main__":
+    run(order_id=os.environ.get("ORDER_ID", ""), mutate_fn=lambda: None)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-discount-loss.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect Saleor order lines whose manual discount silently disappears when
+ * the order's prices recalculate (saleor/saleor#4675).
+ *
+ * Draft and unconfirmed order prices are lazy: any mutation that touches
+ * the order, adding a line, updating a line, changing the shipping address
+ * or method, or applying a voucher, can trigger fetch_order_prices_if_expired,
+ * which re-derives each line's unit price from the undiscounted price plus
+ * whatever catalogue promotions and vouchers currently apply. A manual line
+ * discount applied through orderLineDiscountUpdate is supposed to take
+ * precedence over that, but if its flag was not carried through correctly,
+ * the recalculation falls back to standard pricing and clears
+ * unitDiscountValue and unitDiscountReason without any error.
+ *
+ * This script never blind-restores a discount. Under DRY_RUN=true (the
+ * default) it only reports flagged order and line ids with their before and
+ * after values. When DRY_RUN=false and a human has confirmed the loss is a
+ * regression and not a legitimate price change, it re-applies the exact
+ * captured discount with orderLineDiscountUpdate. Run on demand around any
+ * mutation you suspect of triggering recalculation.
+ *
+ * Guide: https://www.allanninal.dev/saleor/manual-line-discount-deleted-on-recalculation/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decideDiscountLoss(before, after) {
+  const hadDiscount = before.unitDiscountValue > 0 || Boolean(before.unitDiscountReason);
+  const lostValue = after.unitDiscountValue === 0;
+  const lostReason = !after.unitDiscountReason;
+
+  const lost = hadDiscount &amp;&amp; lostValue &amp;&amp; lostReason;
+
+  if (!lost) {
+    return { lost: false, shouldFlag: false, restoreInput: null };
+  }
+
+  const restoreInput = {
+    valueType: before.unitDiscountType,
+    value: before.unitDiscountValue,
+    reason: before.unitDiscountReason,
+  };
+  return { lost: true, shouldFlag: true, restoreInput };
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const ORDER_LINES_QUERY = `
+query($id: ID!) {
+  order(id: $id) {
+    id
+    status
+    lines {
+      id
+      productName
+      unitDiscount { amount currency }
+      unitDiscountType
+      unitDiscountValue
+      unitDiscountReason
+      undiscountedUnitPrice { gross { amount } }
+      unitPrice { gross { amount } }
+      isPriceOverridden
+    }
+  }
+}`;
+
+const RESTORE_DISCOUNT_MUTATION = `
+mutation($lineId: ID!, $input: OrderDiscountCommonInput!) {
+  orderLineDiscountUpdate(orderLineId: $lineId, input: $input) {
+    orderLine { id unitDiscountValue unitDiscountReason }
+    errors { field code message }
+  }
+}`;
+
+async function snapshotOrderLines(orderId) {
+  const order = (await gql(ORDER_LINES_QUERY, { id: orderId })).order;
+  const snapshot = {};
+  for (const line of order.lines) {
+    snapshot[line.id] = {
+      productName: line.productName,
+      unitDiscountType: line.unitDiscountType,
+      unitDiscountValue: line.unitDiscountValue || 0,
+      unitDiscountReason: line.unitDiscountReason,
+      unitPriceGrossAmount: line.unitPrice.gross.amount,
+      undiscountedUnitPriceGrossAmount: line.undiscountedUnitPrice.gross.amount,
+    };
+  }
+  return snapshot;
+}
+
+function flagLosses(orderId, before, after) {
+  const flagged = [];
+  for (const [lineId, beforeLine] of Object.entries(before)) {
+    const afterLine = after[lineId];
+    if (!afterLine) continue;
+    const decision = decideDiscountLoss(beforeLine, afterLine);
+    if (decision.shouldFlag) {
+      flagged.push({
+        orderId,
+        lineId,
+        productName: beforeLine.productName,
+        before: beforeLine,
+        after: afterLine,
+        restoreInput: decision.restoreInput,
+      });
+    }
+  }
+  return flagged;
+}
+
+async function restoreDiscount(lineId, restoreInput) {
+  const result = (await gql(RESTORE_DISCOUNT_MUTATION, { lineId, input: restoreInput })).orderLineDiscountUpdate;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.orderLine;
+}
+
+/**
+ * mutateFn is the caller-supplied function that performs the mutation
+ * suspected of triggering recalculation, for example orderLinesCreate or
+ * orderUpdate. It receives no arguments and its return value is ignored.
+ */
+export async function run(orderId, mutateFn) {
+  const before = await snapshotOrderLines(orderId);
+  await mutateFn();
+  const after = await snapshotOrderLines(orderId);
+
+  const flagged = flagLosses(orderId, before, after);
+
+  for (const item of flagged) {
+    console.warn(
+      `Order ${item.orderId} line ${item.lineId} (${item.productName}) lost its manual discount. before=${item.before.unitDiscountValue} after=${item.after.unitDiscountValue}`
+    );
+    if (!DRY_RUN) {
+      await restoreDiscount(item.lineId, item.restoreInput);
+      console.log(`Restored discount on line ${item.lineId}.`);
+    }
+  }
+
+  console.log(`Done. ${flagged.length} line(s) flagged for a lost manual discount.`);
+  return flagged;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run(process.env.ORDER_ID || "", async () => {}).catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which lines get flagged and what value a human-authorized restore would use. Because <code>decide_discount_loss</code> is pure, the test needs no network and no Saleor account. It just feeds in plain before and after line snapshots and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_manual_discount_loss.py</div>
+      <pre><code class="language-python">from detect_discount_loss import decide_discount_loss
+
+
+def before_line(**over):
+    base = {
+        "unitDiscountType": "FIXED",
+        "unitDiscountValue": 5.0,
+        "unitDiscountReason": "Loyalty discount",
+        "unitPriceGrossAmount": 15.0,
+    }
+    base.update(over)
+    return base
+
+
+def after_line(**over):
+    base = {
+        "unitDiscountType": "FIXED",
+        "unitDiscountValue": 5.0,
+        "unitDiscountReason": "Loyalty discount",
+        "unitPriceGrossAmount": 15.0,
+        "undiscountedUnitPriceGrossAmount": 20.0,
+    }
+    base.update(over)
+    return base
+
+
+def test_no_loss_when_discount_unchanged():
+    decision = decide_discount_loss(before_line(), after_line())
+    assert decision == {"lost": False, "shouldFlag": False, "restoreInput": None}
+
+
+def test_loss_when_value_and_reason_both_cleared():
+    after = after_line(unitDiscountValue=0, unitDiscountReason=None, unitPriceGrossAmount=20.0)
+    decision = decide_discount_loss(before_line(), after)
+    assert decision["lost"] is True
+    assert decision["shouldFlag"] is True
+    assert decision["restoreInput"] == {
+        "valueType": "FIXED",
+        "value": 5.0,
+        "reason": "Loyalty discount",
+    }
+
+
+def test_no_loss_when_line_never_had_a_manual_discount():
+    before = before_line(unitDiscountValue=0, unitDiscountReason=None)
+    after = after_line(unitDiscountValue=0, unitDiscountReason=None, unitPriceGrossAmount=20.0)
+    decision = decide_discount_loss(before, after)
+    assert decision["lost"] is False
+    assert decision["restoreInput"] is None
+
+
+def test_no_loss_when_value_present_but_reason_still_set():
+    after = after_line(unitDiscountValue=0, unitDiscountReason="Loyalty discount")
+    decision = decide_discount_loss(before_line(), after)
+    assert decision["lost"] is False
+
+
+def test_restore_input_uses_percentage_type_from_before():
+    before = before_line(unitDiscountType="PERCENTAGE", unitDiscountValue=10.0)
+    after = after_line(unitDiscountValue=0, unitDiscountReason=None, unitPriceGrossAmount=20.0)
+    decision = decide_discount_loss(before, after)
+    assert decision["restoreInput"]["valueType"] == "PERCENTAGE"
+    assert decision["restoreInput"]["value"] == 10.0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">discount-loss.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideDiscountLoss } from "./detect-discount-loss.js";
+
+const beforeLine = (over = {}) =&gt; ({
+  unitDiscountType: "FIXED",
+  unitDiscountValue: 5.0,
+  unitDiscountReason: "Loyalty discount",
+  unitPriceGrossAmount: 15.0,
+  ...over,
+});
+
+const afterLine = (over = {}) =&gt; ({
+  unitDiscountType: "FIXED",
+  unitDiscountValue: 5.0,
+  unitDiscountReason: "Loyalty discount",
+  unitPriceGrossAmount: 15.0,
+  undiscountedUnitPriceGrossAmount: 20.0,
+  ...over,
+});
+
+test("no loss when discount unchanged", () =&gt; {
+  const decision = decideDiscountLoss(beforeLine(), afterLine());
+  assert.deepEqual(decision, { lost: false, shouldFlag: false, restoreInput: null });
+});
+
+test("loss when value and reason both cleared", () =&gt; {
+  const after = afterLine({ unitDiscountValue: 0, unitDiscountReason: null, unitPriceGrossAmount: 20.0 });
+  const decision = decideDiscountLoss(beforeLine(), after);
+  assert.equal(decision.lost, true);
+  assert.equal(decision.shouldFlag, true);
+  assert.deepEqual(decision.restoreInput, { valueType: "FIXED", value: 5.0, reason: "Loyalty discount" });
+});
+
+test("no loss when line never had a manual discount", () =&gt; {
+  const before = beforeLine({ unitDiscountValue: 0, unitDiscountReason: null });
+  const after = afterLine({ unitDiscountValue: 0, unitDiscountReason: null, unitPriceGrossAmount: 20.0 });
+  const decision = decideDiscountLoss(before, after);
+  assert.equal(decision.lost, false);
+  assert.equal(decision.restoreInput, null);
+});
+
+test("no loss when value present but reason still set", () =&gt; {
+  const after = afterLine({ unitDiscountValue: 0, unitDiscountReason: "Loyalty discount" });
+  const decision = decideDiscountLoss(beforeLine(), after);
+  assert.equal(decision.lost, false);
+});
+
+test("restore input uses percentage type from before", () =&gt; {
+  const before = beforeLine({ unitDiscountType: "PERCENTAGE", unitDiscountValue: 10.0 });
+  const after = afterLine({ unitDiscountValue: 0, unitDiscountReason: null, unitPriceGrossAmount: 20.0 });
+  const decision = decideDiscountLoss(before, after);
+  assert.equal(decision.restoreInput.valueType, "PERCENTAGE");
+  assert.equal(decision.restoreInput.value, 10.0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Support override</span>
+      <h4>A goodwill discount vanished after a shipping address fix</h4>
+      <p>A support agent applied a manual ten percent discount to a line as a goodwill gesture on a delayed order, using <code>orderLineDiscountUpdate</code> with a clear reason. The customer then asked to change the delivery address before the order shipped, so a second agent ran an <code>orderUpdate</code> to correct it. That update triggered a recalculation, and the line's discount silently reverted to full price, no error, no warning.</p>
+      <p>Running the detector around address change mutations caught the exact line and order, with the original ten percent and reason preserved in the snapshot. A supervisor reviewed the before and after, confirmed nothing else about the product price had changed, and authorized the restore. The customer's invoice matched what they were promised.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Bulk draft editing</span>
+      <h4>Adding a line reset an earlier manual price override</h4>
+      <p>A wholesale team builds draft orders by adding lines one at a time as a buyer finalizes their list, and applies a manual discount to a bundle line early in that process. Adding a later line with <code>orderLinesCreate</code> triggered a full price recalculation across the order, and the earlier bundle line's discount came back cleared even though nothing about the bundle line itself was touched.</p>
+      <p>The team started snapshotting lines before and after every <code>orderLinesCreate</code> call during draft assembly. The detector flagged the bundle line within the same session, before the draft was ever completed, so staff could re-apply the discount immediately instead of a customer noticing a higher total at final review.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs around every mutation that can trigger recalculation, a manual discount that gets silently dropped is caught within the same session, not weeks later in a customer complaint. The team gets the exact order, line, and the discount value that used to be there, and any restore stays a deliberate, human-confirmed decision using the captured value, never a script guessing at what the price should be.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my Saleor manual order line discount disappear?</summary>
+      <p>Saleor recalculates draft and unconfirmed order prices lazily. Any mutation that touches the order, adding a line, updating a line, changing the shipping address or method, or applying a voucher, triggers a recalculation pass that re-derives each line's unit price from the undiscounted price plus whatever catalogue promotions and vouchers currently apply. A manually applied discount is supposed to override that, but if its flag or reason was not correctly carried through the update, the recalculation falls back to standard pricing and silently clears unit_discount_value and unit_discount_reason, with no error surfaced.</p>
+    </details>
+    <details>
+      <summary>Can I just restore the discount value I saw before the mutation ran?</summary>
+      <p>Only with a human confirming it first. Blind auto-restore is unsafe because a legitimate price change, such as a product price update between your before and after snapshots, could make the old discount value wrong even though it looks like the same regression. Treat every detected loss as a flagged order and line to review, and only call orderLineDiscountUpdate again with the prior value once a person has confirmed nothing else changed in between.</p>
+    </details>
+    <details>
+      <summary>How do I detect that a manual line discount was silently deleted?</summary>
+      <p>Snapshot every open order's lines before and after any mutation that can trigger recalculation, reading unitDiscount, unitDiscountType, unitDiscountValue, unitDiscountReason, unitPrice, and undiscountedUnitPrice. If a line had a positive unitDiscountValue or a non-null unitDiscountReason before and both are zero or null afterward, while unitPrice has moved back toward undiscountedUnitPrice, that is a silent deletion, not an intentional edit, and the order and line should be flagged.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Manual order: Discount get's deleted. <a href="https://github.com/saleor/saleor/issues/4675" rel="noopener">github.com/saleor/saleor/issues/4675</a></li>
+      <li>[RFC] Refactor sales price calculations in the checkout flow. <a href="https://github.com/saleor/saleor/issues/11887" rel="noopener">github.com/saleor/saleor/issues/11887</a></li>
+      <li>Checkout discount still applied on product/s when sale is deleted or the catalogue is empty. <a href="https://github.com/saleor/saleor/discussions/14617" rel="noopener">github.com/saleor/saleor/discussions/14617</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: Manual Discounts. <a href="https://docs.saleor.io/developer/discounts/manual-discounts" rel="noopener">docs.saleor.io/developer/discounts/manual-discounts</a></li>
+      <li>Saleor Commerce Documentation: OrderLine Object. <a href="https://docs.saleor.io/api-reference/orders/objects/order-line" rel="noopener">docs.saleor.io/api-reference/orders/objects/order-line</a></li>
+      <li>Saleor Commerce Documentation: Price Calculation. <a href="https://docs.saleor.io/developer/price-calculation" rel="noopener">docs.saleor.io/developer/price-calculation</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, orders, channels, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a lost discount for you?</h3>
+    <p>If this saved a customer from an unexpected total, or gave your support team the report they needed, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>

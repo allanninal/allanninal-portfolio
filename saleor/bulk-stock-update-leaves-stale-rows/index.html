@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Saleor Bulk Stock Update That Leaves Stale or Partial Rows</title>
+<meta name="description" content="stockBulkUpdate and productVariantStocksUpdate can persist only some rows of a batch while the errorPolicy quietly decides what survives. Learn why a bulk call can leave stale per-warehouse stock rows and build a Python or Node.js reconciler that finds and safely repairs the mismatch.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/bulk-stock-update-leaves-stale-rows/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Saleor Bulk Stock Update That Leaves Stale or Partial Rows">
+<meta property="og:description" content="Why a bulk stock call can leave some warehouse rows on their old quantity, and a safe Python or Node.js reconciler that diffs intended against actual and only repairs the rows a genuine failure explains.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/bulk-stock-update-leaves-stale-rows/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/bulk-stock-update-leaves-stale-rows/#article","headline":"Fix Saleor Bulk Stock Update That Leaves Stale or Partial Rows","description":"Why stockBulkUpdate and productVariantStocksUpdate can persist only some rows of a batch depending on errorPolicy, and a safe Python or Node.js reconciler that diffs intended against actual quantities and only repairs the rows a genuine failure explains.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/bulk-stock-update-leaves-stale-rows/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Stock & Inventory","keywords":"Saleor bulk stock update stale rows, stockBulkUpdate, productVariantStocksUpdate, errorPolicy, REJECT_FAILED_ROWS, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Bulk stock update leaves stale or partial rows","item":"https://www.allanninal.dev/saleor/bulk-stock-update-leaves-stale-rows/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Saleor bulk stock update not update every warehouse row?","acceptedAnswer":{"@type":"Answer","text":"Saleor's bulk stock mutations process every row you send in one call, but they hand errors off to an errorPolicy. The default REJECT_EVERYTHING rolls back the whole batch if a single row is bad, such as a warehouse not assigned to the variant's shipping zones, an unknown id, or a duplicate warehouse. REJECT_FAILED_ROWS and IGNORE_FAILED_ROWS instead persist only the valid rows and skip the bad ones. Either way, a script that assumes the whole call always succeeds can end up with some Stock rows still on their pre-update quantity."}},{"@type":"Question","name":"How do I detect a stale row after a Saleor bulk stock update?","acceptedAnswer":{"@type":"Answer","text":"Re-run the same productVariantStocksUpdate or stockBulkUpdate call your script issued and capture its errors, bulkStockErrors, or results with per-row codes. Then query current per-warehouse stock for the same variants and compare each intended quantity to the quantity Saleor actually stored. Any row where the mutation reported no error but the read-back quantity does not match what you intended is a stale or partial row."}},{"@type":"Question","name":"Is it safe to automatically rewrite stale stock rows?","acceptedAnswer":{"@type":"Answer","text":"Only for rows whose mismatch is explained by a genuine failed-row error such as NOT_FOUND or INVALID, and only when a human has explicitly turned off dry run. Re-issue a new, scoped stockBulkUpdate with errorPolicy REJECT_FAILED_ROWS for just those rows, never the original batch, then re-read and re-diff to confirm the row actually converged before marking it resolved."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Stock &amp; Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Stock &amp; Inventory</p>
+    <h1>Bulk stock update leaves stale or partial rows</h1>
+    <p class="lead">You fire one <code>stockBulkUpdate</code> or <code>productVariantStocksUpdate</code> call with a list of warehouse rows and move on, assuming every row landed. Then a customer reports a warehouse still shows the old quantity, or a report shows a variant that never actually changed. The batch call did not fail loudly. It just did not fully agree with what you asked for. Here is why that happens and a script that finds every row that is still stale and repairs only the ones it can safely explain.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Report first, repair only when confirmed</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Saleor's bulk stock mutations, <code>productVariantStocksUpdate</code> and <code>stockBulkUpdate</code>, take a list of per-warehouse rows in <code>stocks</code> and process the whole batch in one call, but error handling is row-scoped and controlled by an <code>errorPolicy</code>. The default <code>REJECT_EVERYTHING</code> rolls back the entire batch if even one row is bad, such as a warehouse not on the variant's shipping zones, an unknown id, or a duplicate warehouse, and it does not always make that all-or-nothing behavior obvious to the caller. <code>REJECT_FAILED_ROWS</code> and <code>IGNORE_FAILED_ROWS</code> instead persist the good rows and skip the bad ones on purpose. A script that fires one bulk call and assumes every warehouse updated can end up with Stock rows still holding their old quantity, and concurrent writers between the call and a later read can make a row look stale even when the mutation itself actually succeeded for it. Run a small Python or Node.js script that replays the mutation, reads back real stock, diffs intended against actual, and only auto-repairs the rows a genuine failed-row error explains. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A bulk stock update looks simple from the caller's side. You build a list of <code>{variantId, warehouseId, quantity}</code> rows, some for a hundred warehouses on one variant, some for one warehouse across a hundred variants, send it in one GraphQL call, and expect Saleor to write every row exactly as sent.</p>
+  <p>What actually happens depends on the <code>errorPolicy</code>, and on what else is touching stock at the same time. With the default policy, one bad row anywhere in the batch, a warehouse that is not assigned to the variant's shipping zones, an id that does not exist anymore, or the same warehouse listed twice, rolls back the whole call, so nothing you intended actually landed even though the request itself came back without a hard error. With a row-tolerant policy, Saleor deliberately keeps the good rows and drops the bad ones, which is correct behavior, but only if your script actually reads the per-row result and treats a skipped row differently from a written one. A script that only checks for a top-level exception will not notice either case, and will report success while some rows are quietly stale.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A bulk stock call sends rows for several warehouses, one row is bad, the errorPolicy either rolls back everything or skips just that row, and the caller assumes success without checking, so a Stock row stays on its old quantity.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="80" width="168" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="94" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e2611">One bulk call</text>
+      <text x="94" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55603f">rows for many</text>
+      <text x="94" y="136" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55603f">warehouses</text>
+      <line x1="181" y1="113" x2="221" y2="113" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="224" y="80" width="150" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="299" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e2611">One row is bad</text>
+      <text x="299" y="121" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">unknown id, bad zone,</text>
+      <text x="299" y="136" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">or duplicate warehouse</text>
+      <line x1="377" y1="113" x2="419" y2="113" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="398" y="70" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="398" y="153" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">errorPolicy decides</text>
+      <text x="398" y="166" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">what survives</text>
+      <rect x="422" y="80" width="170" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="507" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Rollback or skip</text>
+      <text x="507" y="121" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">not always obvious</text>
+      <text x="507" y="136" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">to the caller</text>
+      <line x1="595" y1="113" x2="637" y2="113" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="640" y="80" width="110" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="695" y="103" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Stock row</text>
+      <text x="695" y="121" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stays stale</text>
+    </svg>
+    <figcaption>The bulk call does not crash, so the script moves on assuming every row landed. Depending on errorPolicy, one bad row can roll back the whole batch or just be skipped, and either way a Stock row can be left on its old quantity.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li><code>productVariantStocksUpdate</code> takes a <code>stocks: [StockInput!]!</code> list for one variant, and <code>stockBulkUpdate</code> takes rows across many variants and warehouses, both processed in a single call, but the mutation's own history shows it has not always fully propagated every row, a gap tracked in <a href="https://github.com/saleor/saleor/issues/6479" rel="noopener">saleor/saleor#6479</a>.</li>
+    <li>The default <code>errorPolicy</code> is <code>REJECT_EVERYTHING</code>, which rolls back the entire batch the moment any single row fails, for example a warehouse that is not on the variant's shipping zones, a stale or unknown variant or warehouse id, or the same warehouse appearing twice in one call.</li>
+    <li><code>REJECT_FAILED_ROWS</code> and <code>IGNORE_FAILED_ROWS</code> exist specifically to persist the valid rows and drop the invalid ones on purpose, which is correct, but a caller that does not read <code>errors</code>, <code>bulkStockErrors</code>, or <code>results[].errors</code> per row will not know which rows were actually skipped, and can log a false success.</li>
+    <li>Concurrent writers between the bulk call and a later read, another admin editing stock, a webhook-driven allocation, or an order fulfillment decrementing quantity, can also make a row look stale versus your intended target even though the mutation itself genuinely succeeded for that row at the time it ran, a distinct but related class of drift also visible in reports like <a href="https://github.com/saleor/saleor/issues/5578" rel="noopener">saleor/saleor#5578</a>.</li>
+  </ul>
+  <p>None of this throws a top-level exception in the common case. The call returns, your script logs that it ran, and the only sign anything is wrong is a warehouse that customers or staff notice still shows the old number.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot trust the bulk call's return value alone to mean every row was written. The only reliable signal is a read-back. Capture the per-row errors from the mutation, then separately query current stock for the same variants and compare the quantity you intended against the quantity Saleor actually stored. A row that reported no error but still does not match what you asked for is stale, not a fluke, and it deserves a report before anyone assumes the batch was complete.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script never blind-writes over a mismatch. It replays or captures the original mutation's row errors, reads back real per-warehouse stock for the affected variants, and diffs intended quantity against actual quantity for every row. Anything explained by a returned error is labeled, anything that matches is fine, and anything left over is a stale row that goes into a reconciliation report. Only when a human explicitly turns dry run off does it re-issue a small, scoped <code>stockBulkUpdate</code> for just the mismatched rows that a genuine failed-row error explains, then re-reads and re-diffs to confirm convergence.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job reads intended rows and mutation errors, queries actual stock, diffs intended against actual, and if a row is stale and explained by a genuine failed row error and dry run is off, it re-issues a scoped stockBulkUpdate for just that row, otherwise it reports and skips.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Capture intended rows</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">and mutation errors</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Query actual stock</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">per variant, per warehouse</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Diff intended vs</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">actual quantity</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">Stale and</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">explained?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, dry run off</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">no, report only</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#55603f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Scoped repair,</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">re-diff to confirm</text>
+      <text x="684" y="234" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">never the whole original batch</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script always reports every stale row first. It only re-writes rows whose mismatch a genuine failed-row error explains, and only when DRY_RUN is off, scoping the repair call to just those rows.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with read and write access to stock</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read and write product variants and stock, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   # start safe, this script never writes without it off</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   // start safe, this script never writes without it off</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read back actual stock for the affected variants</h3>
+      <p>After the bulk call runs, query current per-warehouse stock for every variant it touched. This is the only source of truth for what Saleor actually stored, independent of whatever the mutation claimed.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">VARIANT_STOCKS_QUERY = """
+query($ids: [ID!]!) {
+  productVariants(first: 100, filter: { ids: $ids }) {
+    edges {
+      node {
+        id
+        sku
+        stocks { quantity quantityAllocated warehouse { id name } }
+      }
+    }
+  }
+}"""
+
+def actual_stock_rows(variant_ids):
+    data = gql(VARIANT_STOCKS_QUERY, {"ids": variant_ids})["productVariants"]
+    rows = []
+    for edge in data["edges"]:
+        node = edge["node"]
+        for stock in node["stocks"]:
+            rows.append({
+                "variantId": node["id"],
+                "sku": node["sku"],
+                "warehouseId": stock["warehouse"]["id"],
+                "quantity": stock["quantity"],
+            })
+    return rows</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const VARIANT_STOCKS_QUERY = `
+query($ids: [ID!]!) {
+  productVariants(first: 100, filter: { ids: $ids }) {
+    edges {
+      node {
+        id
+        sku
+        stocks { quantity quantityAllocated warehouse { id name } }
+      }
+    }
+  }
+}`;
+
+async function actualStockRows(variantIds) {
+  const data = (await gql(VARIANT_STOCKS_QUERY, { ids: variantIds })).productVariants;
+  const rows = [];
+  for (const edge of data.edges) {
+    const node = edge.node;
+    for (const stock of node.stocks) {
+      rows.push({
+        variantId: node.id,
+        sku: node.sku,
+        warehouseId: stock.warehouse.id,
+        quantity: stock.quantity,
+      });
+    }
+  }
+  return rows;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Capture the mutation's own row errors</h3>
+      <p>Re-run, or keep a record of, the same <code>stockBulkUpdate</code> call your script originally issued with <code>errorPolicy: REJECT_FAILED_ROWS</code>. Read <code>results[].errors</code>, each with a <code>field</code>, <code>message</code>, <code>code</code>, and <code>index</code> tying it back to the input row. These are the rows Saleor itself says it could not write, which is different from a row that silently did not match.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">STOCK_BULK_UPDATE = """
+mutation($stocks: [StockBulkUpdateInput!]!) {
+  stockBulkUpdate(stocks: $stocks, errorPolicy: REJECT_FAILED_ROWS) {
+    results {
+      stock { id quantity productVariant { id } warehouse { id } }
+      errors { field message code }
+    }
+    count
+  }
+}"""
+
+def run_bulk_update(rows):
+    stocks_input = [
+        {"variantId": r["variantId"], "warehouseId": r["warehouseId"], "quantity": r["quantity"]}
+        for r in rows
+    ]
+    result = gql(STOCK_BULK_UPDATE, {"stocks": stocks_input})["stockBulkUpdate"]
+    mutation_errors = []
+    for i, row_result in enumerate(result["results"]):
+        for err in (row_result.get("errors") or []):
+            mutation_errors.append({
+                "variantId": rows[i]["variantId"],
+                "warehouseId": rows[i]["warehouseId"],
+                "code": err["code"],
+            })
+    return mutation_errors</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">const STOCK_BULK_UPDATE = `
+mutation($stocks: [StockBulkUpdateInput!]!) {
+  stockBulkUpdate(stocks: $stocks, errorPolicy: REJECT_FAILED_ROWS) {
+    results {
+      stock { id quantity productVariant { id } warehouse { id } }
+      errors { field message code }
+    }
+    count
+  }
+}`;
+
+async function runBulkUpdate(rows) {
+  const stocksInput = rows.map((r) => ({
+    variantId: r.variantId,
+    warehouseId: r.warehouseId,
+    quantity: r.quantity,
+  }));
+  const result = (await gql(STOCK_BULK_UPDATE, { stocks: stocksInput })).stockBulkUpdate;
+  const mutationErrors = [];
+  result.results.forEach((rowResult, i) => {
+    for (const err of rowResult.errors || []) {
+      mutationErrors.push({
+        variantId: rows[i].variantId,
+        warehouseId: rows[i].warehouseId,
+        code: err.code,
+      });
+    }
+  });
+  return mutationErrors;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the intended rows, the actual rows read back, and the mutation errors captured, then returns a status per row: <code>ok</code>, <code>stale</code>, or <code>reported_error</code>. No I/O, so it is easy to test with plain arrays and objects.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def _key(variant_id, warehouse_id):
+    return f"{variant_id}:{warehouse_id}"
+
+
+def diff_stock_rows(intended, actual, mutation_errors):
+    actual_by_key = {_key(r["variantId"], r["warehouseId"]): r["quantity"] for r in actual}
+    error_keys = {_key(e.get("variantId"), e.get("warehouseId")) for e in mutation_errors}
+
+    diffs = []
+    for row in intended:
+        key = _key(row["variantId"], row["warehouseId"])
+        actual_quantity = actual_by_key.get(key)
+
+        if key in error_keys:
+            status = "reported_error"
+        elif actual_quantity is None or actual_quantity != row["quantity"]:
+            status = "stale"
+        else:
+            status = "ok"
+
+        diffs.append({
+            "variantId": row["variantId"],
+            "warehouseId": row["warehouseId"],
+            "intendedQuantity": row["quantity"],
+            "actualQuantity": actual_quantity,
+            "status": status,
+        })
+    return diffs</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">function key(variantId, warehouseId) {
+  return `${variantId}:${warehouseId}`;
+}
+
+export function diffStockRows(intended, actual, mutationErrors) {
+  const actualByKey = new Map(actual.map((r) => [key(r.variantId, r.warehouseId), r.quantity]));
+  const errorKeys = new Set(mutationErrors.map((e) => key(e.variantId, e.warehouseId)));
+
+  return intended.map((row) => {
+    const k = key(row.variantId, row.warehouseId);
+    const actualQuantity = actualByKey.has(k) ? actualByKey.get(k) : null;
+
+    let status;
+    if (errorKeys.has(k)) {
+      status = "reported_error";
+    } else if (actualQuantity === null || actualQuantity !== row.quantity) {
+      status = "stale";
+    } else {
+      status = "ok";
+    }
+
+    return {
+      variantId: row.variantId,
+      warehouseId: row.warehouseId,
+      intendedQuantity: row.quantity,
+      actualQuantity,
+      status,
+    };
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report, and only repair when dry run is off</h3>
+      <p>Under <code>DRY_RUN=true</code>, the default, the script only logs the reconciliation report of every stale and reported-error row. When <code>DRY_RUN=false</code>, it re-issues a new, scoped <code>stockBulkUpdate</code> with <code>errorPolicy: REJECT_FAILED_ROWS</code> for only the rows whose status is <code>stale</code> and whose mismatch is explained by a genuine failed-row code such as <code>NOT_FOUND</code> or <code>INVALID</code>, never the whole original batch. It then re-reads and re-diffs to confirm the row actually converged before marking it resolved.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never blind-write over a mismatch, since a stale-looking row can just mean a concurrent write changed it after your bulk call, not that the call failed. Always dry run first and log the full diff, variant, warehouse, intended, and actual quantity, before any repair. Only ever repair the exact rows the diff flagged, and always re-diff after to confirm convergence.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, reads back actual stock, captures mutation errors, diffs intended against actual with the pure function, and only repairs the explained stale rows when a human turns off dry run.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/bulk-stock-update-leaves-stale-rows" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_bulk_stock.py</div>
+      <pre><code class="language-python">"""Find Saleor bulk stock update rows that stayed stale or partial after
+productVariantStocksUpdate or stockBulkUpdate ran.
+
+Saleor's bulk stock mutations process a list of per-warehouse rows in one
+call, but error handling is row-scoped via an errorPolicy. The default
+REJECT_EVERYTHING rolls back the entire batch on any single bad row
+(saleor/saleor#6479). REJECT_FAILED_ROWS and IGNORE_FAILED_ROWS instead
+persist only the valid rows on purpose. A script that assumes the whole
+batch always lands can end up with Stock rows still on their old quantity,
+and concurrent writers can make a row look stale even after a real success
+(saleor/saleor#5578).
+
+This script never blind-writes over a mismatch. Under DRY_RUN=true (the
+default) it only reports the reconciliation diff. When DRY_RUN=false it
+re-issues a new, scoped stockBulkUpdate for just the rows whose mismatch a
+genuine failed-row error explains, never the original batch, then re-reads
+and re-diffs to confirm convergence. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_bulk_stock")
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+REPAIRABLE_CODES = {"NOT_FOUND", "INVALID"}
+
+VARIANT_STOCKS_QUERY = """
+query($ids: [ID!]!) {
+  productVariants(first: 100, filter: { ids: $ids }) {
+    edges {
+      node {
+        id
+        sku
+        stocks { quantity quantityAllocated warehouse { id name } }
+      }
+    }
+  }
+}"""
+
+STOCK_BULK_UPDATE = """
+mutation($stocks: [StockBulkUpdateInput!]!) {
+  stockBulkUpdate(stocks: $stocks, errorPolicy: REJECT_FAILED_ROWS) {
+    results {
+      stock { id quantity productVariant { id } warehouse { id } }
+      errors { field message code }
+    }
+    count
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def _key(variant_id, warehouse_id):
+    return f"{variant_id}:{warehouse_id}"
+
+
+def diff_stock_rows(intended, actual, mutation_errors):
+    actual_by_key = {_key(r["variantId"], r["warehouseId"]): r["quantity"] for r in actual}
+    error_keys = {_key(e.get("variantId"), e.get("warehouseId")) for e in mutation_errors}
+
+    diffs = []
+    for row in intended:
+        key = _key(row["variantId"], row["warehouseId"])
+        actual_quantity = actual_by_key.get(key)
+
+        if key in error_keys:
+            status = "reported_error"
+        elif actual_quantity is None or actual_quantity != row["quantity"]:
+            status = "stale"
+        else:
+            status = "ok"
+
+        diffs.append({
+            "variantId": row["variantId"],
+            "warehouseId": row["warehouseId"],
+            "intendedQuantity": row["quantity"],
+            "actualQuantity": actual_quantity,
+            "status": status,
+        })
+    return diffs
+
+
+def actual_stock_rows(variant_ids):
+    data = gql(VARIANT_STOCKS_QUERY, {"ids": variant_ids})["productVariants"]
+    rows = []
+    for edge in data["edges"]:
+        node = edge["node"]
+        for stock in node["stocks"]:
+            rows.append({
+                "variantId": node["id"],
+                "sku": node["sku"],
+                "warehouseId": stock["warehouse"]["id"],
+                "quantity": stock["quantity"],
+            })
+    return rows
+
+
+def run_bulk_update(rows):
+    stocks_input = [
+        {"variantId": r["variantId"], "warehouseId": r["warehouseId"], "quantity": r["quantity"]}
+        for r in rows
+    ]
+    result = gql(STOCK_BULK_UPDATE, {"stocks": stocks_input})["stockBulkUpdate"]
+    mutation_errors = []
+    for i, row_result in enumerate(result["results"]):
+        for err in (row_result.get("errors") or []):
+            mutation_errors.append({
+                "variantId": rows[i]["variantId"],
+                "warehouseId": rows[i]["warehouseId"],
+                "code": err["code"],
+            })
+    return mutation_errors
+
+
+def run(intended_rows, mutation_errors=None):
+    variant_ids = sorted({r["variantId"] for r in intended_rows})
+    actual = actual_stock_rows(variant_ids)
+    mutation_errors = mutation_errors or []
+
+    diffs = diff_stock_rows(intended_rows, actual, mutation_errors)
+    stale = [d for d in diffs if d["status"] == "stale"]
+
+    for d in diffs:
+        if d["status"] != "ok":
+            log.warning(
+                "%s variant=%s warehouse=%s intended=%d actual=%s",
+                d["status"], d["variantId"], d["warehouseId"],
+                d["intendedQuantity"], d["actualQuantity"],
+            )
+
+    repairable = [
+        d for d in stale
+        if any(e["code"] in REPAIRABLE_CODES
+               for e in mutation_errors
+               if e.get("variantId") == d["variantId"] and e.get("warehouseId") == d["warehouseId"])
+    ]
+
+    if not repairable:
+        log.info("Done. %d stale row(s) reported, none auto-repairable.", len(stale))
+        return diffs
+
+    log.info("%d stale row(s) explained by a repairable error. %s",
+              len(repairable), "would repair" if DRY_RUN else "repairing")
+
+    if DRY_RUN:
+        return diffs
+
+    repair_rows = [
+        {"variantId": d["variantId"], "warehouseId": d["warehouseId"], "quantity": d["intendedQuantity"]}
+        for d in repairable
+    ]
+    run_bulk_update(repair_rows)
+
+    confirm_actual = actual_stock_rows(variant_ids)
+    confirm_diffs = diff_stock_rows(intended_rows, confirm_actual, [])
+    still_stale = [d for d in confirm_diffs if d["status"] == "stale"]
+    log.info("Repair done. %d row(s) still stale after re-diff.", len(still_stale))
+    return confirm_diffs
+
+
+if __name__ == "__main__":
+    run([])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-bulk-stock.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Saleor bulk stock update rows that stayed stale or partial after
+ * productVariantStocksUpdate or stockBulkUpdate ran.
+ *
+ * Saleor's bulk stock mutations process a list of per-warehouse rows in one
+ * call, but error handling is row-scoped via an errorPolicy. The default
+ * REJECT_EVERYTHING rolls back the entire batch on any single bad row
+ * (saleor/saleor#6479). REJECT_FAILED_ROWS and IGNORE_FAILED_ROWS instead
+ * persist only the valid rows on purpose. A script that assumes the whole
+ * batch always lands can end up with Stock rows still on their old
+ * quantity, and concurrent writers can make a row look stale even after a
+ * real success (saleor/saleor#5578).
+ *
+ * This script never blind-writes over a mismatch. Under DRY_RUN=true (the
+ * default) it only reports the reconciliation diff. When DRY_RUN=false it
+ * re-issues a new, scoped stockBulkUpdate for just the rows whose mismatch
+ * a genuine failed-row error explains, never the original batch, then
+ * re-reads and re-diffs to confirm convergence. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/bulk-stock-update-leaves-stale-rows/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const REPAIRABLE_CODES = new Set(["NOT_FOUND", "INVALID"]);
+
+function key(variantId, warehouseId) {
+  return `${variantId}:${warehouseId}`;
+}
+
+export function diffStockRows(intended, actual, mutationErrors) {
+  const actualByKey = new Map(actual.map((r) => [key(r.variantId, r.warehouseId), r.quantity]));
+  const errorKeys = new Set(mutationErrors.map((e) => key(e.variantId, e.warehouseId)));
+
+  return intended.map((row) => {
+    const k = key(row.variantId, row.warehouseId);
+    const actualQuantity = actualByKey.has(k) ? actualByKey.get(k) : null;
+
+    let status;
+    if (errorKeys.has(k)) {
+      status = "reported_error";
+    } else if (actualQuantity === null || actualQuantity !== row.quantity) {
+      status = "stale";
+    } else {
+      status = "ok";
+    }
+
+    return {
+      variantId: row.variantId,
+      warehouseId: row.warehouseId,
+      intendedQuantity: row.quantity,
+      actualQuantity,
+      status,
+    };
+  });
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const VARIANT_STOCKS_QUERY = `
+query($ids: [ID!]!) {
+  productVariants(first: 100, filter: { ids: $ids }) {
+    edges {
+      node {
+        id
+        sku
+        stocks { quantity quantityAllocated warehouse { id name } }
+      }
+    }
+  }
+}`;
+
+const STOCK_BULK_UPDATE = `
+mutation($stocks: [StockBulkUpdateInput!]!) {
+  stockBulkUpdate(stocks: $stocks, errorPolicy: REJECT_FAILED_ROWS) {
+    results {
+      stock { id quantity productVariant { id } warehouse { id } }
+      errors { field message code }
+    }
+    count
+  }
+}`;
+
+async function actualStockRows(variantIds) {
+  const data = (await gql(VARIANT_STOCKS_QUERY, { ids: variantIds })).productVariants;
+  const rows = [];
+  for (const edge of data.edges) {
+    const node = edge.node;
+    for (const stock of node.stocks) {
+      rows.push({
+        variantId: node.id,
+        sku: node.sku,
+        warehouseId: stock.warehouse.id,
+        quantity: stock.quantity,
+      });
+    }
+  }
+  return rows;
+}
+
+async function runBulkUpdate(rows) {
+  const stocksInput = rows.map((r) => ({
+    variantId: r.variantId,
+    warehouseId: r.warehouseId,
+    quantity: r.quantity,
+  }));
+  const result = (await gql(STOCK_BULK_UPDATE, { stocks: stocksInput })).stockBulkUpdate;
+  const mutationErrors = [];
+  result.results.forEach((rowResult, i) => {
+    for (const err of rowResult.errors || []) {
+      mutationErrors.push({
+        variantId: rows[i].variantId,
+        warehouseId: rows[i].warehouseId,
+        code: err.code,
+      });
+    }
+  });
+  return mutationErrors;
+}
+
+export async function run(intendedRows, mutationErrors = []) {
+  const variantIds = [...new Set(intendedRows.map((r) => r.variantId))].sort();
+  const actual = await actualStockRows(variantIds);
+
+  const diffs = diffStockRows(intendedRows, actual, mutationErrors);
+  const stale = diffs.filter((d) => d.status === "stale");
+
+  for (const d of diffs) {
+    if (d.status !== "ok") {
+      console.warn(
+        `${d.status} variant=${d.variantId} warehouse=${d.warehouseId} intended=${d.intendedQuantity} actual=${d.actualQuantity}`
+      );
+    }
+  }
+
+  const repairable = stale.filter((d) =>
+    mutationErrors.some(
+      (e) => e.variantId === d.variantId && e.warehouseId === d.warehouseId && REPAIRABLE_CODES.has(e.code)
+    )
+  );
+
+  if (!repairable.length) {
+    console.log(`Done. ${stale.length} stale row(s) reported, none auto-repairable.`);
+    return diffs;
+  }
+
+  console.log(`${repairable.length} stale row(s) explained by a repairable error. ${DRY_RUN ? "would repair" : "repairing"}`);
+
+  if (DRY_RUN) return diffs;
+
+  const repairRows = repairable.map((d) => ({
+    variantId: d.variantId,
+    warehouseId: d.warehouseId,
+    quantity: d.intendedQuantity,
+  }));
+  await runBulkUpdate(repairRows);
+
+  const confirmActual = await actualStockRows(variantIds);
+  const confirmDiffs = diffStockRows(intendedRows, confirmActual, []);
+  const stillStale = confirmDiffs.filter((d) => d.status === "stale");
+  console.log(`Repair done. ${stillStale.length} row(s) still stale after re-diff.`);
+  return confirmDiffs;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run([]).catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which rows get treated as stale and which are explained away by a returned error. Because <code>diff_stock_rows</code> is pure, the test needs no network and no Saleor account. It just feeds in plain arrays and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_bulk_stock_diff.py</div>
+      <pre><code class="language-python">from reconcile_bulk_stock import diff_stock_rows
+
+V1 = "gid://saleor/ProductVariant/1"
+W1 = "gid://saleor/Warehouse/1"
+W2 = "gid://saleor/Warehouse/2"
+
+
+def test_ok_when_actual_matches_intended():
+    intended = [{"variantId": V1, "warehouseId": W1, "quantity": 10}]
+    actual = [{"variantId": V1, "warehouseId": W1, "quantity": 10}]
+    result = diff_stock_rows(intended, actual, [])
+    assert result == [{
+        "variantId": V1, "warehouseId": W1,
+        "intendedQuantity": 10, "actualQuantity": 10, "status": "ok",
+    }]
+
+
+def test_stale_when_actual_does_not_match():
+    intended = [{"variantId": V1, "warehouseId": W1, "quantity": 10}]
+    actual = [{"variantId": V1, "warehouseId": W1, "quantity": 4}]
+    result = diff_stock_rows(intended, actual, [])
+    assert result[0]["status"] == "stale"
+    assert result[0]["actualQuantity"] == 4
+
+
+def test_stale_when_actual_missing_entirely():
+    intended = [{"variantId": V1, "warehouseId": W2, "quantity": 5}]
+    result = diff_stock_rows(intended, [], [])
+    assert result[0]["status"] == "stale"
+    assert result[0]["actualQuantity"] is None
+
+
+def test_reported_error_takes_priority_over_mismatch():
+    intended = [{"variantId": V1, "warehouseId": W1, "quantity": 10}]
+    actual = [{"variantId": V1, "warehouseId": W1, "quantity": 4}]
+    errors = [{"variantId": V1, "warehouseId": W1, "code": "NOT_FOUND"}]
+    result = diff_stock_rows(intended, actual, errors)
+    assert result[0]["status"] == "reported_error"
+
+
+def test_multiple_rows_get_independent_status():
+    intended = [
+        {"variantId": V1, "warehouseId": W1, "quantity": 10},
+        {"variantId": V1, "warehouseId": W2, "quantity": 20},
+    ]
+    actual = [
+        {"variantId": V1, "warehouseId": W1, "quantity": 10},
+        {"variantId": V1, "warehouseId": W2, "quantity": 1},
+    ]
+    result = diff_stock_rows(intended, actual, [])
+    statuses = {(r["warehouseId"]): r["status"] for r in result}
+    assert statuses[W1] == "ok"
+    assert statuses[W2] == "stale"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">diff.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { diffStockRows } from "./reconcile-bulk-stock.js";
+
+const V1 = "gid://saleor/ProductVariant/1";
+const W1 = "gid://saleor/Warehouse/1";
+const W2 = "gid://saleor/Warehouse/2";
+
+test("ok when actual matches intended", () =&gt; {
+  const intended = [{ variantId: V1, warehouseId: W1, quantity: 10 }];
+  const actual = [{ variantId: V1, warehouseId: W1, quantity: 10 }];
+  const result = diffStockRows(intended, actual, []);
+  assert.deepEqual(result, [{
+    variantId: V1, warehouseId: W1,
+    intendedQuantity: 10, actualQuantity: 10, status: "ok",
+  }]);
+});
+
+test("stale when actual does not match", () =&gt; {
+  const intended = [{ variantId: V1, warehouseId: W1, quantity: 10 }];
+  const actual = [{ variantId: V1, warehouseId: W1, quantity: 4 }];
+  const result = diffStockRows(intended, actual, []);
+  assert.equal(result[0].status, "stale");
+  assert.equal(result[0].actualQuantity, 4);
+});
+
+test("stale when actual missing entirely", () =&gt; {
+  const intended = [{ variantId: V1, warehouseId: W2, quantity: 5 }];
+  const result = diffStockRows(intended, [], []);
+  assert.equal(result[0].status, "stale");
+  assert.equal(result[0].actualQuantity, null);
+});
+
+test("reported error takes priority over mismatch", () =&gt; {
+  const intended = [{ variantId: V1, warehouseId: W1, quantity: 10 }];
+  const actual = [{ variantId: V1, warehouseId: W1, quantity: 4 }];
+  const errors = [{ variantId: V1, warehouseId: W1, code: "NOT_FOUND" }];
+  const result = diffStockRows(intended, actual, errors);
+  assert.equal(result[0].status, "reported_error");
+});
+
+test("multiple rows get independent status", () =&gt; {
+  const intended = [
+    { variantId: V1, warehouseId: W1, quantity: 10 },
+    { variantId: V1, warehouseId: W2, quantity: 20 },
+  ];
+  const actual = [
+    { variantId: V1, warehouseId: W1, quantity: 10 },
+    { variantId: V1, warehouseId: W2, quantity: 1 },
+  ];
+  const result = diffStockRows(intended, actual, []);
+  const statuses = Object.fromEntries(result.map((r) =&gt; [r.warehouseId, r.status]));
+  assert.equal(statuses[W1], "ok");
+  assert.equal(statuses[W2], "stale");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Multi-warehouse sync</span>
+      <h4>One bad warehouse id silently rolled back forty good ones</h4>
+      <p>A furniture importer synced nightly stock counts from its ERP into Saleor with one <code>stockBulkUpdate</code> call per SKU, covering forty warehouses at a time, using the default error policy. One night a warehouse had been archived in Saleor but not in the ERP feed, and the entire batch rolled back for that SKU, even though the other thirty-nine rows were perfectly valid.</p>
+      <p>The team never saw an exception, since the call itself completed. Only a customer complaint about a warehouse showing stale stock led them to add this reconciler. Now the nightly job diffs intended against actual after every sync, catches the rollback immediately, and reports exactly which SKU and warehouse pair needs attention instead of losing a night's sync silently.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Concurrent writers</span>
+      <h4>A stale-looking row was not actually stale</h4>
+      <p>A marketplace connector pushed bulk stock corrections every few minutes. Occasionally the reconciler flagged a row as stale right after a correction ran, but a second look showed the correction had actually succeeded, and an order fulfillment had decremented the same row moments later.</p>
+      <p>Because the script never auto-repairs a mismatch unless a genuine failed-row error explains it, that row was reported, not blindly overwritten, and the team correctly left it alone rather than fighting the fulfillment's legitimate decrement with a stale intended quantity.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs after every bulk stock call, a rolled-back batch or a silently skipped row gets caught within minutes instead of surfacing as a customer complaint or a bad inventory report. The team gets the exact variant, warehouse, intended, and actual quantity, and any repair stays scoped to just the rows a genuine error explains, confirmed by a re-diff, never a blind rewrite over a row that might have changed for a legitimate reason.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Saleor bulk stock update not update every warehouse row?</summary>
+      <p>Saleor's bulk stock mutations process every row you send in one call, but they hand errors off to an errorPolicy. The default REJECT_EVERYTHING rolls back the whole batch if a single row is bad, such as a warehouse not assigned to the variant's shipping zones, an unknown id, or a duplicate warehouse. REJECT_FAILED_ROWS and IGNORE_FAILED_ROWS instead persist only the valid rows and skip the bad ones. Either way, a script that assumes the whole call always succeeds can end up with some Stock rows still on their pre-update quantity.</p>
+    </details>
+    <details>
+      <summary>How do I detect a stale row after a Saleor bulk stock update?</summary>
+      <p>Re-run the same productVariantStocksUpdate or stockBulkUpdate call your script issued and capture its errors, bulkStockErrors, or results with per-row codes. Then query current per-warehouse stock for the same variants and compare each intended quantity to the quantity Saleor actually stored. Any row where the mutation reported no error but the read-back quantity does not match what you intended is a stale or partial row.</p>
+    </details>
+    <details>
+      <summary>Is it safe to automatically rewrite stale stock rows?</summary>
+      <p>Only for rows whose mismatch is explained by a genuine failed-row error such as NOT_FOUND or INVALID, and only when a human has explicitly turned off dry run. Re-issue a new, scoped stockBulkUpdate with errorPolicy REJECT_FAILED_ROWS for just those rows, never the original batch, then re-read and re-diff to confirm the row actually converged before marking it resolved.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>productVariantStocksUpdate mutation does not fully update stock. <a href="https://github.com/saleor/saleor/issues/6479" rel="noopener">github.com/saleor/saleor/issues/6479</a></li>
+      <li>Bug: Stock update mutations don't trigger webhooks. <a href="https://github.com/saleor/saleor/issues/11630" rel="noopener">github.com/saleor/saleor/issues/11630</a></li>
+      <li>Stock quantity is 0 despite that warehouse quantity has some items. <a href="https://github.com/saleor/saleor/issues/5578" rel="noopener">github.com/saleor/saleor/issues/5578</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: productVariantStocksUpdate Mutation. <a href="https://docs.saleor.io/api-reference/products/mutations/product-variant-stocks-update" rel="noopener">docs.saleor.io/api-reference/products/mutations/product-variant-stocks-update</a></li>
+      <li>Saleor Commerce Documentation: stockBulkUpdate Mutation. <a href="https://docs.saleor.io/docs/3.x/api-reference/products/mutations/stock-bulk-update" rel="noopener">docs.saleor.io/docs/3.x/api-reference/products/mutations/stock-bulk-update</a></li>
+      <li>Saleor Commerce Documentation: Error Policy. <a href="https://docs.saleor.io/developer/bulks/error-policy" rel="noopener">docs.saleor.io/developer/bulks/error-policy</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, stock, channels, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a stale stock row for you?</h3>
+    <p>If this saved you from a rolled-back sync or a stale warehouse count, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,874 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Saleor Orders That Revert to Draft After an Edit</title>
+<meta name="description" content="A confirmed Saleor order gets edited and its status silently flips back to DRAFT, dropping it out of every normal fulfillment queue even though a payment is already attached. Learn why it happens and build a Python or Node.js script that finds the orphaned orders for staff review.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/editing-order-reverts-to-draft/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Saleor Orders That Revert to Draft After an Edit">
+<meta property="og:description" content="Why editing a confirmed order can flip order.status back to DRAFT, and a safe Python or Node.js script that finds the orphaned orders that still carry a payment.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/editing-order-reverts-to-draft/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/editing-order-reverts-to-draft/#article","headline":"Fix Saleor Orders That Revert to Draft After an Edit","description":"Why editing a confirmed order can silently flip order.status back to DRAFT, because the dashboard and API historically reused draft-order line and address mutations against placed orders, and a safe Python or Node.js script that finds the orphaned orders that still carry a payment or transaction for staff review.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/editing-order-reverts-to-draft/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders & Fulfillment","keywords":"Saleor order reverts to draft, order.status DRAFT, OrderStatusFilter, draftOrderComplete, orderConfirm, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Editing a confirmed order reverts it to draft status","item":"https://www.allanninal.dev/saleor/editing-order-reverts-to-draft/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does editing a confirmed Saleor order change its status back to DRAFT?","acceptedAnswer":{"@type":"Answer","text":"Only orders created through draftOrderCreate are meant to start in DRAFT and stay freely editable. Once an order is placed and confirmed it should move through UNCONFIRMED to UNFULFILLED. The dashboard and API have historically reused the same draft-order line and address mutations against a confirmed order, and calling them against a placed order can silently set order.status back to DRAFT instead of rejecting the edit, even though a payment is already attached."}},{"@type":"Question","name":"Why do these reverted orders disappear from the orders queue?","acceptedAnswer":{"@type":"Answer","text":"The OrderStatusFilter enum used by the orders query and the staff dashboard queues has no DRAFT value. Any order pushed back into DRAFT this way falls out of the normal UNFULFILLED and READY_TO_FULFILL views even though it still has a Payment or TransactionItem record attached, so the order is still taking up captured money but nobody is tracking it in the usual queues."}},{"@type":"Question","name":"Can I just call draftOrderComplete to fix an order that reverted to DRAFT?","acceptedAnswer":{"@type":"Answer","text":"Not automatically. Saleor has no reverse of draftOrderComplete, so the only forward paths are draftOrderComplete, which reallocates stock and turns the order back into UNFULFILLED, or orderCancel if the edit was a mistake. Since a payment or transaction is already attached, calling draftOrderComplete blindly risks double charging or mis-allocating stock, so a script should only flag these orders and let a human review the line and address diff before completing or cancelling."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Orders &amp; Fulfillment</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Orders &amp; Fulfillment</p>
+    <h1>Editing a confirmed order reverts it to draft status</h1>
+    <p class="lead">Someone fixes a shipping address or tweaks a line on an order that is already confirmed and paid. Nothing looks wrong in the moment. But the order's status silently flips back to DRAFT, and from that second on it is invisible to every normal fulfillment queue, even though the money is already sitting in a Payment or TransactionItem record. Here is why Saleor lets this happen and a script that finds the orders it happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Flag and report, not auto-fix</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Only orders created with <code>draftOrderCreate</code> are meant to start in <code>DRAFT</code> and stay freely editable. Once an order is placed and confirmed it should move through <code>UNCONFIRMED</code> to <code>UNFULFILLED</code> and become effectively line-locked. Historically, the dashboard and API reused the same draft-order line and address mutations against placed orders, so calling them on a confirmed order can silently set <code>order.status</code> back to <code>DRAFT</code> instead of rejecting the edit. Because the <code>OrderStatusFilter</code> enum used by the <code>orders</code> query has no <code>DRAFT</code> value, that order then vanishes from every normal <code>UNFULFILLED</code> or <code>READY_TO_FULFILL</code> queue, even though it still has a <code>Payment</code> or <code>TransactionItem</code> record attached. Run a small Python or Node.js script that pages through every order with no status filter, reads the raw <code>status</code> field client-side, and flags any order sitting at <code>DRAFT</code> that also carries an active or charged payment or a transaction. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Saleor's order model treats <code>DRAFT</code> as a starting point, not a state a real order should ever fall back into. A draft order created by staff through <code>draftOrderCreate</code> is meant to be edited freely, its lines added and removed, its address changed, right up until <code>draftOrderComplete</code> turns it into a live order. Once that happens, or once a customer places an order through checkout, the order is expected to move forward through <code>UNCONFIRMED</code> and into <code>UNFULFILLED</code>, and its lines are supposed to become effectively locked against the same casual editing a draft allows.</p>
+  <p>The trouble is that the dashboard and the API have historically leaned on the same underlying mutations to edit lines and addresses on both draft orders and placed orders. When one of those mutations gets called against an order that is already confirmed, instead of Saleor rejecting the edit or routing it through a proper amendment flow, the order's <code>status</code> field can get silently written back to <code>DRAFT</code>. Nobody clicked anything that said "revert to draft." A staff member just fixed a typo in the shipping address, or removed a line that was ordered by mistake, and the order quietly stopped being a confirmed order at all.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. Staff edits a line or address on a confirmed order, the same draft-order mutation runs against it, and order.status silently flips back to DRAFT even though a payment is still attached, so the order falls out of the normal queues.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="76" width="150" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="85" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e2611">Order confirmed</text>
+      <text x="85" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55603f">paid, UNFULFILLED</text>
+      <line x1="163" y1="109" x2="205" y2="109" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="76" width="150" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="283" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e2611">Staff edits a line</text>
+      <text x="283" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55603f">or the address</text>
+      <line x1="361" y1="109" x2="403" y2="109" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="382" y="66" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="382" y="136" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">reuses draft-order mutation</text>
+      <rect x="406" y="76" width="170" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="491" y="104" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">status silently</text>
+      <text x="491" y="122" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">becomes DRAFT</text>
+      <line x1="579" y1="109" x2="621" y2="109" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="624" y="76" width="126" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="687" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">drops out of</text>
+      <text x="687" y="117" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">every queue</text>
+      <text x="687" y="133" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">payment still attached</text>
+    </svg>
+    <figcaption>The edit itself looks harmless. What actually changes is the order's status field, and that alone is enough to make a paid order disappear from view.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>In Saleor's order model, only orders created through <code>draftOrderCreate</code> are meant to start in <code>DRAFT</code> and stay freely editable, lines, shipping address, and all, until <code>draftOrderComplete</code> finalizes them.</li>
+    <li>Once an order is placed or confirmed, it is expected to move through <code>UNCONFIRMED</code> into <code>UNFULFILLED</code> and become effectively line-locked. There is no supported path back to <code>DRAFT</code> for a real order.</li>
+    <li>The dashboard and API have historically reused the same draft-order line and address mutations for placed orders. Calling them against a confirmed order can silently flip <code>order.status</code> back to <code>DRAFT</code> instead of rejecting the edit or routing it through a proper amendment flow, a behavior tracked in <a href="https://github.com/saleor/saleor/issues/4978" rel="noopener">saleor/saleor#4978</a>.</li>
+    <li>The customer-facing <code>OrderStatusFilter</code> enum, used by the <code>orders</code> query and the staff dashboard queues, has no <code>DRAFT</code> value. Any order pushed back into <code>DRAFT</code> this way vanishes from the normal <code>UNFULFILLED</code> and <code>READY_TO_FULFILL</code> queues even though it still has <code>Payment</code> or <code>TransactionItem</code> records attached.</li>
+  </ul>
+  <p>None of this throws an error. The mutation succeeds, the edit applies, and the only visible sign anything happened is a status field nobody was watching. Money was taken on an order nobody is tracking anymore, and it usually only surfaces when a customer asks why their paid order never shipped. See the citations at the end for the exact GitHub threads and the order status docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot find these orders by filtering the normal way. Any query restricted to <code>filter: { status: [...] }</code> on the operational statuses will never catch a <code>DRAFT</code> order, because <code>DRAFT</code> is not a member of <code>OrderStatusFilter</code>. Detection has to pull every order, unfiltered, and inspect the raw <code>status</code> field client-side. And there is no safe way to auto-repair a reverted order, since Saleor exposes no reverse of <code>draftOrderComplete</code>. The only forward paths risk double-charging or mis-allocating stock if run blindly, so the right default is to flag these orders for a human to review, not to touch them automatically.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script runs on a schedule. It pages through every order with no status filter at all, since the filter itself cannot see <code>DRAFT</code>, and reads each order's raw <code>status</code>, <code>payments</code>, and <code>transactions</code>. A single pure function decides whether an order is an orphaned draft, meaning it sits at <code>DRAFT</code> while still carrying a payment or transaction record that a legitimate fresh draft order would never have. Anything flagged gets logged with its id, number, and payment ids for staff review. Nothing gets completed or cancelled automatically.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job pages through all orders with no status filter, reads status, payments, and transactions, classifies each with isOrphanedDraftWithPayment, and if true logs a report entry for staff review rather than auto-completing or cancelling the order.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Page all orders,</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">no status filter</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">isOrphanedDraft</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">WithPayment</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">draft with</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">payment?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">no, skip</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#55603f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Report entry</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">staff review, not auto-fix</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports orphaned orders for a human to review. Neither draftOrderComplete nor orderCancel runs automatically.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with order read access</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read orders. Use the resulting app token as a Bearer token, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   # start safe, this script never writes without it off</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   // start safe, this script never writes without it off</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Page through every order with no status filter</h3>
+      <p>This is the part that is easy to get wrong. <code>OrderStatusFilter</code> has no <code>DRAFT</code> value, so a query restricted with <code>filter: { status: [...] }</code> will never return a reverted order. Ask for <code>orders(first, after)</code> with no status filter at all, and read back <code>id</code>, <code>number</code>, <code>status</code>, <code>created</code>, and each order's <code>payments { id isActive chargeStatus }</code> and <code>transactions { id }</code>. Page with a cursor so the job covers the whole order history, or bound it with a channel and a created date range if your store is large.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        status
+        created
+        payments { id isActive chargeStatus }
+        transactions { id }
+      }
+    }
+  }
+}"""
+
+def all_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"cursor": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDERS_QUERY = `
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        status
+        created
+        payments { id isActive chargeStatus }
+        transactions { id }
+      }
+    }
+  }
+}`;
+
+async function* allOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the already-fetched order shape and returns true or false, with no network or database calls of its own. A legitimate draft order never accumulates a captured payment before <code>draftOrderComplete</code> runs, so the rule is strict on purpose: the order must be sitting at <code>DRAFT</code>, and it must also have either an active payment whose charge status is not <code>NOT_CHARGED</code>, or at least one transaction. Only that combination is reachable through the edit-reverts-to-draft defect.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def is_orphaned_draft_with_payment(order):
+    if order.get("status") != "DRAFT":
+        return False
+
+    payments = order.get("payments") or []
+    has_charged_payment = any(
+        p.get("isActive") and p.get("chargeStatus") != "NOT_CHARGED" for p in payments
+    )
+    has_transaction = len(order.get("transactions") or []) > 0
+
+    return has_charged_payment or has_transaction</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function isOrphanedDraftWithPayment(order) {
+  if (order.status !== "DRAFT") return false;
+
+  const payments = order.payments || [];
+  const hasChargedPayment = payments.some(
+    (p) => p.isActive && p.chargeStatus !== "NOT_CHARGED"
+  );
+  const hasTransaction = (order.transactions || []).length > 0;
+
+  return hasChargedPayment || hasTransaction;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report flagged orders, do not auto-repair by default</h3>
+      <p>When an order is flagged, log its <code>id</code>, <code>number</code>, and payment ids for staff review. Do not call <code>draftOrderComplete</code> or <code>orderCancel</code> automatically. There is no safe generic way to "un-revert" an order back to its prior confirmed status, since Saleor exposes no reverse of <code>draftOrderComplete</code>. The only forward paths are <code>draftOrderComplete</code>, which reallocates stock and turns <code>DRAFT</code> back into <code>UNFULFILLED</code>, effectively re-confirming the order, or <code>orderCancel</code> if the edit was erroneous. Since a payment is already attached, calling either blindly risks double-charging or mis-allocating stock.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python"># Opt-in only. Not called by the default flag-and-report flow. Run only after
+# a human has reviewed the line and address diff on the flagged order.
+DRAFT_ORDER_COMPLETE = """
+mutation($id: ID!) {
+  draftOrderComplete(id: $id) {
+    order { id status }
+    errors { field code message }
+  }
+}"""
+
+def complete_draft_order(order_id):
+    result = gql(DRAFT_ORDER_COMPLETE, {"id": order_id})["draftOrderComplete"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["order"]["status"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">// Opt-in only. Not called by the default flag-and-report flow. Run only after
+// a human has reviewed the line and address diff on the flagged order.
+const DRAFT_ORDER_COMPLETE = `
+mutation($id: ID!) {
+  draftOrderComplete(id: $id) {
+    order { id status }
+    errors { field code message }
+  }
+}`;
+
+async function completeDraftOrder(orderId) {
+  const result = (await gql(DRAFT_ORDER_COMPLETE, { id: orderId })).draftOrderComplete;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.order.status;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Under <code>DRY_RUN=true</code>, the default, the script only logs a report entry for each flagged order: <code>{orderId, number, paymentIds}</code>. It never calls <code>draftOrderComplete</code> from the default path, since restoring the order needs a person to confirm the line and address diff first. Only when <code>DRY_RUN=false</code> and an operator has manually reviewed the diff should the guarded path run, and even then it should verify the order's <code>status</code> reads <code>UNFULFILLED</code> afterward before moving on. Run the flag pass on a schedule, for example once an hour.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script's default behavior is report-only, and it should stay that way for almost every store. There is no safe way to guess whether a reverted order's current lines and address are still what the customer actually wants. Only wire in the guarded <code>draftOrderComplete</code> path after a human has reviewed the diff, and always keep <code>DRY_RUN=true</code> until you have reviewed the exact list it would touch.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pages through every order with no status filter, classifies each with the pure function, and reports every orphaned draft for staff review. The completion path stays commented out by default, since flagging is the safe behavior for this issue.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/editing-order-reverts-to-draft" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_orphaned_drafts.py</div>
+      <pre><code class="language-python">"""Flag Saleor orders that were reverted to DRAFT by editing a confirmed
+order, because the dashboard and API have historically reused draft-order
+line and address mutations against placed orders, which can silently write
+order.status back to DRAFT instead of rejecting the edit (see
+saleor/saleor#4978, saleor/saleor#3987, and the order status docs).
+
+Because OrderStatusFilter has no DRAFT value, these orders are invisible to
+any query filtered by status, so this script pages through every order with
+no status filter and inspects the raw status field client-side.
+
+This script never calls draftOrderComplete or orderCancel by default. Under
+DRY_RUN=true (the default) it only logs a report entry for each flagged
+order for staff review. The guarded repair path (complete_draft_order) is
+opt-in only, meant to run after a human has reviewed the line and address
+diff, and should only ever run with DRY_RUN=false. Run on a schedule. Safe
+to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_orphaned_drafts")
+
+API_URL = os.environ.get("SALEOR_API_URL", "https://store.saleor.cloud/graphql/")
+TOKEN = os.environ.get("SALEOR_AUTH_TOKEN", "dummy-token")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        status
+        created
+        payments { id isActive chargeStatus }
+        transactions { id }
+      }
+    }
+  }
+}"""
+
+# Opt-in only. Not called by the default flag-and-report flow. Run only after
+# a human has reviewed the line and address diff on the flagged order.
+DRAFT_ORDER_COMPLETE = """
+mutation($id: ID!) {
+  draftOrderComplete(id: $id) {
+    order { id status }
+    errors { field code message }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def is_orphaned_draft_with_payment(order):
+    if order.get("status") != "DRAFT":
+        return False
+
+    payments = order.get("payments") or []
+    has_charged_payment = any(
+        p.get("isActive") and p.get("chargeStatus") != "NOT_CHARGED" for p in payments
+    )
+    has_transaction = len(order.get("transactions") or []) > 0
+
+    return has_charged_payment or has_transaction
+
+
+def all_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"cursor": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def complete_draft_order(order_id):
+    """Opt-in only. Never called by run(). Wire in yourself only after a human
+    has reviewed the line and address diff on the flagged order."""
+    result = gql(DRAFT_ORDER_COMPLETE, {"id": order_id})["draftOrderComplete"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["order"]["status"]
+
+
+def run():
+    flagged = 0
+    for order in all_orders():
+        if not is_orphaned_draft_with_payment(order):
+            continue
+
+        payment_ids = [p["id"] for p in (order.get("payments") or [])]
+        report_entry = {
+            "orderId": order["id"],
+            "number": order["number"],
+            "paymentIds": payment_ids,
+            "transactionCount": len(order.get("transactions") or []),
+        }
+        log.warning("Orphaned draft order found. %s %s", report_entry,
+                    "(dry run, reporting only)" if DRY_RUN else "(reporting only)")
+        flagged += 1
+
+    log.info("Done. %d orphaned draft order(s) flagged for staff review.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-orphaned-drafts.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Saleor orders that were reverted to DRAFT by editing a confirmed
+ * order, because the dashboard and API have historically reused draft-order
+ * line and address mutations against placed orders, which can silently write
+ * order.status back to DRAFT instead of rejecting the edit (see
+ * saleor/saleor#4978, saleor/saleor#3987, and the order status docs).
+ *
+ * Because OrderStatusFilter has no DRAFT value, these orders are invisible to
+ * any query filtered by status, so this script pages through every order with
+ * no status filter and inspects the raw status field client-side.
+ *
+ * This script never calls draftOrderComplete or orderCancel by default. Under
+ * DRY_RUN=true (the default) it only logs a report entry for each flagged
+ * order for staff review. The guarded repair path (completeDraftOrder) is
+ * opt-in only, meant to run after a human has reviewed the line and address
+ * diff, and should only ever run with DRY_RUN=false. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/editing-order-reverts-to-draft/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function isOrphanedDraftWithPayment(order) {
+  if (order.status !== "DRAFT") return false;
+
+  const payments = order.payments || [];
+  const hasChargedPayment = payments.some(
+    (p) => p.isActive && p.chargeStatus !== "NOT_CHARGED"
+  );
+  const hasTransaction = (order.transactions || []).length > 0;
+
+  return hasChargedPayment || hasTransaction;
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const ORDERS_QUERY = `
+query($cursor: String) {
+  orders(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        status
+        created
+        payments { id isActive chargeStatus }
+        transactions { id }
+      }
+    }
+  }
+}`;
+
+// Opt-in only. Not called by the default flag-and-report flow. Run only after
+// a human has reviewed the line and address diff on the flagged order.
+const DRAFT_ORDER_COMPLETE = `
+mutation($id: ID!) {
+  draftOrderComplete(id: $id) {
+    order { id status }
+    errors { field code message }
+  }
+}`;
+
+async function* allOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+// Opt-in only. Never called by run(). Wire in yourself only after a human has
+// reviewed the line and address diff on the flagged order.
+async function completeDraftOrder(orderId) {
+  const result = (await gql(DRAFT_ORDER_COMPLETE, { id: orderId })).draftOrderComplete;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.order.status;
+}
+
+export async function run() {
+  let flagged = 0;
+
+  for await (const order of allOrders()) {
+    if (!isOrphanedDraftWithPayment(order)) continue;
+
+    const paymentIds = (order.payments || []).map((p) => p.id);
+    const reportEntry = {
+      orderId: order.id,
+      number: order.number,
+      paymentIds,
+      transactionCount: (order.transactions || []).length,
+    };
+    console.warn("Orphaned draft order found.", reportEntry, DRY_RUN ? "(dry run, reporting only)" : "(reporting only)");
+    flagged++;
+  }
+
+  console.log(`Done. ${flagged} orphaned draft order(s) flagged for staff review.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get reported as orphaned. Because <code>is_orphaned_draft_with_payment</code> is pure, taking only the already-fetched order shape and making no network or database calls of its own, the test needs no Saleor account. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_editing_reverts_draft.py</div>
+      <pre><code class="language-python">from flag_orphaned_drafts import is_orphaned_draft_with_payment
+
+
+def order(**over):
+    base = {
+        "status": "DRAFT",
+        "payments": [{"id": "UGF5bWVudDox", "isActive": True, "chargeStatus": "FULLY_CHARGED"}],
+        "transactions": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_flagged_when_draft_with_charged_active_payment():
+    assert is_orphaned_draft_with_payment(order()) is True
+
+
+def test_flagged_when_draft_with_transaction_and_no_payment():
+    o = order(payments=[], transactions=[{"id": "VHJhbnNhY3Rpb25JdGVtOjE="}])
+    assert is_orphaned_draft_with_payment(o) is True
+
+
+def test_not_flagged_when_not_draft():
+    o = order(status="UNFULFILLED")
+    assert is_orphaned_draft_with_payment(o) is False
+
+
+def test_not_flagged_when_draft_with_no_payment_or_transaction():
+    o = order(payments=[], transactions=[])
+    assert is_orphaned_draft_with_payment(o) is False
+
+
+def test_not_flagged_when_payment_is_not_charged():
+    o = order(payments=[{"id": "UGF5bWVudDox", "isActive": True, "chargeStatus": "NOT_CHARGED"}])
+    assert is_orphaned_draft_with_payment(o) is False
+
+
+def test_not_flagged_when_payment_is_inactive():
+    o = order(payments=[{"id": "UGF5bWVudDox", "isActive": False, "chargeStatus": "FULLY_CHARGED"}])
+    assert is_orphaned_draft_with_payment(o) is False
+
+
+def test_flagged_when_multiple_payments_and_only_one_qualifies():
+    o = order(payments=[
+        {"id": "UGF5bWVudDox", "isActive": False, "chargeStatus": "FULLY_CHARGED"},
+        {"id": "UGF5bWVudDoy", "isActive": True, "chargeStatus": "PARTIALLY_CHARGED"},
+    ])
+    assert is_orphaned_draft_with_payment(o) is True</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">orphaned-drafts.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isOrphanedDraftWithPayment } from "./flag-orphaned-drafts.js";
+
+const order = (over = {}) => ({
+  status: "DRAFT",
+  payments: [{ id: "UGF5bWVudDox", isActive: true, chargeStatus: "FULLY_CHARGED" }],
+  transactions: [],
+  ...over,
+});
+
+test("flagged when draft with a charged active payment", () =&gt; {
+  assert.equal(isOrphanedDraftWithPayment(order()), true);
+});
+
+test("flagged when draft with a transaction and no payment", () =&gt; {
+  const o = order({ payments: [], transactions: [{ id: "VHJhbnNhY3Rpb25JdGVtOjE=" }] });
+  assert.equal(isOrphanedDraftWithPayment(o), true);
+});
+
+test("not flagged when status is not DRAFT", () =&gt; {
+  assert.equal(isOrphanedDraftWithPayment(order({ status: "UNFULFILLED" })), false);
+});
+
+test("not flagged when draft has no payment or transaction", () =&gt; {
+  assert.equal(isOrphanedDraftWithPayment(order({ payments: [], transactions: [] })), false);
+});
+
+test("not flagged when payment is not charged", () =&gt; {
+  const o = order({ payments: [{ id: "UGF5bWVudDox", isActive: true, chargeStatus: "NOT_CHARGED" }] });
+  assert.equal(isOrphanedDraftWithPayment(o), false);
+});
+
+test("not flagged when payment is inactive", () =&gt; {
+  const o = order({ payments: [{ id: "UGF5bWVudDox", isActive: false, chargeStatus: "FULLY_CHARGED" }] });
+  assert.equal(isOrphanedDraftWithPayment(o), false);
+});
+
+test("flagged when multiple payments and only one qualifies", () =&gt; {
+  const o = order({
+    payments: [
+      { id: "UGF5bWVudDox", isActive: false, chargeStatus: "FULLY_CHARGED" },
+      { id: "UGF5bWVudDoy", isActive: true, chargeStatus: "PARTIALLY_CHARGED" },
+    ],
+  });
+  assert.equal(isOrphanedDraftWithPayment(o), true);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Address correction</span>
+      <h4>A typo fix that quietly unshipped an order</h4>
+      <p>A customer messaged support to fix a misspelled street name on an order that was already paid and confirmed. The support agent used the same address edit screen they used for draft orders every day. The address updated correctly, but the order's status silently became <code>DRAFT</code>, and it dropped out of the fulfillment queue the warehouse worked from that afternoon.</p>
+      <p>Nobody noticed until the customer asked where their package was, three days past the normal delivery window. Running the flag script against the full order history surfaced it in the very first pass, since it still carried an active, fully charged payment. Staff reviewed the address diff, confirmed it was correct, and completed the order by hand.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Line removed by mistake</span>
+      <h4>Removing a duplicate line reverted the whole order</h4>
+      <p>A warehouse picker flagged a duplicate line on a confirmed order, and an admin removed it using the line-editing mutation they were used to from draft orders. The duplicate was gone, but so was the order's confirmed status, and it sat at <code>DRAFT</code> for a week with a captured payment attached, invisible to every report the finance team ran.</p>
+      <p>The team started running the flag script hourly as a safety net across every channel. It caught this order and two similar ones within the first day of running, each with its payment ids attached to the log line, and staff completed each one after checking the remaining lines matched what the customer actually paid for.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, an order that got silently reverted to <code>DRAFT</code> stops being invisible. It shows up in a report within an hour of the edit that caused it, with its number and payment ids right there for whoever reviews it. Nothing gets completed or cancelled behind anyone's back, since the only safe way to decide what a reverted order should become is a person who can see exactly what changed and confirm it against what the customer actually paid for.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does editing a confirmed Saleor order change its status back to DRAFT?</summary>
+      <p>Only orders created through draftOrderCreate are meant to start in DRAFT and stay freely editable. Once an order is placed and confirmed it should move through UNCONFIRMED to UNFULFILLED. The dashboard and API have historically reused the same draft-order line and address mutations against a confirmed order, and calling them against a placed order can silently set order.status back to DRAFT instead of rejecting the edit, even though a payment is already attached.</p>
+    </details>
+    <details>
+      <summary>Why do these reverted orders disappear from the orders queue?</summary>
+      <p>The OrderStatusFilter enum used by the orders query and the staff dashboard queues has no DRAFT value. Any order pushed back into DRAFT this way falls out of the normal UNFULFILLED and READY_TO_FULFILL views even though it still has a Payment or TransactionItem record attached, so the order is still taking up captured money but nobody is tracking it in the usual queues.</p>
+    </details>
+    <details>
+      <summary>Can I just call draftOrderComplete to fix an order that reverted to DRAFT?</summary>
+      <p>Not automatically. Saleor has no reverse of draftOrderComplete, so the only forward paths are draftOrderComplete, which reallocates stock and turns the order back into UNFULFILLED, or orderCancel if the edit was a mistake. Since a payment or transaction is already attached, calling draftOrderComplete blindly risks double charging or mis-allocating stock, so a script should only flag these orders and let a human review the line and address diff before completing or cancelling.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Editing order change it's status to DRAFT. <a href="https://github.com/saleor/saleor/issues/4978" rel="noopener">github.com/saleor/saleor/issues/4978</a></li>
+      <li>Updating order in dashboard. <a href="https://github.com/saleor/saleor/issues/3987" rel="noopener">github.com/saleor/saleor/issues/3987</a></li>
+      <li>Saleor Commerce Documentation: Order Status. <a href="https://docs.saleor.io/developer/checkout/order-status" rel="noopener">docs.saleor.io/developer/checkout/order-status</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: the orderConfirm mutation. <a href="https://docs.saleor.io/api-reference/orders/mutations/order-confirm" rel="noopener">docs.saleor.io/api-reference/orders/mutations/order-confirm</a></li>
+      <li>Saleor Commerce Documentation: the OrderStatusFilter enum. <a href="https://docs.saleor.io/api-reference/orders/enums/order-status-filter" rel="noopener">docs.saleor.io/api-reference/orders/enums/order-status-filter</a></li>
+      <li>Saleor Commerce Documentation: the Order object. <a href="https://docs.saleor.io/api-reference/orders/objects/order" rel="noopener">docs.saleor.io/api-reference/orders/objects/order</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, stock, channels, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a reverted order for you?</h3>
+    <p>If this saved you from a customer chasing a paid order that quietly vanished from the queue, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>

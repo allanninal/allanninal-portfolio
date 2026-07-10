@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Saleor Orders Charged More Than Their Total</title>
+<meta name="description" content="A payment app double-fires a webhook, or two TransactionItems each look valid on their own, and suddenly totalCharged plus totalAuthorized is bigger than the order total. Learn why Saleor allows this OVERCHARGED state and build a Python or Node.js script that flags it and drafts a granted refund for a human to approve.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/order-charged-more-than-total/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Saleor Orders Charged More Than Their Total">
+<meta property="og:description" content="Why Saleor lets captured plus authorized amounts exceed an order's total, and a safe Python or Node.js script that flags OVERCHARGED orders and prepares an orderGrantedRefundCreate for a human to approve.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/order-charged-more-than-total/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/order-charged-more-than-total/#article","headline":"Fix Saleor Orders Charged More Than Their Total","description":"Why Saleor tracks authorizedAmount and chargedAmount independently per TransactionItem instead of hard-capping the sum against the order total, which lets a buggy payment app or a double webhook push an order into the OVERCHARGED charge status, and a safe Python or Node.js script that flags it and drafts a granted refund for a human to approve.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/order-charged-more-than-total/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments & Transactions","keywords":"Saleor OVERCHARGED, order.chargeStatus, totalBalance, TransactionItem, orderGrantedRefundCreate, transactionRequestRefundForGrantedRefund, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Order can be charged more than its total","item":"https://www.allanninal.dev/saleor/order-charged-more-than-total/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can a Saleor order really be charged more than its total?","acceptedAnswer":{"@type":"Answer","text":"Yes. Saleor tracks authorizedAmount and chargedAmount independently on each TransactionItem and aggregates them onto the order rather than hard-capping the sum with a database constraint. A buggy payment app, a double-delivered webhook, or more than one TransactionItem attached to the same order can each look valid on their own while together pushing totalCharged plus totalAuthorized above order.total. Saleor even has a name for it: order.chargeStatus becomes OVERCHARGED."}},{"@type":"Question","name":"How do I find orders that were overcharged?","acceptedAnswer":{"@type":"Answer","text":"Query orders with their total, totalCharged, totalAuthorized, totalBalance, chargeStatus, and the per-transaction chargedAmount and authorizedAmount, then compare the sum against the order total in your own code, since Saleor has no orders filter that returns only OVERCHARGED orders directly. Flag any order where totalCharged plus totalAuthorized exceeds total.gross.amount by more than a small rounding tolerance, and treat chargeStatus equal to OVERCHARGED and totalBalance greater than zero as corroborating signals."}},{"@type":"Question","name":"Is it safe to auto-refund an overcharged order?","acceptedAnswer":{"@type":"Answer","text":"No, not automatically. Reversing real captured money requires a human decision about which transaction to refund, whether it should be a partial or full refund, and whether the merchant already shipped against that money. The safe pattern is to flag and report only, then let a human approve an orderGrantedRefundCreate for the overage amount, and only call transactionRequestRefundForGrantedRefund once that approval exists, always behind a dry run guard."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Payments &amp; Transactions</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Payments &amp; Transactions</p>
+    <h1>Order can be charged more than its total</h1>
+    <p class="lead">The order total says one number. The finance report says a bigger one. Nobody edited the price, nobody added a line item, and yet the order somehow collected more money than it was ever supposed to. This is not corrupted data. Saleor has a name for this exact state, and it exists because nothing in the system hard-caps what a payment app or a duplicate webhook is allowed to charge. Here is why it happens and a script that finds every order in that state before a refund conversation gets awkward.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Flag and report, not auto-refund</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Saleor tracks <code>authorizedAmount</code> and <code>chargedAmount</code> independently on every <code>TransactionItem</code>, then aggregates them onto the order as <code>totalCharged</code> and <code>totalAuthorized</code>. Nothing at the database level stops that sum from exceeding <code>order.total</code>. Historically, <code>checkoutPaymentCreate</code> accepted a payment amount higher than the checkout total with no server-side cap (saleor/saleor#4162), and separately a store could attach more than one <code>TransactionItem</code> to an order where each individual capture looked fine but the combined total did not (saleor/saleor#7399). Saleor is honest about this: it surfaces the result as the <code>OVERCHARGED</code> value of <code>order.chargeStatus</code>, which only exists because this state is reachable, not prevented. Run a small Python or Node.js script that pages through orders, compares <code>totalCharged + totalAuthorized</code> against <code>total.gross.amount</code>, and reports every order that crossed the line with its transaction breakdown. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>An order total in Saleor is a fixed number computed from its lines, shipping, and taxes. It is easy to assume that whatever money moves against that order is checked against that number before it is accepted. It is not, at least not with a hard constraint that blocks the write.</p>
+  <p>Each <code>TransactionItem</code> attached to an order carries its own <code>authorizedAmount</code> and <code>chargedAmount</code>, set independently every time a payment app or gateway reports an event back to Saleor. The order then rolls those numbers up into <code>totalAuthorized</code> and <code>totalCharged</code>, purely as an aggregate for reporting. Nothing forces that aggregate to stay under <code>order.total</code>. A single overly generous capture request can slip through, as <code>checkoutPaymentCreate</code> once did when it accepted an amount above the checkout total with no server-side cap. Or the overage can build up gradually: two separate <code>TransactionItems</code> on the same order, each individually well within a plausible range, whose combined <code>chargedAmount</code> only becomes a problem once you add them together, which is exactly the shape of the doubled-capture case reported in saleor/saleor#7399.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. Two TransactionItems each report a charge that looks valid alone, Saleor sums chargedAmount and authorizedAmount without a hard cap, and the total crosses the order total, landing on chargeStatus OVERCHARGED.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="170" height="56" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="95" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">TransactionItem A</text>
+      <text x="95" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">charged: looks valid</text>
+      <rect x="10" y="86" width="170" height="56" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="95" y="110" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">TransactionItem B</text>
+      <text x="95" y="127" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">charged: looks valid</text>
+      <line x1="183" y1="48" x2="235" y2="82" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="183" y1="114" x2="235" y2="88" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="238" y="60" width="175" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="325" y="84" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Summed, no cap</text>
+      <text x="325" y="101" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">totalCharged on order</text>
+      <line x1="416" y1="90" x2="458" y2="90" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="437" y="50" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="437" y="117" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">no DB constraint</text>
+      <rect x="461" y="60" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="536" y="84" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Exceeds</text>
+      <text x="536" y="101" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">order.total</text>
+      <line x1="611" y1="90" x2="653" y2="90" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="656" y="60" width="94" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="703" y="86" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">chargeStatus</text>
+      <text x="703" y="103" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">OVERCHARGED</text>
+    </svg>
+    <figcaption>Each TransactionItem's amount can look reasonable in isolation. Saleor sums them onto the order without a hard cap, so the aggregate can still cross the order total.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li><code>authorizedAmount</code> and <code>chargedAmount</code> live on each <code>TransactionItem</code> independently, set by whatever the payment app or gateway reports back through its webhook or sync response, with no shared ledger enforcing a ceiling.</li>
+    <li><code>order.totalCharged</code> and <code>order.totalAuthorized</code> are aggregates computed across all of an order's transactions, built for reporting, not enforcement. There is no database constraint that rejects a write once the sum would exceed <code>order.total</code>.</li>
+    <li>Historically, <code>checkoutPaymentCreate</code> would accept a payment amount higher than the checkout total with no server-side cap (saleor/saleor#4162), so a single miscalculated request from a buggy integration could overcharge on its own.</li>
+    <li>Separately, a store can end up with more than one <code>TransactionItem</code> attached to the same order, for example from a double-delivered webhook or a manual retry after a timeout that actually succeeded. Each individual amount can look completely valid, and only the sum reveals the problem (saleor/saleor#7399).</li>
+    <li>A manual <code>orderGrantedRefundCreate</code> or capture call run against the wrong transaction, or run twice, has the same effect: real money moves, and nothing stops it from pushing the total past what the order is actually worth.</li>
+  </ul>
+  <p>Saleor does not treat this as impossible. It is a recognized state with its own value on <code>order.chargeStatus</code>: <code>OVERCHARGED</code>. That naming is itself the confirmation that this is an accepted, if unwanted, outcome rather than a bug that corrupts the schema. See the citations at the end for the exact issue threads and the RFC discussing tighter coupling between refunds and transactions.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot prevent this by validating one transaction at a time, because each individual transaction can be perfectly valid on its own. The overage only shows up when you sum every transaction on the order and compare that sum against the order total. That is a detection problem, not a single-request validation problem, so the fix is a script that walks your orders and does that comparison for you, on the numbers Saleor already reports.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script runs on a schedule. It pages through orders with their total and their transactions, sums <code>chargedAmount</code> plus <code>authorizedAmount</code> per order with one pure function, and compares that sum against <code>order.total.gross.amount</code>. Anything over gets written to a report with the exact overage and a per-transaction breakdown. Nothing gets refunded automatically. A human reviews the report and, only once they approve it, the script's guarded path creates a granted refund and, if you flip the dry run flag off, requests it against the gateway.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job pages through orders with totals and transactions, sums chargedAmount and authorizedAmount with decideOverchargeFlag, and if overcharged writes a report entry, then only on human approval creates a granted refund under a dry run guard.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Page orders, read</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">total, transactions</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">decideOverchargeFlag</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">pure decision function</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">over</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">total?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="198" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">no, within tolerance, skip</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#55603f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Report entry</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">then human-approved refund</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports overcharged orders. Creating a granted refund still needs a human to approve the amount, and the gateway call itself stays behind a dry run guard.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with order read and refund access</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read orders and payments. Since the guarded repair path calls <code>orderGrantedRefundCreate</code> and <code>transactionRequestRefundForGrantedRefund</code>, it also needs permission to manage orders and handle payments. Use the resulting app token as a Bearer token, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export OVERCHARGE_EPSILON="0.005"
+export DRY_RUN="true"   # start safe, this script never writes without it off</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export OVERCHARGE_EPSILON="0.005"
+export DRY_RUN="true"   // start safe, this script never writes without it off</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Page through orders with their transactions and total</h3>
+      <p>Ask for <code>orders(first, after)</code> and read back <code>id</code>, <code>number</code>, <code>chargeStatus</code>, <code>totalCharged</code>, <code>totalAuthorized</code>, <code>totalBalance</code>, <code>total.gross</code>, and each order's <code>transactions</code> with their <code>chargedAmount</code>, <code>authorizedAmount</code>, and <code>refundedAmount</code>. Saleor has no filter that returns only <code>OVERCHARGED</code> orders directly, so the comparison happens in your own code. Page with a cursor so the job handles a large backlog.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDERS_QUERY = """
+query FlagOverchargedOrders($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        chargeStatus
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        totalBalance { amount currency }
+        total { gross { amount currency } }
+        transactions {
+          id
+          chargedAmount { amount }
+          authorizedAmount { amount }
+          refundedAmount { amount }
+        }
+      }
+    }
+  }
+}"""
+
+def all_orders(page_size=50):
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"first": page_size, "after": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDERS_QUERY = `
+query FlagOverchargedOrders($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        chargeStatus
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        totalBalance { amount currency }
+        total { gross { amount currency } }
+        transactions {
+          id
+          chargedAmount { amount }
+          authorizedAmount { amount }
+          refundedAmount { amount }
+        }
+      }
+    }
+  }
+}`;
+
+async function* allOrders(pageSize = 50) {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { first: pageSize, after: cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes plain order and transaction data and returns whether it is overcharged, the summed amount, and the overage. It sums <code>chargedAmount</code> plus <code>authorizedAmount</code> across the transactions array, falling back to <code>order.totalCharged</code> and <code>order.totalAuthorized</code> if that array is missing, then compares the sum to <code>order.totalGrossAmount</code> with a small epsilon so ordinary rounding does not trip a false positive. A pure function like this needs no network to test, which we do later.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_overcharge_flag(order, transactions=None, epsilon=0.005):
+    transactions = transactions or []
+    if transactions:
+        captured_plus_authorized = sum(
+            (t.get("chargedAmount") or 0) + (t.get("authorizedAmount") or 0)
+            for t in transactions
+        )
+    else:
+        captured_plus_authorized = (order.get("totalCharged") or 0) + (order.get("totalAuthorized") or 0)
+
+    total_gross = order.get("totalGrossAmount") or 0
+    overage_amount = captured_plus_authorized - total_gross
+    is_overcharged = overage_amount > epsilon
+
+    return {
+        "isOvercharged": is_overcharged,
+        "capturedPlusAuthorized": captured_plus_authorized,
+        "overageAmount": max(overage_amount, 0.0) if is_overcharged else 0.0,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideOverchargeFlag(order, transactions = [], epsilon = 0.005) {
+  const captured_plus_authorized = transactions.length
+    ? transactions.reduce((sum, t) => sum + (t.chargedAmount || 0) + (t.authorizedAmount || 0), 0)
+    : (order.totalCharged || 0) + (order.totalAuthorized || 0);
+
+  const totalGross = order.totalGrossAmount || 0;
+  const overageAmount = captured_plus_authorized - totalGross;
+  const isOvercharged = overageAmount > epsilon;
+
+  return {
+    isOvercharged,
+    capturedPlusAuthorized: captured_plus_authorized,
+    overageAmount: isOvercharged ? Math.max(overageAmount, 0) : 0,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Prepare a granted refund, do not auto-execute it</h3>
+      <p>When an order is flagged, the safe next step is creating a granted refund record with <code>orderGrantedRefundCreate</code> for the overage amount, which just records that a refund of that size is warranted. It does not itself move money. Only once a human has reviewed and approved that record should the script's separate, explicitly opt-in path call <code>transactionRequestRefundForGrantedRefund</code> against the actual transaction, and even that stays behind <code>DRY_RUN=false</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">GRANTED_REFUND_CREATE = """
+mutation($orderId: ID!, $amount: PositiveDecimal!, $reason: String!) {
+  orderGrantedRefundCreate(orderId: $orderId, input: { amount: $amount, reason: $reason }) {
+    orderGrantedRefund { id amount { amount } }
+    errors { field code message }
+  }
+}"""
+
+# Opt-in only. Never called by run(). Only fire after a human approves the
+# grantedRefund record created above, and only with DRY_RUN=false.
+REQUEST_REFUND_FOR_GRANTED_REFUND = """
+mutation($transactionId: ID!, $grantedRefundId: ID!) {
+  transactionRequestRefundForGrantedRefund(id: $transactionId, grantedRefundId: $grantedRefundId) {
+    transaction { id }
+    errors { field code message }
+  }
+}"""
+
+def create_granted_refund(order_id, overage_amount, reason):
+    result = gql(GRANTED_REFUND_CREATE, {
+        "orderId": order_id,
+        "amount": round(overage_amount, 2),
+        "reason": reason,
+    })["orderGrantedRefundCreate"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["orderGrantedRefund"]["id"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">const GRANTED_REFUND_CREATE = `
+mutation($orderId: ID!, $amount: PositiveDecimal!, $reason: String!) {
+  orderGrantedRefundCreate(orderId: $orderId, input: { amount: $amount, reason: $reason }) {
+    orderGrantedRefund { id amount { amount } }
+    errors { field code message }
+  }
+}`;
+
+// Opt-in only. Never called by run(). Only fire after a human approves the
+// grantedRefund record created above, and only with DRY_RUN=false.
+const REQUEST_REFUND_FOR_GRANTED_REFUND = `
+mutation($transactionId: ID!, $grantedRefundId: ID!) {
+  transactionRequestRefundForGrantedRefund(id: $transactionId, grantedRefundId: $grantedRefundId) {
+    transaction { id }
+    errors { field code message }
+  }
+}`;
+
+async function createGrantedRefund(orderId, overageAmount, reason) {
+  const result = (await gql(GRANTED_REFUND_CREATE, {
+    orderId,
+    amount: Math.round(overageAmount * 100) / 100,
+    reason,
+  })).orderGrantedRefundCreate;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.orderGrantedRefund.id;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Under <code>DRY_RUN=true</code>, the default, the script only logs the proposed granted refund input for each overcharged order: the order id, number, overage amount, and the per-transaction breakdown. It never calls <code>orderGrantedRefundCreate</code> or <code>transactionRequestRefundForGrantedRefund</code> from the default path. Run it on a schedule that matches how quickly finance wants to catch a discrepancy, for example once a day, then re-query the order afterward to confirm <code>chargeStatus</code> moved off <code>OVERCHARGED</code> and <code>totalBalance.amount</code> returned to zero once a refund is actually processed.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script's default behavior is report-only, and it should stay that way. Reversing real captured money needs a human decision about which transaction to refund, whether it is partial or full, and whether goods already shipped against that money. Only wire in the guarded refund path once a person has reviewed the flagged list, and always start with <code>DRY_RUN=true</code>.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pages through orders, flags each with the pure function, and logs a proposed granted refund for every overcharged order. The refund-execution path stays commented out by default, since flagging is the safe behavior for this issue.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/order-charged-more-than-total" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_overcharged_orders.py</div>
+      <pre><code class="language-python">"""Flag Saleor orders where totalCharged plus totalAuthorized exceeds the
+order total, because Saleor tracks authorizedAmount and chargedAmount
+independently per TransactionItem and aggregates them without a hard cap
+against order.total (see saleor/saleor#4162, saleor/saleor#7399, and the
+order.chargeStatus OVERCHARGED value in the docs).
+
+This script never calls orderGrantedRefundCreate or
+transactionRequestRefundForGrantedRefund by default. Under DRY_RUN=true (the
+default) it only logs the proposed granted refund input for each overcharged
+order for a human to review. The guarded repair path (create_granted_refund)
+is opt-in only, meant to run after a human approves the amount, and should
+only ever run with DRY_RUN=false. Run on a schedule. Safe to run again and
+again, since it never writes anything on its own.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_overcharged_orders")
+
+API_URL = os.environ.get("SALEOR_API_URL", "https://store.saleor.cloud/graphql/")
+TOKEN = os.environ.get("SALEOR_AUTH_TOKEN", "dummy-token")
+EPSILON = float(os.environ.get("OVERCHARGE_EPSILON", "0.005"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ORDERS_QUERY = """
+query FlagOverchargedOrders($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        chargeStatus
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        totalBalance { amount currency }
+        total { gross { amount currency } }
+        transactions {
+          id
+          chargedAmount { amount }
+          authorizedAmount { amount }
+          refundedAmount { amount }
+        }
+      }
+    }
+  }
+}"""
+
+GRANTED_REFUND_CREATE = """
+mutation($orderId: ID!, $amount: PositiveDecimal!, $reason: String!) {
+  orderGrantedRefundCreate(orderId: $orderId, input: { amount: $amount, reason: $reason }) {
+    orderGrantedRefund { id amount { amount } }
+    errors { field code message }
+  }
+}"""
+
+# Opt-in only. Never called by run(). Only fire after a human approves the
+# grantedRefund record created above, and only with DRY_RUN=false.
+REQUEST_REFUND_FOR_GRANTED_REFUND = """
+mutation($transactionId: ID!, $grantedRefundId: ID!) {
+  transactionRequestRefundForGrantedRefund(id: $transactionId, grantedRefundId: $grantedRefundId) {
+    transaction { id }
+    errors { field code message }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def decide_overcharge_flag(order, transactions=None, epsilon=0.005):
+    transactions = transactions or []
+    if transactions:
+        captured_plus_authorized = sum(
+            (t.get("chargedAmount") or 0) + (t.get("authorizedAmount") or 0)
+            for t in transactions
+        )
+    else:
+        captured_plus_authorized = (order.get("totalCharged") or 0) + (order.get("totalAuthorized") or 0)
+
+    total_gross = order.get("totalGrossAmount") or 0
+    overage_amount = captured_plus_authorized - total_gross
+    is_overcharged = overage_amount > epsilon
+
+    return {
+        "isOvercharged": is_overcharged,
+        "capturedPlusAuthorized": captured_plus_authorized,
+        "overageAmount": max(overage_amount, 0.0) if is_overcharged else 0.0,
+    }
+
+
+def all_orders(page_size=50):
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"first": page_size, "after": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def create_granted_refund(order_id, overage_amount, reason):
+    """Opt-in only. Never called by run(). Wire in yourself after a human
+    approves the flagged overage amount."""
+    result = gql(GRANTED_REFUND_CREATE, {
+        "orderId": order_id,
+        "amount": round(overage_amount, 2),
+        "reason": reason,
+    })["orderGrantedRefundCreate"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["orderGrantedRefund"]["id"]
+
+
+def request_refund_for_granted_refund(transaction_id, granted_refund_id):
+    """Opt-in only. Never called by run(). Executes the refund against the
+    gateway once a granted refund has been approved."""
+    result = gql(REQUEST_REFUND_FOR_GRANTED_REFUND, {
+        "transactionId": transaction_id,
+        "grantedRefundId": granted_refund_id,
+    })["transactionRequestRefundForGrantedRefund"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["transaction"]["id"]
+
+
+def to_plain(node):
+    return {
+        "id": node["id"],
+        "number": node["number"],
+        "chargeStatus": node["chargeStatus"],
+        "totalCharged": (node.get("totalCharged") or {}).get("amount") or 0,
+        "totalAuthorized": (node.get("totalAuthorized") or {}).get("amount") or 0,
+        "totalBalance": (node.get("totalBalance") or {}).get("amount") or 0,
+        "totalGrossAmount": (node.get("total") or {}).get("gross", {}).get("amount") or 0,
+        "currency": (node.get("total") or {}).get("gross", {}).get("currency"),
+    }
+
+
+def to_plain_transactions(node):
+    return [
+        {
+            "id": t["id"],
+            "chargedAmount": (t.get("chargedAmount") or {}).get("amount") or 0,
+            "authorizedAmount": (t.get("authorizedAmount") or {}).get("amount") or 0,
+            "refundedAmount": (t.get("refundedAmount") or {}).get("amount") or 0,
+        }
+        for t in (node.get("transactions") or [])
+    ]
+
+
+def run():
+    flagged = 0
+
+    for node in all_orders():
+        order = to_plain(node)
+        transactions = to_plain_transactions(node)
+        decision = decide_overcharge_flag(order, transactions, EPSILON)
+        if not decision["isOvercharged"]:
+            continue
+
+        report_entry = {
+            "orderId": order["id"],
+            "number": order["number"],
+            "chargeStatus": order["chargeStatus"],
+            "capturedPlusAuthorized": decision["capturedPlusAuthorized"],
+            "orderTotal": order["totalGrossAmount"],
+            "overageAmount": round(decision["overageAmount"], 2),
+            "totalBalance": order["totalBalance"],
+            "transactions": transactions,
+        }
+        log.warning("Overcharged order found. %s %s", report_entry,
+                    "(dry run, reporting only)" if DRY_RUN else "(reporting only, refund requires approval)")
+        flagged += 1
+
+        proposed_input = {
+            "orderId": order["id"],
+            "amount": round(decision["overageAmount"], 2),
+            "reason": "Overcharge auto-detected: captured+authorized exceeded order total",
+        }
+        log.info("Proposed grantedRefund input: %s", proposed_input)
+
+    log.info("Done. %d overcharged order(s) flagged for review.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-overcharged-orders.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Saleor orders where totalCharged plus totalAuthorized exceeds the
+ * order total, because Saleor tracks authorizedAmount and chargedAmount
+ * independently per TransactionItem and aggregates them without a hard cap
+ * against order.total (see saleor/saleor#4162, saleor/saleor#7399, and the
+ * order.chargeStatus OVERCHARGED value in the docs).
+ *
+ * This script never calls orderGrantedRefundCreate or
+ * transactionRequestRefundForGrantedRefund by default. Under DRY_RUN=true
+ * (the default) it only logs the proposed granted refund input for each
+ * overcharged order for a human to review. The guarded repair path
+ * (createGrantedRefund) is opt-in only, meant to run after a human approves
+ * the amount, and should only ever run with DRY_RUN=false. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/order-charged-more-than-total/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const EPSILON = Number(process.env.OVERCHARGE_EPSILON || 0.005);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decideOverchargeFlag(order, transactions = [], epsilon = 0.005) {
+  const capturedPlusAuthorized = transactions.length
+    ? transactions.reduce((sum, t) => sum + (t.chargedAmount || 0) + (t.authorizedAmount || 0), 0)
+    : (order.totalCharged || 0) + (order.totalAuthorized || 0);
+
+  const totalGross = order.totalGrossAmount || 0;
+  const overageAmount = capturedPlusAuthorized - totalGross;
+  const isOvercharged = overageAmount > epsilon;
+
+  return {
+    isOvercharged,
+    capturedPlusAuthorized,
+    overageAmount: isOvercharged ? Math.max(overageAmount, 0) : 0,
+  };
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const ORDERS_QUERY = `
+query FlagOverchargedOrders($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        number
+        chargeStatus
+        totalCharged { amount currency }
+        totalAuthorized { amount currency }
+        totalBalance { amount currency }
+        total { gross { amount currency } }
+        transactions {
+          id
+          chargedAmount { amount }
+          authorizedAmount { amount }
+          refundedAmount { amount }
+        }
+      }
+    }
+  }
+}`;
+
+const GRANTED_REFUND_CREATE = `
+mutation($orderId: ID!, $amount: PositiveDecimal!, $reason: String!) {
+  orderGrantedRefundCreate(orderId: $orderId, input: { amount: $amount, reason: $reason }) {
+    orderGrantedRefund { id amount { amount } }
+    errors { field code message }
+  }
+}`;
+
+// Opt-in only. Never called by run(). Only fire after a human approves the
+// grantedRefund record created above, and only with DRY_RUN=false.
+const REQUEST_REFUND_FOR_GRANTED_REFUND = `
+mutation($transactionId: ID!, $grantedRefundId: ID!) {
+  transactionRequestRefundForGrantedRefund(id: $transactionId, grantedRefundId: $grantedRefundId) {
+    transaction { id }
+    errors { field code message }
+  }
+}`;
+
+async function* allOrders(pageSize = 50) {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { first: pageSize, after: cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+// Opt-in only. Never called by run(). Wire in yourself after a human
+// approves the flagged overage amount.
+async function createGrantedRefund(orderId, overageAmount, reason) {
+  const result = (await gql(GRANTED_REFUND_CREATE, {
+    orderId,
+    amount: Math.round(overageAmount * 100) / 100,
+    reason,
+  })).orderGrantedRefundCreate;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.orderGrantedRefund.id;
+}
+
+// Opt-in only. Never called by run(). Executes the refund against the
+// gateway once a granted refund has been approved.
+async function requestRefundForGrantedRefund(transactionId, grantedRefundId) {
+  const result = (await gql(REQUEST_REFUND_FOR_GRANTED_REFUND, {
+    transactionId,
+    grantedRefundId,
+  })).transactionRequestRefundForGrantedRefund;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.transaction.id;
+}
+
+function toPlain(node) {
+  return {
+    id: node.id,
+    number: node.number,
+    chargeStatus: node.chargeStatus,
+    totalCharged: node.totalCharged?.amount ?? 0,
+    totalAuthorized: node.totalAuthorized?.amount ?? 0,
+    totalBalance: node.totalBalance?.amount ?? 0,
+    totalGrossAmount: node.total?.gross?.amount ?? 0,
+    currency: node.total?.gross?.currency ?? null,
+  };
+}
+
+function toPlainTransactions(node) {
+  return (node.transactions || []).map((t) => ({
+    id: t.id,
+    chargedAmount: t.chargedAmount?.amount ?? 0,
+    authorizedAmount: t.authorizedAmount?.amount ?? 0,
+    refundedAmount: t.refundedAmount?.amount ?? 0,
+  }));
+}
+
+export async function run() {
+  let flagged = 0;
+
+  for await (const node of allOrders()) {
+    const order = toPlain(node);
+    const transactions = toPlainTransactions(node);
+    const decision = decideOverchargeFlag(order, transactions, EPSILON);
+    if (!decision.isOvercharged) continue;
+
+    const reportEntry = {
+      orderId: order.id,
+      number: order.number,
+      chargeStatus: order.chargeStatus,
+      capturedPlusAuthorized: decision.capturedPlusAuthorized,
+      orderTotal: order.totalGrossAmount,
+      overageAmount: Math.round(decision.overageAmount * 100) / 100,
+      totalBalance: order.totalBalance,
+      transactions,
+    };
+    console.warn(
+      "Overcharged order found.", reportEntry,
+      DRY_RUN ? "(dry run, reporting only)" : "(reporting only, refund requires approval)"
+    );
+    flagged++;
+
+    const proposedInput = {
+      orderId: order.id,
+      amount: Math.round(decision.overageAmount * 100) / 100,
+      reason: "Overcharge auto-detected: captured+authorized exceeded order total",
+    };
+    console.log("Proposed grantedRefund input:", proposedInput);
+  }
+
+  console.log(`Done. ${flagged} overcharged order(s) flagged for review.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get reported as overcharged. Because <code>decide_overcharge_flag</code> is pure, taking plain order and transaction data as arguments instead of querying anything itself, the test needs no network and no Saleor account. It just feeds in fixture orders and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_overcharge_decision.py</div>
+      <pre><code class="language-python">from flag_overcharged_orders import decide_overcharge_flag
+
+
+def order(**over):
+    base = {"totalGrossAmount": 100.0, "totalCharged": 100.0, "totalAuthorized": 0.0, "currency": "USD"}
+    base.update(over)
+    return base
+
+
+def test_exact_match_is_not_overcharged():
+    result = decide_overcharge_flag(order(), [{"chargedAmount": 100.0, "authorizedAmount": 0.0}])
+    assert result["isOvercharged"] is False
+    assert result["capturedPlusAuthorized"] == 100.0
+    assert result["overageAmount"] == 0.0
+
+
+def test_one_cent_over_is_overcharged():
+    result = decide_overcharge_flag(order(), [{"chargedAmount": 100.01, "authorizedAmount": 0.0}])
+    assert result["isOvercharged"] is True
+    assert round(result["overageAmount"], 2) == 0.01
+
+
+def test_within_epsilon_is_not_overcharged():
+    result = decide_overcharge_flag(order(), [{"chargedAmount": 100.003, "authorizedAmount": 0.0}], epsilon=0.005)
+    assert result["isOvercharged"] is False
+
+
+def test_double_capture_is_overcharged():
+    transactions = [
+        {"chargedAmount": 100.0, "authorizedAmount": 0.0},
+        {"chargedAmount": 100.0, "authorizedAmount": 0.0},
+    ]
+    result = decide_overcharge_flag(order(), transactions)
+    assert result["isOvercharged"] is True
+    assert result["capturedPlusAuthorized"] == 200.0
+    assert round(result["overageAmount"], 2) == 100.0
+
+
+def test_zero_total_with_any_charge_is_overcharged():
+    result = decide_overcharge_flag(order(totalGrossAmount=0.0), [{"chargedAmount": 5.0, "authorizedAmount": 0.0}])
+    assert result["isOvercharged"] is True
+
+
+def test_falls_back_to_order_totals_when_no_transactions_array():
+    result = decide_overcharge_flag(order(totalCharged=150.0, totalAuthorized=0.0), transactions=None)
+    assert result["isOvercharged"] is True
+    assert result["capturedPlusAuthorized"] == 150.0
+
+
+def test_authorized_plus_charged_together_can_overcharge():
+    transactions = [{"chargedAmount": 80.0, "authorizedAmount": 25.0}]
+    result = decide_overcharge_flag(order(), transactions)
+    assert result["isOvercharged"] is True
+    assert result["capturedPlusAuthorized"] == 105.0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide-overcharge.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideOverchargeFlag } from "./flag-overcharged-orders.js";
+
+const order = (over = {}) => ({
+  totalGrossAmount: 100.0,
+  totalCharged: 100.0,
+  totalAuthorized: 0.0,
+  currency: "USD",
+  ...over,
+});
+
+test("exact match is not overcharged", () =&gt; {
+  const result = decideOverchargeFlag(order(), [{ chargedAmount: 100.0, authorizedAmount: 0.0 }]);
+  assert.equal(result.isOvercharged, false);
+  assert.equal(result.capturedPlusAuthorized, 100.0);
+  assert.equal(result.overageAmount, 0);
+});
+
+test("one cent over is overcharged", () =&gt; {
+  const result = decideOverchargeFlag(order(), [{ chargedAmount: 100.01, authorizedAmount: 0.0 }]);
+  assert.equal(result.isOvercharged, true);
+  assert.equal(Math.round(result.overageAmount * 100) / 100, 0.01);
+});
+
+test("within epsilon is not overcharged", () =&gt; {
+  const result = decideOverchargeFlag(order(), [{ chargedAmount: 100.003, authorizedAmount: 0.0 }], 0.005);
+  assert.equal(result.isOvercharged, false);
+});
+
+test("double capture is overcharged", () =&gt; {
+  const transactions = [
+    { chargedAmount: 100.0, authorizedAmount: 0.0 },
+    { chargedAmount: 100.0, authorizedAmount: 0.0 },
+  ];
+  const result = decideOverchargeFlag(order(), transactions);
+  assert.equal(result.isOvercharged, true);
+  assert.equal(result.capturedPlusAuthorized, 200.0);
+  assert.equal(Math.round(result.overageAmount * 100) / 100, 100.0);
+});
+
+test("zero total with any charge is overcharged", () =&gt; {
+  const result = decideOverchargeFlag(order({ totalGrossAmount: 0.0 }), [{ chargedAmount: 5.0, authorizedAmount: 0.0 }]);
+  assert.equal(result.isOvercharged, true);
+});
+
+test("falls back to order totals when no transactions array", () =&gt; {
+  const result = decideOverchargeFlag(order({ totalCharged: 150.0, totalAuthorized: 0.0 }), []);
+  assert.equal(result.isOvercharged, true);
+  assert.equal(result.capturedPlusAuthorized, 150.0);
+});
+
+test("authorized plus charged together can overcharge", () =&gt; {
+  const transactions = [{ chargedAmount: 80.0, authorizedAmount: 25.0 }];
+  const result = decideOverchargeFlag(order(), transactions);
+  assert.equal(result.isOvercharged, true);
+  assert.equal(result.capturedPlusAuthorized, 105.0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Duplicate webhook</span>
+      <h4>A retried webhook charged the same order twice</h4>
+      <p>A payment app's webhook endpoint timed out on the gateway's side, so the gateway retried the delivery a few seconds later. The app processed both deliveries as separate capture events, each one landing on its own <code>TransactionItem</code> with a perfectly reasonable <code>chargedAmount</code>. Individually neither transaction looked wrong. Together they doubled the money taken from the customer, and nobody noticed until a customer emailed asking why their card was charged twice.</p>
+      <p>Running the flag script against the store's recent orders surfaced the exact order within the first pass, with both transaction ids and amounts laid out side by side. Finance approved a granted refund for the difference the same day, and the team added idempotency keys to the webhook handler so a retried delivery updates the existing transaction instead of creating a second one.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Manual capture mistake</span>
+      <h4>A support agent captured an already-captured authorization</h4>
+      <p>An order had an authorization placed, then a support agent, working from an old ticket, manually triggered a capture against it not realizing another agent had already captured the same authorization the day before through a different tool. The order's <code>totalCharged</code> quietly became larger than <code>total.gross.amount</code>, and Saleor's own <code>chargeStatus</code> flipped to <code>OVERCHARGED</code>, but nothing paged anyone about it.</p>
+      <p>The daily flag run caught it that night, reporting the order id, the overage amount, and both transactions involved. A manager reviewed the report the next morning, approved a granted refund for the exact overage, and the team updated their support runbook so agents check <code>chargeStatus</code> before ever triggering a manual capture.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, an overcharge does not sit hidden in a finance report until a customer complains. It shows up within one run, with the exact overage amount and the transaction breakdown that explains it. Nothing gets refunded automatically, since deciding which transaction to reverse and whether it is a partial or full refund needs a person who knows whether goods already shipped, but that person now starts from a clear, pre-computed number instead of hand-auditing every order.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Can a Saleor order really be charged more than its total?</summary>
+      <p>Yes. Saleor tracks authorizedAmount and chargedAmount independently on each TransactionItem and aggregates them onto the order rather than hard-capping the sum with a database constraint. A buggy payment app, a double-delivered webhook, or more than one TransactionItem attached to the same order can each look valid on their own while together pushing totalCharged plus totalAuthorized above order.total. Saleor even has a name for it: order.chargeStatus becomes OVERCHARGED.</p>
+    </details>
+    <details>
+      <summary>How do I find orders that were overcharged?</summary>
+      <p>Query orders with their total, totalCharged, totalAuthorized, totalBalance, chargeStatus, and the per-transaction chargedAmount and authorizedAmount, then compare the sum against the order total in your own code, since Saleor has no orders filter that returns only OVERCHARGED orders directly. Flag any order where totalCharged plus totalAuthorized exceeds total.gross.amount by more than a small rounding tolerance, and treat chargeStatus equal to OVERCHARGED and totalBalance greater than zero as corroborating signals.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-refund an overcharged order?</summary>
+      <p>No, not automatically. Reversing real captured money requires a human decision about which transaction to refund, whether it should be a partial or full refund, and whether the merchant already shipped against that money. The safe pattern is to flag and report only, then let a human approve an orderGrantedRefundCreate for the overage amount, and only call transactionRequestRefundForGrantedRefund once that approval exists, always behind a dry run guard.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Saleor will authorize and charge more than the order's total if allowed. <a href="https://github.com/saleor/saleor/issues/4162" rel="noopener">github.com/saleor/saleor/issues/4162</a></li>
+      <li>Captured amount is twice the total amount resulting in an outstanding balance. <a href="https://github.com/saleor/saleor/issues/7399" rel="noopener">github.com/saleor/saleor/issues/7399</a></li>
+      <li>RFC: Improve relation between orderGrantedRefund and TransactionItem. <a href="https://github.com/saleor/saleor/discussions/15458" rel="noopener">github.com/saleor/saleor/discussions/15458</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: the TransactionItem object. <a href="https://docs.saleor.io/api-reference/payments/objects/transaction-item" rel="noopener">docs.saleor.io/api-reference/payments/objects/transaction-item</a></li>
+      <li>Saleor Commerce Documentation: refunds. <a href="https://docs.saleor.io/developer/payments/refunds" rel="noopener">docs.saleor.io/developer/payments/refunds</a></li>
+      <li>Saleor Commerce Documentation: payments lifecycle. <a href="https://docs.saleor.io/developer/payments/lifecycle" rel="noopener">docs.saleor.io/developer/payments/lifecycle</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, payments, transactions, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch an overcharge before finance did?</h3>
+    <p>If this saved you an awkward refund conversation or a mismatched revenue report, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>

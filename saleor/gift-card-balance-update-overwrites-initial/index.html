@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Saleor Gift Card Balance Update Overwrites Initial Balance</title>
+<meta name="description" content="Calling giftCardUpdate with balanceAmount to top up a gift card resets both initialBalance and currentBalance to the same value, silently erasing any spend already on the card. Learn why the mutation does this and build a Python or Node.js script that flags every card it happened to.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/gift-card-balance-update-overwrites-initial/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Saleor Gift Card Balance Update Overwrites Initial Balance">
+<meta property="og:description" content="Why giftCardUpdate's balanceAmount field resets a partially spent gift card's currentBalance back up to initialBalance, and a safe Python or Node.js script that finds every card this happened to and reports the last known-good balance.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/gift-card-balance-update-overwrites-initial/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/gift-card-balance-update-overwrites-initial/#article","headline":"Fix Saleor Gift Card Balance Update Overwrites Initial Balance","description":"Saleor's giftCardUpdate mutation exposes a single balanceAmount field that is written to both initialBalance and currentBalance at once, with no separate top-up field and no server-side check for a card that has already been spent down. A safe Python or Node.js script pages through gift cards, flags every card where this happened, and recovers the last known-good remaining balance from the card's own event log.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/gift-card-balance-update-overwrites-initial/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Vouchers & Gift Cards","keywords":"Saleor gift card balance overwritten, giftCardUpdate balanceAmount, initialBalance currentBalance, GiftCardEvent, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Gift card balance update overwrites initial balance","item":"https://www.allanninal.dev/saleor/gift-card-balance-update-overwrites-initial/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did topping up a gift card erase the customer's remaining balance?","acceptedAnswer":{"@type":"Answer","text":"The giftCardUpdate mutation has a single balanceAmount field, and Saleor writes that same amount to both initialBalance and currentBalance in one update. If you meant to top up only the remaining balance on a card that had already been partially spent, the write also reset initialBalance to match, and since currentBalance was set to that same new value, the card's spend history was overwritten rather than added to."}},{"@type":"Question","name":"How do I find gift cards whose balance was overwritten this way?","acceptedAnswer":{"@type":"Answer","text":"Query giftCards with initialBalance, currentBalance, and events, and flag a card when currentBalance is greater than initialBalance, which can never happen legitimately, or when its events show an UPDATED entry where oldCurrentBalance differed from oldInitialBalance (proof the card had been spent) immediately followed by newInitialBalance equal to newCurrentBalance (proof the update reset both fields together)."}},{"@type":"Question","name":"Can I automatically restore the correct balance once I find an affected card?","acceptedAnswer":{"@type":"Answer","text":"Not safely as a blanket fix. Saleor keeps no separate ledger column, so the true remaining balance after the overwrite only survives as the oldCurrentBalance snapshot on the GiftCardEvent just before the faulty update. Report that recovered figure for each affected card and have a human confirm it before writing anything back, since any follow-up giftCardUpdate call will again set initialBalance and currentBalance to the same value."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Vouchers &amp; Gift Cards</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Vouchers &amp; Gift Cards</p>
+    <h1>Gift card balance update overwrites initial balance</h1>
+    <p class="lead">A support agent tops up a gift card to refund a customer, or a script "adds" a bit more balance after a promotion, and the mutation looks like it worked. Then someone notices the card's remaining balance no longer matches what the customer had spent. It did not add to the balance. It replaced it, and the card's whole spend history quietly disappeared in the same write. Here is why Saleor's gift card update behaves this way and a script that finds every card it happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Flag and report, not auto-fix</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Saleor's <code>giftCardUpdate</code> mutation exposes a single <code>balanceAmount</code> field on <code>GiftCardUpdateInput</code>, and whatever amount you pass gets written to both <code>initialBalance</code> and <code>currentBalance</code> at once. There is no separate "top up the remaining balance" field, and no server-side check for whether the card has already been partially spent. So a call meant to top up only the remaining balance on an active, already-used card ends up resetting <code>currentBalance</code> back up to match the new <code>initialBalance</code>, erasing the spend recorded in the card's <code>GiftCardEvent</code>s. Run a small Python or Node.js script that pages through gift cards, flags any card where this already happened, and reports the last known-good remaining balance recovered from the event log. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A gift card in Saleor tracks two numbers: <code>initialBalance</code>, what the card was originally worth, and <code>currentBalance</code>, what is left to spend. The gap between them is the card's spend history, redemptions the customer already made. That gap is the entire point of tracking two numbers instead of one.</p>
+  <p><code>giftCardUpdate</code> does not know about that gap. It takes one input field, <code>balanceAmount</code>, the same field used when a card is first authored with <code>giftCardCreate</code>, and applies it as a flat write to both balances. Call it on a brand new, unused card and nothing looks wrong, because <code>initialBalance</code> and <code>currentBalance</code> already matched. Call it on a card a customer has been spending down for weeks, meaning to add a top-up on top of what remains, and the mutation does not add anything. It sets both numbers to the exact value you passed, discarding whatever had already been spent.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A gift card has an initial balance of 50 and a current balance of 12 after spending. A staff member calls giftCardUpdate with balanceAmount 60 intending to top up the remaining balance, but the mutation writes 60 to both initialBalance and currentBalance, erasing the fact that 38 had already been spent.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="230" height="62" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="125" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Card before update</text>
+      <text x="125" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">initial 50, current 12 (spent 38)</text>
+      <line x1="125" y1="82" x2="125" y2="118" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <text x="240" y="106" font-family="sans-serif" font-size="10.5" fill="#55603f">staff means to top up remaining</text>
+      <rect x="10" y="120" width="230" height="62" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="125" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">giftCardUpdate</text>
+      <text x="125" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">balanceAmount: 60</text>
+      <line x1="240" y1="151" x2="282" y2="151" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <text x="300" y="120" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="285" y="120" width="250" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="410" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">both fields set to 60</text>
+      <text x="410" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">initial 60, current 60</text>
+      <line x1="535" y1="151" x2="577" y2="151" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="580" y="120" width="170" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="665" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">spend history gone</text>
+      <text x="665" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">the 38 already spent, erased</text>
+    </svg>
+    <figcaption>balanceAmount is one field applied to two balances at once. There is no top-up field, so intent to add gets read as intent to replace.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li><code>GiftCardUpdateInput</code> only has <code>balanceAmount</code> for changing what a card is worth, there is no separate "adjust remaining balance" or "top-up" field to add to <code>currentBalance</code> without touching <code>initialBalance</code>.</li>
+    <li>The mutation applies that one amount as a single write to both <code>initialBalance</code> and <code>currentBalance</code>, the same code path used when a card is first authored with <code>giftCardCreate</code>.</li>
+    <li>There is no server-side check on the card's usage state before that write. Saleor does not reject or warn when the result would leave <code>currentBalance</code> equal to a freshly set <code>initialBalance</code> on a card that had already been spent down.</li>
+    <li>Staff tooling or scripts built for a customer-service refund-to-card end up calling the same mutation meant for authoring the original balance, because it is the only balance-writing mutation available.</li>
+  </ul>
+  <p>Nothing about this raises an error. The mutation returns a perfectly normal <code>GiftCard</code> object with the new balances applied. The only trace left behind is a mismatch between the card's <code>GiftCardEvent</code> log, which still shows the spend that happened, and the balances now sitting on the card, which no longer reflect it. See the citations at the end for the exact docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>currentBalance</code> can never legitimately be greater than <code>initialBalance</code>. That single fact turns the most obvious case of this bug into a one-line check. The harder case, a card whose balances are internally consistent but whose history was still wiped, only shows up by reading the card's own <code>GiftCardEvent</code>s: an <code>UPDATED</code> event where the balance before the write had already diverged (spend had happened), immediately followed by a write that collapsed both fields back to one number.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not try to guess a corrected balance and write it back automatically. The true remaining balance the customer should have is not recoverable from the card object once it has been overwritten, Saleor keeps no separate ledger column, only the event log's snapshot of the balance at the moment just before the faulty update. So the script's job is to find every affected card, recover that last known-good number from its own history, and hand a clear report to a human.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job pages through gift cards with their events, runs classifyGiftCardBalanceOverwrite, a pure function, to decide if a card is affected, and if so reports the card id, display code, recovered balance, and erroneous balance to staff instead of auto-writing a fix.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Audit job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">runs on a schedule</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Page giftCards,</text>
+      <text x="112" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">read balances and</text>
+      <text x="112" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">events per card</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">classifyGiftCard</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">BalanceOverwrite</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">affected?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="585" y="198" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">no, skip</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#55603f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="614" y="185" width="136" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="682" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Report to staff</text>
+      <text x="682" y="221" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">id, code, recovered balance</text>
+      <path d="M690,138 C710,138 682,150 682,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever flags and reports. Writing a corrected balance stays a human decision, gated on confirming the recovered figure is right.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with gift card read access</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read gift cards. Use the resulting app token as a Bearer token, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   # start safe, this script only reports by default</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export DRY_RUN="true"   // start safe, this script only reports by default</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Page through gift cards with their balances and events</h3>
+      <p>Ask <code>giftCards(first: 100, after: $cursor)</code> for each card's <code>id</code>, <code>displayCode</code>, <code>isActive</code>, <code>initialBalance</code>, <code>currentBalance</code>, and its last 50 <code>events</code> with their <code>type</code>, <code>date</code>, and before-and-after <code>balance</code> snapshot. The events list is what lets the decision function see a card's history, not just its current numbers.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">GIFT_CARDS_QUERY = """
+query($cursor: String) {
+  giftCards(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        displayCode
+        isActive
+        initialBalance { amount currency }
+        currentBalance { amount currency }
+        created
+        lastUsedOn
+        events(first: 50) {
+          edges {
+            node {
+              type
+              date
+              balance { initialBalance currentBalance oldInitialBalance oldCurrentBalance }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+def gift_cards():
+    cursor = None
+    while True:
+        data = gql(GIFT_CARDS_QUERY, {"cursor": cursor})["giftCards"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const GIFT_CARDS_QUERY = `
+query($cursor: String) {
+  giftCards(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        displayCode
+        isActive
+        initialBalance { amount currency }
+        currentBalance { amount currency }
+        created
+        lastUsedOn
+        events(first: 50) {
+          edges {
+            node {
+              type
+              date
+              balance { initialBalance currentBalance oldInitialBalance oldCurrentBalance }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+async function* giftCards() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(GIFT_CARDS_QUERY, { cursor })).giftCards;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a card's balances and a plain list of its events, and returns a classification. There are two ways in: the literal anomaly, <code>currentBalance</code> greater than <code>initialBalance</code>, which can never happen legitimately and is unrecoverable from the current state alone. Or the subtler case, scanning events for an <code>UPDATED</code> entry where the balance had already diverged (spend happened) right before a write that collapsed both fields to one number, in which case the event's own <code>oldCurrentBalanceAmount</code> is the recovered figure.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def classify_gift_card_balance_overwrite(card):
+    if card["currentBalanceAmount"] > card["initialBalanceAmount"]:
+        return {"affected": True, "reason": "current_exceeds_initial", "recoveredCurrentBalanceAmount": None}
+
+    for event in card["events"]:
+        if event["type"] != "UPDATED":
+            continue
+        old_initial = event["oldInitialBalanceAmount"]
+        old_current = event["oldCurrentBalanceAmount"]
+        new_initial = event["newInitialBalanceAmount"]
+        new_current = event["newCurrentBalanceAmount"]
+        if old_initial is None or old_current is None:
+            continue
+        if old_current == old_initial:
+            continue
+        if new_initial is None or new_current is None or new_initial != new_current:
+            continue
+        return {"affected": True, "reason": "update_reset_spent_card", "recoveredCurrentBalanceAmount": old_current}
+
+    return {"affected": False, "reason": None, "recoveredCurrentBalanceAmount": None}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function classifyGiftCardBalanceOverwrite(card) {
+  if (card.currentBalanceAmount > card.initialBalanceAmount) {
+    return { affected: true, reason: "current_exceeds_initial", recoveredCurrentBalanceAmount: null };
+  }
+
+  for (const event of card.events) {
+    if (event.type !== "UPDATED") continue;
+    const { oldInitialBalanceAmount, oldCurrentBalanceAmount, newInitialBalanceAmount, newCurrentBalanceAmount } = event;
+    if (oldInitialBalanceAmount == null || oldCurrentBalanceAmount == null) continue;
+    if (oldCurrentBalanceAmount === oldInitialBalanceAmount) continue;
+    if (newInitialBalanceAmount == null || newCurrentBalanceAmount == null) continue;
+    if (newInitialBalanceAmount !== newCurrentBalanceAmount) continue;
+    return { affected: true, reason: "update_reset_spent_card", recoveredCurrentBalanceAmount: oldCurrentBalanceAmount };
+  }
+
+  return { affected: false, reason: null, recoveredCurrentBalanceAmount: null };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report the overwrite, do not auto-write a fix</h3>
+      <p>When a card is affected, log <code>{id, displayCode, recoveredCurrentBalanceAmount, currentBalanceAmount, initialBalanceAmount, reason}</code>. Do not guess a corrected value and write it back. If <code>reason</code> is <code>current_exceeds_initial</code>, there is no recoverable figure at all, the card object alone cannot tell you what it should be. If <code>reason</code> is <code>update_reset_spent_card</code>, the recovered figure is a strong lead, but only a human who has confirmed it against the customer's own records should turn it into a write.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script's default behavior is report-only, and it should stay that way. If a human confirms a recovered balance is correct, the only corrective lever is another <code>giftCardUpdate(input: { balanceAmount: $recoveredCurrentBalance })</code> call, and that call will again set both <code>initialBalance</code> and <code>currentBalance</code> to the same value. That is only safe when the card's original <code>initialBalance</code> should also legitimately become that recovered figure, for example closing out the card at its last known remaining value. Going forward, prefer never calling <code>giftCardUpdate.balanceAmount</code> on a card where <code>currentBalance</code> and <code>initialBalance</code> already differ, and route real top-ups through order or refund flows, or record them with <code>giftCardAddNote</code> and a manual ledger instead.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, walks every gift card with its events, classifies each one, and reports every card whose balance was overwritten. The default run never writes to Saleor at all, since flagging is the safe behavior for this issue.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/gift-card-balance-update-overwrites-initial" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">audit_gift_card_balances.py</div>
+      <pre><code class="language-python">"""Find Saleor gift cards whose balance was overwritten by a giftCardUpdate
+call that used balanceAmount to top up the remaining balance on a card
+that had already been partially spent (see the GiftCard object docs and
+the giftCardUpdate mutation docs).
+
+balanceAmount on GiftCardUpdateInput is written to both initialBalance and
+currentBalance in one go, with no server-side check for whether the card
+had already been spent down. This script never writes a corrected balance.
+Saleor keeps no separate ledger column, so the true remaining balance only
+survives as the oldCurrentBalance snapshot on the GiftCardEvent just before
+the faulty update. Under DRY_RUN=true (the default, and the only mode this
+script supports out of the box) it logs a report entry for every affected
+card: {id, displayCode, recoveredCurrentBalanceAmount, currentBalanceAmount,
+initialBalanceAmount, reason}. Hand that report to staff for a confirmed
+manual correction. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("audit_gift_card_balances")
+
+API_URL = os.environ.get("SALEOR_API_URL", "https://store.saleor.cloud/graphql/")
+TOKEN = os.environ.get("SALEOR_AUTH_TOKEN", "dummy-token")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+GIFT_CARDS_QUERY = """
+query($cursor: String) {
+  giftCards(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        displayCode
+        isActive
+        initialBalance { amount currency }
+        currentBalance { amount currency }
+        created
+        lastUsedOn
+        events(first: 50) {
+          edges {
+            node {
+              type
+              date
+              balance { initialBalance currentBalance oldInitialBalance oldCurrentBalance }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def classify_gift_card_balance_overwrite(card):
+    if card["currentBalanceAmount"] > card["initialBalanceAmount"]:
+        return {"affected": True, "reason": "current_exceeds_initial", "recoveredCurrentBalanceAmount": None}
+
+    for event in card["events"]:
+        if event["type"] != "UPDATED":
+            continue
+        old_initial = event["oldInitialBalanceAmount"]
+        old_current = event["oldCurrentBalanceAmount"]
+        new_initial = event["newInitialBalanceAmount"]
+        new_current = event["newCurrentBalanceAmount"]
+        if old_initial is None or old_current is None:
+            continue
+        if old_current == old_initial:
+            continue
+        if new_initial is None or new_current is None or new_initial != new_current:
+            continue
+        return {"affected": True, "reason": "update_reset_spent_card", "recoveredCurrentBalanceAmount": old_current}
+
+    return {"affected": False, "reason": None, "recoveredCurrentBalanceAmount": None}
+
+
+def _to_plain_card(node):
+    events = []
+    for edge in node["events"]["edges"]:
+        ev = edge["node"]
+        bal = ev.get("balance") or {}
+        events.append({
+            "type": ev["type"],
+            "oldInitialBalanceAmount": bal.get("oldInitialBalance"),
+            "oldCurrentBalanceAmount": bal.get("oldCurrentBalance"),
+            "newInitialBalanceAmount": bal.get("initialBalance"),
+            "newCurrentBalanceAmount": bal.get("currentBalance"),
+        })
+    return {
+        "id": node["id"],
+        "displayCode": node["displayCode"],
+        "initialBalanceAmount": node["initialBalance"]["amount"],
+        "currentBalanceAmount": node["currentBalance"]["amount"],
+        "events": events,
+    }
+
+
+def gift_cards():
+    cursor = None
+    while True:
+        data = gql(GIFT_CARDS_QUERY, {"cursor": cursor})["giftCards"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def run():
+    flagged = 0
+    for node in gift_cards():
+        card = _to_plain_card(node)
+        result = classify_gift_card_balance_overwrite(card)
+        if not result["affected"]:
+            continue
+
+        report_entry = {
+            "id": card["id"],
+            "displayCode": card["displayCode"],
+            "recoveredCurrentBalanceAmount": result["recoveredCurrentBalanceAmount"],
+            "currentBalanceAmount": card["currentBalanceAmount"],
+            "initialBalanceAmount": card["initialBalanceAmount"],
+            "reason": result["reason"],
+        }
+        log.warning("Overwritten gift card balance found. %s %s", report_entry,
+                    "(dry run, reporting only)" if DRY_RUN else "(reporting only, confirm before any write)")
+        flagged += 1
+
+    log.info("Done. %d gift card(s) flagged for staff review.", flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">audit-gift-card-balances.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Saleor gift cards whose balance was overwritten by a giftCardUpdate
+ * call that used balanceAmount to top up the remaining balance on a card
+ * that had already been partially spent (see the GiftCard object docs and
+ * the giftCardUpdate mutation docs).
+ *
+ * balanceAmount on GiftCardUpdateInput is written to both initialBalance
+ * and currentBalance in one go, with no server-side check for whether the
+ * card had already been spent down. This script never writes a corrected
+ * balance. Saleor keeps no separate ledger column, so the true remaining
+ * balance only survives as the oldCurrentBalance snapshot on the
+ * GiftCardEvent just before the faulty update. Under DRY_RUN=true (the
+ * default, and the only mode this script supports out of the box) it logs
+ * a report entry for every affected card. Hand that report to staff for a
+ * confirmed manual correction. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/gift-card-balance-update-overwrites-initial/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function classifyGiftCardBalanceOverwrite(card) {
+  if (card.currentBalanceAmount > card.initialBalanceAmount) {
+    return { affected: true, reason: "current_exceeds_initial", recoveredCurrentBalanceAmount: null };
+  }
+
+  for (const event of card.events) {
+    if (event.type !== "UPDATED") continue;
+    const { oldInitialBalanceAmount, oldCurrentBalanceAmount, newInitialBalanceAmount, newCurrentBalanceAmount } = event;
+    if (oldInitialBalanceAmount == null || oldCurrentBalanceAmount == null) continue;
+    if (oldCurrentBalanceAmount === oldInitialBalanceAmount) continue;
+    if (newInitialBalanceAmount == null || newCurrentBalanceAmount == null) continue;
+    if (newInitialBalanceAmount !== newCurrentBalanceAmount) continue;
+    return { affected: true, reason: "update_reset_spent_card", recoveredCurrentBalanceAmount: oldCurrentBalanceAmount };
+  }
+
+  return { affected: false, reason: null, recoveredCurrentBalanceAmount: null };
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const GIFT_CARDS_QUERY = `
+query($cursor: String) {
+  giftCards(first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id
+        displayCode
+        isActive
+        initialBalance { amount currency }
+        currentBalance { amount currency }
+        created
+        lastUsedOn
+        events(first: 50) {
+          edges {
+            node {
+              type
+              date
+              balance { initialBalance currentBalance oldInitialBalance oldCurrentBalance }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+function toPlainCard(node) {
+  const events = node.events.edges.map((edge) => {
+    const ev = edge.node;
+    const bal = ev.balance || {};
+    return {
+      type: ev.type,
+      oldInitialBalanceAmount: bal.oldInitialBalance ?? null,
+      oldCurrentBalanceAmount: bal.oldCurrentBalance ?? null,
+      newInitialBalanceAmount: bal.initialBalance ?? null,
+      newCurrentBalanceAmount: bal.currentBalance ?? null,
+    };
+  });
+  return {
+    id: node.id,
+    displayCode: node.displayCode,
+    initialBalanceAmount: node.initialBalance.amount,
+    currentBalanceAmount: node.currentBalance.amount,
+    events,
+  };
+}
+
+async function* giftCards() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(GIFT_CARDS_QUERY, { cursor })).giftCards;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+export async function run() {
+  let flagged = 0;
+  for await (const node of giftCards()) {
+    const card = toPlainCard(node);
+    const result = classifyGiftCardBalanceOverwrite(card);
+    if (!result.affected) continue;
+
+    const reportEntry = {
+      id: card.id,
+      displayCode: card.displayCode,
+      recoveredCurrentBalanceAmount: result.recoveredCurrentBalanceAmount,
+      currentBalanceAmount: card.currentBalanceAmount,
+      initialBalanceAmount: card.initialBalanceAmount,
+      reason: result.reason,
+    };
+    console.warn(
+      "Overwritten gift card balance found.",
+      reportEntry,
+      DRY_RUN ? "(dry run, reporting only)" : "(reporting only, confirm before any write)"
+    );
+    flagged++;
+  }
+
+  console.log(`Done. ${flagged} gift card(s) flagged for staff review.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which cards get reported as overwritten and what balance gets recovered. Because <code>classify_gift_card_balance_overwrite</code> is pure, taking a plain card object instead of hitting the API, the test needs no network and no Saleor account. It just feeds in fixture data and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_gift_card_overwrite.py</div>
+      <pre><code class="language-python">from audit_gift_card_balances import classify_gift_card_balance_overwrite
+
+
+def event(**over):
+    base = {
+        "type": "UPDATED",
+        "oldInitialBalanceAmount": None,
+        "oldCurrentBalanceAmount": None,
+        "newInitialBalanceAmount": None,
+        "newCurrentBalanceAmount": None,
+    }
+    base.update(over)
+    return base
+
+
+def card(**over):
+    base = {"initialBalanceAmount": 50, "currentBalanceAmount": 50, "events": []}
+    base.update(over)
+    return base
+
+
+def test_not_affected_for_a_healthy_untouched_card():
+    result = classify_gift_card_balance_overwrite(card())
+    assert result == {"affected": False, "reason": None, "recoveredCurrentBalanceAmount": None}
+
+
+def test_current_exceeds_initial_is_unrecoverable():
+    result = classify_gift_card_balance_overwrite(card(initialBalanceAmount=50, currentBalanceAmount=60))
+    assert result == {"affected": True, "reason": "current_exceeds_initial", "recoveredCurrentBalanceAmount": None}
+
+
+def test_update_reset_a_spent_card_recovers_old_current_balance():
+    c = card(initialBalanceAmount=60, currentBalanceAmount=60, events=[
+        event(oldInitialBalanceAmount=50, oldCurrentBalanceAmount=12,
+              newInitialBalanceAmount=60, newCurrentBalanceAmount=60),
+    ])
+    result = classify_gift_card_balance_overwrite(c)
+    assert result == {"affected": True, "reason": "update_reset_spent_card", "recoveredCurrentBalanceAmount": 12}
+
+
+def test_update_on_a_never_spent_card_is_not_flagged():
+    c = card(initialBalanceAmount=60, currentBalanceAmount=60, events=[
+        event(oldInitialBalanceAmount=50, oldCurrentBalanceAmount=50,
+              newInitialBalanceAmount=60, newCurrentBalanceAmount=60),
+    ])
+    result = classify_gift_card_balance_overwrite(c)
+    assert result == {"affected": False, "reason": None, "recoveredCurrentBalanceAmount": None}
+
+
+def test_update_that_keeps_balances_apart_is_not_flagged():
+    c = card(initialBalanceAmount=50, currentBalanceAmount=20, events=[
+        event(oldInitialBalanceAmount=50, oldCurrentBalanceAmount=30,
+              newInitialBalanceAmount=50, newCurrentBalanceAmount=20),
+    ])
+    result = classify_gift_card_balance_overwrite(c)
+    assert result == {"affected": False, "reason": None, "recoveredCurrentBalanceAmount": None}
+
+
+def test_events_with_missing_balance_data_are_skipped_not_crashed():
+    c = card(events=[event(type="ISSUED")])
+    result = classify_gift_card_balance_overwrite(c)
+    assert result == {"affected": False, "reason": None, "recoveredCurrentBalanceAmount": None}
+
+
+def test_earliest_matching_update_wins_when_scanning_chronologically():
+    c = card(initialBalanceAmount=60, currentBalanceAmount=60, events=[
+        event(oldInitialBalanceAmount=50, oldCurrentBalanceAmount=12,
+              newInitialBalanceAmount=60, newCurrentBalanceAmount=60),
+        event(oldInitialBalanceAmount=60, oldCurrentBalanceAmount=12,
+              newInitialBalanceAmount=90, newCurrentBalanceAmount=90),
+    ])
+    result = classify_gift_card_balance_overwrite(c)
+    assert result["recoveredCurrentBalanceAmount"] == 12</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">overwrite.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyGiftCardBalanceOverwrite } from "./audit-gift-card-balances.js";
+
+const event = (over = {}) =&gt; ({
+  type: "UPDATED",
+  oldInitialBalanceAmount: null,
+  oldCurrentBalanceAmount: null,
+  newInitialBalanceAmount: null,
+  newCurrentBalanceAmount: null,
+  ...over,
+});
+
+const card = (over = {}) =&gt; ({ initialBalanceAmount: 50, currentBalanceAmount: 50, events: [], ...over });
+
+test("not affected for a healthy untouched card", () =&gt; {
+  const result = classifyGiftCardBalanceOverwrite(card());
+  assert.deepEqual(result, { affected: false, reason: null, recoveredCurrentBalanceAmount: null });
+});
+
+test("current exceeds initial is unrecoverable", () =&gt; {
+  const result = classifyGiftCardBalanceOverwrite(card({ initialBalanceAmount: 50, currentBalanceAmount: 60 }));
+  assert.deepEqual(result, { affected: true, reason: "current_exceeds_initial", recoveredCurrentBalanceAmount: null });
+});
+
+test("update reset a spent card recovers old current balance", () =&gt; {
+  const c = card({
+    initialBalanceAmount: 60,
+    currentBalanceAmount: 60,
+    events: [event({ oldInitialBalanceAmount: 50, oldCurrentBalanceAmount: 12, newInitialBalanceAmount: 60, newCurrentBalanceAmount: 60 })],
+  });
+  const result = classifyGiftCardBalanceOverwrite(c);
+  assert.deepEqual(result, { affected: true, reason: "update_reset_spent_card", recoveredCurrentBalanceAmount: 12 });
+});
+
+test("update on a never spent card is not flagged", () =&gt; {
+  const c = card({
+    initialBalanceAmount: 60,
+    currentBalanceAmount: 60,
+    events: [event({ oldInitialBalanceAmount: 50, oldCurrentBalanceAmount: 50, newInitialBalanceAmount: 60, newCurrentBalanceAmount: 60 })],
+  });
+  const result = classifyGiftCardBalanceOverwrite(c);
+  assert.deepEqual(result, { affected: false, reason: null, recoveredCurrentBalanceAmount: null });
+});
+
+test("update that keeps balances apart is not flagged", () =&gt; {
+  const c = card({
+    initialBalanceAmount: 50,
+    currentBalanceAmount: 20,
+    events: [event({ oldInitialBalanceAmount: 50, oldCurrentBalanceAmount: 30, newInitialBalanceAmount: 50, newCurrentBalanceAmount: 20 })],
+  });
+  const result = classifyGiftCardBalanceOverwrite(c);
+  assert.deepEqual(result, { affected: false, reason: null, recoveredCurrentBalanceAmount: null });
+});
+
+test("events with missing balance data are skipped, not crashed", () =&gt; {
+  const c = card({ events: [event({ type: "ISSUED" })] });
+  const result = classifyGiftCardBalanceOverwrite(c);
+  assert.deepEqual(result, { affected: false, reason: null, recoveredCurrentBalanceAmount: null });
+});
+
+test("earliest matching update wins when scanning chronologically", () =&gt; {
+  const c = card({
+    initialBalanceAmount: 60,
+    currentBalanceAmount: 60,
+    events: [
+      event({ oldInitialBalanceAmount: 50, oldCurrentBalanceAmount: 12, newInitialBalanceAmount: 60, newCurrentBalanceAmount: 60 }),
+      event({ oldInitialBalanceAmount: 60, oldCurrentBalanceAmount: 12, newInitialBalanceAmount: 90, newCurrentBalanceAmount: 90 }),
+    ],
+  });
+  const result = classifyGiftCardBalanceOverwrite(c);
+  assert.equal(result.recoveredCurrentBalanceAmount, 12);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Customer service refund</span>
+      <h4>A refund-to-card wiped a loyal customer's remaining balance</h4>
+      <p>A support agent handling a return decided to refund the customer to their existing gift card instead of issuing a new one. They called <code>giftCardUpdate</code> with <code>balanceAmount</code> set to the old balance plus the refund, expecting it to add the refund on top. The card had 18 left on a 50 card. The call set both <code>initialBalance</code> and <code>currentBalance</code> to the new total, and the 32 already spent simply vanished from the numbers, though the order history still showed it.</p>
+      <p>Running the audit script found the card immediately: the <code>UPDATED</code> event showed <code>oldCurrentBalance</code> of 18 against an <code>oldInitialBalance</code> of 50, followed by a write where both new balances matched. The recovered figure of 18 matched exactly what the customer's own order history implied, and staff manually corrected the record after confirming it.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Promotion top-up script</span>
+      <h4>A loyalty bonus script quietly reset an entire batch of cards</h4>
+      <p>A store ran a script during a promotion to add a bonus amount to every active gift card. The script read each card's current balance, added the bonus, and called <code>giftCardUpdate</code> with that sum as <code>balanceAmount</code>. For cards nobody had used yet, this worked exactly as intended. For cards that customers had already spent from, the write reset <code>initialBalance</code> up to match, silently restoring balance that had actually already been redeemed.</p>
+      <p>The audit script flagged every affected card in one pass, with the recovered <code>oldCurrentBalance</code> for each showing exactly how much had genuinely been spent before the bonus write. Staff used the report to manually recalculate what each card should hold, and the team rewrote the promotion script to only ever add the bonus to <code>currentBalance</code> conceptually, routing new top-ups through a proper refund or order flow instead of <code>giftCardUpdate</code>.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no overwritten gift card balance goes unnoticed. The audit surfaces every affected card with the exact balance recovered from its own event history, so staff can decide, with real evidence, whether to correct the card and to what value. Nothing gets written automatically, since the only safe move here is a confirmed human decision, and future top-ups get routed away from <code>giftCardUpdate.balanceAmount</code> entirely once a card has any spend on it.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did topping up a gift card erase the customer's remaining balance?</summary>
+      <p>The giftCardUpdate mutation has a single balanceAmount field, and Saleor writes that same amount to both initialBalance and currentBalance in one update. If you meant to top up only the remaining balance on a card that had already been partially spent, the write also reset initialBalance to match, and since currentBalance was set to that same new value, the card's spend history was overwritten rather than added to.</p>
+    </details>
+    <details>
+      <summary>How do I find gift cards whose balance was overwritten this way?</summary>
+      <p>Query giftCards with initialBalance, currentBalance, and events, and flag a card when currentBalance is greater than initialBalance, which can never happen legitimately, or when its events show an UPDATED entry where oldCurrentBalance differed from oldInitialBalance (proof the card had been spent) immediately followed by newInitialBalance equal to newCurrentBalance (proof the update reset both fields together).</p>
+    </details>
+    <details>
+      <summary>Can I automatically restore the correct balance once I find an affected card?</summary>
+      <p>Not safely as a blanket fix. Saleor keeps no separate ledger column, so the true remaining balance after the overwrite only survives as the oldCurrentBalance snapshot on the GiftCardEvent just before the faulty update. Report that recovered figure for each affected card and have a human confirm it before writing anything back, since any follow-up giftCardUpdate call will again set initialBalance and currentBalance to the same value.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Saleor Commerce Documentation: Gift Cards overview. <a href="https://docs.saleor.io/developer/gift-cards" rel="noopener">docs.saleor.io/developer/gift-cards</a></li>
+      <li>Saleor Commerce Documentation: the GiftCard object, including initialBalance and currentBalance. <a href="https://docs.saleor.io/api-reference/gift-cards/objects/gift-card" rel="noopener">docs.saleor.io/api-reference/gift-cards/objects/gift-card</a></li>
+      <li>saleor/saleor GitHub repository, gift card issues. <a href="https://github.com/saleor/saleor/issues" rel="noopener">github.com/saleor/saleor/issues</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: the giftCardUpdate mutation. <a href="https://docs.saleor.io/api-reference/gift-cards/mutations/gift-card-update" rel="noopener">docs.saleor.io/api-reference/gift-cards/mutations/gift-card-update</a></li>
+      <li>Saleor Commerce Documentation: the giftCardCreate mutation. <a href="https://docs.saleor.io/api-reference/gift-cards/mutations/gift-card-create" rel="noopener">docs.saleor.io/api-reference/gift-cards/mutations/gift-card-create</a></li>
+      <li>Saleor Commerce Documentation: API reference overview. <a href="https://docs.saleor.io/api-reference/" rel="noopener">docs.saleor.io/api-reference/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, payments, discounts, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch an overwritten gift card balance for you?</h3>
+    <p>If this saved you from a confused customer or an unrecoverable balance mistake, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>
