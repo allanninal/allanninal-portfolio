@@ -1,0 +1,965 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicate Credit Memo Created for One Refund Action in Magento 2</title>
+<meta name="description" content="A double form submit, a retried refund API call, or a Payflow IPN firing twice can create two sales_creditmemo records for the same Magento 2 order. Learn why nothing guards CreditmemoService::refund() with an idempotency key, and how to detect the duplicates over the REST API.">
+<link rel="canonical" href="https://www.allanninal.dev/magento/duplicate-credit-memo-created/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Duplicate Credit Memo Created for One Refund Action in Magento 2">
+<meta property="og:description" content="Why Magento 2 and Adobe Commerce can create two credit memos for a single refund, and a safe Python or Node.js script that detects near-duplicate creditmemos over the REST API.">
+<meta property="og:url" content="https://www.allanninal.dev/magento/duplicate-credit-memo-created/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/magento/assets/magento.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/magento/duplicate-credit-memo-created/#article","headline":"Duplicate Credit Memo Created for One Refund Action in Magento 2","description":"Why Magento 2 and Adobe Commerce can create two credit memos for a single refund, and a safe Python or Node.js script that detects near-duplicate creditmemos over the REST API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/magento/duplicate-credit-memo-created/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Credit Memos and Refunds","keywords":"Magento duplicate credit memo, CreditmemoService refund, PayPal Payflow IPN, POST V1/order refund, POST V1/creditmemo, Magento REST API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/magento/"},{"@type":"ListItem","position":2,"name":"Duplicate credit memo created for one refund action","item":"https://www.allanninal.dev/magento/duplicate-credit-memo-created/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did Magento create two credit memos for a single refund?","acceptedAnswer":{"@type":"Answer","text":"Magento 2 and Adobe Commerce do not guard credit memo creation with an idempotency key. The admin Refund controller, the REST refund endpoints, and payment gateway async notifications such as a PayPal Payflow IPN all call CreditmemoService::refund() independently. If the same refund is triggered twice in close succession, such as a double form submit, a retried API call, or an observer firing more than once before the order's refunded totals are persisted and re-checked, two sales_creditmemo records get created against the same invoice before the first transaction commits."}},{"@type":"Question","name":"Is it safe to auto-delete or cancel a duplicate credit memo?","acceptedAnswer":{"@type":"Answer","text":"No. Magento has no supported REST endpoint to delete a creditmemo, and cancelling or reversing one that already triggered a real gateway refund would misstate base_total_refunded without reversing the money that actually left the account. The safe pattern is to detect and report duplicates for manual admin and finance review, not to auto-correct them."}},{"@type":"Question","name":"How do I detect duplicate credit memos through the REST API?","acceptedAnswer":{"@type":"Answer","text":"Call GET /rest/V1/creditmemos with a searchCriteria filter on order_id, then group the results by order_id and look for records whose grand_total matches within a cent and whose created_at timestamps fall within about 60 seconds of each other. That pattern matches a duplicate creation far more reliably than counting creditmemos alone, since some orders legitimately get more than one partial refund."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/magento/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / magento</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/magento/">Field notes</a> / Credit Memos and Refunds</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Credit Memos and Refunds</p>
+    <h1>Duplicate credit memo created for one refund action</h1>
+    <p class="lead">Someone clicks Refund once, the page is slow, and they click it again just to be sure. Or a payment gateway retries a webhook it never got an acknowledgment for. Either way, two credit memos appear against the same order, seconds apart, for the same amount, and now the refunded total is double what it should be. Here is why Magento never stops the second one, and a small script that finds every near-duplicate pair so a human can review it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Creditmemo REST API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Magento 2 and Adobe Commerce do not guard credit memo creation with an idempotency key. The admin Refund controller action, the REST <code>POST /V1/order/{id}/refund</code> and <code>POST /V1/creditmemo</code> endpoints, and payment gateway async notifications such as a PayPal Payflow IPN all ultimately call <code>CreditmemoFactory</code> and <code>CreditmemoService::refund()</code> independently, with no shared lock between them. If the same refund fires twice in close succession, before the order's <code>base_total_refunded</code> and the invoice's refundable state are persisted and re-checked, two <code>sales_creditmemo</code> records get created against the same invoice before the first transaction commits. A script can list credit memos over the REST API, group them by order, and flag any pair whose <code>grand_total</code> matches within a cent and whose <code>created_at</code> falls within about 60 seconds of each other. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Creating a credit memo in Magento is not one atomic, guarded operation from the customer's point of view. It is whatever code path happens to call it. The admin Refund button calls it. The REST refund endpoint calls it. A payment gateway's asynchronous notification, arriving on its own schedule, also calls it. None of these paths know about each other, and none of them check first whether a credit memo for this exact refund was already created a moment ago.</p>
+  <p>So when the same refund action is triggered twice, a slow page load followed by an impatient second click, a client that retries an API call it thinks timed out, or a Payflow IPN that fires more than once before Magento's own bookkeeping catches up, both calls can pass validation and both can succeed. The order's refunded total and the invoice's remaining refundable amount are read, checked, and only written back to the database once each transaction commits, and that gap is wide enough for two credit memos to land against the same invoice before either commit finishes.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Two refund triggers, a double click and a retried webhook, both call CreditmemoService refund independently, and because there is no idempotency key or lock, both succeed and create a credit memo each against the same invoice before the order's refunded total is rechecked.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b584c"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="14" width="185" height="54" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="102" y="36" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Double form submit</text>
+      <text x="102" y="53" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">or a retried refund call</text>
+      <rect x="10" y="150" width="185" height="54" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="102" y="172" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Payflow IPN retry</text>
+      <text x="102" y="189" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">async gateway notification</text>
+      <line x1="195" y1="41" x2="248" y2="88" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="195" y1="177" x2="248" y2="120" stroke="#6b584c" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="251" y="83" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="358" y="107" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">CreditmemoService::refund()</text>
+      <text x="358" y="124" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">no idempotency key, no lock</text>
+      <line x1="466" y1="104" x2="497" y2="104" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="481" y="90" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="500" y="74" width="130" height="56" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="565" y="97" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Creditmemo A</text>
+      <text x="565" y="114" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">created, commits</text>
+      <rect x="500" y="140" width="130" height="56" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="565" y="163" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Creditmemo B</text>
+      <text x="565" y="177" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">seconds later, same amount</text>
+      <line x1="358" y1="143" x2="358" y2="160" stroke="#cf4b3f" stroke-width="2"></line>
+      <line x1="358" y1="160" x2="497" y2="160" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="645" y="107" width="105" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="697" y="130" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Order over</text>
+      <text x="697" y="147" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">refunded</text>
+      <line x1="630" y1="102" x2="642" y2="128" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="630" y1="168" x2="642" y2="145" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Neither trigger checks whether a matching credit memo was just created. Both pass validation before the first one commits, so both succeed.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>The admin Refund controller action, the REST <code>POST /V1/order/{id}/refund</code> and <code>POST /V1/creditmemo</code> endpoints, and payment gateway async notifications all ultimately call <code>CreditmemoFactory</code> and <code>CreditmemoService::refund()</code> independently. None of these entry points shares a lock or an idempotency key with the others.</li>
+    <li>A refund's own order state, <code>base_total_refunded</code>, and the invoice's <code>can_refund</code> flag are only re-checked and persisted once each request's transaction commits. Two nearly simultaneous refund triggers can both read the state as refundable before either one writes back.</li>
+    <li>This is documented for full refunds on PayPal Payflow orders, where the gateway's own IPN retry behavior triggers a second credit memo creation seconds after the first, tracked in <code>magento/magento2#24149</code> and <code>#35193</code>.</li>
+    <li>It is also documented as a generic API-driven duplication, not tied to any one payment method, tracked in <code>magento/magento2#30987</code> and <code>#4329</code>, and in a related async observer case in <code>#40473</code> where a second async process fires a duplicate refund path before the first has finished.</li>
+    <li>In every reported case the two credit memos appear seconds apart with matching amounts against the same order, which is exactly the signature a detection script can look for.</li>
+  </ul>
+  <p>This is a recurring complaint precisely because it costs real money. The store has now refunded a customer twice for one return, or refunded them once through the gateway and recorded it twice in the ledger, and nobody notices until reconciliation. See the citations at the end for the exact threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Auto-fixing this is unsafe. Magento has no supported REST endpoint to delete a creditmemo, and cancelling or reversing one that already triggered a real gateway refund would misstate <code>base_total_refunded</code> without reversing the money that actually left the account. The correct action is to detect and report: list the order, the duplicate creditmemo <code>entity_id</code> and <code>increment_id</code> values, each one's <code>grand_total</code>, and the time delta between them, so a human on the finance team decides what to do. Never auto-post a cancellation or an additional creditmemo mutation without sign-off.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch any existing credit memo. We add a job that lists credit memos over the REST API, groups them by order, clusters the ones whose amounts and timestamps line up close enough to be the same refund fired twice, and reports every cluster it finds for manual review.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists credit memos filtered by order, groups them by order id, clusters records whose grand total and created at are close enough, and reports a duplicate group for manual review, otherwise it reports the order as fine.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fef1ea" stroke="#f6bfa1"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Scheduled job</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">runs on a timer</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">List credit memos</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">GET /creditmemos by order_id</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#f6bfa1"></rect>
+      <text x="362" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b1a10">Group and cluster</text>
+      <text x="362" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b584c">same amount, within 60s</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="585,106 672,138 585,170 498,138" fill="#fef1ea" stroke="#f6bfa1"></polygon>
+      <text x="585" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">Cluster has</text>
+      <text x="585" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b1a10">more than one?</text>
+      <text x="675" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="672" y1="138" x2="700" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="198" font-family="sans-serif" font-size="10.5" fill="#6b584c" font-weight="700">no, report ok</text>
+      <line x1="585" y1="170" x2="585" y2="205" stroke="#6b584c" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag duplicate group</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b584c">report row for review</text>
+      <path d="M700,138 C720,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports a duplicate group. It never cancels or deletes a credit memo, since there is no supported way to do that safely.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin bearer token</h3>
+      <p>Authenticate the same way as any other Magento REST client. Either call <code>POST /rest/V1/integration/admin/token</code> with an admin username and password, or create an integration and use its token directly. Keep the store URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export LOOKBACK_DAYS="7"
+export TOLERANCE_SECONDS="60"
+export AMOUNT_EPSILON="0.01"
+export DRY_RUN="true"   # report-only either way, this only affects log verbosity</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MAGENTO_URL="https://your-store.example.com"
+export MAGENTO_ADMIN_TOKEN="eyJraWQ..."
+export LOOKBACK_DAYS="7"
+export TOLERANCE_SECONDS="60"
+export AMOUNT_EPSILON="0.01"
+export DRY_RUN="true"   // report-only either way, this only affects log verbosity</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Magento REST API</h3>
+      <p>Every call sends <code>Authorization: Bearer &lt;token&gt;</code> to a <code>/rest/V1</code> route. A small helper wraps the request and raises on a non 200 response, since Magento returns structured error bodies worth surfacing as is.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const MAGENTO_URL = (process.env.MAGENTO_URL || "").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN;
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List recent credit memos by order</h3>
+      <p>Call <code>GET /rest/V1/creditmemos</code> with a <code>searchCriteria</code> filter on <code>created_at</code> using <code>conditionType=gteq</code> for your lookback window, plus <code>pageSize</code> and <code>currentPage</code> for paging. Read back <code>entity_id</code>, <code>increment_id</code>, <code>order_id</code>, <code>grand_total</code>, and <code>created_at</code>, since the decision function needs all of them to group and compare.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def recent_creditmemos(since_iso, page_size=100, current_page=1):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+        "searchCriteria[filterGroups][0][filters][0][value]": since_iso,
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": current_page,
+    }
+    return magento_get("/creditmemos", params)["items"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function recentCreditmemos(sinceIso, pageSize = 100, currentPage = 1) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+    "searchCriteria[filterGroups][0][filters][0][value]": sinceIso,
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": currentPage,
+  };
+  const data = await magentoGet("/creditmemos", params);
+  return data.items;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a flat list of credit memo records and returns the duplicate groups. A pure function like this is easy to read and easy to test, which we do later. It groups the input by <code>order_id</code>, sorts each group by <code>created_at</code>, and walks pairwise, clustering records whose <code>grand_total</code> differs by no more than a small amount epsilon, by default one cent, and whose <code>created_at</code> differs by no more than a tolerance, by default 60 seconds. Any order with more than one record in a cluster is reported with its duplicate entity ids and the excess amount, the sum of the cluster's totals minus one representative total.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def detect_duplicate_credit_memos(creditmemos, tolerance_seconds=60, amount_epsilon=0.01):
+    by_order = {}
+    for cm in creditmemos:
+        by_order.setdefault(cm["orderId"], []).append(cm)
+
+    results = []
+    for order_id, records in by_order.items():
+        ordered = sorted(records, key=lambda r: r["createdAtEpoch"])
+        clusters = []
+        for record in ordered:
+            placed = False
+            for cluster in clusters:
+                last = cluster[-1]
+                if (abs(record["grandTotal"] - last["grandTotal"]) <= amount_epsilon
+                        and abs(record["createdAtEpoch"] - last["createdAtEpoch"]) <= tolerance_seconds):
+                    cluster.append(record)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([record])
+
+        for cluster in clusters:
+            if len(cluster) > 1:
+                total_over_refund = round(
+                    sum(r["grandTotal"] for r in cluster) - cluster[0]["grandTotal"], 2
+                )
+                results.append({
+                    "orderId": order_id,
+                    "duplicateGroup": [r["entityId"] for r in cluster],
+                    "totalOverRefund": total_over_refund,
+                })
+    return results</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function detectDuplicateCreditMemos(creditmemos, toleranceSeconds = 60, amountEpsilon = 0.01) {
+  const byOrder = new Map();
+  for (const cm of creditmemos) {
+    if (!byOrder.has(cm.orderId)) byOrder.set(cm.orderId, []);
+    byOrder.get(cm.orderId).push(cm);
+  }
+
+  const results = [];
+  for (const [orderId, records] of byOrder) {
+    const ordered = [...records].sort((a, b) => a.createdAtEpoch - b.createdAtEpoch);
+    const clusters = [];
+    for (const record of ordered) {
+      let placed = false;
+      for (const cluster of clusters) {
+        const last = cluster[cluster.length - 1];
+        if (
+          Math.abs(record.grandTotal - last.grandTotal) <= amountEpsilon &&
+          Math.abs(record.createdAtEpoch - last.createdAtEpoch) <= toleranceSeconds
+        ) {
+          cluster.push(record);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) clusters.push([record]);
+    }
+
+    for (const cluster of clusters) {
+      if (cluster.length > 1) {
+        const totalOverRefund = round2(
+          cluster.reduce((sum, r) => sum + r.grandTotal, 0) - cluster[0].grandTotal
+        );
+        results.push({
+          orderId,
+          duplicateGroup: cluster.map((r) => r.entityId),
+          totalOverRefund,
+        });
+      }
+    }
+  }
+  return results;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report by default, never auto-repair</h3>
+      <p>The output is a structured report row per duplicate group: the <code>order_id</code>, the duplicate <code>entity_id</code> and <code>increment_id</code> values, each one's <code>grand_total</code>, and the <code>created_at</code> delta, for the finance team to review. There is no code path in this script that cancels, deletes, or mutates an existing credit memo, because Magento has no supported endpoint to delete one, and cancelling one that already triggered a real gateway refund would desynchronize the books without reversing the money.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. <code>DRY_RUN</code> only changes log verbosity here, since this script never mutates a creditmemo: it reports every duplicate group either way. If your team wants a comment left on the record for the finance team, that write is guarded separately behind <code>DRY_RUN=false</code> and calls <code>PUT /rest/V1/creditmemo/{id}/comments</code> to append a note, never a cancellation or a new creditmemo mutation, and only after a human has reviewed the report.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never cancels, deletes, or creates a credit memo. There is no supported way to safely undo one that already reached a payment gateway, so every duplicate found here is a lead for a human on the finance team to review, not something to auto-correct.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pages through recent credit memos, clusters near-duplicates with the pure function, and prints a structured report. It never mutates an existing credit memo, so it is safe to run again and again.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/magento-fixes/tree/main/duplicate-credit-memo-created" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the magento-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_duplicate_creditmemos.py</div>
+      <pre><code class="language-python">"""Flag Magento 2 credit memos that appear to be duplicates from a single
+refund action.
+
+Magento does not guard credit memo creation with an idempotency key. The
+admin Refund controller, the REST refund endpoints, and payment gateway
+async notifications such as a PayPal Payflow IPN all call
+CreditmemoService::refund() independently. If the same refund fires twice in
+close succession, two sales_creditmemo records can land against the same
+invoice before the first transaction commits. There is no supported endpoint
+to delete a creditmemo, so this only reports the duplicate, it never cancels
+or mutates one. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_duplicate_creditmemos")
+
+MAGENTO_URL = os.environ["MAGENTO_URL"].rstrip("/")
+TOKEN = os.environ["MAGENTO_ADMIN_TOKEN"]
+LOOKBACK_DAYS = float(os.environ.get("LOOKBACK_DAYS", "7"))
+TOLERANCE_SECONDS = float(os.environ.get("TOLERANCE_SECONDS", "60"))
+AMOUNT_EPSILON = float(os.environ.get("AMOUNT_EPSILON", "0.01"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def magento_get(path, params=None):
+    r = requests.get(
+        f"{MAGENTO_URL}/rest/V1{path}",
+        params=params or {},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def since_iso(lookback_days):
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=lookback_days)
+    return since.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def recent_creditmemos(since, page_size=100, current_page=1):
+    params = {
+        "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+        "searchCriteria[filterGroups][0][filters][0][value]": since,
+        "searchCriteria[pageSize]": page_size,
+        "searchCriteria[currentPage]": current_page,
+    }
+    return magento_get("/creditmemos", params)["items"]
+
+
+def iso_to_epoch(iso):
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def normalize_creditmemo(raw):
+    return {
+        "entityId": raw.get("entity_id"),
+        "incrementId": raw.get("increment_id"),
+        "orderId": raw.get("order_id"),
+        "grandTotal": float(raw.get("grand_total") or 0),
+        "createdAtEpoch": iso_to_epoch(raw["created_at"]),
+    }
+
+
+def detect_duplicate_credit_memos(creditmemos, tolerance_seconds=60, amount_epsilon=0.01):
+    by_order = {}
+    for cm in creditmemos:
+        by_order.setdefault(cm["orderId"], []).append(cm)
+
+    results = []
+    for order_id, records in by_order.items():
+        ordered = sorted(records, key=lambda r: r["createdAtEpoch"])
+        clusters = []
+        for record in ordered:
+            placed = False
+            for cluster in clusters:
+                last = cluster[-1]
+                if (abs(record["grandTotal"] - last["grandTotal"]) <= amount_epsilon
+                        and abs(record["createdAtEpoch"] - last["createdAtEpoch"]) <= tolerance_seconds):
+                    cluster.append(record)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([record])
+
+        for cluster in clusters:
+            if len(cluster) > 1:
+                total_over_refund = round(
+                    sum(r["grandTotal"] for r in cluster) - cluster[0]["grandTotal"], 2
+                )
+                results.append({
+                    "orderId": order_id,
+                    "duplicateGroup": [r["entityId"] for r in cluster],
+                    "totalOverRefund": total_over_refund,
+                })
+    return results
+
+
+def run():
+    since = since_iso(LOOKBACK_DAYS)
+    normalized = []
+    page = 1
+    while True:
+        raw_items = recent_creditmemos(since, current_page=page)
+        if not raw_items:
+            break
+        normalized.extend(normalize_creditmemo(raw) for raw in raw_items)
+        if len(raw_items) < 100:
+            break
+        page += 1
+
+    duplicates = detect_duplicate_credit_memos(normalized, TOLERANCE_SECONDS, AMOUNT_EPSILON)
+
+    for row in duplicates:
+        log.warning(
+            "Order %s has duplicate credit memos %s. Excess refunded: %.2f",
+            row["orderId"], row["duplicateGroup"], row["totalOverRefund"],
+        )
+
+    if duplicates:
+        log.error("%d order(s) with duplicate credit memos. This script never cancels or deletes them.", len(duplicates))
+    else:
+        log.info("Done. No duplicate credit memos found.")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-duplicate-creditmemos.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Magento 2 credit memos that appear to be duplicates from a single
+ * refund action.
+ *
+ * Magento does not guard credit memo creation with an idempotency key. The
+ * admin Refund controller, the REST refund endpoints, and payment gateway
+ * async notifications such as a PayPal Payflow IPN all call
+ * CreditmemoService::refund() independently. If the same refund fires twice
+ * in close succession, two sales_creditmemo records can land against the
+ * same invoice before the first transaction commits. There is no supported
+ * endpoint to delete a creditmemo, so this only reports the duplicate, it
+ * never cancels or mutates one. Run on a schedule. Safe to run again and
+ * again.
+ *
+ * Guide: https://www.allanninal.dev/magento/duplicate-credit-memo-created/
+ */
+import { pathToFileURL } from "node:url";
+
+const MAGENTO_URL = (process.env.MAGENTO_URL || "https://demo.example.com").replace(/\/$/, "");
+const TOKEN = process.env.MAGENTO_ADMIN_TOKEN || "token_dummy";
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 7);
+const TOLERANCE_SECONDS = Number(process.env.TOLERANCE_SECONDS || 60);
+const AMOUNT_EPSILON = Number(process.env.AMOUNT_EPSILON || 0.01);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function detectDuplicateCreditMemos(creditmemos, toleranceSeconds = 60, amountEpsilon = 0.01) {
+  const byOrder = new Map();
+  for (const cm of creditmemos) {
+    if (!byOrder.has(cm.orderId)) byOrder.set(cm.orderId, []);
+    byOrder.get(cm.orderId).push(cm);
+  }
+
+  const results = [];
+  for (const [orderId, records] of byOrder) {
+    const ordered = [...records].sort((a, b) => a.createdAtEpoch - b.createdAtEpoch);
+    const clusters = [];
+    for (const record of ordered) {
+      let placed = false;
+      for (const cluster of clusters) {
+        const last = cluster[cluster.length - 1];
+        if (
+          Math.abs(record.grandTotal - last.grandTotal) <= amountEpsilon &&
+          Math.abs(record.createdAtEpoch - last.createdAtEpoch) <= toleranceSeconds
+        ) {
+          cluster.push(record);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) clusters.push([record]);
+    }
+
+    for (const cluster of clusters) {
+      if (cluster.length > 1) {
+        const totalOverRefund = round2(
+          cluster.reduce((sum, r) => sum + r.grandTotal, 0) - cluster[0].grandTotal
+        );
+        results.push({
+          orderId,
+          duplicateGroup: cluster.map((r) => r.entityId),
+          totalOverRefund,
+        });
+      }
+    }
+  }
+  return results;
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+async function magentoGet(path, params = {}) {
+  const url = new URL(`${MAGENTO_URL}/rest/V1${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
+  if (!res.ok) throw new Error(`Magento ${res.status}`);
+  return res.json();
+}
+
+function sinceIso(lookbackDays) {
+  const since = new Date(Date.now() - lookbackDays * 86400 * 1000);
+  return since.toISOString().slice(0, 19).replace("T", " ");
+}
+
+async function recentCreditmemos(since, pageSize = 100, currentPage = 1) {
+  const params = {
+    "searchCriteria[filterGroups][0][filters][0][field]": "created_at",
+    "searchCriteria[filterGroups][0][filters][0][conditionType]": "gteq",
+    "searchCriteria[filterGroups][0][filters][0][value]": since,
+    "searchCriteria[pageSize]": pageSize,
+    "searchCriteria[currentPage]": currentPage,
+  };
+  const data = await magentoGet("/creditmemos", params);
+  return data.items;
+}
+
+function isoToEpoch(iso) {
+  return Date.parse(iso) / 1000;
+}
+
+function normalizeCreditmemo(raw) {
+  return {
+    entityId: raw.entity_id,
+    incrementId: raw.increment_id,
+    orderId: raw.order_id,
+    grandTotal: Number(raw.grand_total || 0),
+    createdAtEpoch: isoToEpoch(raw.created_at),
+  };
+}
+
+export async function run() {
+  const since = sinceIso(LOOKBACK_DAYS);
+  const normalized = [];
+  let page = 1;
+
+  while (true) {
+    const rawItems = await recentCreditmemos(since, 100, page);
+    if (!rawItems.length) break;
+    normalized.push(...rawItems.map(normalizeCreditmemo));
+    if (rawItems.length < 100) break;
+    page++;
+  }
+
+  const duplicates = detectDuplicateCreditMemos(normalized, TOLERANCE_SECONDS, AMOUNT_EPSILON);
+
+  for (const row of duplicates) {
+    console.warn(
+      `Order ${row.orderId} has duplicate credit memos ${JSON.stringify(row.duplicateGroup)}. ` +
+      `Excess refunded: ${row.totalOverRefund.toFixed(2)}`
+    );
+  }
+
+  if (duplicates.length) {
+    console.error(`${duplicates.length} order(s) with duplicate credit memos. This script never cancels or deletes them.`);
+  } else {
+    console.log("Done. No duplicate credit memos found.");
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The clustering rule is the part most worth testing, because it decides whether an order gets flagged for finance review. Because we kept <code>detect_duplicate_credit_memos</code> pure, the test needs no network, no Magento store, and no admin token. It just feeds in plain fixture records and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_duplicate_creditmemos.py</div>
+      <pre><code class="language-python">from flag_duplicate_creditmemos import detect_duplicate_credit_memos
+
+
+def cm(entity_id, order_id, grand_total, created_at_epoch):
+    return {
+        "entityId": entity_id,
+        "orderId": order_id,
+        "grandTotal": grand_total,
+        "createdAtEpoch": created_at_epoch,
+    }
+
+
+def test_no_duplicates_for_single_creditmemo_per_order():
+    records = [cm(1, "100", 50.0, 1000)]
+    assert detect_duplicate_credit_memos(records) == []
+
+
+def test_flags_two_near_identical_creditmemos_seconds_apart():
+    records = [
+        cm(1, "100", 50.0, 1000),
+        cm(2, "100", 50.0, 1030),
+    ]
+    result = detect_duplicate_credit_memos(records)
+    assert len(result) == 1
+    assert result[0]["orderId"] == "100"
+    assert sorted(result[0]["duplicateGroup"]) == [1, 2]
+    assert result[0]["totalOverRefund"] == 50.0
+
+
+def test_does_not_flag_two_legitimate_partial_refunds_far_apart():
+    records = [
+        cm(1, "100", 30.0, 1000),
+        cm(2, "100", 20.0, 1000 + 3600),
+    ]
+    assert detect_duplicate_credit_memos(records) == []
+
+
+def test_does_not_flag_different_amounts_close_in_time():
+    records = [
+        cm(1, "100", 30.0, 1000),
+        cm(2, "100", 45.0, 1010),
+    ]
+    assert detect_duplicate_credit_memos(records) == []
+
+
+def test_flags_three_way_duplicate_and_sums_excess():
+    records = [
+        cm(1, "200", 20.0, 5000),
+        cm(2, "200", 20.0, 5015),
+        cm(3, "200", 20.0, 5040),
+    ]
+    result = detect_duplicate_credit_memos(records)
+    assert len(result) == 1
+    assert sorted(result[0]["duplicateGroup"]) == [1, 2, 3]
+    assert result[0]["totalOverRefund"] == 40.0
+
+
+def test_separate_orders_are_evaluated_independently():
+    records = [
+        cm(1, "100", 50.0, 1000),
+        cm(2, "100", 50.0, 1020),
+        cm(3, "200", 50.0, 1000),
+    ]
+    result = detect_duplicate_credit_memos(records)
+    assert len(result) == 1
+    assert result[0]["orderId"] == "100"
+
+
+def test_amount_within_epsilon_still_counts_as_duplicate():
+    records = [
+        cm(1, "100", 50.00, 1000),
+        cm(2, "100", 50.005, 1010),
+    ]
+    result = detect_duplicate_credit_memos(records, amount_epsilon=0.01)
+    assert len(result) == 1
+
+
+def test_exactly_at_tolerance_boundary_is_flagged():
+    records = [
+        cm(1, "100", 50.0, 1000),
+        cm(2, "100", 50.0, 1060),
+    ]
+    result = detect_duplicate_credit_memos(records, tolerance_seconds=60)
+    assert len(result) == 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">duplicate-creditmemos.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectDuplicateCreditMemos } from "./flag-duplicate-creditmemos.js";
+
+const cm = (entityId, orderId, grandTotal, createdAtEpoch) => ({
+  entityId, orderId, grandTotal, createdAtEpoch,
+});
+
+test("no duplicates for single creditmemo per order", () => {
+  const records = [cm(1, "100", 50.0, 1000)];
+  assert.deepEqual(detectDuplicateCreditMemos(records), []);
+});
+
+test("flags two near-identical creditmemos seconds apart", () => {
+  const records = [
+    cm(1, "100", 50.0, 1000),
+    cm(2, "100", 50.0, 1030),
+  ];
+  const result = detectDuplicateCreditMemos(records);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].orderId, "100");
+  assert.deepEqual([...result[0].duplicateGroup].sort(), [1, 2]);
+  assert.equal(result[0].totalOverRefund, 50.0);
+});
+
+test("does not flag two legitimate partial refunds far apart", () => {
+  const records = [
+    cm(1, "100", 30.0, 1000),
+    cm(2, "100", 20.0, 1000 + 3600),
+  ];
+  assert.deepEqual(detectDuplicateCreditMemos(records), []);
+});
+
+test("does not flag different amounts close in time", () => {
+  const records = [
+    cm(1, "100", 30.0, 1000),
+    cm(2, "100", 45.0, 1010),
+  ];
+  assert.deepEqual(detectDuplicateCreditMemos(records), []);
+});
+
+test("flags three-way duplicate and sums excess", () => {
+  const records = [
+    cm(1, "200", 20.0, 5000),
+    cm(2, "200", 20.0, 5015),
+    cm(3, "200", 20.0, 5040),
+  ];
+  const result = detectDuplicateCreditMemos(records);
+  assert.equal(result.length, 1);
+  assert.deepEqual([...result[0].duplicateGroup].sort(), [1, 2, 3]);
+  assert.equal(result[0].totalOverRefund, 40.0);
+});
+
+test("separate orders are evaluated independently", () => {
+  const records = [
+    cm(1, "100", 50.0, 1000),
+    cm(2, "100", 50.0, 1020),
+    cm(3, "200", 50.0, 1000),
+  ];
+  const result = detectDuplicateCreditMemos(records);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].orderId, "100");
+});
+
+test("amount within epsilon still counts as duplicate", () => {
+  const records = [
+    cm(1, "100", 50.00, 1000),
+    cm(2, "100", 50.005, 1010),
+  ];
+  const result = detectDuplicateCreditMemos(records, 60, 0.01);
+  assert.equal(result.length, 1);
+});
+
+test("exactly at tolerance boundary is flagged", () => {
+  const records = [
+    cm(1, "100", 50.0, 1000),
+    cm(2, "100", 50.0, 1060),
+  ];
+  const result = detectDuplicateCreditMemos(records, 60, 0.01);
+  assert.equal(result.length, 1);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Payflow IPN</span>
+      <h4>The full refund that posted twice</h4>
+      <p>A merchant processing refunds through PayPal Payflow noticed customers occasionally messaging support to say they had been refunded twice for the same order. Nothing in the admin looked wrong at a glance, since both credit memos showed a legitimate grand total.</p>
+      <p>Running the detection script against a month of credit memos surfaced a dozen orders with two records seconds apart, matching the pattern reported in the Payflow IPN retry issue. Finance reviewed each one, confirmed the gateway had in fact only moved money once for some and twice for others, and corrected the ledger by hand instead of trusting the record count alone.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Retried API call</span>
+      <h4>The returns portal that retried on a timeout</h4>
+      <p>A custom returns portal called <code>POST /V1/order/{id}/refund</code> and, on a slow response, retried the same call after a client side timeout, assuming the first attempt had failed. Both attempts had actually succeeded on the Magento side.</p>
+      <p>The script's clustering, driven only by each credit memo's own order id, amount, and timestamp, caught every one of those pairs without needing to know anything about the returns portal's retry logic. The integration team added a client side idempotency check before retrying, and the script kept running to confirm no new duplicates appeared.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a refund fired twice by a double click, a retried call, or an async webhook is caught within one detection cycle instead of surfacing weeks later during reconciliation. The report carries the order id, the duplicate credit memo entity and increment ids, each one's grand total, and the time delta between them, so the finance team can decide fast whether the gateway actually moved money twice. Keep any actual correction, including a comment left through <code>PUT /rest/V1/creditmemo/{id}/comments</code>, gated behind a human and a dry run, since that is what keeps the script from ever guessing at a financial record.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did Magento create two credit memos for a single refund?</summary>
+      <p>Magento 2 and Adobe Commerce do not guard credit memo creation with an idempotency key. The admin Refund controller, the REST refund endpoints, and payment gateway async notifications such as a PayPal Payflow IPN all call CreditmemoService::refund() independently. If the same refund is triggered twice in close succession, such as a double form submit, a retried API call, or an observer firing more than once before the order's refunded totals are persisted and re-checked, two sales_creditmemo records get created against the same invoice before the first transaction commits.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-delete or cancel a duplicate credit memo?</summary>
+      <p>No. Magento has no supported REST endpoint to delete a creditmemo, and cancelling or reversing one that already triggered a real gateway refund would misstate base_total_refunded without reversing the money that actually left the account. The safe pattern is to detect and report duplicates for manual admin and finance review, not to auto-correct them.</p>
+    </details>
+    <details>
+      <summary>How do I detect duplicate credit memos through the REST API?</summary>
+      <p>Call GET /rest/V1/creditmemos with a searchCriteria filter on order_id, then group the results by order_id and look for records whose grand_total matches within a cent and whose created_at timestamps fall within about 60 seconds of each other. That pattern matches a duplicate creation far more reliably than counting creditmemos alone, since some orders legitimately get more than one partial refund.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/magento/">Browse all Magento field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>GitHub Issue: Paypal Payflow Credit Memo is duplicated on full refund. <a href="https://github.com/magento/magento2/issues/24149" rel="noopener">github.com/magento/magento2/issues/24149</a></li>
+      <li>GitHub Issue: Getting Extra Duplicate credit memo. <a href="https://github.com/magento/magento2/issues/30987" rel="noopener">github.com/magento/magento2/issues/30987</a></li>
+      <li>GitHub Issue: Async sales email sending causes duplicate gift card refunds. <a href="https://github.com/magento/magento2/issues/40473" rel="noopener">github.com/magento/magento2/issues/40473</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Adobe Commerce Developer Documentation: search using REST endpoints, including searchCriteria. <a href="https://developer.adobe.com/commerce/webapi/rest/use-rest/performing-searches" rel="noopener">developer.adobe.com/commerce/webapi/rest/use-rest/performing-searches</a></li>
+      <li>Adobe Commerce: Orders API reference. <a href="https://adobe-commerce.redoc.ly/2.4.6-admin/tag/orders/" rel="noopener">adobe-commerce.redoc.ly/2.4.6-admin/tag/orders</a></li>
+      <li>Commerce PHP Extensions: searching with repositories. <a href="https://developer.adobe.com/commerce/php/development/components/searching-with-repositories" rel="noopener">developer.adobe.com/commerce/php/development/components/searching-with-repositories</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Magento 2 or Adobe Commerce orders, payments, catalog data, or inventory that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a duplicate refund?</h3>
+    <p>If this saved you a confusing reconciliation or a refund that went out twice, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/magento/">Back to all Magento field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Magento 2 and Adobe Commerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/magento/assets/magento.js" defer></script>
+</body>
+</html>
