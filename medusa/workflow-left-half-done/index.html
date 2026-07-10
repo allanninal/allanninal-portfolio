@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Medusa Workflow Left Half Done After a Failed Rollback</title>
+<meta name="description" content="A Medusa v2 workflow throws mid-saga, but a step without a compensation function or a crashed process leaves its side effect committed. Learn why workflows get left half done and build a Python or Node.js script that finds and safely clears the orphaned reservations.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/workflow-left-half-done/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Medusa Workflow Left Half Done After a Failed Rollback">
+<meta property="og:description" content="Why a Medusa v2 workflow can crash or roll back only partway, and a safe Python or Node.js script that finds the leftover reservations and reports the rest for a human.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/workflow-left-half-done/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/workflow-left-half-done/#article","headline":"Fix a Medusa Workflow Left Half Done After a Failed Rollback","description":"Why a Medusa v2 workflow step without a compensation function, or a process crash mid-saga, leaves committed side effects behind, and a safe Python or Node.js script that finds and reports the leftover reservations and reservations.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/workflow-left-half-done/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Events, workflows, and jobs","keywords":"Medusa workflow, saga, compensation function, workflow_execution, createRemoteLinkStep, stuck reservation, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Workflow left half done","item":"https://www.allanninal.dev/medusa/workflow-left-half-done/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a Medusa workflow sometimes leave data behind after it fails?","acceptedAnswer":{"@type":"Answer","text":"Medusa v2 workflows are sagas, and each step's rollback is opt-in through a compensation function passed to createStep. If a step has no compensation function, such as createRemoteLinkStep, its side effect stays in place when a later step throws. Separately, if the process crashes or restarts mid-workflow, or the in-memory Workflow Engine is used in production instead of the Redis one, the saga never reaches the compensating phase at all, so already-committed steps like an inventory reservation stay committed while the workflow_execution row is stuck in a non-terminal state."}},{"@type":"Question","name":"How do I find workflows that never finished in Medusa?","acceptedAnswer":{"@type":"Answer","text":"List reservations with GET /admin/reservations and, for each one that has a line_item_id, look up its parent order with GET /admin/orders/{order_id}. A reservation whose order returns 404 or whose order.status is canceled is an orphan left by a half run workflow. You can also list workflow_execution rows through the Workflow Engine module and filter for a state that is not done or reverted and an updated_at older than a threshold, which points at the exact transaction and step that got stuck."}},{"@type":"Question","name":"Is it safe to automatically delete leftover reservations from a failed workflow?","acceptedAnswer":{"@type":"Answer","text":"Only for the unambiguous case: a reservation whose parent order no longer resolves at all, or whose order status is canceled. Deleting a reservation tied to a live, in-progress order risks double selling stock or corrupting that order, so anything still mid-flight, or any orphaned module link row, should only be reported with its transaction_id, workflow_id, and step name for a human to review."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Events, workflows, and jobs</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Events, workflows, and jobs</p>
+    <h1>Workflow left half done</h1>
+    <p class="lead">A workflow reserves stock, then a later step throws while charging a payment or booking a fulfillment. You expect Medusa to undo the reservation and leave things clean. Sometimes it does. Sometimes it does not, because the step that reserved the stock was never given a way to undo itself, or the process that was running the workflow died before it got the chance. Here is why a Medusa v2 workflow can be left half done and a small script that finds the leftover reservations and tells you, safely, what to do about them.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2 workflows are sagas. Each step's rollback logic is opt-in, defined by passing a compensation function into <code>createStep</code>, so any step that skips one leaves its side effect in place if a later step throws. <code>createRemoteLinkStep</code> is a real example: it shipped without compensation and left module link rows behind after a rollback (GitHub #9844). Separately, if the process crashes mid transaction, or the in-memory Workflow Engine is used instead of <code>@medusajs/workflow-engine-redis</code> in production, the saga never reaches the compensating phase at all, so a step that already committed, like a reservation made by <code>reserveInventoryStep</code> before a later payment step fails, stays committed while the <code>workflow_execution</code> row sits stuck at a state like <code>invoking</code>, never <code>done</code> or <code>reverted</code>. Run a script that lists reservations, resolves each one's parent order, and reports the ones that are clearly orphaned, deleting only the unambiguous case where the order is gone or canceled. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A Medusa workflow is a chain of steps, and it is built like a database transaction that spans multiple systems: a saga. When every step succeeds, everything commits together and the workflow finishes. When a step throws partway through, Medusa is supposed to walk backward through the steps that already ran and undo each one, in order, so the world ends up as if the workflow never started.</p>
+  <p>The catch is that undoing a step is not automatic. Each step's author has to explicitly write a compensation function and hand it to <code>createStep</code>. If they do not, that step has no rollback at all, so its side effect just stays in place forever when a later step fails. <code>createRemoteLinkStep</code>, the step Medusa uses internally to write module link rows such as a promotion linked to a campaign, shipped without one, and GitHub issue #9844 documents exactly that: a rollback that leaves link rows behind. On top of that, compensation only ever runs if the workflow engine gets the chance to run it. If the Node process crashes, restarts, or the in-memory Workflow Engine is used in production instead of <code>@medusajs/workflow-engine-redis</code>, the saga's state is lost mid flight, and the steps that already committed, like a reservation created by <code>reserveInventoryStep</code>, are never rolled back at all.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A workflow reserves inventory, a later step fails, and either the step had no compensation function or the process crashed before compensation could run, so the reservation stays committed and the workflow_execution row is stuck in a non terminal state.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="165" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="92" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Step 1 commits</text>
+      <text x="92" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">reserveInventoryStep</text>
+      <line x1="92" y1="86" x2="92" y2="112" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="114" width="230" height="72" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="125" y="138" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Step 2 throws</text>
+      <text x="125" y="155" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">payment or fulfillment fails</text>
+      <text x="125" y="171" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">or the process crashes</text>
+      <line x1="240" y1="150" x2="282" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="261" y="112" text-anchor="middle" font-family="sans-serif" font-size="21" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="261" y="200" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">no compensation, or none ran</text>
+      <rect x="285" y="118" width="180" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="375" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Reservation stays</text>
+      <text x="375" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">stock still held</text>
+      <line x1="465" y1="150" x2="507" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="510" y="112" width="240" height="76" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="630" y="136" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">workflow_execution stuck</text>
+      <text x="630" y="153" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">state: "invoking"</text>
+      <text x="630" y="169" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">never "done" or "reverted"</text>
+    </svg>
+    <figcaption>A step commits its side effect, a later step throws, and either that step had no compensation function or the process died before compensation ran. Either way, the side effect is stuck and the workflow_execution row never reaches a terminal state.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Medusa's workflow engine gives every step the chance to opt in to a rollback, but it never forces one. A few common ways stores end up with half-run workflows:</p>
+  <ul>
+    <li>A step is written without a compensation function, so it has nothing to undo. <code>createRemoteLinkStep</code> is a documented case of this, and it left module link rows in place after a rollback, per GitHub issue #9844.</li>
+    <li>A long-running workflow does not save its state correctly to the <code>workflow_execution</code> table, so the row is missing or wrong when something later needs to check on it, matching the pattern in GitHub issue #9077.</li>
+    <li>The process running the workflow crashes or restarts mid transaction. If the in-memory Workflow Engine module is used instead of <code>@medusajs/workflow-engine-redis</code> in production, the saga's progress lives only in that process's memory and is gone the moment it dies, so compensation never gets invoked for the steps that already committed.</li>
+    <li>Fulfillment does not always delete the inventory reservation it should, leaving reservations stuck after an order-level operation like cancellation, as reported in GitHub issue #11266.</li>
+  </ul>
+  <p>The net effect is the same in every case. A step's side effect, most often a reservation, is left committed in the database while the workflow that created it never reached a clean end. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A half-run workflow can leave two different kinds of mess behind, and only one of them is safe to touch automatically. A reservation whose parent order is missing entirely, or whose order was canceled, is unambiguous: nothing legitimate needs that stock anymore, so it can be deleted. A stuck <code>workflow_execution</code> row that is still mid flight, or an orphaned module link row from a step like <code>createRemoteLinkStep</code>, is not unambiguous. Deleting or reversing those without knowing exactly what a human intended risks corrupting a live process, so the right move there is to report the transaction id, workflow id, and step name and let a person decide.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch live checkouts or in-flight workflows. The job lists reservations, resolves each one's parent order, classifies it with a pure decision function, and only deletes the unambiguous orphans. Everything else, including any reservation tied to a still-active order, is left alone and reported.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists reservations, looks up each reservation's parent order, classifies the reservation with a pure function as orphaned no order, orphaned canceled order, stale pending review, or healthy, then deletes only the unambiguous orphan cases when dry run is off, and reports everything else.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List reservations</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">id, line_item_id</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Look up parent order</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">id, status, or 404</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pure decision fn</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">classifyReservation</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Order missing or</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">canceled?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, dry run off</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">no, report only</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="610" y="185" width="140" height="55" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="680" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Stale or healthy</text>
+      <text x="680" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">logged for a human</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">DELETE reservation</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">only the unambiguous case</text>
+    </svg>
+    <figcaption>Every reservation is classified first. Only an orphan with no order, or one tied to a canceled order, is ever deleted, and only with DRY_RUN off. Anything mid flight is reported, not touched.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. Keep the backend URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export STALE_MINUTES="10"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install @medusajs/js-sdk
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export STALE_MINUTES="10"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List reservations that came from a line item</h3>
+      <p>Ask for every reservation with the fields the decision needs: <code>line_item_id</code>, <code>created_at</code>, and the order it points at. A reservation with no <code>line_item_id</code> is a manual one someone created by hand, not something a workflow left behind, so it is never in scope here.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_reservations(token):
+    reservations = []
+    offset = 0
+    limit = 200
+    while True:
+        data = admin_get(token, "/admin/reservations", {
+            "fields": "id,line_item_id,inventory_item_id,location_id,quantity,created_at,*line_item.order_id",
+            "limit": limit,
+            "offset": offset,
+        })
+        reservations.extend(data["reservations"])
+        offset += limit
+        if offset &gt;= data["count"]:
+            return reservations</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import Medusa from "@medusajs/js-sdk";
+
+const sdk = new Medusa({ baseUrl: process.env.MEDUSA_BACKEND_URL, auth: { type: "jwt" } });
+
+async function listReservations() {
+  const reservations = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const { reservations: page, count } = await sdk.admin.reservation.list({
+      fields: "id,line_item_id,inventory_item_id,location_id,quantity,created_at,*line_item.order_id",
+      limit,
+      offset,
+    });
+    reservations.push(...page);
+    offset += limit;
+    if (offset &gt;= count) return reservations;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Look up each reservation's parent order</h3>
+      <p>For a reservation that came from a line item, fetch the order it belongs to and read only <code>id</code> and <code>status</code>. A 404 here means the order no longer resolves at all. Catch that case explicitly and pass along <code>null</code> instead of letting the request blow up the whole run.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def get_order_or_none(token, order_id):
+    """Returns {"id": str, "status": str} or None if the order no longer resolves."""
+    if not order_id:
+        return None
+    r = requests.get(
+        f"{BACKEND_URL}/admin/orders/{order_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"fields": "id,status"},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()["order"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function getOrderOrNull(orderId) {
+  if (!orderId) return null;
+  try {
+    const { order } = await sdk.admin.order.retrieve(orderId, { fields: "id,status" });
+    return order;
+  } catch (err) {
+    if (err?.response?.status === 404 || err?.status === 404) return null;
+    throw err;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the classification in its own function that takes a reservation, the order it resolved to (or <code>null</code>), the current time, and the staleness window, and returns a plain answer. It never touches the network, so it is trivial to unit test with fixture data. Only two outcomes are ever eligible for an automatic delete: <code>orphaned_no_order</code> and <code>orphaned_canceled_order</code>. Everything else is either healthy or just flagged for a human to look at.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def classify_reservation(reservation, order, now_iso, stale_minutes=10):
+    """Pure decision function. No I/O.
+
+    reservation: {"id": str, "line_item_id": str | None, "created_at": str (ISO)}
+    order: {"id": str, "status": str} | None
+    now_iso: str (ISO timestamp)
+    stale_minutes: int
+
+    Returns "orphaned_no_order" | "orphaned_canceled_order" |
+            "stale_pending_review" | "healthy".
+    """
+    if reservation.get("line_item_id") is None:
+        return "healthy"
+
+    if order is None:
+        return "orphaned_no_order"
+
+    if order.get("status") == "canceled":
+        return "orphaned_canceled_order"
+
+    age_ms = _parse_iso_ms(now_iso) - _parse_iso_ms(reservation["created_at"])
+    if age_ms &gt; stale_minutes * 60000 and order.get("status") not in ("pending", "completed"):
+        return "stale_pending_review"
+
+    return "healthy"
+
+
+def _parse_iso_ms(iso):
+    from datetime import datetime
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, line_item_id: string | null, created_at: string }} reservation
+ * @param {{ id: string, status: string } | null} order
+ * @param {string} nowIso
+ * @param {number} staleMinutes
+ * @returns {"orphaned_no_order" | "orphaned_canceled_order" | "stale_pending_review" | "healthy"}
+ */
+export function classifyReservation(reservation, order, nowIso, staleMinutes = 10) {
+  if (reservation.line_item_id == null) return "healthy";
+
+  if (order == null) return "orphaned_no_order";
+
+  if (order.status === "canceled") return "orphaned_canceled_order";
+
+  const ageMs = Date.parse(nowIso) - Date.parse(reservation.created_at);
+  if (ageMs &gt; staleMinutes * 60000 &amp;&amp; !["pending", "completed"].includes(order.status)) {
+    return "stale_pending_review";
+  }
+
+  return "healthy";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Delete only the unambiguous orphans, report the rest</h3>
+      <p>When a reservation is classified as <code>orphaned_no_order</code> or <code>orphaned_canceled_order</code>, log its id and its (missing or canceled) order, then call <code>DELETE /admin/reservations/{id}</code>. When it comes back <code>stale_pending_review</code>, only report it, since that status means the order is still active in some other sense and a human needs to look before anything is touched.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">DELETABLE = {"orphaned_no_order", "orphaned_canceled_order"}
+
+def delete_reservation(token, reservation_id):
+    r = requests.delete(
+        f"{BACKEND_URL}/admin/reservations/{reservation_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">const DELETABLE = new Set(["orphaned_no_order", "orphaned_canceled_order"]);
+
+async function deleteReservation(reservationId) {
+  return sdk.admin.reservation.delete(reservationId);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only logs the reservation id and classification it would act on. Read the output, agree with it, then switch it off to let it write. Run it on a schedule, for example every fifteen minutes, so a half-run workflow never sits unnoticed for long.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This script deletes reservations one at a time, logging the <code>transaction_id</code> context and the stale reservation id before each delete, and it only ever deletes the two unambiguous classifications. A <code>stuck workflow_execution</code> row still mid flight, or an orphaned module link row from a step like <code>createRemoteLinkStep</code>, is reported only, never written to, because acting on those without a human's judgment risks corrupting a live process.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever deletes a reservation whose parent order is gone or canceled.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/workflow-left-half-done" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_half_run_workflows.py</div>
+      <pre><code class="language-python">"""Reconcile Medusa reservations left behind by a workflow that never finished.
+
+Medusa v2 workflows are sagas: each step's rollback is opt-in through a compensation
+function passed to createStep, so a step without one, such as createRemoteLinkStep
+(GitHub #9844), leaves its side effect in place if a later step throws. Separately, a
+crashed process or the in-memory Workflow Engine used in production means the saga
+never reaches the compensating phase at all, so an already-committed reservation from
+reserveInventoryStep stays committed while workflow_execution is stuck in a
+non-terminal state (GitHub #9077, #12913, #11266).
+
+This lists reservations, resolves each line_item_id's parent order, classifies each
+reservation with a pure function, and deletes only the unambiguous orphan cases:
+an order that no longer resolves (404) or an order whose status is canceled.
+Everything else is reported only. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_half_run_workflows")
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+STALE_MINUTES = float(os.environ.get("STALE_MINUTES", "10"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+DELETABLE = {"orphaned_no_order", "orphaned_canceled_order"}
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_delete(token, path):
+    r = requests.delete(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _parse_iso_ms(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000
+
+
+def classify_reservation(reservation, order, now_iso, stale_minutes=10):
+    """Pure decision function. No I/O.
+
+    reservation: {"id": str, "line_item_id": str | None, "created_at": str (ISO)}
+    order: {"id": str, "status": str} | None
+    now_iso: str (ISO timestamp)
+    stale_minutes: int
+
+    Returns "orphaned_no_order" | "orphaned_canceled_order" |
+            "stale_pending_review" | "healthy".
+    """
+    if reservation.get("line_item_id") is None:
+        return "healthy"
+
+    if order is None:
+        return "orphaned_no_order"
+
+    if order.get("status") == "canceled":
+        return "orphaned_canceled_order"
+
+    age_ms = _parse_iso_ms(now_iso) - _parse_iso_ms(reservation["created_at"])
+    if age_ms &gt; stale_minutes * 60000 and order.get("status") not in ("pending", "completed"):
+        return "stale_pending_review"
+
+    return "healthy"
+
+
+def list_reservations(token):
+    reservations = []
+    offset = 0
+    limit = 200
+    while True:
+        data = admin_get(token, "/admin/reservations", {
+            "fields": "id,line_item_id,inventory_item_id,location_id,quantity,created_at,*line_item.order_id",
+            "limit": limit,
+            "offset": offset,
+        })
+        reservations.extend(data["reservations"])
+        offset += limit
+        if offset &gt;= data["count"]:
+            return reservations
+
+
+def get_order_or_none(token, order_id):
+    if not order_id:
+        return None
+    r = requests.get(
+        f"{BACKEND_URL}/admin/orders/{order_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"fields": "id,status"},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()["order"]
+
+
+def run():
+    token = get_admin_token()
+    reservations = list_reservations(token)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    deleted = 0
+    reported = 0
+    for reservation in reservations:
+        line_item = reservation.get("line_item") or {}
+        order_id = line_item.get("order_id")
+        order = get_order_or_none(token, order_id) if reservation.get("line_item_id") else None
+
+        outcome = classify_reservation(reservation, order, now_iso, STALE_MINUTES)
+        if outcome == "healthy":
+            continue
+
+        if outcome in DELETABLE:
+            log.warning(
+                "Reservation %s classified as %s. order_id=%s. %s",
+                reservation["id"], outcome, order_id, "Would delete" if DRY_RUN else "Deleting",
+            )
+            if not DRY_RUN:
+                admin_delete(token, f"/admin/reservations/{reservation['id']}")
+            deleted += 1
+        else:
+            log.info(
+                "Reservation %s reported as %s. order_id=%s status=%s (needs human review, not touched).",
+                reservation["id"], outcome, order_id, (order or {}).get("status"),
+            )
+            reported += 1
+
+    log.info(
+        "Done. %d reservation(s) %s, %d reservation(s) reported for review.",
+        deleted, "to delete" if DRY_RUN else "deleted", reported,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-half-run-workflows.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile Medusa reservations left behind by a workflow that never finished.
+ *
+ * Medusa v2 workflows are sagas: each step's rollback is opt-in through a compensation
+ * function passed to createStep, so a step without one, such as createRemoteLinkStep
+ * (GitHub #9844), leaves its side effect in place if a later step throws. Separately, a
+ * crashed process or the in-memory Workflow Engine used in production means the saga
+ * never reaches the compensating phase at all, so an already-committed reservation from
+ * reserveInventoryStep stays committed while workflow_execution is stuck in a
+ * non-terminal state (GitHub #9077, #12913, #11266).
+ *
+ * This lists reservations, resolves each line_item_id's parent order, classifies each
+ * reservation with a pure function, and deletes only the unambiguous orphan cases:
+ * an order that no longer resolves (404) or an order whose status is canceled.
+ * Everything else is reported only. Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/workflow-left-half-done/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const STALE_MINUTES = Number(process.env.STALE_MINUTES || 10);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const DELETABLE = new Set(["orphaned_no_order", "orphaned_canceled_order"]);
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, line_item_id: string | null, created_at: string }} reservation
+ * @param {{ id: string, status: string } | null} order
+ * @param {string} nowIso
+ * @param {number} staleMinutes
+ * @returns {"orphaned_no_order" | "orphaned_canceled_order" | "stale_pending_review" | "healthy"}
+ */
+export function classifyReservation(reservation, order, nowIso, staleMinutes = 10) {
+  if (reservation.line_item_id == null) return "healthy";
+
+  if (order == null) return "orphaned_no_order";
+
+  if (order.status === "canceled") return "orphaned_canceled_order";
+
+  const ageMs = Date.parse(nowIso) - Date.parse(reservation.created_at);
+  if (ageMs &gt; staleMinutes * 60000 &amp;&amp; !["pending", "completed"].includes(order.status)) {
+    return "stale_pending_review";
+  }
+
+  return "healthy";
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function adminDelete(token, path) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on DELETE ${path}`);
+  return res.json();
+}
+
+async function listReservations(token) {
+  const reservations = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const data = await adminGet(token, "/admin/reservations", {
+      fields: "id,line_item_id,inventory_item_id,location_id,quantity,created_at,*line_item.order_id",
+      limit,
+      offset,
+    });
+    reservations.push(...data.reservations);
+    offset += limit;
+    if (offset &gt;= data.count) return reservations;
+  }
+}
+
+async function getOrderOrNull(token, orderId) {
+  if (!orderId) return null;
+  const res = await fetch(new URL(`${BACKEND_URL}/admin/orders/${orderId}?fields=id,status`), {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET /admin/orders/${orderId}`);
+  const body = await res.json();
+  return body.order;
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const reservations = await listReservations(token);
+  const nowIso = new Date().toISOString();
+
+  let deleted = 0;
+  let reported = 0;
+  for (const reservation of reservations) {
+    const orderId = reservation.line_item?.order_id;
+    const order = reservation.line_item_id ? await getOrderOrNull(token, orderId) : null;
+
+    const outcome = classifyReservation(reservation, order, nowIso, STALE_MINUTES);
+    if (outcome === "healthy") continue;
+
+    if (DELETABLE.has(outcome)) {
+      console.warn(
+        `Reservation ${reservation.id} classified as ${outcome}. order_id=${orderId}. ${DRY_RUN ? "Would delete" : "Deleting"}`
+      );
+      if (!DRY_RUN) await adminDelete(token, `/admin/reservations/${reservation.id}`);
+      deleted++;
+    } else {
+      console.log(
+        `Reservation ${reservation.id} reported as ${outcome}. order_id=${orderId} status=${order?.status} (needs human review, not touched).`
+      );
+      reported++;
+    }
+  }
+
+  console.log(`Done. ${deleted} reservation(s) ${DRY_RUN ? "to delete" : "deleted"}, ${reported} reservation(s) reported for review.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>classify_reservation</code> is the part most worth testing, because it decides which reservations are safe to delete versus merely reported. It is pure, so the test needs no network and no Medusa backend. It just feeds in plain data structures and a fixed clock, and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_workflow_reservations.py</div>
+      <pre><code class="language-python">from reconcile_half_run_workflows import classify_reservation
+
+NOW = "2026-07-10T00:20:00+00:00"
+
+
+def reservation(**over):
+    base = {"id": "res_1", "line_item_id": "item_1", "created_at": "2026-07-10T00:00:00+00:00"}
+    base.update(over)
+    return base
+
+
+def test_healthy_when_no_line_item_id():
+    r = reservation(line_item_id=None)
+    assert classify_reservation(r, None, NOW, 10) == "healthy"
+
+
+def test_orphaned_no_order_when_order_missing():
+    r = reservation()
+    assert classify_reservation(r, None, NOW, 10) == "orphaned_no_order"
+
+
+def test_orphaned_canceled_order_when_order_canceled():
+    order = {"id": "order_1", "status": "canceled"}
+    r = reservation()
+    assert classify_reservation(r, order, NOW, 10) == "orphaned_canceled_order"
+
+
+def test_healthy_when_order_pending_even_if_old():
+    order = {"id": "order_1", "status": "pending"}
+    r = reservation()
+    assert classify_reservation(r, order, NOW, 10) == "healthy"
+
+
+def test_stale_pending_review_when_old_and_order_in_limbo():
+    order = {"id": "order_1", "status": "requires_action"}
+    r = reservation()
+    assert classify_reservation(r, order, NOW, 10) == "stale_pending_review"
+
+
+def test_healthy_when_young_even_if_order_in_limbo():
+    order = {"id": "order_1", "status": "requires_action"}
+    r = reservation(created_at="2026-07-10T00:15:00+00:00")
+    assert classify_reservation(r, order, NOW, 10) == "healthy"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reservations.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyReservation } from "./reconcile-half-run-workflows.js";
+
+const NOW = "2026-07-10T00:20:00Z";
+
+const reservation = (over = {}) =&gt; ({
+  id: "res_1",
+  line_item_id: "item_1",
+  created_at: "2026-07-10T00:00:00Z",
+  ...over,
+});
+
+test("healthy when no line_item_id", () =&gt; {
+  const r = reservation({ line_item_id: null });
+  assert.equal(classifyReservation(r, null, NOW, 10), "healthy");
+});
+
+test("orphaned_no_order when order missing", () =&gt; {
+  const r = reservation();
+  assert.equal(classifyReservation(r, null, NOW, 10), "orphaned_no_order");
+});
+
+test("orphaned_canceled_order when order canceled", () =&gt; {
+  const order = { id: "order_1", status: "canceled" };
+  const r = reservation();
+  assert.equal(classifyReservation(r, order, NOW, 10), "orphaned_canceled_order");
+});
+
+test("healthy when order pending even if old", () =&gt; {
+  const order = { id: "order_1", status: "pending" };
+  const r = reservation();
+  assert.equal(classifyReservation(r, order, NOW, 10), "healthy");
+});
+
+test("stale_pending_review when old and order in limbo", () =&gt; {
+  const order = { id: "order_1", status: "requires_action" };
+  const r = reservation();
+  assert.equal(classifyReservation(r, order, NOW, 10), "stale_pending_review");
+});
+
+test("healthy when young even if order in limbo", () =&gt; {
+  const order = { id: "order_1", status: "requires_action" };
+  const r = reservation({ created_at: "2026-07-10T00:15:00Z" });
+  assert.equal(classifyReservation(r, order, NOW, 10), "healthy");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Missing compensation</span>
+      <h4>A promotion link row that outlived its cart</h4>
+      <p>A team built a custom workflow around <code>createRemoteLinkStep</code> to link a promotion to a campaign as part of a larger checkout flow. A later step in that same workflow failed on a validation error, and the rollback ran, but the link row stayed in place because that step had never been given a compensation function, matching the exact gap reported in GitHub issue #9844.</p>
+      <p>The reservations created earlier in the same workflow were resolved against orders and found to belong to an order that no longer existed. The script reported the workflow's transaction id alongside the deleted reservations, and the team used that id to track down and clean up the link row by hand, since a link row was outside what the script was built to touch.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Crashed process</span>
+      <h4>A deploy that landed mid-checkout</h4>
+      <p>A store redeployed its Medusa backend during a busy period, and the deploy happened to land while a handful of checkouts were mid workflow. Those processes died before their steps could compensate, and because the store was running the in-memory Workflow Engine rather than <code>@medusajs/workflow-engine-redis</code>, the saga state for those transactions was gone the moment the old process exited.</p>
+      <p>Running the script in dry run surfaced the reservations from those interrupted checkouts. Most resolved to orders that were still <code>pending</code> and were correctly left alone as healthy. A few resolved to orders that had since been canceled by the customer trying again, and those were the unambiguous case the script deleted, freeing the stock immediately.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a workflow that stops halfway never gets to quietly hold stock forever. The unambiguous orphans, reservations with no order or a canceled one, are cleared automatically and logged one delete at a time. Anything still mid flight, or any orphaned link row from a step without compensation, is reported with enough detail, the transaction id, workflow id, and step name, for a human to safely decide what to do. Nothing gets touched on a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a Medusa workflow sometimes leave data behind after it fails?</summary>
+      <p>Medusa v2 workflows are sagas, and each step's rollback is opt-in through a compensation function passed to createStep. If a step has no compensation function, such as createRemoteLinkStep, its side effect stays in place when a later step throws. Separately, if the process crashes or restarts mid-workflow, or the in-memory Workflow Engine is used in production instead of the Redis one, the saga never reaches the compensating phase at all, so already-committed steps like an inventory reservation stay committed while the workflow_execution row is stuck in a non-terminal state.</p>
+    </details>
+    <details>
+      <summary>How do I find workflows that never finished in Medusa?</summary>
+      <p>List reservations with GET /admin/reservations and, for each one that has a line_item_id, look up its parent order with GET /admin/orders/{order_id}. A reservation whose order returns 404 or whose order.status is canceled is an orphan left by a half run workflow. You can also list workflow_execution rows through the Workflow Engine module and filter for a state that is not done or reverted and an updated_at older than a threshold, which points at the exact transaction and step that got stuck.</p>
+    </details>
+    <details>
+      <summary>Is it safe to automatically delete leftover reservations from a failed workflow?</summary>
+      <p>Only for the unambiguous case: a reservation whose parent order no longer resolves at all, or whose order status is canceled. Deleting a reservation tied to a live, in-progress order risks double selling stock or corrupting that order, so anything still mid-flight, or any orphaned module link row, should only be reported with its transaction_id, workflow_id, and step name for a human to review.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>createRemoteLinkStep does not perform any compensation. Medusa GitHub Issue #9844. <a href="https://github.com/medusajs/medusa/issues/9844" rel="noopener">github.com/medusajs/medusa/issues/9844</a></li>
+      <li>Long-running workflows don't save correctly in the workflow_execution table. Medusa GitHub Issue #9077. <a href="https://github.com/medusajs/medusa/issues/9077" rel="noopener">github.com/medusajs/medusa/issues/9077</a></li>
+      <li>Order fulfillment is not deleting inventory item reservations sometimes. Medusa GitHub Issue #11266. <a href="https://github.com/medusajs/medusa/issues/11266" rel="noopener">github.com/medusajs/medusa/issues/11266</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Compensation Function. <a href="https://docs.medusajs.com/learn/fundamentals/workflows/compensation-function" rel="noopener">docs.medusajs.com/learn/fundamentals/workflows/compensation-function</a></li>
+      <li>Medusa Documentation: Store Workflow Executions. <a href="https://docs.medusajs.com/learn/fundamentals/workflows/store-executions" rel="noopener">docs.medusajs.com/learn/fundamentals/workflows/store-executions</a></li>
+      <li>Medusa Documentation: How to Use the Workflow Engine Module. <a href="https://docs.medusajs.com/resources/infrastructure-modules/workflow-engine/how-to-use" rel="noopener">docs.medusajs.com/resources/infrastructure-modules/workflow-engine/how-to-use</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa storefront access, pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a stuck workflow?</h3>
+    <p>If this saved you from chasing a phantom reservation or a support ticket about stock that would not add up, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

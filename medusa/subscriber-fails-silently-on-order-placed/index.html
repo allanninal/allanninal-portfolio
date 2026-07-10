@@ -1,0 +1,913 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Subscriber That Fails Silently on order.placed in Medusa</title>
+<meta name="description" content="A Medusa v2 subscriber on order.placed throws or hangs and nothing shows it happened, so the order looks fine while a side effect like the confirmation email never ran. Learn why and build a Python or Node.js script that reconciles orders against the Notification module to find and repair the gap.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/subscriber-fails-silently-on-order-placed/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Subscriber That Fails Silently on order.placed in Medusa">
+<meta property="og:description" content="Why an order.placed subscriber can throw or hang without surfacing anywhere, and a Python or Node.js script that finds the orders whose side effect never ran and repairs them safely.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/subscriber-fails-silently-on-order-placed/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/subscriber-fails-silently-on-order-placed/#article","headline":"Fix a Subscriber That Fails Silently on order.placed in Medusa","description":"Why a Medusa v2 subscriber attached to order.placed can throw or hang without surfacing anywhere, and a Python or Node.js script that reconciles orders against the Notification module to find the ones whose side effect never ran.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/subscriber-fails-silently-on-order-placed/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Events, workflows, and jobs","keywords":"Medusa subscriber fails silently, order.placed subscriber, subscriberConfig context, Medusa event bus, Notification module, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Subscriber fails silently on order.placed","item":"https://www.allanninal.dev/medusa/subscriber-fails-silently-on-order-placed/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Medusa order.placed subscriber fail without any error in the logs?","acceptedAnswer":{"@type":"Answer","text":"A subscriber function in Medusa v2 runs detached from the request and workflow that emitted the event. If the subscriber throws inside an async callback that Medusa's event bus does not await to completion, or the container it resolves a service from is misconfigured, the rejection can be swallowed by the process instead of bubbling up to a place that logs it clearly. The order itself finishes normally because the workflow already committed before the event fired, so nothing about the order looks wrong even though the side effect never happened."}},{"@type":"Question","name":"Does subscriberConfig with a context.subscriberId stop a subscriber from failing?","acceptedAnswer":{"@type":"Answer","text":"No, context.subscriberId only gives a subscriber a stable identity so Medusa can deduplicate retries and avoid double-registering the same handler on hot reload. It does not add error handling, retries, or logging on its own. A subscriber still needs its own try or catch, and still needs a durable event bus, to avoid failing without a trace."}},{"@type":"Question","name":"How do I find orders whose order.placed subscriber never completed, without redeploying anything?","acceptedAnswer":{"@type":"Answer","text":"Cross-reference the Admin API's orders list against the Notification module's delivery log at /admin/notifications, which records every notification attempt regardless of which subscriber triggered it. An order older than a short grace window with zero notification rows for the expected event_name is the signature of a subscriber that silently failed. This needs no redeploy and no log access, only two read-only Admin API calls."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Events, workflows, and jobs</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Events, workflows, and jobs</p>
+    <h1>Subscriber fails silently on order.placed</h1>
+    <p class="lead">The order is there. The payment captured. Everything in the Admin looks correct. But the confirmation email never went out, or the warehouse sync never ran, and nobody can point to an error that explains why. The subscriber attached to <code>order.placed</code> failed, but it failed in a place nothing was watching, so the order finished as if everything had gone perfectly. Here is why a Medusa subscriber can fail without a trace and a script that finds the orders it happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Reconcile against the Notification module</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>A subscriber in Medusa v2 is a plain async function registered against an event name, and it runs detached from the workflow that emitted the event. The order was already placed and committed before the event ever fired, so a thrown error, a rejected promise nobody awaited, or a container resolution failure inside the subscriber has nowhere to report back to the order itself. Nothing in the Admin, the order status, or the API response changes. The one durable trace that a side effect actually happened is the Notification module's own delivery log at <code>/admin/notifications</code>, which is written independently of whichever subscriber triggered it. The practical fix is to reconcile: list recent orders, list the notifications actually recorded for each one, and flag any order past a short grace window with zero notification rows for the expected <code>event_name</code>, such as <code>order.placed</code>. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In Medusa v2, placing an order runs as a workflow. The workflow reserves inventory, creates the order, and commits it, and only after that succeeds does it emit <code>order.placed</code> on the event bus. Subscribers registered for that event name then run their own side effects, sending the confirmation email, notifying a fulfillment partner, pushing the order to an external system.</p>
+  <p>The order's own success has already been decided by the time any subscriber runs. A subscriber is just a function Medusa calls when the event arrives, and how well that call is supervised depends entirely on how the subscriber was written. If the function throws inside a callback the event bus does not await all the way through, if it depends on a service the dependency container could not resolve, or if it silently swallows its own promise rejection, the failure has no path back to the order. The order stays exactly as correct as it already was, and the one thing that changed is a side effect that a customer or a warehouse was expecting never arrived.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. The order placed workflow commits the order and emits order.placed. A subscriber runs detached from that workflow and throws, but the rejection is swallowed, so the confirmation email never sends and nothing shows an error.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="165" height="70" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="92" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Order workflow</text>
+      <text x="92" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">commits, emits event</text>
+      <line x1="178" y1="105" x2="220" y2="105" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="223" y="70" width="170" height="70" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="308" y="93" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">order.placed subscriber</text>
+      <text x="308" y="110" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">runs detached, throws or</text>
+      <text x="308" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">hangs inside itself</text>
+      <line x1="393" y1="105" x2="447" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="420" y="63" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="420" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">rejection swallowed</text>
+      <rect x="450" y="70" width="160" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="530" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Order still looks fine</text>
+      <text x="530" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">status unchanged</text>
+      <rect x="633" y="70" width="117" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Confirmation</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">email: never sent</text>
+      <line x1="611" y1="105" x2="630" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The order was already correct before the subscriber ran. Whatever the subscriber failed to do disappears with it, because nothing connects the two.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Every one of these is a real way a subscriber can fail without leaving a trace, not a single bug with one cause:</p>
+  <ul>
+    <li>A subscriber that does <code>someAsyncCall().then(...)</code> without a <code>catch</code>, or that fires an inner async callback the outer function does not <code>await</code>, produces an unhandled promise rejection. Node logs that separately from the request that triggered it, often to a place nobody is monitoring, and Medusa's event bus never sees it as a subscriber failure at all.</li>
+    <li>A subscriber resolves a service from the container with <code>container.resolve(...)</code>. If the module key is wrong, or the module was not registered in that environment, the resolve throws before the subscriber's own logic ever runs, and that throw can land in the same unwatched place.</li>
+    <li>Subscribers registered with a duplicate <code>context.subscriberId</code>, or registered twice because of a hot-reload or a module that got required more than once, can silently overwrite one another so only the last registration actually runs, and it may not be the one you expect.</li>
+    <li>With the default in-memory event bus, an event emitted while a subscriber module is still being loaded, or during a deploy, has no subscriber attached yet and is gone before one exists. Even with a durable, Redis-backed event bus configured, a subscriber that throws inside its handler still needs its own retry and logging, since the durable bus guarantees delivery to the handler, not that the handler succeeds.</li>
+  </ul>
+  <p>This is a common source of confusion because the order itself is telling the truth. It really was placed, the payment really did capture, and nothing about the order record indicates a problem. The only visible symptom is somewhere else entirely, a customer asking where their receipt is, or a warehouse system that never received the order it was supposed to fulfill.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot ask the order whether its subscriber succeeded, because the order and the subscriber are not connected after the event fires. But you can ask the Notification module, since <code>/admin/notifications</code> persists a durable row for every notification attempt regardless of which subscriber or event caused it. Comparing what should have happened, an order past a short grace window, against what the Notification module actually recorded turns an invisible failure into a short, reviewable list. Repair narrowly from there, re-triggering only the specific action that produces the missing side effect, guarded by an idempotency check so nothing sends twice.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change the subscriber code from the outside and we do not touch checkout. We list recent orders, list the notifications Medusa actually recorded for each one, and flag any order past a grace window with no notification row for the expected <code>event_name</code>. Behind <code>DRY_RUN</code>, the repair step re-triggers only the specific confirmation action for each flagged order, skipping any order that already has a matching notification to avoid sending it twice.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists recent orders, lists notifications recorded for each order, checks whether a notification with the expected event name exists past the grace window, flags the order if missing, then either logs it in dry run or re-triggers the specific confirmation action guarded by an idempotency check.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List recent orders</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">created_at, status</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="210" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="115" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List notifications</text>
+      <text x="115" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">resource_id, event_name</text>
+      <line x1="220" y1="138" x2="262" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="265" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Past grace window?</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">created_at &lt; now minus 10 min</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 677,138 590,170 503,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Notification</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">missing?</text>
+      <text x="680" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="677" y1="138" x2="705" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, leave alone</text>
+      <line x1="590" y1="170" x2="590" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="633" y="185" width="127" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="696" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag, then guarded</text>
+      <text x="696" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">re-trigger if approved</text>
+      <path d="M705,138 C725,138 696,150 696,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script flags first. Repair only re-triggers the specific confirmation action, guarded by an idempotency check against the Notification module's own log.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend and an admin user with rights to read orders and notifications. Exchange the email and password for a JWT once, then send it as a Bearer token on every admin call. Keep everything in environment variables, never hardcoded.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, only logs the flagged order_id values</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install @medusajs/js-sdk
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, only logs the flagged order_id values</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Both languages exchange credentials for a token the same way. The Python version talks to the REST route directly with <code>requests</code>. The Node version uses the official <code>@medusajs/js-sdk</code>, which wraps the same login call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import Medusa from "@medusajs/js-sdk";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+
+async function login() {
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List recent orders, then the notifications recorded for each</h3>
+      <p>Ask for orders sorted newest first with the fields the decision needs: id, display_id, status, fulfillment_status, payment_status, created_at, and the customer. Page through with limit and offset. Then, for every order, list the notifications Medusa actually recorded against it. <code>/admin/notifications</code> is a real v2 admin resource backed by the Notification Module, and it persists every notification attempt regardless of which subscriber triggered it, so it tells the truth even when the subscriber itself failed silently.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_FIELDS = "id,display_id,status,fulfillment_status,payment_status,created_at,*customer"
+
+def list_recent_orders(token, limit=100):
+    headers = {"Authorization": f"Bearer {token}"}
+    out, offset = [], 0
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/orders",
+            params={"fields": ORDER_FIELDS, "limit": limit, "offset": offset, "order": "-created_at"},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        out.extend(body["orders"])
+        offset += limit
+        if offset &gt;= body["count"]:
+            return out
+
+
+def list_notifications_for_order(token, order_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/notifications",
+        params={"resource_id": order_id, "resource_type": "order", "limit": 50},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["notifications"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_FIELDS = "id,display_id,status,fulfillment_status,payment_status,created_at,*customer";
+
+async function listRecentOrders(sdk, limit = 100) {
+  const out = [];
+  let offset = 0;
+  while (true) {
+    const body = await sdk.admin.order.list({
+      fields: ORDER_FIELDS, limit, offset, order: "-created_at",
+    });
+    out.push(...body.orders);
+    offset += limit;
+    if (offset &gt;= body.count) return out;
+  }
+}
+
+async function listNotificationsForOrder(sdk, orderId) {
+  const body = await sdk.client.fetch("/admin/notifications", {
+    method: "GET",
+    query: { resource_id: orderId, resource_type: "order", limit: 50 },
+  });
+  return body.notifications;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no network calls. Build a set of order ids that already have a notification with the expected <code>event_name</code>, then flag any order older than a grace window, for example ten minutes, to allow for async delivery, that is not in that set. The function takes both arrays plus the time bounds and returns the minimal tuples for a flag, nothing more.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from datetime import datetime
+
+def find_orders_missing_notification(orders, notifications, expected_event, grace_ms, now_ms):
+    """Pure: no I/O. orders and notifications are plain dicts/lists already fetched."""
+    notified_ids = {
+        n["resource_id"]
+        for n in notifications
+        if n.get("resource_type") == "order" and n.get("event_name") == expected_event
+    }
+
+    flagged = []
+    for order in orders:
+        created_ms = datetime.fromisoformat(
+            order["created_at"].replace("Z", "+00:00")
+        ).timestamp() * 1000
+        if (now_ms - created_ms) &gt; grace_ms and order["id"] not in notified_ids:
+            flagged.append({"order_id": order["id"], "expected_event": expected_event})
+    return flagged</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findOrdersMissingNotification(orders, notifications, expectedEvent, graceMs, nowMs) {
+  // Pure: no I/O. orders and notifications are plain arrays already fetched.
+  const notifiedIds = new Set(
+    notifications
+      .filter((n) => n.resource_type === "order" && n.event_name === expectedEvent)
+      .map((n) => n.resource_id)
+  );
+
+  const flagged = [];
+  for (const order of orders) {
+    const createdMs = Date.parse(order.created_at);
+    if (nowMs - createdMs &gt; graceMs && !notifiedIds.has(order.id)) {
+      flagged.push({ order_id: order.id, expected_event: expectedEvent });
+    }
+  }
+  return flagged;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair by re-triggering the specific action, guarded and idempotent</h3>
+      <p>Do not fabricate a historical notification and do not re-emit the raw event, since you cannot know every subscriber attached to <code>order.placed</code> or how many of them already ran successfully. For each flagged order, skip it if a notification for that <code>event_name</code> and <code>resource_id</code> already exists by the time the repair runs, someone else may have fixed it, and only then call the narrow admin action that re-sends the confirmation. This example re-triggers a custom subscriber endpoint your app exposes for this purpose, which is the safest shape since it isolates the one side effect instead of re-emitting an event with unknown subscribers attached.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def already_notified(token, order_id, expected_event):
+    notifications = list_notifications_for_order(token, order_id)
+    return any(n.get("event_name") == expected_event for n in notifications)
+
+
+def retrigger_order_confirmation(token, order_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/orders/{order_id}/resend-confirmation",
+        json={},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function alreadyNotified(sdk, orderId, expectedEvent) {
+  const notifications = await listNotificationsForOrder(sdk, orderId);
+  return notifications.some((n) => n.event_name === expectedEvent);
+}
+
+async function retriggerOrderConfirmation(sdk, orderId) {
+  return sdk.client.fetch(`/admin/orders/${orderId}/resend-confirmation`, {
+    method: "POST",
+    body: {},
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports the flagged orders, one record per order, with the fields an ops queue needs: order id, display id, expected event, missing since, and customer email. Read the output, get a human to approve the batch, then switch <code>DRY_RUN</code> off to let it re-trigger for real, still guarded by the idempotency check on every single order.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never auto-fabricate a historical notification and never re-emit the raw event. Always start with <code>DRY_RUN=true</code>, always require a human to approve the batch before writing, and always re-check for an existing notification immediately before re-triggering, so a slow run or a second operator can never send the same confirmation twice.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists recent orders and their notifications, flags every order missing the expected event with a pure function, and either reports the batch or re-triggers the specific confirmation action depending on <code>DRY_RUN</code>, skipping any order idempotency already covers.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/subscriber-fails-silently-on-order-placed" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_missing_notifications.py</div>
+      <pre><code class="language-python">"""Find Medusa v2 orders whose expected notification, such as order.placed,
+never fired because the subscriber attached to that event threw, hung, or
+failed to resolve a service without surfacing anywhere the order itself can
+show. Never re-emits the raw event and never fabricates historical
+notifications. DRY_RUN=true only reports the flagged orders. Safe to run
+again and again, because repair is guarded by an idempotency check against
+the Notification module's own log.
+"""
+import os
+import logging
+from datetime import datetime
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_missing_notifications")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+EXPECTED_EVENT = os.environ.get("EXPECTED_EVENT", "order.placed")
+GRACE_MINUTES = float(os.environ.get("GRACE_MINUTES", "10"))
+
+ORDER_FIELDS = "id,display_id,status,fulfillment_status,payment_status,created_at,*customer"
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def list_recent_orders(token, limit=100):
+    headers = {"Authorization": f"Bearer {token}"}
+    out, offset = [], 0
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/orders",
+            params={"fields": ORDER_FIELDS, "limit": limit, "offset": offset, "order": "-created_at"},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        out.extend(body["orders"])
+        offset += limit
+        if offset &gt;= body["count"]:
+            return out
+
+
+def list_notifications_for_order(token, order_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/notifications",
+        params={"resource_id": order_id, "resource_type": "order", "limit": 50},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["notifications"]
+
+
+def find_orders_missing_notification(orders, notifications, expected_event, grace_ms, now_ms):
+    """Pure: no I/O. orders and notifications are plain dicts/lists already fetched."""
+    notified_ids = {
+        n["resource_id"]
+        for n in notifications
+        if n.get("resource_type") == "order" and n.get("event_name") == expected_event
+    }
+
+    flagged = []
+    for order in orders:
+        created_ms = datetime.fromisoformat(
+            order["created_at"].replace("Z", "+00:00")
+        ).timestamp() * 1000
+        if (now_ms - created_ms) &gt; grace_ms and order["id"] not in notified_ids:
+            flagged.append({"order_id": order["id"], "expected_event": expected_event})
+    return flagged
+
+
+def already_notified(token, order_id, expected_event):
+    notifications = list_notifications_for_order(token, order_id)
+    return any(n.get("event_name") == expected_event for n in notifications)
+
+
+def retrigger_order_confirmation(token, order_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/orders/{order_id}/resend-confirmation",
+        json={},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    token = get_token()
+    orders = list_recent_orders(token)
+
+    all_notifications = []
+    for order in orders:
+        all_notifications.extend(list_notifications_for_order(token, order["id"]))
+
+    now_ms = datetime.now().timestamp() * 1000
+    grace_ms = GRACE_MINUTES * 60 * 1000
+    flagged = find_orders_missing_notification(orders, all_notifications, EXPECTED_EVENT, grace_ms, now_ms)
+
+    if not flagged:
+        log.info("No orders missing %s across %d order(s).", EXPECTED_EVENT, len(orders))
+        return
+
+    by_id = {o["id"]: o for o in orders}
+    for item in flagged:
+        order = by_id[item["order_id"]]
+        customer = order.get("customer") or {}
+        log.warning(
+            "Order %s (display_id=%s) missing %s since %s. customer_email=%s",
+            order["id"], order.get("display_id"), item["expected_event"],
+            order["created_at"], customer.get("email"),
+        )
+
+    if not DRY_RUN:
+        for item in flagged:
+            order_id = item["order_id"]
+            if already_notified(token, order_id, item["expected_event"]):
+                log.info("Order %s already notified since the scan ran. Skipping.", order_id)
+                continue
+            log.info("Order %s: re-triggering %s.", order_id, item["expected_event"])
+            retrigger_order_confirmation(token, order_id)
+
+    log.info("Done. %d order(s) %s.", len(flagged), "to review" if DRY_RUN else "processed")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-missing-notifications.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Medusa v2 orders whose expected notification, such as order.placed,
+ * never fired because the subscriber attached to that event threw, hung, or
+ * failed to resolve a service without surfacing anywhere the order itself
+ * can show. Never re-emits the raw event and never fabricates historical
+ * notifications. DRY_RUN=true only reports the flagged orders. Safe to run
+ * again and again, because repair is guarded by an idempotency check
+ * against the Notification module's own log.
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const EXPECTED_EVENT = process.env.EXPECTED_EVENT || "order.placed";
+const GRACE_MINUTES = Number(process.env.GRACE_MINUTES || 10);
+
+const ORDER_FIELDS = "id,display_id,status,fulfillment_status,payment_status,created_at,*customer";
+
+export function findOrdersMissingNotification(orders, notifications, expectedEvent, graceMs, nowMs) {
+  // Pure: no I/O. orders and notifications are plain arrays already fetched.
+  const notifiedIds = new Set(
+    notifications
+      .filter((n) => n.resource_type === "order" && n.event_name === expectedEvent)
+      .map((n) => n.resource_id)
+  );
+
+  const flagged = [];
+  for (const order of orders) {
+    const createdMs = Date.parse(order.created_at);
+    if (nowMs - createdMs &gt; graceMs && !notifiedIds.has(order.id)) {
+      flagged.push({ order_id: order.id, expected_event: expectedEvent });
+    }
+  }
+  return flagged;
+}
+
+async function login() {
+  const { default: Medusa } = await import("@medusajs/js-sdk");
+  const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}
+
+async function listRecentOrders(sdk, limit = 100) {
+  const out = [];
+  let offset = 0;
+  while (true) {
+    const body = await sdk.admin.order.list({
+      fields: ORDER_FIELDS, limit, offset, order: "-created_at",
+    });
+    out.push(...body.orders);
+    offset += limit;
+    if (offset &gt;= body.count) return out;
+  }
+}
+
+async function listNotificationsForOrder(sdk, orderId) {
+  const body = await sdk.client.fetch("/admin/notifications", {
+    method: "GET",
+    query: { resource_id: orderId, resource_type: "order", limit: 50 },
+  });
+  return body.notifications;
+}
+
+async function alreadyNotified(sdk, orderId, expectedEvent) {
+  const notifications = await listNotificationsForOrder(sdk, orderId);
+  return notifications.some((n) => n.event_name === expectedEvent);
+}
+
+async function retriggerOrderConfirmation(sdk, orderId) {
+  return sdk.client.fetch(`/admin/orders/${orderId}/resend-confirmation`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function run() {
+  const sdk = await login();
+  const orders = await listRecentOrders(sdk);
+
+  const allNotifications = [];
+  for (const order of orders) {
+    allNotifications.push(...(await listNotificationsForOrder(sdk, order.id)));
+  }
+
+  const nowMs = Date.now();
+  const graceMs = GRACE_MINUTES * 60 * 1000;
+  const flagged = findOrdersMissingNotification(orders, allNotifications, EXPECTED_EVENT, graceMs, nowMs);
+
+  if (flagged.length === 0) {
+    console.log(`No orders missing ${EXPECTED_EVENT} across ${orders.length} order(s).`);
+    return;
+  }
+
+  const byId = new Map(orders.map((o) => [o.id, o]));
+  for (const item of flagged) {
+    const order = byId.get(item.order_id);
+    console.warn(
+      `Order ${order.id} (display_id=${order.display_id}) missing ${item.expected_event} since ${order.created_at}. customer_email=${order.customer?.email}`
+    );
+  }
+
+  if (!DRY_RUN) {
+    for (const item of flagged) {
+      if (await alreadyNotified(sdk, item.order_id, item.expected_event)) {
+        console.log(`Order ${item.order_id} already notified since the scan ran. Skipping.`);
+        continue;
+      }
+      console.log(`Order ${item.order_id}: re-triggering ${item.expected_event}.`);
+      await retriggerOrderConfirmation(sdk, item.order_id);
+    }
+  }
+
+  console.log(`Done. ${flagged.length} order(s) ${DRY_RUN ? "to review" : "processed"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the one that decides the outcome, <code>find_orders_missing_notification</code>. It is pure, no network and no database, so the tests feed in plain order and notification arrays plus a fixed clock and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_subscriber_missing_notifications.py</div>
+      <pre><code class="language-python">from find_missing_notifications import find_orders_missing_notification
+
+NOW_MS = 1_752_105_600_000  # 2026-07-10T00:00:00Z in epoch ms
+GRACE_MS = 10 * 60 * 1000   # 10 minutes
+
+
+def order(**over):
+    base = {"id": "order_1", "created_at": "2026-07-09T23:00:00Z", "fulfillment_status": "not_fulfilled"}
+    base.update(over)
+    return base
+
+
+def notification(**over):
+    base = {"resource_id": "order_1", "resource_type": "order", "event_name": "order.placed"}
+    base.update(over)
+    return base
+
+
+def test_flags_order_past_grace_with_no_notification():
+    result = find_orders_missing_notification([order()], [], "order.placed", GRACE_MS, NOW_MS)
+    assert result == [{"order_id": "order_1", "expected_event": "order.placed"}]
+
+
+def test_does_not_flag_when_notification_exists():
+    result = find_orders_missing_notification([order()], [notification()], "order.placed", GRACE_MS, NOW_MS)
+    assert result == []
+
+
+def test_does_not_flag_within_grace_window():
+    recent = order(created_at="2026-07-09T23:58:00Z")
+    result = find_orders_missing_notification([recent], [], "order.placed", GRACE_MS, NOW_MS)
+    assert result == []
+
+
+def test_ignores_notification_for_a_different_event():
+    result = find_orders_missing_notification(
+        [order()], [notification(event_name="order.fulfillment_created")], "order.placed", GRACE_MS, NOW_MS
+    )
+    assert result == [{"order_id": "order_1", "expected_event": "order.placed"}]
+
+
+def test_ignores_notification_for_a_different_resource_type():
+    result = find_orders_missing_notification(
+        [order()], [notification(resource_type="customer")], "order.placed", GRACE_MS, NOW_MS
+    )
+    assert result == [{"order_id": "order_1", "expected_event": "order.placed"}]
+
+
+def test_handles_multiple_orders_independently():
+    orders = [order(), order(id="order_2", created_at="2026-07-09T22:00:00Z")]
+    notifications = [notification(resource_id="order_2")]
+    result = find_orders_missing_notification(orders, notifications, "order.placed", GRACE_MS, NOW_MS)
+    assert result == [{"order_id": "order_1", "expected_event": "order.placed"}]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">missing-notifications.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findOrdersMissingNotification } from "./find-missing-notifications.js";
+
+const NOW_MS = Date.parse("2026-07-10T00:00:00Z");
+const GRACE_MS = 10 * 60 * 1000;
+
+const order = (over = {}) =&gt; ({
+  id: "order_1",
+  created_at: "2026-07-09T23:00:00Z",
+  fulfillment_status: "not_fulfilled",
+  ...over,
+});
+
+const notification = (over = {}) =&gt; ({
+  resource_id: "order_1",
+  resource_type: "order",
+  event_name: "order.placed",
+  ...over,
+});
+
+test("flags order past grace with no notification", () =&gt; {
+  const result = findOrdersMissingNotification([order()], [], "order.placed", GRACE_MS, NOW_MS);
+  assert.deepEqual(result, [{ order_id: "order_1", expected_event: "order.placed" }]);
+});
+
+test("does not flag when notification exists", () =&gt; {
+  const result = findOrdersMissingNotification([order()], [notification()], "order.placed", GRACE_MS, NOW_MS);
+  assert.deepEqual(result, []);
+});
+
+test("does not flag within grace window", () =&gt; {
+  const recent = order({ created_at: "2026-07-09T23:58:00Z" });
+  const result = findOrdersMissingNotification([recent], [], "order.placed", GRACE_MS, NOW_MS);
+  assert.deepEqual(result, []);
+});
+
+test("ignores notification for a different event", () =&gt; {
+  const result = findOrdersMissingNotification(
+    [order()], [notification({ event_name: "order.fulfillment_created" })], "order.placed", GRACE_MS, NOW_MS
+  );
+  assert.deepEqual(result, [{ order_id: "order_1", expected_event: "order.placed" }]);
+});
+
+test("ignores notification for a different resource type", () =&gt; {
+  const result = findOrdersMissingNotification(
+    [order()], [notification({ resource_type: "customer" })], "order.placed", GRACE_MS, NOW_MS
+  );
+  assert.deepEqual(result, [{ order_id: "order_1", expected_event: "order.placed" }]);
+});
+
+test("handles multiple orders independently", () =&gt; {
+  const orders = [order(), order({ id: "order_2", created_at: "2026-07-09T22:00:00Z" })];
+  const notifications = [notification({ resource_id: "order_2" })];
+  const result = findOrdersMissingNotification(orders, notifications, "order.placed", GRACE_MS, NOW_MS);
+  assert.deepEqual(result, [{ order_id: "order_1", expected_event: "order.placed" }]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Unhandled rejection</span>
+      <h4>The confirmation emails that stopped without warning</h4>
+      <p>A store's <code>order.placed</code> subscriber called a third party email provider and chained a <code>.then()</code> onto the response without a matching <code>.catch()</code>. When the provider's API key rotated and calls began returning 401s, every rejection went unhandled. Node logged it as a generic unhandled rejection warning buried in a wall of other startup noise, and nothing in the order, the Admin, or the checkout flow indicated a problem.</p>
+      <p>Running the reconciler against the previous three days of orders found forty two with zero <code>order.placed</code> notification rows, all after the exact hour the key rotated. The team fixed the subscriber to await and catch properly, then approved a batch re-trigger. The idempotency check confirmed none of the forty two had a notification recorded since, and all forty two received their confirmation email for the first time, days late but correct.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Container resolution</span>
+      <h4>The subscriber that failed before it could even run</h4>
+      <p>A subscriber resolved a custom notification service from the container using a module key that had been renamed in a recent refactor. In production the resolve threw immediately, before any of the subscriber's actual logic executed, and the throw happened inside the event bus's internal handling rather than anywhere the application's own error monitoring was attached.</p>
+      <p>Staging never caught it because the module key had not changed there yet. The reconciler caught it in production the same way, by comparing <code>order.placed</code> notifications against orders whose age exceeded the grace window. Once the module key was fixed and redeployed, the reconciler was run once more to confirm zero new orders were missing the notification, then the historical batch was repaired the normal guarded way.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this reconciler on a schedule, or right after a deploy that touched a subscriber. It never re-emits the raw event and never fabricates a notification record, so it can never send a customer two receipts or mask a real gap. It only tells you which orders never got the side effect Medusa itself was supposed to trigger, cross-referenced against the Notification module's own durable log, and it only writes when a human has approved the batch and the idempotency check confirms nothing changed underneath it. The durable fix stays in the subscriber itself: wrap the body in try or catch, await every promise all the way through, log failures somewhere your team actually watches, and give each subscriber a stable <code>context.subscriberId</code> so retries and hot reloads cannot silently double-register or drop it.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Medusa order.placed subscriber fail without any error in the logs?</summary>
+      <p>A subscriber function in Medusa v2 runs detached from the request and workflow that emitted the event. If the subscriber throws inside an async callback that Medusa's event bus does not await to completion, or the container it resolves a service from is misconfigured, the rejection can be swallowed by the process instead of bubbling up to a place that logs it clearly. The order itself finishes normally because the workflow already committed before the event fired, so nothing about the order looks wrong even though the side effect never happened.</p>
+    </details>
+    <details>
+      <summary>Does subscriberConfig with a context.subscriberId stop a subscriber from failing?</summary>
+      <p>No, context.subscriberId only gives a subscriber a stable identity so Medusa can deduplicate retries and avoid double-registering the same handler on hot reload. It does not add error handling, retries, or logging on its own. A subscriber still needs its own try or catch, and still needs a durable event bus, to avoid failing without a trace.</p>
+    </details>
+    <details>
+      <summary>How do I find orders whose order.placed subscriber never completed, without redeploying anything?</summary>
+      <p>Cross-reference the Admin API's orders list against the Notification module's delivery log at /admin/notifications, which records every notification attempt regardless of which subscriber triggered it. An order older than a short grace window with zero notification rows for the expected event_name is the signature of a subscriber that silently failed. This needs no redeploy and no log access, only two read-only Admin API calls.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/medusa/">Browse all Medusa field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>a. <a href="https://example.com" rel="noopener">example.com</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>a. <a href="https://example.com" rel="noopener">example.com</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silently dropped subscriber?</h3>
+    <p>If this saved you from a customer support ticket or a confusing missing email, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

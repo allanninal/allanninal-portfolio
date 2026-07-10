@@ -1,0 +1,1030 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Payment Captured but Order Not Paid in Medusa</title>
+<meta name="description" content="Stripe or a custom provider confirms the charge, but the Medusa v2 order never leaves not_paid. Learn why payment_status is derived, not written, and build a Python or Node.js script that finds and safely repairs the mismatch.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/payment-captured-but-order-not-paid/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Payment Captured but Order Not Paid in Medusa">
+<meta property="og:description" content="Why a captured payment in Medusa v2 does not always move the order off not_paid, and a Python or Node.js script that finds and safely repairs the mismatch.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/payment-captured-but-order-not-paid/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/payment-captured-but-order-not-paid/#article","headline":"Fix Payment Captured but Order Not Paid in Medusa","description":"Why a captured payment in Medusa v2 does not always move the order off not_paid, and a Python or Node.js script that finds and safely repairs the reconciliation gap.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/payment-captured-but-order-not-paid/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders and fulfillment","keywords":"Medusa payment_status not_paid, capturePaymentWorkflow, payment.captured event, payment_collections, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Payment captured but order not paid","item":"https://www.allanninal.dev/medusa/payment-captured-but-order-not-paid/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Medusa order still show not_paid after Stripe confirms the charge?","acceptedAnswer":{"@type":"Answer","text":"payment_status is not a field the capture call writes directly. It is derived from the order's payment_collections and their underlying Payment records, reconciled through the order's summary. If the capture step succeeds against the provider but the linking step does not create the matching order transaction, the Payment shows captured_at set while the order never advances off not_paid."}},{"@type":"Question","name":"Is it safe to force payment_status to captured with a script?","acceptedAnswer":{"@type":"Answer","text":"No. payment_status is a derived value, not a plain column, so writing it directly can desync again on the next workflow run. The safe repair is to re-invoke capturePaymentWorkflow through the existing payment_id, which is idempotent since the payment is already captured provider side, so it cannot double charge."}},{"@type":"Question","name":"What if re-running the capture step does not clear the mismatch?","acceptedAnswer":{"@type":"Answer","text":"That points to a deeper missing transaction bug rather than a timing gap, the kind reported in GitHub issue #9887 for providers that return captured from authorizePayment without the full workflow running. Flag that order to a human instead of writing status directly, since a forced overwrite would mask the bug rather than fix it."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Orders and fulfillment</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Orders and fulfillment</p>
+    <h1>Payment captured but order not paid</h1>
+    <p class="lead">Stripe confirms the charge. Your custom provider confirms the charge. The money is gone from the customer's card and it is sitting in your account. But the Medusa order still shows not_paid, the summary still says nothing was paid, and anything downstream that gates on payment status just sits there waiting. Here is why a successful capture does not always mean the order agrees, and a script that finds the mismatch and repairs it the safe way.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Reconcile first, never force-write status</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, an order's <code>payment_status</code> is not a stored field the capture call writes directly. It is derived from the order's linked <code>payment_collections</code> and their underlying Payment records, reconciled through the order's <code>summary</code> (<code>paid_total</code>, <code>transaction_total</code>, <code>pending_difference</code>). If the capture step succeeds against the provider but the linking step does not create the matching order transaction, or the <code>payment.captured</code> event is missed because the in-memory event bus dropped it, the Payment shows <code>captured_at</code> set while the order never advances off <code>not_paid</code>. Run a small Python or Node.js script that lists recently updated orders, sums each order's captured amounts against its reported <code>payment_status</code> and <code>summary</code>, and flags any mismatch. Behind a <code>DRY_RUN</code> guard it repairs the safe way, by re-invoking the capture route on the existing payment, not by writing status directly.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>It is tempting to think of <code>payment_status</code> as a column you can just update, the way you would flip a boolean. It is not. Medusa computes it every time an order is read, by looking at the order's <code>payment_collections</code>, the Payment records under each collection, and the captures recorded against those payments, then reconciling all of that through the order's <code>summary</code>.</p>
+  <p>When <code>capturePaymentWorkflow</code> runs cleanly end to end, the provider confirms the capture, the workflow's linking step records the matching order transaction, an <code>emitEventStep</code> fires <code>payment.captured</code>, and the order's <code>payment_collections</code> and <code>summary</code> both move together. The problem shows up when that chain breaks partway. The provider-side capture can succeed, the Payment's own <code>captured_at</code> gets set, and yet the linking step that ties it back to the order's transaction total never runs, or the event that should trigger it never arrives. The money moved. The order does not know it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A payment provider confirms a capture and captured_at is set on the Payment, but the linking step or the payment.captured event is missed, so the order's summary and payment_status never advance off not_paid.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="170" height="70" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Provider captures</text>
+      <text x="95" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">Payment.captured_at set</text>
+      <line x1="183" y1="105" x2="225" y2="105" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="228" y="70" width="175" height="70" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="315" y="93" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Linking step</text>
+      <text x="315" y="110" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">or payment.captured event</text>
+      <text x="315" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">is missed</text>
+      <line x1="403" y1="105" x2="457" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="430" y="63" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="430" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">order never told</text>
+      <rect x="460" y="70" width="160" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="540" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">summary.paid_total</text>
+      <text x="540" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">stays at 0</text>
+      <rect x="643" y="70" width="107" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="696" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">payment_status</text>
+      <text x="696" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">not_paid</text>
+      <line x1="622" y1="105" x2="640" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The Payment record and the order's summary can disagree. The capture happened, but nothing carried that fact back to the order.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Every one of these is a real gap in how the pieces connect, not a single bug with one cause:</p>
+  <ul>
+    <li><code>payment_status</code> is computed from <code>payment_collections</code> and their payments, reconciled through the order's <code>summary</code> (<code>paid_total</code>, <code>transaction_total</code>, <code>pending_difference</code>). It is never a plain column the capture call writes to.</li>
+    <li>If <code>capturePaymentWorkflow</code>'s capture step succeeds against the provider but the subsequent linking step does not create or emit the matching order transaction, the Payment shows <code>captured_at</code> set while the PaymentCollection and order stay on <code>not_paid</code> or <code>awaiting</code>.</li>
+    <li>The default event bus module is in-memory. It does not persist across processes, so a <code>payment.captured</code> event can be lost if the worker that should react to it is not the same process, or restarts at the wrong moment.</li>
+    <li>A custom payment provider that returns <code>captured</code> straight from <code>authorizePayment</code>, instead of letting the full capture workflow run, can leave Medusa with no order transaction to reconcile against at all, which is exactly the shape of GitHub issue #9887.</li>
+    <li>This exact symptom, a confirmed charge with <code>summary.paid_total</code> stuck at 0, is documented across multiple Medusa issues (#9887, #11766, #2629, #13067) and was acknowledged as fixed upstream in v2.11.1 for the automatic-capture path, which means older versions and custom providers can still hit it.</li>
+  </ul>
+  <p>This is a common source of confusion because the payment gateway's own dashboard shows the charge as settled, so it looks like a Medusa display bug rather than a missing reconciliation step. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot fix this by writing <code>payment_status</code> directly. It is derived, not stored, so a forced write gets recomputed and can desync again on the very next workflow run. The safe pattern is to re-run the same workflow Medusa itself uses to reconcile, re-invoking <code>capturePaymentWorkflow</code> against the existing <code>payment_id</code>. Because the payment is already captured provider side, this cannot double charge. It only repeats the linking and event steps that should have run the first time.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout and we do not overwrite status. We list recently updated orders with their summary and payment_collections expanded, sum the captured amount across every payment on every collection with a pure function, and compare that against the order's reported status and paid total. Behind <code>DRY_RUN</code>, the repair step re-invokes the capture route on each flagged payment, one order at a time, then re-fetches the order to confirm it advanced.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists recent orders with summary and payment collections, sums captured amounts, flags a mismatch against payment_status and paid_total, then either logs it in dry run or re-invokes the capture route to reconcile, otherwise flags to a human if it still does not clear.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List recent orders</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">summary, payment_collections</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="210" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="115" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Sum captured amounts</text>
+      <text x="115" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">across payments.captures</text>
+      <line x1="220" y1="138" x2="262" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="265" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Compare to status</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">payment_status, paid_total</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 677,138 590,170 503,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Mismatch</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">found?</text>
+      <text x="680" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="677" y1="138" x2="705" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, leave alone</text>
+      <line x1="590" y1="170" x2="590" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="633" y="185" width="127" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="696" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Re-invoke capture</text>
+      <text x="696" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">or flag to a human</text>
+      <path d="M705,138 C725,138 696,150 696,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script flags first. Repair re-invokes the same capture route Medusa uses, one payment at a time, and reports what it cannot fix instead of forcing a status write.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend and an admin user with rights to read and capture payments. Exchange the email and password for a JWT once, then send it as a Bearer token on every admin call. Keep everything in environment variables, never hardcoded.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, only logs the order_id/payment_id pairs</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install @medusajs/js-sdk
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, only logs the order_id/payment_id pairs</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Both languages exchange credentials for a token the same way. The Python version talks to the REST route directly with <code>requests</code>. The Node version uses the official <code>@medusajs/js-sdk</code>, which wraps the same login call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import Medusa from "@medusajs/js-sdk";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+
+async function login() {
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List recently updated orders with the fields to reconcile</h3>
+      <p>Ask for orders with <code>payment_status</code>, the order's <code>summary</code>, and every <code>payment_collections</code> entry with its nested payments and captures. Page through with <code>limit</code> and <code>offset</code>. This one call carries everything the decision function needs, no second lookup required.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_FIELDS = (
+    "id,status,payment_status,*summary,"
+    "*payment_collections,*payment_collections.payments,"
+    "payment_collections.payments.captured_at,"
+    "payment_collections.payments.captures,"
+    "payment_collections.payments.captures.raw_amount"
+)
+
+def list_recent_orders(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    out, offset, limit = [], 0, 100
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/orders",
+            params={"fields": ORDER_FIELDS, "limit": limit, "offset": offset},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        out.extend(body["orders"])
+        offset += limit
+        if offset &gt;= body["count"]:
+            return out</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_FIELDS =
+  "id,status,payment_status,*summary," +
+  "*payment_collections,*payment_collections.payments," +
+  "payment_collections.payments.captured_at," +
+  "payment_collections.payments.captures," +
+  "payment_collections.payments.captures.raw_amount";
+
+async function listRecentOrders(sdk) {
+  const out = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const body = await sdk.admin.order.list({ fields: ORDER_FIELDS, limit, offset });
+    out.push(...body.orders);
+    offset += limit;
+    if (offset &gt;= body.count) return out;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no network calls, so it is easy to read and easy to test. Sum <code>captures[].raw_amount.value</code> across every payment on every payment collection to get the total captured. An order is mismatched when money was captured but the order's own status or summary still says otherwise, or when a specific collection disagrees with its own payments.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">UNPAID_STATUSES = {"not_paid", "awaiting"}
+STALE_COLLECTION_STATUSES = {"not_paid", "awaiting", "authorized"}
+
+def detect_payment_status_mismatch(order):
+    """Pure: no I/O. order is a dict with payment_status, summary, payment_collections."""
+    total_captured = 0
+    stale_collection = False
+    for pc in order.get("payment_collections", []) or []:
+        pc_captured = 0
+        for payment in pc.get("payments", []) or []:
+            for capture in payment.get("captures", []) or []:
+                pc_captured += capture.get("raw_amount", {}).get("value", 0)
+        total_captured += pc_captured
+        if pc_captured &gt; 0 and pc.get("status") in STALE_COLLECTION_STATUSES:
+            stale_collection = True
+
+    paid_total = (order.get("summary") or {}).get("raw_paid_total", {}).get("value", 0)
+    payment_status = order.get("payment_status")
+
+    reason = None
+    if total_captured &gt; 0 and payment_status in UNPAID_STATUSES:
+        reason = "captured funds exist but payment_status is still %s" % payment_status
+    elif total_captured &gt; 0 and paid_total == 0:
+        reason = "captured funds exist but summary.raw_paid_total is 0"
+    elif stale_collection:
+        reason = "a payment_collection is captured but its own status has not advanced"
+
+    return {
+        "orderId": order.get("id"),
+        "mismatched": reason is not None,
+        "reason": reason,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const UNPAID_STATUSES = new Set(["not_paid", "awaiting"]);
+const STALE_COLLECTION_STATUSES = new Set(["not_paid", "awaiting", "authorized"]);
+
+export function detectPaymentStatusMismatch(order) {
+  // Pure: no I/O. order has payment_status, summary, payment_collections.
+  let totalCaptured = 0;
+  let staleCollection = false;
+
+  for (const pc of order.payment_collections || []) {
+    let pcCaptured = 0;
+    for (const payment of pc.payments || []) {
+      for (const capture of payment.captures || []) {
+        pcCaptured += capture.raw_amount?.value || 0;
+      }
+    }
+    totalCaptured += pcCaptured;
+    if (pcCaptured &gt; 0 && STALE_COLLECTION_STATUSES.has(pc.status)) {
+      staleCollection = true;
+    }
+  }
+
+  const paidTotal = order.summary?.raw_paid_total?.value || 0;
+  const paymentStatus = order.payment_status;
+
+  let reason = null;
+  if (totalCaptured &gt; 0 && UNPAID_STATUSES.has(paymentStatus)) {
+    reason = `captured funds exist but payment_status is still ${paymentStatus}`;
+  } else if (totalCaptured &gt; 0 && paidTotal === 0) {
+    reason = "captured funds exist but summary.raw_paid_total is 0";
+  } else if (staleCollection) {
+    reason = "a payment_collection is captured but its own status has not advanced";
+  }
+
+  return {
+    orderId: order.id,
+    mismatched: reason !== null,
+    reason,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair by re-invoking the capture route, never by writing status</h3>
+      <p>For each flagged order, call the payment capture route with the existing <code>payment_id</code>. This re-runs the linking step and the <code>payment.captured</code> event that Medusa itself uses to reconcile the order. It is idempotent since the payment is already captured provider side, so it cannot double charge. Then re-fetch the order to confirm <code>payment_status</code> actually moved.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def reinvoke_capture(token, payment_id, amount=None):
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"amount": amount} if amount is not None else {}
+    r = requests.post(
+        f"{BASE_URL}/admin/payments/{payment_id}/capture",
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_order(token, order_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/orders/{order_id}",
+        params={"fields": "id,payment_status,*summary,*payment_collections.payments.captures"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["order"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function reinvokeCapture(sdk, paymentId, amount) {
+  return sdk.admin.payment.capture(paymentId, amount != null ? { amount } : {});
+}
+
+async function getOrder(sdk, orderId) {
+  const body = await sdk.admin.order.retrieve(orderId, {
+    fields: "id,payment_status,*summary,*payment_collections.payments.captures",
+  });
+  return body.order;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. On the first few runs, leave <code>DRY_RUN</code> on so the script only logs the <code>order_id</code>/<code>payment_id</code> pairs it would re-trigger. Read the output, agree with it, then switch it off to let it call the capture route for real. If a mismatch survives the re-invoke, do not force a status write. Log it as needing a human, since that usually means there is no local Payment record to reconcile against at all.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never write <code>payment_status</code> directly. It is derived, not stored, and a forced value gets recomputed on the next workflow run anyway. Always start with <code>DRY_RUN=true</code>, and if re-invoking the capture step does not clear a mismatch, report that order to a human instead of masking it with a status overwrite.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists recent orders with the fields needed to reconcile, flags every mismatch with a pure function, and either logs the repair or re-invokes the capture route depending on <code>DRY_RUN</code>, confirming the result after.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/payment-captured-but-order-not-paid" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_payment_status.py</div>
+      <pre><code class="language-python">"""Find Medusa v2 orders where a payment was captured but the order never
+advanced off not_paid, and repair them the safe way. Never writes payment_status
+directly, since it is derived, not stored. DRY_RUN=true only logs the
+order_id/payment_id pairs it would re-trigger. Safe to run again and again,
+because re-invoking capture on an already captured payment cannot double charge.
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_payment_status")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+UNPAID_STATUSES = {"not_paid", "awaiting"}
+STALE_COLLECTION_STATUSES = {"not_paid", "awaiting", "authorized"}
+
+ORDER_FIELDS = (
+    "id,status,payment_status,*summary,"
+    "*payment_collections,*payment_collections.payments,"
+    "payment_collections.payments.captured_at,"
+    "payment_collections.payments.captures,"
+    "payment_collections.payments.captures.raw_amount"
+)
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def list_recent_orders(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    out, offset, limit = [], 0, 100
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/orders",
+            params={"fields": ORDER_FIELDS, "limit": limit, "offset": offset},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        out.extend(body["orders"])
+        offset += limit
+        if offset >= body["count"]:
+            return out
+
+
+def detect_payment_status_mismatch(order):
+    """Pure: no I/O. order is a dict with payment_status, summary, payment_collections."""
+    total_captured = 0
+    stale_collection = False
+    for pc in order.get("payment_collections", []) or []:
+        pc_captured = 0
+        for payment in pc.get("payments", []) or []:
+            for capture in payment.get("captures", []) or []:
+                pc_captured += capture.get("raw_amount", {}).get("value", 0)
+        total_captured += pc_captured
+        if pc_captured > 0 and pc.get("status") in STALE_COLLECTION_STATUSES:
+            stale_collection = True
+
+    paid_total = (order.get("summary") or {}).get("raw_paid_total", {}).get("value", 0)
+    payment_status = order.get("payment_status")
+
+    reason = None
+    if total_captured > 0 and payment_status in UNPAID_STATUSES:
+        reason = "captured funds exist but payment_status is still %s" % payment_status
+    elif total_captured > 0 and paid_total == 0:
+        reason = "captured funds exist but summary.raw_paid_total is 0"
+    elif stale_collection:
+        reason = "a payment_collection is captured but its own status has not advanced"
+
+    return {
+        "orderId": order.get("id"),
+        "mismatched": reason is not None,
+        "reason": reason,
+    }
+
+
+def flagged_payment_ids(order):
+    """Collect the payment_id values worth re-invoking capture on for this order."""
+    ids = []
+    for pc in order.get("payment_collections", []) or []:
+        for payment in pc.get("payments", []) or []:
+            if payment.get("captured_at") and payment.get("id"):
+                ids.append(payment["id"])
+    return ids
+
+
+def reinvoke_capture(token, payment_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/payments/{payment_id}/capture",
+        json={},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_order(token, order_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/orders/{order_id}",
+        params={"fields": ORDER_FIELDS},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["order"]
+
+
+def run():
+    token = get_token()
+    orders = list_recent_orders(token)
+
+    flagged = []
+    for order in orders:
+        result = detect_payment_status_mismatch(order)
+        if result["mismatched"]:
+            flagged.append((order, result))
+
+    if not flagged:
+        log.info("No payment_status mismatches found across %d order(s).", len(orders))
+        return
+
+    for order, result in flagged:
+        payment_ids = flagged_payment_ids(order)
+        if not payment_ids:
+            log.warning(
+                "Order %s mismatched (%s) but has no local Payment with captured_at set. "
+                "Flagging to a human, not writing status.", order["id"], result["reason"],
+            )
+            continue
+
+        for payment_id in payment_ids:
+            log.info(
+                "Order %s payment %s: %s. %s",
+                order["id"], payment_id, result["reason"],
+                "Would re-invoke capture" if DRY_RUN else "Re-invoking capture",
+            )
+            if not DRY_RUN:
+                reinvoke_capture(token, payment_id)
+
+        if not DRY_RUN:
+            refreshed = get_order(token, order["id"])
+            still_mismatched = detect_payment_status_mismatch(refreshed)["mismatched"]
+            if still_mismatched:
+                log.warning(
+                    "Order %s still mismatched after re-invoking capture. "
+                    "Flagging to a human, not writing status.", order["id"],
+                )
+            else:
+                log.info("Order %s confirmed reconciled. payment_status=%s",
+                         order["id"], refreshed["payment_status"])
+
+    log.info("Done. %d order(s) %s.", len(flagged), "to reconcile" if DRY_RUN else "processed")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-payment-status.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Medusa v2 orders where a payment was captured but the order never
+ * advanced off not_paid, and repair them the safe way. Never writes
+ * payment_status directly, since it is derived, not stored. DRY_RUN=true
+ * only logs the order_id/payment_id pairs it would re-trigger. Safe to run
+ * again and again, because re-invoking capture on an already captured
+ * payment cannot double charge.
+ */
+import { pathToFileURL } from "node:url";
+import Medusa from "@medusajs/js-sdk";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const UNPAID_STATUSES = new Set(["not_paid", "awaiting"]);
+const STALE_COLLECTION_STATUSES = new Set(["not_paid", "awaiting", "authorized"]);
+
+const ORDER_FIELDS =
+  "id,status,payment_status,*summary," +
+  "*payment_collections,*payment_collections.payments," +
+  "payment_collections.payments.captured_at," +
+  "payment_collections.payments.captures," +
+  "payment_collections.payments.captures.raw_amount";
+
+export function detectPaymentStatusMismatch(order) {
+  // Pure: no I/O. order has payment_status, summary, payment_collections.
+  let totalCaptured = 0;
+  let staleCollection = false;
+
+  for (const pc of order.payment_collections || []) {
+    let pcCaptured = 0;
+    for (const payment of pc.payments || []) {
+      for (const capture of payment.captures || []) {
+        pcCaptured += capture.raw_amount?.value || 0;
+      }
+    }
+    totalCaptured += pcCaptured;
+    if (pcCaptured > 0 && STALE_COLLECTION_STATUSES.has(pc.status)) {
+      staleCollection = true;
+    }
+  }
+
+  const paidTotal = order.summary?.raw_paid_total?.value || 0;
+  const paymentStatus = order.payment_status;
+
+  let reason = null;
+  if (totalCaptured > 0 && UNPAID_STATUSES.has(paymentStatus)) {
+    reason = `captured funds exist but payment_status is still ${paymentStatus}`;
+  } else if (totalCaptured > 0 && paidTotal === 0) {
+    reason = "captured funds exist but summary.raw_paid_total is 0";
+  } else if (staleCollection) {
+    reason = "a payment_collection is captured but its own status has not advanced";
+  }
+
+  return {
+    orderId: order.id,
+    mismatched: reason !== null,
+    reason,
+  };
+}
+
+function flaggedPaymentIds(order) {
+  const ids = [];
+  for (const pc of order.payment_collections || []) {
+    for (const payment of pc.payments || []) {
+      if (payment.captured_at && payment.id) ids.push(payment.id);
+    }
+  }
+  return ids;
+}
+
+async function login() {
+  const { default: Medusa } = await import("@medusajs/js-sdk");
+  const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}
+
+async function listRecentOrders(sdk) {
+  const out = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const body = await sdk.admin.order.list({ fields: ORDER_FIELDS, limit, offset });
+    out.push(...body.orders);
+    offset += limit;
+    if (offset >= body.count) return out;
+  }
+}
+
+async function reinvokeCapture(sdk, paymentId) {
+  return sdk.admin.payment.capture(paymentId, {});
+}
+
+async function getOrder(sdk, orderId) {
+  const body = await sdk.admin.order.retrieve(orderId, { fields: ORDER_FIELDS });
+  return body.order;
+}
+
+export async function run() {
+  const sdk = await login();
+  const orders = await listRecentOrders(sdk);
+
+  const flagged = [];
+  for (const order of orders) {
+    const result = detectPaymentStatusMismatch(order);
+    if (result.mismatched) flagged.push([order, result]);
+  }
+
+  if (flagged.length === 0) {
+    console.log(`No payment_status mismatches found across ${orders.length} order(s).`);
+    return;
+  }
+
+  for (const [order, result] of flagged) {
+    const paymentIds = flaggedPaymentIds(order);
+    if (paymentIds.length === 0) {
+      console.warn(
+        `Order ${order.id} mismatched (${result.reason}) but has no local Payment with captured_at set. Flagging to a human, not writing status.`
+      );
+      continue;
+    }
+
+    for (const paymentId of paymentIds) {
+      console.log(
+        `Order ${order.id} payment ${paymentId}: ${result.reason}. ${DRY_RUN ? "Would re-invoke capture" : "Re-invoking capture"}`
+      );
+      if (!DRY_RUN) await reinvokeCapture(sdk, paymentId);
+    }
+
+    if (!DRY_RUN) {
+      const refreshed = await getOrder(sdk, order.id);
+      const stillMismatched = detectPaymentStatusMismatch(refreshed).mismatched;
+      if (stillMismatched) {
+        console.warn(`Order ${order.id} still mismatched after re-invoking capture. Flagging to a human, not writing status.`);
+      } else {
+        console.log(`Order ${order.id} confirmed reconciled. payment_status=${refreshed.payment_status}`);
+      }
+    }
+  }
+
+  console.log(`Done. ${flagged.length} order(s) ${DRY_RUN ? "to reconcile" : "processed"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the one that decides the outcome, <code>detect_payment_status_mismatch</code>. It is pure, no network and no database, so the tests feed in plain order objects built from fixtures and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_payment_status_mismatch.py</div>
+      <pre><code class="language-python">from reconcile_payment_status import detect_payment_status_mismatch
+
+
+def order(**over):
+    base = {
+        "id": "order_1",
+        "payment_status": "captured",
+        "summary": {"raw_paid_total": {"value": 5000}, "raw_transaction_total": {"value": 5000}},
+        "payment_collections": [
+            {
+                "status": "captured",
+                "payments": [
+                    {"captured_at": "2026-07-01T00:00:00Z", "captures": [{"raw_amount": {"value": 5000}}]}
+                ],
+            }
+        ],
+    }
+    base.update(over)
+    return base
+
+
+def test_no_mismatch_when_everything_agrees():
+    result = detect_payment_status_mismatch(order())
+    assert result == {"orderId": "order_1", "mismatched": False, "reason": None}
+
+
+def test_mismatch_when_captured_but_status_not_paid():
+    o = order(payment_status="not_paid")
+    result = detect_payment_status_mismatch(o)
+    assert result["mismatched"] is True
+    assert "payment_status is still not_paid" in result["reason"]
+
+
+def test_mismatch_when_captured_but_paid_total_zero():
+    o = order()
+    o["summary"]["raw_paid_total"]["value"] = 0
+    result = detect_payment_status_mismatch(o)
+    assert result["mismatched"] is True
+    assert "raw_paid_total is 0" in result["reason"]
+
+
+def test_mismatch_when_collection_status_stale():
+    o = order()
+    o["payment_collections"][0]["status"] = "awaiting"
+    result = detect_payment_status_mismatch(o)
+    assert result["mismatched"] is True
+
+
+def test_no_mismatch_when_nothing_captured():
+    o = order(payment_status="not_paid")
+    o["summary"]["raw_paid_total"]["value"] = 0
+    o["payment_collections"][0]["payments"][0]["captures"] = []
+    result = detect_payment_status_mismatch(o)
+    assert result["mismatched"] is False
+
+
+def test_sums_captures_across_multiple_payment_collections():
+    o = order()
+    o["payment_collections"].append({
+        "status": "captured",
+        "payments": [
+            {"captured_at": "2026-07-02T00:00:00Z", "captures": [{"raw_amount": {"value": 1500}}]}
+        ],
+    })
+    result = detect_payment_status_mismatch(o)
+    assert result["mismatched"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">payment-status-mismatch.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectPaymentStatusMismatch } from "./reconcile-payment-status.js";
+
+const order = (over = {}) => ({
+  id: "order_1",
+  payment_status: "captured",
+  summary: { raw_paid_total: { value: 5000 }, raw_transaction_total: { value: 5000 } },
+  payment_collections: [
+    {
+      status: "captured",
+      payments: [
+        { captured_at: "2026-07-01T00:00:00Z", captures: [{ raw_amount: { value: 5000 } }] },
+      ],
+    },
+  ],
+  ...over,
+});
+
+test("no mismatch when everything agrees", () => {
+  const result = detectPaymentStatusMismatch(order());
+  assert.deepEqual(result, { orderId: "order_1", mismatched: false, reason: null });
+});
+
+test("mismatch when captured but status not_paid", () => {
+  const result = detectPaymentStatusMismatch(order({ payment_status: "not_paid" }));
+  assert.equal(result.mismatched, true);
+  assert.match(result.reason, /payment_status is still not_paid/);
+});
+
+test("mismatch when captured but paid_total zero", () => {
+  const o = order();
+  o.summary.raw_paid_total.value = 0;
+  const result = detectPaymentStatusMismatch(o);
+  assert.equal(result.mismatched, true);
+  assert.match(result.reason, /raw_paid_total is 0/);
+});
+
+test("mismatch when collection status stale", () => {
+  const o = order();
+  o.payment_collections[0].status = "awaiting";
+  const result = detectPaymentStatusMismatch(o);
+  assert.equal(result.mismatched, true);
+});
+
+test("no mismatch when nothing captured", () => {
+  const o = order({ payment_status: "not_paid" });
+  o.summary.raw_paid_total.value = 0;
+  o.payment_collections[0].payments[0].captures = [];
+  const result = detectPaymentStatusMismatch(o);
+  assert.equal(result.mismatched, false);
+});
+
+test("sums captures across multiple payment collections", () => {
+  const o = order();
+  o.payment_collections.push({
+    status: "captured",
+    payments: [
+      { captured_at: "2026-07-02T00:00:00Z", captures: [{ raw_amount: { value: 1500 } }] },
+    ],
+  });
+  const result = detectPaymentStatusMismatch(o);
+  assert.equal(result.mismatched, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Custom payment provider</span>
+      <h4>The provider that skipped the linking step</h4>
+      <p>A store ran a custom payment provider that returned <code>captured</code> straight from <code>authorizePayment</code> instead of letting the full capture workflow run through its own steps. Stripe style dashboards on the provider's own side showed every charge settled, but the store's Medusa orders sat on <code>not_paid</code> by the dozen, and the fulfillment team assumed the checkout was broken.</p>
+      <p>Running the reconciler in dry run showed every affected order had a Payment with <code>captured_at</code> set and captures summing above zero, while <code>payment_status</code> never moved. Re-invoking the capture route on each flagged payment ran the linking step that should have run the first time, and the orders cleared without touching a single database row directly.</p>
+    </div>
+    <div class="case">
+      <span class="tag">In-memory event bus</span>
+      <h4>The restart that dropped a batch of payment.captured events</h4>
+      <p>A team running Medusa without the Redis event bus module hit a burst of orders during a promotion. A worker process restarted mid burst, and every <code>payment.captured</code> event queued in memory at that moment was lost with it, even though the captures themselves went through fine at the provider.</p>
+      <p>The script's summed capture check caught the exact orders affected by comparing captured amounts against <code>summary.raw_paid_total</code>. A handful of orders still failed to reconcile after the re-invoke, since they had no local Payment record at all to hang the capture off. The team flagged those to a human instead of forcing a status write over an actual gap in the payment link.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this on a schedule against recently updated orders, or right after a spike in captures. It never writes <code>payment_status</code> directly, so it can never desync the order further. It reconciles the same way Medusa's own workflow does, by re-invoking capture on the payment that actually has the money, then confirms the order caught up. Anything that still disagrees after that gets reported to a human, because that is a missing transaction, not a timing gap a script should paper over.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Medusa order still show not_paid after Stripe confirms the charge?</summary>
+      <p>payment_status is not a field the capture call writes directly. It is derived from the order's payment_collections and their underlying Payment records, reconciled through the order's summary. If the capture step succeeds against the provider but the linking step does not create the matching order transaction, the Payment shows captured_at set while the order never advances off not_paid.</p>
+    </details>
+    <details>
+      <summary>Is it safe to force payment_status to captured with a script?</summary>
+      <p>No. payment_status is a derived value, not a plain column, so writing it directly can desync again on the next workflow run. The safe repair is to re-invoke capturePaymentWorkflow through the existing payment_id, which is idempotent since the payment is already captured provider side, so it cannot double charge.</p>
+    </details>
+    <details>
+      <summary>What if re-running the capture step does not clear the mismatch?</summary>
+      <p>That points to a deeper missing transaction bug rather than a timing gap, the kind reported in GitHub issue #9887 for providers that return captured from authorizePayment without the full workflow running. Flag that order to a human instead of writing status directly, since a forced overwrite would mask the bug rather than fix it.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/medusa/">Browse all Medusa field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #11766: outstanding amount is incorrect after a payment has been captured from a custom payment provider. <a href="https://github.com/medusajs/medusa/issues/11766" rel="noopener">github.com/medusajs/medusa/issues/11766</a></li>
+      <li>medusajs/medusa GitHub issue #9887: Returning "capture" status from authorizePayment does not create order transactions. <a href="https://github.com/medusajs/medusa/issues/9887" rel="noopener">github.com/medusajs/medusa/issues/9887</a></li>
+      <li>medusajs/medusa GitHub issue #2629: Stripe automatic payment capture does not update the order payment status. <a href="https://github.com/medusajs/medusa/issues/2629" rel="noopener">github.com/medusajs/medusa/issues/2629</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Accept Payment in Checkout Flow (Payment Module). <a href="https://docs.medusajs.com/resources/commerce-modules/payment/payment-flow" rel="noopener">docs.medusajs.com/resources/commerce-modules/payment/payment-flow</a></li>
+      <li>Medusa Core Workflows Reference: capturePaymentWorkflow. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/capturePaymentWorkflow" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/capturePaymentWorkflow</a></li>
+      <li>Medusa Admin User Guide: Manage Order Payments in Medusa Admin. <a href="https://docs.medusajs.com/user-guide/orders/payments" rel="noopener">docs.medusajs.com/user-guide/orders/payments</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up a stuck payment status?</h3>
+    <p>If this saved you from a confusing reconciliation or a scary forced status write, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>
