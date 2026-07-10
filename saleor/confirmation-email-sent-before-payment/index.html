@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Saleor Sending the Order Confirmation Email Before Payment Succeeds</title>
+<meta name="description" content="Saleor emails the order confirmation the moment checkoutComplete creates the order, not when the payment actually captures. Learn why customers get a confirmed email for an order that later fails to pay, and build a Python or Node.js script that flags the affected orders for support follow-up.">
+<link rel="canonical" href="https://www.allanninal.dev/saleor/confirmation-email-sent-before-payment/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Saleor Sending the Order Confirmation Email Before Payment Succeeds">
+<meta property="og:description" content="Why send_order_confirmation fires at order creation instead of payment success, and a safe Python or Node.js script that flags orders whose confirmation email arrived before, or without, a successful charge.">
+<meta property="og:url" content="https://www.allanninal.dev/saleor/confirmation-email-sent-before-payment/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/saleor/assets/saleor.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/saleor/confirmation-email-sent-before-payment/#article","headline":"Fix Saleor Sending the Order Confirmation Email Before Payment Succeeds","description":"Saleor's send_order_confirmation fires the moment checkoutComplete creates the order, regardless of whether the chosen payment or transaction has actually reached a captured or charge-success state. A safe Python or Node.js script that flags the affected orders for support follow-up.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/saleor/confirmation-email-sent-before-payment/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Customers & Notifications","keywords":"Saleor order confirmation email, send_order_confirmation, checkoutComplete, OrderEventsEnum PLACED, TransactionEvent CHARGE_SUCCESS, isPaid, orderCancel, Saleor GraphQL, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Saleor field notes","item":"https://www.allanninal.dev/saleor/"},{"@type":"ListItem","position":2,"name":"Order confirmation email sent before payment succeeds","item":"https://www.allanninal.dev/saleor/confirmation-email-sent-before-payment/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my customer get an order confirmation email for an order that was never paid?","acceptedAnswer":{"@type":"Answer","text":"Saleor sends the order confirmation email the moment checkoutComplete creates the order, not when the payment actually succeeds. The order can exist as UNCONFIRMED or UNFULFILLED with isPaid false while the transaction is still pending, failed, or the customer abandoned an off-site payment page. Nothing in core checkout logic gates the email on a successful CHARGE_SUCCESS or AUTHORIZATION_SUCCESS transaction event."}},{"@type":"Question","name":"Can I stop Saleor from sending that email early or un-send it after the fact?","acceptedAnswer":{"@type":"Answer","text":"Not through the API. Saleor has no mutation to un-send or retroactively suppress an email already delivered, and no supported mutation to defer send_order_confirmation until after a charge succeeds. The only durable fix is application-level: gate the notification dispatch behind a webhook or task triggered by a successful TRANSACTION_CHARGE_REQUESTED handling or legacy PAYMENT_CAPTURED event, which is a custom plugin or app change, not something an ops script can patch through GraphQL."}},{"@type":"Question","name":"What should a detection script actually do about orders like this?","acceptedAnswer":{"@type":"Answer","text":"Flag and report only. Compare each order's PLACED event timestamp against its earliest successful charge event, and if the confirmation fired with no successful charge and the order is still unpaid, surface it for support to send a corrected follow-up email. Only under a DRY_RUN=false guard, and only once the order is old enough to clear a grace window for slower payment methods, is it safe to also cancel the order with orderCancel so it does not sit around unpaid forever."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/saleor/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / saleor</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/saleor/">Field notes</a> / Customers &amp; Notifications</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Customers &amp; Notifications</p>
+    <h1>Order confirmation email sent before payment succeeds</h1>
+    <p class="lead">The customer got redirected off to a payment provider, never finished paying, and still landed a cheerful "your order is confirmed" email in their inbox minutes later. Now support is fielding a confused reply about an order that is not actually paid, and possibly never will be. Here is why Saleor sends that email at order creation instead of payment success, and a script that finds every order caught in the gap.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Saleor GraphQL API</span>
+      <span class="chip">Flag and report, not auto-fix</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Saleor's checkout flow calls <code>send_order_confirmation</code> synchronously right after <code>checkoutComplete</code> creates the order, which fires the <code>ORDER_CREATED</code> notification and logs the <code>OrderEventsEnum.PLACED</code> order event, regardless of whether the chosen payment or transaction has actually reached a captured or charge-success state. This is a long-standing, acknowledged gap in Saleor (GitHub issue #3527). When a customer is redirected off-site to a payment provider and abandons or fails that payment, they still receive a confirmation email for an order sitting <code>UNCONFIRMED</code> or <code>UNFULFILLED</code> with <code>isPaid</code> false. There is no mutation to un-send that email. Run a small Python or Node.js script that compares each order's <code>PLACED</code> event timestamp against its transaction timeline, flags the ones where the email fired with no successful charge behind it, and only cancels the truly abandoned ones after a grace window, guarded by dry run. Full code, tests, and the decision logic are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In Saleor, placing an order and paying for an order are two separate events that happen to usually occur close together, but are never actually linked. <code>checkoutComplete</code> converts a checkout into an order, and as part of that same call, Saleor triggers <code>send_order_confirmation</code>, which emits the order confirmation notification and logs the <code>PLACED</code> event. That happens whether the payment behind the checkout captured successfully, is still pending, or failed outright.</p>
+  <p>Most of the time this is invisible, because an on-site card payment authorizes and captures within the same request, so the order is effectively paid by the time the email goes out. But plenty of payment methods do not work that way. A customer redirected to a bank page, a wallet, or a buy-now-pay-later provider might close the tab, get declined on the provider's side, or simply never finish. Saleor already sent the order confirmation before any of that plays out, because the email was never waiting on the transaction in the first place. The order exists in <code>UNCONFIRMED</code> or <code>UNFULFILLED</code> with <code>isPaid</code> false, sometimes forever, while the customer holds an email that says otherwise.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. checkoutComplete creates the order and immediately sends the confirmation email and logs the PLACED event, but the customer is still off-site paying, and if that payment never succeeds the order stays isPaid false while the email already promised a confirmed order.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55603f"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="76" width="150" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="85" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e2611">checkoutComplete</text>
+      <text x="85" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55603f">order is created</text>
+      <line x1="163" y1="109" x2="205" y2="109" stroke="#55603f" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="76" width="150" height="66" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="283" y="99" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Email sent,</text>
+      <text x="283" y="117" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">PLACED logged</text>
+      <text x="283" y="132" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55603f">happens right away</text>
+      <line x1="361" y1="109" x2="403" y2="109" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="382" y="66" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="382" y="136" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">not gated on payment</text>
+      <rect x="406" y="76" width="175" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="493" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Customer still</text>
+      <text x="493" y="117" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">off-site paying</text>
+      <text x="493" y="133" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55603f">bank, wallet, BNPL redirect</text>
+      <line x1="584" y1="109" x2="626" y2="109" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="629" y="76" width="121" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="102" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Payment fails</text>
+      <text x="689" y="120" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">or abandoned</text>
+    </svg>
+    <figcaption>The email and the PLACED event fire at order creation. The payment is still an open question at that moment, and the email never waits for the answer.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>Saleor treats "order placed" and "payment captured" as two independent, non-blocking events. An order can exist in <code>UNCONFIRMED</code> or <code>UNFULFILLED</code> with <code>isPaid</code> false while its transactions are still <code>CHARGE_PENDING</code> or have failed outright.</li>
+    <li><code>checkoutComplete</code> calls <code>send_order_confirmation</code> synchronously as part of creating the order, which emits the <code>ORDER_CREATED</code> or account confirmation notification and logs the <code>OrderEventsEnum.PLACED</code> order event. Nothing in that path checks the payment or transaction state first.</li>
+    <li>Nothing in core checkout logic gates the confirmation email on a successful <code>TransactionEvent</code> of type <code>CHARGE_SUCCESS</code> or <code>AUTHORIZATION_SUCCESS</code>. The dispatch and the payment outcome are simply unrelated code paths.</li>
+    <li>This gap is most visible with payment methods that redirect off-site, such as bank transfers, wallets, or buy-now-pay-later, where there is a real gap in time and control between order creation and the payment actually resolving one way or the other.</li>
+  </ul>
+  <p>This is a long-standing, acknowledged design gap, not a bug specific to any one deployment: see GitHub issue #3527 in the citations, filed years ago and still describing the exact same behavior. Store owners usually find out about it only when a customer replies confused to a confirmation email for an order that later shows unpaid or cancelled.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot fix this by watching the email queue, because the email is not the bug, the missing gate is. The confirmation dispatch and the payment success are two independent signals in Saleor, and nothing in core wiring will ever make the first wait on the second. Detection has to compare timestamps after the fact: when did <code>PLACED</code> fire, and when, if ever, did a <code>CHARGE_SUCCESS</code> transaction event land. There is also no supported way to un-send an email once it is out, so the only honest response to a bad match is to flag it for a human, and only cancel the order outright once you are sure the payment truly is not coming.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The script runs on a schedule. For each order it pulls the order event timeline and the transaction timeline, finds the timestamp of the <code>PLACED</code> event and the earliest successful charge event, and runs a single pure function to classify the order. Orders where the email correctly followed a successful charge are left alone. Orders where the email fired early and payment never arrived are reported for support follow-up, and only once they clear a grace window with still no successful charge does the script mark them eligible for cancellation, itself gated behind a dry run flag.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job pulls each order's PLACED event and charge success timestamp, runs decide_confirmation_timing_issue, and if the order is flagged either reports it for support or, past the grace window with DRY_RUN false, cancels it with orderCancel.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#f2f9e7" stroke="#c6df9f"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">Pull events and</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">transactions per order</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#c6df9f"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e2611">decide_confirmation</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55603f">_timing_issue</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#f2f9e7" stroke="#c6df9f"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e2611">flagged?</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55603f">or ok</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="592" y="198" font-family="sans-serif" font-size="10.5" fill="#55603f" font-weight="700">ok, email matched payment</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#55603f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Report, and</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55603f">orderCancel past grace</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Every order is classified from its own timeline. Only orders past the grace window with no successful charge ever become eligible for cancellation, and only under a dry run guard.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an app token with order read and manage access</h3>
+      <p>Create an app in Saleor Dashboard under Configuration, Apps, and give it permission to read orders. If you plan to use the guarded cancellation path, it also needs permission to manage orders since that path calls <code>orderCancel</code>. Use the resulting app token as a Bearer token, or exchange staff credentials with <code>tokenCreate</code>. Keep the API URL and token in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export CANCEL_GRACE_HOURS="24"
+export DRY_RUN="true"   # start safe, this script never writes without it off</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export SALEOR_API_URL="https://store.saleor.cloud/graphql/"
+export SALEOR_AUTH_TOKEN="your-app-or-staff-token"
+export CANCEL_GRACE_HOURS="24"
+export DRY_RUN="true"   // start safe, this script never writes without it off</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Saleor GraphQL API</h3>
+      <p>Saleor is one GraphQL endpoint. Every call is a POST with a JSON body of <code>{query, variables}</code> and an <code>Authorization: Bearer &lt;token&gt;</code> header. A small helper sends a query and returns the data, raising if Saleor reports errors.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+API_URL = os.environ["SALEOR_API_URL"]
+TOKEN = os.environ["SALEOR_AUTH_TOKEN"]
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const API_URL = process.env.SALEOR_API_URL;
+const TOKEN = process.env.SALEOR_AUTH_TOKEN;
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Page through orders and pull each timeline</h3>
+      <p>First page through <code>orders(first, after)</code> reading <code>id</code>, <code>number</code>, <code>isPaid</code>, <code>status</code>, <code>created</code>, <code>events { type date }</code>, and the legacy <code>payments { transactions { kind isSuccess created } }</code> for older deployments. Then, per order, call the Transactions API to read <code>transactions { events { type createdAt } }</code> for the current transaction model. Page with a cursor so the job handles a large backlog.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDERS_QUERY = """
+query OrdersWithTimeline($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number isPaid status created
+        events { type date }
+        payments { id isActive transactions { id kind isSuccess created } }
+      }
+    }
+  }
+}"""
+
+TRANSACTIONS_QUERY = """
+query OrderTransactions($id: ID!) {
+  order(id: $id) {
+    id isPaid
+    transactions { id events { type createdAt pspReference } }
+  }
+}"""
+
+def all_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"first": 50, "after": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+def fetch_transactions(order_id):
+    return gql(TRANSACTIONS_QUERY, {"id": order_id})["order"]["transactions"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDERS_QUERY = `
+query OrdersWithTimeline($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number isPaid status created
+        events { type date }
+        payments { id isActive transactions { id kind isSuccess created } }
+      }
+    }
+  }
+}`;
+
+const TRANSACTIONS_QUERY = `
+query OrderTransactions($id: ID!) {
+  order(id: $id) {
+    id isPaid
+    transactions { id events { type createdAt pspReference } }
+  }
+}`;
+
+async function* allOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { first: 50, after: cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function fetchTransactions(orderId) {
+  const data = await gql(TRANSACTIONS_QUERY, { id: orderId });
+  return data.order.transactions;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Find the two timestamps that matter</h3>
+      <p>From the order events, take the timestamp of the event where <code>type == PLACED</code>, since that is when <code>send_order_confirmation</code> fired. From the transactions, take the earliest <code>TransactionEvent.createdAt</code> where <code>type == CHARGE_SUCCESS</code>, falling back to the legacy <code>Transaction.created</code> where <code>kind == CAPTURE</code> and <code>isSuccess == true</code> for stores still on the old payments model.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">timeline.py</div>
+      <pre><code class="language-python">def confirm_event_timestamp(order):
+    for event in order.get("events") or []:
+        if event.get("type") == "PLACED":
+            return event.get("date")
+    return None
+
+def charge_success_timestamp(order, transactions):
+    times = [e["createdAt"] for t in (transactions or []) for e in (t.get("events") or [])
+             if e.get("type") == "CHARGE_SUCCESS"]
+    if not times:
+        for payment in order.get("payments") or []:
+            for tx in payment.get("transactions") or []:
+                if tx.get("kind") == "CAPTURE" and tx.get("isSuccess"):
+                    times.append(tx["created"])
+    return min(times) if times else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">timeline.js</div>
+      <pre><code class="language-javascript">export function confirmEventTimestamp(order) {
+  for (const event of order.events || []) {
+    if (event.type === "PLACED") return event.date;
+  }
+  return null;
+}
+
+export function chargeSuccessTimestamp(order, transactions) {
+  let times = [];
+  for (const t of transactions || []) {
+    for (const e of t.events || []) {
+      if (e.type === "CHARGE_SUCCESS") times.push(e.createdAt);
+    }
+  }
+  if (times.length === 0) {
+    for (const payment of order.payments || []) {
+      for (const tx of payment.transactions || []) {
+        if (tx.kind === "CAPTURE" &amp;&amp; tx.isSuccess) times.push(tx.created);
+      }
+    }
+  }
+  return times.length ? times.sort()[0] : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the two timestamps, whether the order is paid, and the current time, and returns one of three outcomes. It never touches the network, so it is easy to test and easy to trust. An order is <code>ok</code> whenever there was never a confirmation to worry about, when the charge succeeded at or before the confirmation, or when it is paid through some other path such as a manual <code>orderMarkAsPaid</code>. It becomes <code>flag_email_premature</code> when the confirmation fired with no successful charge yet and the order is still young, and <code>flag_and_eligible_for_cancel</code> once that same order clears the grace window.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_confirmation_timing_issue(confirm_event_ts, charge_success_ts, order_is_paid,
+                                      now, cancel_grace_hours=24):
+    if confirm_event_ts is None:
+        return "ok"
+    if charge_success_ts is not None and confirm_event_ts &lt;= charge_success_ts:
+        return "ok"
+    if charge_success_ts is not None and confirm_event_ts &gt; charge_success_ts:
+        return "ok"
+    if order_is_paid:
+        return "ok"
+    age_hours = (now - confirm_event_ts).total_seconds() / 3600
+    if age_hours &gt;= cancel_grace_hours:
+        return "flag_and_eligible_for_cancel"
+    return "flag_email_premature"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideConfirmationTimingIssue(confirmEventTs, chargeSuccessTs, orderIsPaid,
+                                               now, cancelGraceHours = 24) {
+  if (confirmEventTs === null || confirmEventTs === undefined) return "ok";
+  if (chargeSuccessTs !== null &amp;&amp; chargeSuccessTs !== undefined &amp;&amp; confirmEventTs &lt;= chargeSuccessTs) return "ok";
+  if (chargeSuccessTs !== null &amp;&amp; chargeSuccessTs !== undefined &amp;&amp; confirmEventTs &gt; chargeSuccessTs) return "ok";
+  if (orderIsPaid) return "ok";
+  const ageHours = (now - confirmEventTs) / (1000 * 60 * 60);
+  if (ageHours &gt;= cancelGraceHours) return "flag_and_eligible_for_cancel";
+  return "flag_email_premature";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report every flagged order, cancel only the eligible ones</h3>
+      <p>For every order the function does not call <code>ok</code>, write a report entry with the order id, number, both timestamps, and current <code>isPaid</code> and status, so support can send a corrected follow-up email. Only for orders that come back <code>flag_and_eligible_for_cancel</code>, and only under <code>DRY_RUN=false</code>, call <code>orderCancel</code> to release the allocation. There is no supported mutation to un-send the email itself, so cancellation is the only corrective write this script ever makes.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">CANCEL_ORDER = """
+mutation CancelUnpaidOrder($id: ID!) {
+  orderCancel(id: $id) {
+    order { id status }
+    errors { field message code }
+  }
+}"""
+
+def cancel_unpaid_order(order_id):
+    result = gql(CANCEL_ORDER, {"id": order_id})["orderCancel"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["order"]["status"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">const CANCEL_ORDER = `
+mutation CancelUnpaidOrder($id: ID!) {
+  orderCancel(id: $id) {
+    order { id status }
+    errors { field message code }
+  }
+}`;
+
+async function cancelUnpaidOrder(orderId) {
+  const result = (await gql(CANCEL_ORDER, { id: orderId })).orderCancel;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.order.status;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script's default behavior is report-only, and it should stay that way for almost every store. Only flip <code>DRY_RUN=false</code> once you have reviewed the exact list of orders it would cancel, and only for orders past the grace window with no successful charge, so a slower payment method such as a bank transfer still in flight never gets cancelled out from under a customer who did pay.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pages through orders, pulls each transaction timeline, classifies every order with the pure function, reports every flagged order, and only cancels the ones eligible for it when <code>DRY_RUN</code> is off.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/saleor-fixes/tree/main/confirmation-email-sent-before-payment" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the saleor-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_confirmation_timing.py</div>
+      <pre><code class="language-python">"""Flag Saleor orders whose confirmation email fired before the payment ever
+succeeded, because send_order_confirmation runs synchronously inside
+checkoutComplete at order-creation time, never gated on a successful
+CHARGE_SUCCESS or AUTHORIZATION_SUCCESS transaction event (see saleor/saleor#3527
+and the TransactionEvent and Order object docs).
+
+This script never un-sends an email, since Saleor has no mutation for that.
+Under DRY_RUN=true (the default) it only logs a report entry for each flagged
+order for support follow-up. Only orders that clear CANCEL_GRACE_HOURS with
+still no successful charge are cancelled with orderCancel, and only when
+DRY_RUN=false. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_confirmation_timing")
+
+API_URL = os.environ.get("SALEOR_API_URL", "https://store.saleor.cloud/graphql/")
+TOKEN = os.environ.get("SALEOR_AUTH_TOKEN", "dummy-token")
+CANCEL_GRACE_HOURS = float(os.environ.get("CANCEL_GRACE_HOURS", "24"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ORDERS_QUERY = """
+query OrdersWithTimeline($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number isPaid status created
+        events { type date }
+        payments { id isActive transactions { id kind isSuccess created } }
+      }
+    }
+  }
+}"""
+
+TRANSACTIONS_QUERY = """
+query OrderTransactions($id: ID!) {
+  order(id: $id) {
+    id isPaid
+    transactions { id events { type createdAt pspReference } }
+  }
+}"""
+
+CANCEL_ORDER = """
+mutation CancelUnpaidOrder($id: ID!) {
+  orderCancel(id: $id) {
+    order { id status }
+    errors { field message code }
+  }
+}"""
+
+
+def gql(query, variables=None):
+    r = requests.post(
+        API_URL,
+        json={"query": query, "variables": variables or {}},
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("errors"):
+        raise RuntimeError(body["errors"])
+    return body["data"]
+
+
+def confirm_event_timestamp(order):
+    for event in order.get("events") or []:
+        if event.get("type") == "PLACED":
+            return event.get("date")
+    return None
+
+
+def charge_success_timestamp(order, transactions):
+    times = [e["createdAt"] for t in (transactions or []) for e in (t.get("events") or [])
+             if e.get("type") == "CHARGE_SUCCESS"]
+    if not times:
+        for payment in order.get("payments") or []:
+            for tx in payment.get("transactions") or []:
+                if tx.get("kind") == "CAPTURE" and tx.get("isSuccess"):
+                    times.append(tx["created"])
+    return min(times) if times else None
+
+
+def decide_confirmation_timing_issue(confirm_event_ts, charge_success_ts, order_is_paid,
+                                      now, cancel_grace_hours=24):
+    if confirm_event_ts is None:
+        return "ok"
+    if charge_success_ts is not None and confirm_event_ts &lt;= charge_success_ts:
+        return "ok"
+    if charge_success_ts is not None and confirm_event_ts &gt; charge_success_ts:
+        return "ok"
+    if order_is_paid:
+        return "ok"
+    age_hours = (now - confirm_event_ts).total_seconds() / 3600
+    if age_hours &gt;= cancel_grace_hours:
+        return "flag_and_eligible_for_cancel"
+    return "flag_email_premature"
+
+
+def parse_iso(value):
+    return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def all_orders():
+    cursor = None
+    while True:
+        data = gql(ORDERS_QUERY, {"first": 50, "after": cursor})["orders"]
+        for edge in data["edges"]:
+            yield edge["node"]
+        if not data["pageInfo"]["hasNextPage"]:
+            return
+        cursor = data["pageInfo"]["endCursor"]
+
+
+def fetch_transactions(order_id):
+    return gql(TRANSACTIONS_QUERY, {"id": order_id})["order"]["transactions"]
+
+
+def cancel_unpaid_order(order_id):
+    result = gql(CANCEL_ORDER, {"id": order_id})["orderCancel"]
+    if result["errors"]:
+        raise RuntimeError(result["errors"])
+    return result["order"]["status"]
+
+
+def run():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    flagged = 0
+    cancelled = 0
+
+    for order in all_orders():
+        confirm_iso = confirm_event_timestamp(order)
+        if confirm_iso is None:
+            continue
+
+        transactions = fetch_transactions(order["id"])
+        charge_iso = charge_success_timestamp(order, transactions)
+
+        confirm_ts = parse_iso(confirm_iso)
+        charge_ts = parse_iso(charge_iso) if charge_iso else None
+
+        outcome = decide_confirmation_timing_issue(
+            confirm_ts, charge_ts, order.get("isPaid", False), now, CANCEL_GRACE_HOURS
+        )
+        if outcome == "ok":
+            continue
+
+        flagged += 1
+        report_entry = {
+            "orderId": order["id"],
+            "number": order["number"],
+            "confirmEventTs": confirm_iso,
+            "chargeSuccessTs": charge_iso,
+            "isPaid": order.get("isPaid", False),
+            "status": order.get("status"),
+            "outcome": outcome,
+        }
+        log.warning("Confirmation timing issue found. %s", report_entry)
+
+        if outcome == "flag_and_eligible_for_cancel":
+            if not DRY_RUN:
+                cancel_unpaid_order(order["id"])
+                cancelled += 1
+            else:
+                log.info("Order %s would be cancelled (dry run).", order["number"])
+
+    log.info("Done. %d order(s) flagged, %d cancelled.", flagged, cancelled)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-confirmation-timing.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Saleor orders whose confirmation email fired before the payment ever
+ * succeeded, because send_order_confirmation runs synchronously inside
+ * checkoutComplete at order-creation time, never gated on a successful
+ * CHARGE_SUCCESS or AUTHORIZATION_SUCCESS transaction event (see saleor/saleor#3527
+ * and the TransactionEvent and Order object docs).
+ *
+ * This script never un-sends an email, since Saleor has no mutation for that.
+ * Under DRY_RUN=true (the default) it only logs a report entry for each flagged
+ * order for support follow-up. Only orders that clear CANCEL_GRACE_HOURS with
+ * still no successful charge are cancelled with orderCancel, and only when
+ * DRY_RUN=false. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/saleor/confirmation-email-sent-before-payment/
+ */
+import { pathToFileURL } from "node:url";
+
+const API_URL = process.env.SALEOR_API_URL || "https://store.saleor.cloud/graphql/";
+const TOKEN = process.env.SALEOR_AUTH_TOKEN || "dummy-token";
+const CANCEL_GRACE_HOURS = Number(process.env.CANCEL_GRACE_HOURS || 24);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function confirmEventTimestamp(order) {
+  for (const event of order.events || []) {
+    if (event.type === "PLACED") return event.date;
+  }
+  return null;
+}
+
+export function chargeSuccessTimestamp(order, transactions) {
+  let times = [];
+  for (const t of transactions || []) {
+    for (const e of t.events || []) {
+      if (e.type === "CHARGE_SUCCESS") times.push(e.createdAt);
+    }
+  }
+  if (times.length === 0) {
+    for (const payment of order.payments || []) {
+      for (const tx of payment.transactions || []) {
+        if (tx.kind === "CAPTURE" &amp;&amp; tx.isSuccess) times.push(tx.created);
+      }
+    }
+  }
+  return times.length ? times.sort()[0] : null;
+}
+
+export function decideConfirmationTimingIssue(confirmEventTs, chargeSuccessTs, orderIsPaid,
+                                               now, cancelGraceHours = 24) {
+  if (confirmEventTs === null || confirmEventTs === undefined) return "ok";
+  if (chargeSuccessTs !== null &amp;&amp; chargeSuccessTs !== undefined &amp;&amp; confirmEventTs &lt;= chargeSuccessTs) return "ok";
+  if (chargeSuccessTs !== null &amp;&amp; chargeSuccessTs !== undefined &amp;&amp; confirmEventTs &gt; chargeSuccessTs) return "ok";
+  if (orderIsPaid) return "ok";
+  const ageHours = (now - confirmEventTs) / (1000 * 60 * 60);
+  if (ageHours &gt;= cancelGraceHours) return "flag_and_eligible_for_cancel";
+  return "flag_email_premature";
+}
+
+async function gql(query, variables = {}) {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`Saleor ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(JSON.stringify(body.errors));
+  return body.data;
+}
+
+const ORDERS_QUERY = `
+query OrdersWithTimeline($first: Int!, $after: String) {
+  orders(first: $first, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    edges {
+      node {
+        id number isPaid status created
+        events { type date }
+        payments { id isActive transactions { id kind isSuccess created } }
+      }
+    }
+  }
+}`;
+
+const TRANSACTIONS_QUERY = `
+query OrderTransactions($id: ID!) {
+  order(id: $id) {
+    id isPaid
+    transactions { id events { type createdAt pspReference } }
+  }
+}`;
+
+const CANCEL_ORDER = `
+mutation CancelUnpaidOrder($id: ID!) {
+  orderCancel(id: $id) {
+    order { id status }
+    errors { field message code }
+  }
+}`;
+
+async function* allOrders() {
+  let cursor = null;
+  while (true) {
+    const data = (await gql(ORDERS_QUERY, { first: 50, after: cursor })).orders;
+    for (const edge of data.edges) yield edge.node;
+    if (!data.pageInfo.hasNextPage) return;
+    cursor = data.pageInfo.endCursor;
+  }
+}
+
+async function fetchTransactions(orderId) {
+  const data = await gql(TRANSACTIONS_QUERY, { id: orderId });
+  return data.order.transactions;
+}
+
+async function cancelUnpaidOrder(orderId) {
+  const result = (await gql(CANCEL_ORDER, { id: orderId })).orderCancel;
+  if (result.errors.length) throw new Error(JSON.stringify(result.errors));
+  return result.order.status;
+}
+
+export async function run() {
+  const now = Date.now();
+  let flagged = 0;
+  let cancelled = 0;
+
+  for await (const order of allOrders()) {
+    const confirmIso = confirmEventTimestamp(order);
+    if (confirmIso === null) continue;
+
+    const transactions = await fetchTransactions(order.id);
+    const chargeIso = chargeSuccessTimestamp(order, transactions);
+
+    const confirmTs = Date.parse(confirmIso);
+    const chargeTs = chargeIso ? Date.parse(chargeIso) : null;
+
+    const outcome = decideConfirmationTimingIssue(
+      confirmTs, chargeTs, order.isPaid === true, now, CANCEL_GRACE_HOURS
+    );
+    if (outcome === "ok") continue;
+
+    flagged++;
+    const reportEntry = {
+      orderId: order.id,
+      number: order.number,
+      confirmEventTs: confirmIso,
+      chargeSuccessTs: chargeIso,
+      isPaid: order.isPaid === true,
+      status: order.status,
+      outcome,
+    };
+    console.warn("Confirmation timing issue found.", reportEntry);
+
+    if (outcome === "flag_and_eligible_for_cancel") {
+      if (!DRY_RUN) {
+        await cancelUnpaidOrder(order.id);
+        cancelled++;
+      } else {
+        console.log(`Order ${order.number} would be cancelled (dry run).`);
+      }
+    }
+  }
+
+  console.log(`Done. ${flagged} order(s) flagged, ${cancelled} cancelled.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get reported to support and which ones ever become eligible for cancellation. Because <code>decide_confirmation_timing_issue</code> is pure, taking the current time as an argument instead of reading the clock itself, the test needs no network and no Saleor account. It just feeds in plain timestamps and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_confirmation_timing.py</div>
+      <pre><code class="language-python">import datetime
+from flag_confirmation_timing import decide_confirmation_timing_issue
+
+NOW = datetime.datetime(2026, 7, 10, tzinfo=datetime.timezone.utc)
+
+
+def hours_ago(h):
+    return NOW - datetime.timedelta(hours=h)
+
+
+def test_ok_when_no_confirmation_was_ever_sent():
+    result = decide_confirmation_timing_issue(None, hours_ago(1), False, NOW)
+    assert result == "ok"
+
+
+def test_ok_when_charge_succeeded_before_confirmation():
+    confirm = hours_ago(1)
+    charge = hours_ago(2)
+    result = decide_confirmation_timing_issue(confirm, charge, False, NOW)
+    assert result == "ok"
+
+
+def test_ok_when_charge_succeeded_after_confirmation_same_request():
+    confirm = hours_ago(2)
+    charge = hours_ago(1)
+    result = decide_confirmation_timing_issue(confirm, charge, False, NOW)
+    assert result == "ok"
+
+
+def test_ok_when_no_charge_but_order_is_paid_another_way():
+    result = decide_confirmation_timing_issue(hours_ago(30), None, True, NOW)
+    assert result == "ok"
+
+
+def test_flag_email_premature_when_recent_and_unpaid_with_no_charge():
+    result = decide_confirmation_timing_issue(hours_ago(1), None, False, NOW, cancel_grace_hours=24)
+    assert result == "flag_email_premature"
+
+
+def test_flag_and_eligible_for_cancel_past_grace_window():
+    result = decide_confirmation_timing_issue(hours_ago(25), None, False, NOW, cancel_grace_hours=24)
+    assert result == "flag_and_eligible_for_cancel"
+
+
+def test_exactly_at_grace_window_is_eligible_for_cancel():
+    result = decide_confirmation_timing_issue(hours_ago(24), None, False, NOW, cancel_grace_hours=24)
+    assert result == "flag_and_eligible_for_cancel"
+
+
+def test_custom_grace_window_is_respected():
+    result = decide_confirmation_timing_issue(hours_ago(5), None, False, NOW, cancel_grace_hours=4)
+    assert result == "flag_and_eligible_for_cancel"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">timing.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideConfirmationTimingIssue } from "./flag-confirmation-timing.js";
+
+const NOW = new Date("2026-07-10T00:00:00Z").getTime();
+const hoursAgo = (h) =&gt; NOW - h * 60 * 60 * 1000;
+
+test("ok when no confirmation was ever sent", () =&gt; {
+  const result = decideConfirmationTimingIssue(null, hoursAgo(1), false, NOW);
+  assert.equal(result, "ok");
+});
+
+test("ok when charge succeeded before confirmation", () =&gt; {
+  const confirm = hoursAgo(1);
+  const charge = hoursAgo(2);
+  assert.equal(decideConfirmationTimingIssue(confirm, charge, false, NOW), "ok");
+});
+
+test("ok when charge succeeded after confirmation in the same request", () =&gt; {
+  const confirm = hoursAgo(2);
+  const charge = hoursAgo(1);
+  assert.equal(decideConfirmationTimingIssue(confirm, charge, false, NOW), "ok");
+});
+
+test("ok when no charge but order is paid another way", () =&gt; {
+  assert.equal(decideConfirmationTimingIssue(hoursAgo(30), null, true, NOW), "ok");
+});
+
+test("flag_email_premature when recent and unpaid with no charge", () =&gt; {
+  const result = decideConfirmationTimingIssue(hoursAgo(1), null, false, NOW, 24);
+  assert.equal(result, "flag_email_premature");
+});
+
+test("flag_and_eligible_for_cancel past the grace window", () =&gt; {
+  const result = decideConfirmationTimingIssue(hoursAgo(25), null, false, NOW, 24);
+  assert.equal(result, "flag_and_eligible_for_cancel");
+});
+
+test("exactly at the grace window is eligible for cancel", () =&gt; {
+  const result = decideConfirmationTimingIssue(hoursAgo(24), null, false, NOW, 24);
+  assert.equal(result, "flag_and_eligible_for_cancel");
+});
+
+test("a custom grace window is respected", () =&gt; {
+  const result = decideConfirmationTimingIssue(hoursAgo(5), null, false, NOW, 4);
+  assert.equal(result, "flag_and_eligible_for_cancel");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Bank redirect abandoned</span>
+      <h4>The customer closed the tab and kept the email</h4>
+      <p>A store offering a redirect-based bank payment method saw a spike in support tickets from customers asking why an item they never finished paying for was "confirmed." The confirmation email had gone out the instant the order was created, well before the customer even reached the bank's page, and a good number of them simply abandoned it there.</p>
+      <p>Running the flag script surfaced every order where the <code>PLACED</code> event had no successful charge behind it. Support used the report to send each customer a short, honest follow-up explaining the payment never completed, and the orders that stayed unpaid past 24 hours were cancelled automatically, freeing the stock they had been holding.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Declined off-site wallet</span>
+      <h4>The wallet declined the charge two minutes after the email</h4>
+      <p>A merchant using a wallet-based payment provider found that a subset of orders were marked <code>isPaid: false</code> for days despite customers reporting they received the confirmation email right away. The wallet provider's decline came back a full two minutes after Saleor had already created the order and dispatched the notification, so the timing gap was there in every single case.</p>
+      <p>The team scheduled the script hourly. Orders flagged as <code>flag_email_premature</code> gave support a same-day heads-up on likely declines, and only the ones that aged past the grace window with no successful charge were ever cancelled, keeping the automation from touching an order some slower payment method might still legitimately complete.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a confirmation email that went out ahead of a failed or abandoned payment stops being a silent support burden. It shows up in a report within one run of the timing gap existing, with both timestamps and the current payment state right there for whoever follows up. No email ever gets un-sent, since Saleor has no way to do that, but the honest correction, and the cancellation of orders that truly never got paid, both happen on a schedule instead of only when a confused customer writes in.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my customer get an order confirmation email for an order that was never paid?</summary>
+      <p>Saleor sends the order confirmation email the moment checkoutComplete creates the order, not when the payment actually succeeds. The order can exist as UNCONFIRMED or UNFULFILLED with isPaid false while the transaction is still pending, failed, or the customer abandoned an off-site payment page. Nothing in core checkout logic gates the email on a successful CHARGE_SUCCESS or AUTHORIZATION_SUCCESS transaction event.</p>
+    </details>
+    <details>
+      <summary>Can I stop Saleor from sending that email early or un-send it after the fact?</summary>
+      <p>Not through the API. Saleor has no mutation to un-send or retroactively suppress an email already delivered, and no supported mutation to defer send_order_confirmation until after a charge succeeds. The only durable fix is application-level: gate the notification dispatch behind a webhook or task triggered by a successful TRANSACTION_CHARGE_REQUESTED handling or legacy PAYMENT_CAPTURED event, which is a custom plugin or app change, not something an ops script can patch through GraphQL.</p>
+    </details>
+    <details>
+      <summary>What should a detection script actually do about orders like this?</summary>
+      <p>Flag and report only. Compare each order's PLACED event timestamp against its earliest successful charge event, and if the confirmation fired with no successful charge and the order is still unpaid, surface it for support to send a corrected follow-up email. Only under a DRY_RUN=false guard, and only once the order is old enough to clear a grace window for slower payment methods, is it safe to also cancel the order with orderCancel so it does not sit around unpaid forever.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/saleor/">Browse all Saleor field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Order confirmation email is sent before order is paid. <a href="https://github.com/saleor/saleor/issues/3527" rel="noopener">github.com/saleor/saleor/issues/3527</a></li>
+      <li>How to receive notification about customer's order? <a href="https://github.com/saleor/saleor/issues/4932" rel="noopener">github.com/saleor/saleor/issues/4932</a></li>
+      <li>Saleor Commerce Documentation: Order Status. <a href="https://docs.saleor.io/developer/checkout/order-status" rel="noopener">docs.saleor.io/developer/checkout/order-status</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Saleor Commerce Documentation: the TransactionEvent object. <a href="https://docs.saleor.io/api-reference/payments/objects/transaction-event" rel="noopener">docs.saleor.io/api-reference/payments/objects/transaction-event</a></li>
+      <li>Saleor Commerce Documentation: the TransactionEventTypeEnum enum. <a href="https://docs.saleor.io/api-reference/payments/enums/transaction-event-type-enum" rel="noopener">docs.saleor.io/api-reference/payments/enums/transaction-event-type-enum</a></li>
+      <li>Saleor Commerce Documentation: the Order object. <a href="https://docs.saleor.io/api-reference/orders/objects/order" rel="noopener">docs.saleor.io/api-reference/orders/objects/order</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Saleor checkout, payments, notifications, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up a batch of confusing emails?</h3>
+    <p>If this saved you from a customer replying confused to a confirmation email that never should have gone out yet, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/saleor/">Back to all Saleor field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Saleor.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/saleor/assets/saleor.js" defer></script>
+</body>
+</html>
