@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Webhook Firing Duplicate Events Within the Same Second</title>
+<meta name="description" content="A BigCommerce store/order/statusUpdated webhook fires two near-identical events for the same order within the same second. Learn why at-least-once delivery and multi-hook fan-out cause this, and build a Python or Node.js idempotency check that drops the duplicate safely.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Webhook Firing Duplicate Events Within the Same Second">
+<meta property="og:description" content="Why a store/order/statusUpdated webhook can fire twice for the same order in the same second, and a safe Python or Node.js idempotency check plus duplicate hook cleanup.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/#article","headline":"Fix BigCommerce Webhook Firing Duplicate Events Within the Same Second","description":"Why BigCommerce's at-least-once webhook delivery and multi-hook fan-out can send two near-identical store/order/statusUpdated events for the same order within the same second, and a safe Python or Node.js idempotency check that drops the duplicate without touching order state.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Webhooks","keywords":"BigCommerce webhooks, store/order/statusUpdated, duplicate events, idempotency, at-least-once delivery, v3/hooks, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Webhook fires duplicate events within the same second","item":"https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my BigCommerce webhook fire twice for the same order within a second?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce guarantees at-least-once delivery, not exactly-once. If your endpoint is slow, times out, or its 200 OK response is lost in transit, the retry mechanism re-sends the same logical event. Separately, one admin or API action can legitimately trigger more than one webhook subscription, so two distinct, valid events for the same order can land within the same second."}},{"@type":"Question","name":"Can I trust the hash field on the webhook payload to detect duplicates?","acceptedAnswer":{"@type":"Answer","text":"Not by itself. The hash is not guaranteed to be stable or independently verifiable across retries. Instead, key an idempotency check on store_id, resource_id, and new_status_id, with created_at rounded into a one to two second bucket, and confirm the authoritative state with a GET to the order endpoint when you need certainty."}},{"@type":"Question","name":"Should I automatically delete a webhook subscription if I see duplicate deliveries?","acceptedAnswer":{"@type":"Answer","text":"Only if you first confirm there are genuinely two active hook registrations with the same scope and destination via GET /v3/hooks. If there is only one hook, the duplicates are retries, not fan-out, and there is nothing to delete. Deleting a hook is a real, destructive action, so keep it behind a DRY_RUN guard and only ever remove the redundant duplicate, keeping the oldest id."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Webhooks</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Webhooks</p>
+    <h1>BigCommerce webhook fires duplicate events within the same second</h1>
+    <p class="lead">Your endpoint logs two store/order/statusUpdated calls for the same order, same status, a fraction of a second apart. Nothing in your store looks broken, the order's real status is correct, but your handler ran twice. BigCommerce's webhook service is at-least-once, not exactly-once, and a single admin action can legitimately trigger more than one subscription at once. Here is why that happens and a small idempotency check that drops the duplicate without ever touching order state.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce v3 Hooks API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's webhook service guarantees at-least-once delivery, not exactly-once. If your endpoint is slow, times out, or its 200 OK response is lost in transit, the retry mechanism re-sends the identical event. Separately, a single order status change can legitimately fire more than one webhook subscription in the same second, each with its own <code>created_at</code> and a <code>hash</code> that is not guaranteed stable, so hash alone cannot prove a duplicate. Keep a short-lived idempotency store keyed on <code>(store_id, resource_id, new_status_id)</code> with <code>created_at</code> rounded into a one to two second bucket, drop anything that matches an entry already seen, and confirm the order's real state with <code>GET /v2/orders/{order_id}</code> when you need certainty. Also check <code>GET /v3/hooks</code> for a duplicate hook registration pointed at the same destination, a common cause of doubled delivery. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce webhooks are not a guarantee that your endpoint receives each logical event exactly once. The delivery contract is at-least-once: if your handler is slow, if the connection times out mid-response, or if the 200 OK your endpoint sent back gets lost on the way to BigCommerce, the delivery is treated as failed and the same event is retried. From your side, that shows up as the same <code>store/order/statusUpdated</code> payload for the same order id and the same <code>status_id</code> arriving twice, sometimes less than a second apart.</p>
+  <p>There is a second, entirely legitimate cause that looks identical in your logs. A single action in the admin or through the API, an order status change plus its associated order-updated action, for instance, can trigger more than one distinct webhook subscription at once. Two different, valid events for the same order can land in your endpoint within the same second, each with its own <code>created_at</code> and its own <code>hash</code>. Because that hash is not guaranteed to be stable or independently verifiable, you cannot lean on it alone to tell a true retry-duplicate apart from two separate, both-real events. Either way, the result your handler sees is the same: near-identical payloads, same order, same status, landing almost simultaneously.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. BigCommerce sends a webhook, the endpoint is slow or its 200 OK response is lost, so BigCommerce retries and delivers the same logical event a second time, both landing within the same one second window at the consumer.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="72" width="150" height="64" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Order status</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">changes once</text>
+      <line x1="163" y1="104" x2="205" y2="104" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="72" width="165" height="64" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="290" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Webhook POST #1</text>
+      <text x="290" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">200 OK lost in transit</text>
+      <line x1="376" y1="104" x2="445" y2="104" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#8635;</text>
+      <text x="410" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Retry fires</text>
+      <rect x="448" y="72" width="165" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="530" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Webhook POST #2</text>
+      <text x="530" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">same order, same status</text>
+      <line x1="613" y1="104" x2="655" y2="104" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="658" y="72" width="95" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="705" y="98" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Handler</text>
+      <text x="705" y="115" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">runs twice</text>
+      <text x="410" y="175" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">Both requests land inside the same one second window</text>
+      <line x1="150" y1="150" x2="700" y2="150" stroke="#8a93a8" stroke-width="1.4" stroke-dasharray="4 4"></line>
+    </svg>
+    <figcaption>BigCommerce's at-least-once contract means a slow or lost acknowledgement gets retried, sending the identical event again within the same second.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>Your webhook receiver is slow to respond, or hangs past BigCommerce's timeout, so BigCommerce treats the first delivery as failed and retries it, even though your handler may have already started processing it.</li>
+    <li>Your endpoint's 200 OK response is sent but lost in transit, a network blip on either side, so BigCommerce never sees the acknowledgement and retries a delivery you actually already received.</li>
+    <li>A single admin or API action legitimately fires more than one webhook subscription, for example an order status change plus an associated order-updated action, producing two distinct, both-valid events for the same order within the same second.</li>
+    <li>Two active hook registrations exist for the same <code>scope</code>, such as <code>store/order/statusUpdated</code>, pointed at the same <code>destination</code> URL, a common misconfiguration that doubles every delivery for that scope.</li>
+    <li>The top-level <code>hash</code> on the payload is not guaranteed to be stable or independently verifiable across retries, so treating a matching hash as proof of a duplicate, or a differing hash as proof of a new event, is not reliable on its own.</li>
+  </ul>
+  <p>This is a recurring theme in BigCommerce support threads: merchants see the exact same order status update delivered two or more times in the same second, with the order itself only having changed once. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The webhook payload alone cannot tell you whether an event is a duplicate. What can is a short idempotency window keyed on the fields that actually identify "this state transition happened," namely <code>resource_id</code> and <code>new_status_id</code>, with <code>created_at</code> rounded into a one to two second bucket. If you have already processed that key inside the window, drop the new delivery. If you need to be certain about the order's current state rather than trust the payload, call <code>GET /v2/orders/{order_id}</code> and compare <code>status_id</code> and <code>date_modified</code> against what you last recorded. This is a redundant-delivery problem, not an order-data problem, so the fix never touches the order itself.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how BigCommerce sends webhooks and we do not touch order state. We add an idempotency check in front of the handler, and a separate, guarded check for duplicate hook registrations that would otherwise double every delivery.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. An inbound webhook POST is checked against a short-lived idempotency store keyed on resource id and new status id with created at rounded to a bucket. If the key was already seen within the window it is dropped as a duplicate, otherwise it is recorded and processed. A separate check on v3 hooks flags or removes a duplicate hook registration pointed at the same destination.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Inbound POST</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">store/order/statusUpdated</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Read payload</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">resource_id, new_status_id</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Idempotency store</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">key, last seen created_at</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Within window</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">of last seen?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">yes, drop as duplicate</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Process event</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">record key, run handler</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>A new key inside the window is processed and recorded. A repeat key inside the window is dropped as a duplicate before your handler ever runs.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (read) scope to confirm order state, and Webhooks (modify) if you want the script to be able to clean up a duplicate hook registration. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DEDUPE_WINDOW_SECONDS="2"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DEDUPE_WINDOW_SECONDS="2"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the REST Management API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET, and we reuse it against the V2 order endpoint and the V3 hooks endpoint.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_delete(path):
+    r = requests.delete(f"{API_BASE}{path}", headers=HEADERS, timeout=30)
+    r.raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcDelete(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "DELETE", headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>The heart of the fix is a lookup against a short-lived idempotency store, keyed on <code>(resource_id, new_status_id)</code>, holding the last-seen <code>created_at</code> epoch for that key. If a prior entry exists and the new event's timestamp is within the dedupe window of it, it is a duplicate and gets dropped. Otherwise the store is updated and the event is processed. Because the function only touches the dict you pass it, it needs no network and no store to unit test.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def is_duplicate_webhook_event(
+    seen_events: dict, resource_id: int, new_status_id: int,
+    created_at_epoch: float, window_seconds: float = 2.0
+) -&gt; bool:
+    key = (resource_id, new_status_id)
+    last_seen = seen_events.get(key)
+    if last_seen is not None and abs(created_at_epoch - last_seen) &lt;= window_seconds:
+        return True
+    seen_events[key] = created_at_epoch
+    return False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function isDuplicateWebhookEvent(
+  seenEvents, resourceId, newStatusId, createdAtEpoch, windowSeconds = 2.0
+) {
+  const key = `${resourceId}:${newStatusId}`;
+  const lastSeen = seenEvents.get(key);
+  if (lastSeen !== undefined &amp;&amp; Math.abs(createdAtEpoch - lastSeen) &lt;= windowSeconds) {
+    return true;
+  }
+  seenEvents.set(key, createdAtEpoch);
+  return false;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Confirm the authoritative order state when it matters</h3>
+      <p>The idempotency check alone is enough to stop a handler from double-processing. When you need certainty about what BigCommerce currently believes, rather than trusting the payload, call <code>GET /v2/orders/{order_id}</code> and compare its <code>status_id</code> and <code>date_modified</code> against the last value you recorded for that order.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">confirm.py</div>
+      <pre><code class="language-python">def fetch_order_state(order_id):
+    order = bc_get(f"/v2/orders/{order_id}")
+    return {"status_id": order.get("status_id"), "date_modified": order.get("date_modified")}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">confirm.js</div>
+      <pre><code class="language-javascript">async function fetchOrderState(orderId) {
+  const order = await bcGet(`/v2/orders/${orderId}`);
+  return { statusId: order.status_id, dateModified: order.date_modified };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Check for a duplicate hook registration</h3>
+      <p>List every registered hook with <code>GET /v3/hooks</code> and group by <code>scope</code> plus <code>destination</code>. If two active hooks share the same scope, for example <code>store/order/statusUpdated</code>, and the same destination URL, every logical event to that endpoint is being delivered twice by design, not by a retry. That is a configuration bug, and it is worth fixing at the source.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">hooks.py</div>
+      <pre><code class="language-python">def find_duplicate_hooks(scope, destination):
+    hooks = bc_get("/v3/hooks")
+    data = hooks.get("data", []) if isinstance(hooks, dict) else hooks
+    matches = [h for h in data if h.get("scope") == scope and h.get("destination") == destination]
+    matches.sort(key=lambda h: h.get("id", 0))
+    return matches</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">hooks.js</div>
+      <pre><code class="language-javascript">async function findDuplicateHooks(scope, destination) {
+  const hooks = await bcGet("/v3/hooks");
+  const data = Array.isArray(hooks) ? hooks : hooks.data || [];
+  const matches = data.filter((h) =&gt; h.scope === scope &amp;&amp; h.destination === destination);
+  matches.sort((a, b) =&gt; (a.id || 0) - (b.id || 0));
+  return matches;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The full script processes each inbound webhook payload through the idempotency check first. Anything flagged a duplicate is logged and dropped before your business logic runs. Separately, it lists <code>/v3/hooks</code> once, and if it finds more than one active hook on the same scope and destination, it keeps the oldest <code>id</code> and, only when <code>DRY_RUN</code> is false, deletes the redundant one with <code>DELETE /v3/hooks/{hook_id}</code>. When <code>DRY_RUN</code> is true, which is the default, it only reports the duplicate hooks and logs suspected duplicate deliveries, order id, status_id, timestamps, and hash, for manual review. It never writes to an order, because BigCommerce already applied the status_id correctly; the bug is redundant notification, not redundant mutation.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. There is no BigCommerce endpoint to de-duplicate a delivery after the fact, so the only real write this script ever makes is deleting a confirmed redundant hook registration, and only after your own idempotency handling is already in place. Never use this job to alter an order's status_id, that value was already set correctly by BigCommerce.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, keeps the idempotency store in memory for the life of the process, logs what it does, respects the dry run flag, and only deletes a hook registration when it has confirmed a genuine duplicate scope and destination pair.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/webhook-duplicate-events-same-second" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">dedupe_same_second_webhooks.py</div>
+      <pre><code class="language-python">"""Drop duplicate BigCommerce store/order/statusUpdated events fired in the same second.
+
+BigCommerce's webhook service guarantees at-least-once delivery, not exactly-once.
+If your endpoint is slow, times out, or its 200 OK response is lost in transit, the
+retry mechanism re-sends the same logical event. Separately, a single admin or API
+action can legitimately trigger more than one webhook subscription in the same
+second, and each carries its own created_at and a hash that is not guaranteed
+stable, so hash alone cannot prove a duplicate. This script keeps a short-lived
+idempotency store keyed on (resource_id, new_status_id) with created_at rounded
+into a window, drops repeats inside that window, confirms the order's real state
+with GET /v2/orders/{id} when needed, and separately checks GET /v3/hooks for a
+duplicate hook registration on the same scope and destination, which is a common
+misconfiguration that doubles every delivery. It never writes to order state.
+
+Guide: https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dedupe_same_second_webhooks")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+DEDUPE_WINDOW_SECONDS = float(os.environ.get("DEDUPE_WINDOW_SECONDS", "2"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+WATCHED_SCOPE = "store/order/statusUpdated"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_delete(path):
+    r = requests.delete(f"{API_BASE}{path}", headers=HEADERS, timeout=30)
+    r.raise_for_status()
+
+
+def is_duplicate_webhook_event(
+    seen_events: dict, resource_id: int, new_status_id: int,
+    created_at_epoch: float, window_seconds: float = DEDUPE_WINDOW_SECONDS,
+) -&gt; bool:
+    """Pure decision. No network, no side effects.
+
+    seen_events maps (resource_id, new_status_id) to the last-seen created_at
+    epoch for that key. If a prior entry exists within window_seconds of the
+    new event, it is a duplicate: return True and leave the store untouched.
+    Otherwise record created_at_epoch for the key and return False, meaning
+    the event should be processed. A different new_status_id for the same
+    resource_id is treated as a distinct event, never a duplicate of the
+    other status.
+    """
+    key = (resource_id, new_status_id)
+    last_seen = seen_events.get(key)
+    if last_seen is not None and abs(created_at_epoch - last_seen) &lt;= window_seconds:
+        return True
+    seen_events[key] = created_at_epoch
+    return False
+
+
+def fetch_order_state(order_id):
+    """Confirm the authoritative order state instead of trusting the payload alone."""
+    order = bc_get(f"/v2/orders/{order_id}")
+    return {"status_id": order.get("status_id"), "date_modified": order.get("date_modified")}
+
+
+def find_duplicate_hooks(scope, destination):
+    """List /v3/hooks and return every active hook matching scope and destination,
+    oldest id first. More than one entry means every delivery to that destination
+    is doubled by configuration, not by a retry."""
+    hooks = bc_get("/v3/hooks")
+    data = hooks.get("data", []) if isinstance(hooks, dict) else hooks
+    matches = [h for h in data if h.get("scope") == scope and h.get("destination") == destination]
+    matches.sort(key=lambda h: h.get("id", 0))
+    return matches
+
+
+def handle_webhook_event(seen_events, payload):
+    """Process one inbound store/order/statusUpdated payload.
+
+    Returns "processed" or "dropped_duplicate". Never mutates order state:
+    the order's status_id was already applied correctly by BigCommerce, the
+    bug being guarded against is redundant notification delivery.
+    """
+    resource_id = payload["data"]["id"]
+    new_status_id = payload["data"]["status"]["new_status_id"]
+    created_at_epoch = payload["created_at"]
+    event_hash = payload.get("hash")
+
+    if is_duplicate_webhook_event(seen_events, resource_id, new_status_id, created_at_epoch):
+        log.info(
+            "Duplicate dropped. resource_id=%s new_status_id=%s created_at=%s hash=%s",
+            resource_id, new_status_id, created_at_epoch, event_hash,
+        )
+        return "dropped_duplicate"
+
+    log.info(
+        "Processing event. resource_id=%s new_status_id=%s created_at=%s hash=%s",
+        resource_id, new_status_id, created_at_epoch, event_hash,
+    )
+    return "processed"
+
+
+def run(destination_url):
+    duplicate_hooks = find_duplicate_hooks(WATCHED_SCOPE, destination_url)
+
+    if len(duplicate_hooks) &lt;= 1:
+        log.info("No duplicate hook registration found for scope=%s destination=%s", WATCHED_SCOPE, destination_url)
+        return
+
+    keep = duplicate_hooks[0]
+    redundant = duplicate_hooks[1:]
+    log.warning(
+        "Found %d hooks on scope=%s destination=%s. Keeping id=%s, redundant ids=%s",
+        len(duplicate_hooks), WATCHED_SCOPE, destination_url, keep.get("id"),
+        [h.get("id") for h in redundant],
+    )
+
+    for hook in redundant:
+        if not DRY_RUN:
+            bc_delete(f"/v3/hooks/{hook['id']}")
+            log.info("Deleted redundant hook id=%s", hook["id"])
+        else:
+            log.info("Dry run: would delete redundant hook id=%s", hook["id"])
+
+
+if __name__ == "__main__":
+    run(destination_url=os.environ.get("WEBHOOK_DESTINATION_URL", "https://example.com/webhooks/bigcommerce"))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">dedupe-same-second-webhooks.js</div>
+      <pre><code class="language-javascript">/**
+ * Drop duplicate BigCommerce store/order/statusUpdated events fired in the same second.
+ *
+ * BigCommerce's webhook service guarantees at-least-once delivery, not exactly-once.
+ * If your endpoint is slow, times out, or its 200 OK response is lost in transit, the
+ * retry mechanism re-sends the same logical event. Separately, a single admin or API
+ * action can legitimately trigger more than one webhook subscription in the same
+ * second, and each carries its own created_at and a hash that is not guaranteed
+ * stable, so hash alone cannot prove a duplicate. This script keeps a short-lived
+ * idempotency store keyed on (resourceId, newStatusId) with createdAt rounded into
+ * a window, drops repeats inside that window, confirms the order's real state with
+ * GET /v2/orders/{id} when needed, and separately checks GET /v3/hooks for a
+ * duplicate hook registration on the same scope and destination, a common
+ * misconfiguration that doubles every delivery. It never writes to order state.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/webhook-duplicate-events-same-second/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+const DEDUPE_WINDOW_SECONDS = Number(process.env.DEDUPE_WINDOW_SECONDS || 2);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const WATCHED_SCOPE = "store/order/statusUpdated";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * seenEvents is a Map from "resourceId:newStatusId" to the last-seen createdAt
+ * epoch for that key. If a prior entry exists within windowSeconds of the new
+ * event, it is a duplicate: return true and leave the map untouched. Otherwise
+ * record createdAtEpoch for the key and return false, meaning the event should
+ * be processed. A different newStatusId for the same resourceId is treated as
+ * a distinct event, never a duplicate of the other status.
+ */
+export function isDuplicateWebhookEvent(
+  seenEvents, resourceId, newStatusId, createdAtEpoch, windowSeconds = DEDUPE_WINDOW_SECONDS
+) {
+  const key = `${resourceId}:${newStatusId}`;
+  const lastSeen = seenEvents.get(key);
+  if (lastSeen !== undefined &amp;&amp; Math.abs(createdAtEpoch - lastSeen) &lt;= windowSeconds) {
+    return true;
+  }
+  seenEvents.set(key, createdAtEpoch);
+  return false;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcDelete(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "DELETE", headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+}
+
+/** Confirm the authoritative order state instead of trusting the payload alone. */
+export async function fetchOrderState(orderId) {
+  const order = await bcGet(`/v2/orders/${orderId}`);
+  return { statusId: order.status_id, dateModified: order.date_modified };
+}
+
+/**
+ * List /v3/hooks and return every active hook matching scope and destination,
+ * oldest id first. More than one entry means every delivery to that destination
+ * is doubled by configuration, not by a retry.
+ */
+export async function findDuplicateHooks(scope, destination) {
+  const hooks = await bcGet("/v3/hooks");
+  const data = Array.isArray(hooks) ? hooks : hooks.data || [];
+  const matches = data.filter((h) =&gt; h.scope === scope &amp;&amp; h.destination === destination);
+  matches.sort((a, b) =&gt; (a.id || 0) - (b.id || 0));
+  return matches;
+}
+
+/**
+ * Process one inbound store/order/statusUpdated payload. Returns "processed" or
+ * "dropped_duplicate". Never mutates order state: the order's status_id was
+ * already applied correctly by BigCommerce, the bug being guarded against is
+ * redundant notification delivery.
+ */
+export function handleWebhookEvent(seenEvents, payload) {
+  const resourceId = payload.data.id;
+  const newStatusId = payload.data.status.new_status_id;
+  const createdAtEpoch = payload.created_at;
+  const eventHash = payload.hash;
+
+  if (isDuplicateWebhookEvent(seenEvents, resourceId, newStatusId, createdAtEpoch)) {
+    console.log(
+      `Duplicate dropped. resource_id=${resourceId} new_status_id=${newStatusId} created_at=${createdAtEpoch} hash=${eventHash}`
+    );
+    return "dropped_duplicate";
+  }
+
+  console.log(
+    `Processing event. resource_id=${resourceId} new_status_id=${newStatusId} created_at=${createdAtEpoch} hash=${eventHash}`
+  );
+  return "processed";
+}
+
+export async function run(destinationUrl = process.env.WEBHOOK_DESTINATION_URL || "https://example.com/webhooks/bigcommerce") {
+  const duplicateHooks = await findDuplicateHooks(WATCHED_SCOPE, destinationUrl);
+
+  if (duplicateHooks.length &lt;= 1) {
+    console.log(`No duplicate hook registration found for scope=${WATCHED_SCOPE} destination=${destinationUrl}`);
+    return;
+  }
+
+  const keep = duplicateHooks[0];
+  const redundant = duplicateHooks.slice(1);
+  console.warn(
+    `Found ${duplicateHooks.length} hooks on scope=${WATCHED_SCOPE} destination=${destinationUrl}. ` +
+    `Keeping id=${keep.id}, redundant ids=${redundant.map((h) =&gt; h.id)}`
+  );
+
+  for (const hook of redundant) {
+    if (!DRY_RUN) {
+      await bcDelete(`/v3/hooks/${hook.id}`);
+      console.log(`Deleted redundant hook id=${hook.id}`);
+    } else {
+      console.log(`Dry run: would delete redundant hook id=${hook.id}`);
+    }
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The idempotency check is the part most worth testing, because it decides whether your handler runs once or twice for the same real-world event. Because <code>is_duplicate_webhook_event</code> takes only plain values and a plain dict, the test needs no network and no webhook receiver. It just feeds in timestamps and checks the answer, including the exact boundary of the window.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_webhook_duplicate_detection.py</div>
+      <pre><code class="language-python">from dedupe_same_second_webhooks import is_duplicate_webhook_event
+
+
+def test_first_event_is_not_a_duplicate():
+    seen = {}
+    assert is_duplicate_webhook_event(seen, 501, 11, 1000.0) is False
+    assert seen[(501, 11)] == 1000.0
+
+
+def test_second_event_within_window_is_a_duplicate():
+    seen = {(501, 11): 1000.0}
+    assert is_duplicate_webhook_event(seen, 501, 11, 1000.8) is True
+
+
+def test_event_exactly_at_window_edge_is_a_duplicate():
+    seen = {(501, 11): 1000.0}
+    assert is_duplicate_webhook_event(seen, 501, 11, 1002.0, window_seconds=2.0) is True
+
+
+def test_event_just_outside_window_is_not_a_duplicate():
+    seen = {(501, 11): 1000.0}
+    assert is_duplicate_webhook_event(seen, 501, 11, 1002.1, window_seconds=2.0) is False
+
+
+def test_out_of_order_timestamp_within_window_is_still_a_duplicate():
+    seen = {(501, 11): 1005.0}
+    assert is_duplicate_webhook_event(seen, 501, 11, 1004.0, window_seconds=2.0) is True
+
+
+def test_different_status_id_is_a_distinct_event_not_a_duplicate():
+    seen = {(501, 11): 1000.0}
+    assert is_duplicate_webhook_event(seen, 501, 12, 1000.2) is False
+
+
+def test_different_resource_id_is_a_distinct_event_not_a_duplicate():
+    seen = {(501, 11): 1000.0}
+    assert is_duplicate_webhook_event(seen, 502, 11, 1000.2) is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">dedupe-same-second-webhooks.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isDuplicateWebhookEvent } from "./dedupe-same-second-webhooks.js";
+
+test("first event is not a duplicate", () =&gt; {
+  const seen = new Map();
+  assert.equal(isDuplicateWebhookEvent(seen, 501, 11, 1000.0), false);
+  assert.equal(seen.get("501:11"), 1000.0);
+});
+
+test("second event within window is a duplicate", () =&gt; {
+  const seen = new Map([["501:11", 1000.0]]);
+  assert.equal(isDuplicateWebhookEvent(seen, 501, 11, 1000.8), true);
+});
+
+test("event exactly at window edge is a duplicate", () =&gt; {
+  const seen = new Map([["501:11", 1000.0]]);
+  assert.equal(isDuplicateWebhookEvent(seen, 501, 11, 1002.0, 2.0), true);
+});
+
+test("event just outside window is not a duplicate", () =&gt; {
+  const seen = new Map([["501:11", 1000.0]]);
+  assert.equal(isDuplicateWebhookEvent(seen, 501, 11, 1002.1, 2.0), false);
+});
+
+test("out of order timestamp within window is still a duplicate", () =&gt; {
+  const seen = new Map([["501:11", 1005.0]]);
+  assert.equal(isDuplicateWebhookEvent(seen, 501, 11, 1004.0, 2.0), true);
+});
+
+test("different status id is a distinct event, not a duplicate", () =&gt; {
+  const seen = new Map([["501:11", 1000.0]]);
+  assert.equal(isDuplicateWebhookEvent(seen, 501, 12, 1000.2), false);
+});
+
+test("different resource id is a distinct event, not a duplicate", () =&gt; {
+  const seen = new Map([["501:11", 1000.0]]);
+  assert.equal(isDuplicateWebhookEvent(seen, 502, 11, 1000.2), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Slow handler, at-least-once retry</span>
+      <h4>The integration that ran its fulfillment sync twice per order</h4>
+      <p>A mid-size store's order management integration took a few seconds to write each status change to its own database before responding. Under load, that response sometimes arrived after BigCommerce's timeout, so BigCommerce retried the identical event. The integration had no idempotency check, so it ran its downstream fulfillment sync twice for the same status change, occasionally double-emailing the customer.</p>
+      <p>Adding the idempotency check in front of the handler fixed it without touching the slow handler itself. Duplicate deliveries inside the window are now dropped before the fulfillment sync ever runs, and the underlying slowness became a performance problem to fix separately, not a correctness bug.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Duplicate hook registration</span>
+      <h4>The store with two hooks quietly pointed at the same URL</h4>
+      <p>During a platform migration, a developer registered a new webhook subscription for <code>store/order/statusUpdated</code> pointed at the new endpoint, but the old registration on the same scope and destination was never removed. Every order status change was delivered twice from that point on, and the team initially suspected a BigCommerce retry bug.</p>
+      <p>Running <code>GET /v3/hooks</code> immediately showed two active entries with the same scope and destination. With <code>DRY_RUN=true</code> the script reported the duplicate and which id was older; once confirmed, flipping <code>DRY_RUN</code> to false removed the redundant one and deliveries dropped back to one per event.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this is in place, a slow response or a lost acknowledgement no longer causes your handler to run twice, because the retry is caught by the idempotency window before it reaches your business logic. A genuine duplicate hook registration gets found and, once confirmed, removed, so every order status change is delivered exactly once at the transport level too. Nothing about the order's own status_id is ever touched, because it was already correct.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my BigCommerce webhook fire twice for the same order within a second?</summary>
+      <p>BigCommerce guarantees at-least-once delivery, not exactly-once. If your endpoint is slow, times out, or its 200 OK response is lost in transit, the retry mechanism re-sends the same logical event. Separately, one admin or API action can legitimately trigger more than one webhook subscription, so two distinct, valid events for the same order can land within the same second.</p>
+    </details>
+    <details>
+      <summary>Can I trust the hash field on the webhook payload to detect duplicates?</summary>
+      <p>Not by itself. The hash is not guaranteed to be stable or independently verifiable across retries. Instead, key an idempotency check on store_id, resource_id, and new_status_id, with created_at rounded into a one to two second bucket, and confirm the authoritative state with a GET to the order endpoint when you need certainty.</p>
+    </details>
+    <details>
+      <summary>Should I automatically delete a webhook subscription if I see duplicate deliveries?</summary>
+      <p>Only if you first confirm there are genuinely two active hook registrations with the same scope and destination via GET /v3/hooks. If there is only one hook, the duplicates are retries, not fan-out, and there is nothing to delete. Deleting a hook is a real, destructive action, so keep it behind a DRY_RUN guard and only ever remove the redundant duplicate, keeping the oldest id.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">Orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">Transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Support: store/order/updated webhook sending multiple times within the same second, same status. <a href="https://support.bigcommerce.com/s/question/0D54O00006L47cxSAB/storeorderupdated-webhook-sending-multiple-times-within-same-second-same-status?language=en_US" rel="noopener">support.bigcommerce.com storeorderupdated webhook sending multiple times</a></li>
+      <li>BigCommerce Support: webhooks duplicate order status updates. <a href="https://support.bigcommerce.com/s/question/0D54O00006PlBpcSAF/web-hooks-duplicate-order-status-updates?language=en_US" rel="noopener">support.bigcommerce.com webhooks duplicate order status updates</a></li>
+      <li>BigCommerce Support: webhooks sent multiple times by BigCommerce. <a href="https://support.bigcommerce.com/s/question/0D51B00004MFHttSAH/webhooks-sent-multiple-times-by-bigcommerce?language=en_US" rel="noopener">support.bigcommerce.com webhooks sent multiple times</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Webhooks overview and at-least-once delivery guarantee. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks" rel="noopener">developer.bigcommerce.com webhooks overview</a></li>
+      <li>BigCommerce Developer Center: the store/order/statusUpdated payload model. <a href="https://developer.bigcommerce.com/api-reference/store-management/webhooks/models/store-order-statusupdated" rel="noopener">developer.bigcommerce.com store/order/statusUpdated model</a></li>
+      <li>BigCommerce Docs: Webhooks v3, the /v3/hooks endpoint. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/integrations/webhooks" rel="noopener">docs.bigcommerce.com webhooks v3</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop your handler from double firing?</h3>
+    <p>If this saved you a pile of duplicate notifications or caught a stray hook registration, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
