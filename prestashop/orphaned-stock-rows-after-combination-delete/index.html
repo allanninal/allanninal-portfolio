@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Orphaned PrestaShop Stock Rows After a Combination Delete</title>
+<meta name="description" content="Deleting a PrestaShop product combination does not reliably remove its stock_available row, so orphaned quantity keeps inflating the product's reported total stock. Learn why it happens and build a Python or Node.js reconciler that finds and safely removes the orphan rows.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/orphaned-stock-rows-after-combination-delete/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Orphaned PrestaShop Stock Rows After a Combination Delete">
+<meta property="og:description" content="Why stock_available rows survive a deleted combination, and a safe Python or Node.js reconciler that finds and removes the orphan rows through the Webservice API.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/orphaned-stock-rows-after-combination-delete/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/orphaned-stock-rows-after-combination-delete/#article","headline":"Fix Orphaned PrestaShop Stock Rows After a Combination Delete","description":"Why stock_available rows survive a deleted combination, and a safe Python or Node.js reconciler that finds and removes the orphan rows through the Webservice API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/orphaned-stock-rows-after-combination-delete/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Stock & Inventory","keywords":"PrestaShop orphaned stock_available, combination delete, id_product_attribute, stock_availables webservice, PrestaShop Webservice API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Orphaned stock rows remain after a combination is deleted","item":"https://www.allanninal.dev/prestashop/orphaned-stock-rows-after-combination-delete/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does PrestaShop leave a stock_available row behind after I delete a combination?","acceptedAnswer":{"@type":"Answer","text":"There is no enforced cascade between combinations (product_attribute) and stock_available. When a combination is deleted through the Back Office or the combinations webservice resource, its stock_available row, keyed by id_product_attribute, is not reliably removed, so it can be left behind holding whatever quantity it had."}},{"@type":"Question","name":"How does an orphaned stock row affect my reported stock?","acceptedAnswer":{"@type":"Answer","text":"The Back Office and the product's stock summary sum quantity across every stock_available row tied to a product. An orphan row with a nonzero quantity or an out_of_stock override still gets counted in that sum even though no live combination corresponds to it anymore, so the displayed total stock is inflated versus the true sum over live combinations."}},{"@type":"Question","name":"Is it safe to delete orphaned stock_available rows automatically?","acceptedAnswer":{"@type":"Answer","text":"Yes, once confirmed. An orphan row references an id_product_attribute that no longer exists in the live combinations list, so removing it cannot affect any real combination. The safe pattern is to re-fetch and re-diff immediately before deleting, so a combination created between detection and repair is never mistaken for an orphan."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Stock &amp; Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Stock &amp; Inventory</p>
+    <h1>Orphaned stock rows remain after a combination is deleted</h1>
+    <p class="lead">You delete a product combination in the Back Office, or through the <code>combinations</code> webservice resource, and everything looks clean. But the <code>stock_available</code> row that belonged to it can stay behind, still holding a quantity, still counted in the product's reported total stock, even though no combination points to it anymore. Here is why PrestaShop does not clean that row up on its own, and a small script that finds every orphan and removes it safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Deleting a combination removes the <code>product_attribute</code> row, but there is no enforced cascade to the matching <code>stock_available</code> row, so it can be left behind holding stale quantity. Run a script that lists the product's live combinations with <code>GET /api/combinations?filter[id_product]=X</code>, lists every stock row with <code>GET /api/stock_availables?filter[id_product]=X</code>, and diffs the two: any stock row whose <code>id_product_attribute</code> is nonzero and not in the live combination set is an orphan. Sum its quantity to see how much it is inflating the product's displayed total stock, then delete it with <code>DELETE /api/stock_availables/[id]</code>. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every product combination in PrestaShop has its own stock row, tied together by <code>id_product_attribute</code>. When you add a combination, PrestaShop creates a <code>stock_available</code> row for it. When you delete that combination, you would expect the matching stock row to go with it. That link is not guaranteed.</p>
+  <p>Community forum reports and PrestaShop's own issue tracker document this gap: deleting a combination can leave its <code>stock_available</code> row behind. If a new combination is created afterward, PrestaShop assigns it a brand new <code>id_product_attribute</code>, so it never reuses the orphan row. The old row just sits there, still holding whatever quantity or <code>out_of_stock</code> setting it had, unrelated to anything a customer can actually buy.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A combination is deleted, the product_attribute row is removed, but the stock_available row is not reliably removed with it, so it becomes an orphan that still holds quantity.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="165" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="92" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Combination deleted</text>
+      <text x="92" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">Back Office or webservice</text>
+      <line x1="178" y1="105" x2="220" y2="105" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="223" y="70" width="175" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="310" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">product_attribute</text>
+      <text x="310" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">row removed cleanly</text>
+      <line x1="398" y1="105" x2="450" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="424" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="424" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">no enforced cascade</text>
+      <rect x="453" y="70" width="165" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="535" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">stock_available stays</text>
+      <text x="535" y="112" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">still holds quantity</text>
+      <line x1="631" y1="105" x2="650" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="653" y="70" width="97" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="701" y="98" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Total stock</text>
+      <text x="701" y="116" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">inflated</text>
+      <text x="380" y="180" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">the Back Office sums quantity across every stock_available row tied to the product</text>
+    </svg>
+    <figcaption>The combination is gone, but nothing told the stock row to go with it. It keeps counting toward the product's total.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>PrestaShop ties a combination's stock to its <code>id_product_attribute</code>, but the delete path does not enforce a matching cleanup of <code>stock_available</code> in every case. A few recurring ways stores end up with orphan rows:</p>
+  <ul>
+    <li>A combination is deleted from the Back Office product edit screen, and the <code>stock_available</code> row keyed to its <code>id_product_attribute</code> is not removed with it.</li>
+    <li>A combination is deleted through the <code>combinations</code> webservice resource, which offers the same gap since it is not guaranteed to cascade the delete to stock either.</li>
+    <li>A new combination is created later on the same product. It gets a fresh <code>id_product_attribute</code>, so it never reclaims the orphan row, and the old row keeps accumulating alongside it.</li>
+    <li>Bulk combination management, generating and regenerating combinations from attribute combinations, deleting and recreating variants during a catalog cleanup, all multiply the same gap across many products at once.</li>
+  </ul>
+  <p>This is a known, recurring defect rather than a one-off misconfiguration. Forum threads and PrestaShop's own core issue tracker document wrong stock quantities showing in the Back Office tied directly to this gap between combinations and <code>stock_available</code>. See the citations at the end for the exact reports.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The Back Office and the product's <code>quantity</code> summary do not ask "which combinations actually exist right now." They sum <code>quantity</code> across every <code>stock_available</code> row tied to the product's <code>id_product</code>, live or not. An orphan row does not need to be visible anywhere in the product edit screen to still be counted. The only reliable way to find one is to compare the stock rows against the combinations that are actually still live, id by id.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never guess which rows are orphans from the Back Office UI. The script pulls the product's live combinations, pulls every stock row tied to that product, and builds the set of valid <code>id_product_attribute</code> values, always including <code>0</code> for the base product's own row. Any stock row outside that set is an orphan, and it is safe to delete because it references a combination that no longer exists.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists live combinations and all stock rows for a product, builds the set of valid id_product_attribute values, flags any stock row outside that set as an orphan, and in live mode deletes it after a fresh re-diff.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="190" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="105" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">List combinations</text>
+      <text x="105" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">GET /api/combinations</text>
+      <line x1="105" y1="80" x2="105" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">List stock_availables</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">every row for the product</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="365" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Diff by attribute id</text>
+      <text x="365" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">live ids vs stock rows</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 677,138 590,170 503,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Orphan</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">found?</text>
+      <text x="680" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="677" y1="138" x2="705" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#6b4f5b" font-weight="700">no, skip</text>
+      <line x1="590" y1="170" x2="590" y2="215" stroke="#6b4f5b" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="65" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Re-diff, then delete</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">DELETE /api/stock_availables</text>
+      <text x="684" y="236" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">avoids a creation race</text>
+      <path d="M705,138 C725,138 684,150 684,180" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only deletes stock rows whose id_product_attribute matches no live combination, and it re-checks that fact right before it deletes.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a webservice key with the right permissions</h3>
+      <p>In the backoffice, go to Advanced Parameters, Webservice, and create a key with read access to <code>combinations</code> and <code>stock_availables</code>, plus delete access to <code>stock_availables</code>. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List the product's live combinations</h3>
+      <p>Ask the <code>combinations</code> resource for every combination that still belongs to the product. Each object's <code>id</code> is the <code>id_product_attribute</code> a live stock row should be keyed to. This is the ground truth for what actually exists right now.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def live_combinations(id_product):
+    data = api_get("combinations", {"display": "full", "filter[id_product]": id_product})
+    return data.get("combinations") or []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function liveCombinations(idProduct) {
+  const data = await apiGet("combinations", { display: "full", "filter[id_product]": idProduct });
+  return data.combinations || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List every stock row tied to the product</h3>
+      <p>Ask the <code>stock_availables</code> resource for every row filtered by the same <code>id_product</code>. Read back the row's own <code>id</code> (needed later to delete it), <code>id_product_attribute</code>, <code>quantity</code>, and <code>out_of_stock</code>. This is every row the Back Office will sum into the product's total stock, live or orphaned.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def stock_rows_for_product(id_product):
+    data = api_get("stock_availables", {"display": "full", "filter[id_product]": id_product})
+    rows = data.get("stock_availables") or []
+    return [
+        {
+            "id": int(r["id"]),
+            "id_product_attribute": int(r.get("id_product_attribute") or 0),
+            "quantity": int(r.get("quantity") or 0),
+            "out_of_stock": int(r.get("out_of_stock") or 0),
+            "id_shop": int(r.get("id_shop") or 0),
+        }
+        for r in rows
+    ]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function stockRowsForProduct(idProduct) {
+  const data = await apiGet("stock_availables", { display: "full", "filter[id_product]": idProduct });
+  const rows = data.stock_availables || [];
+  return rows.map((r) => ({
+    id: Number(r.id),
+    id_product_attribute: Number(r.id_product_attribute || 0),
+    quantity: Number(r.quantity || 0),
+    out_of_stock: Number(r.out_of_stock || 0),
+    id_shop: Number(r.id_shop || 0),
+  }));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the actual decision in its own function that takes plain lists in and returns plain data out. Build the set of live ids from the combinations, always including <code>0</code> for the base product's own stock row, then return every stock row whose <code>id_product_attribute</code> is not in that set. Nothing here talks to the network, so it is simple to test with hand built fixtures, including the edge case of a stock row that is missing for a combination that does exist, which is a different problem and never flagged as an orphan here.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_orphan_stock_rows(combinations, stock_rows):
+    live_ids = {0} | {int(c["id"]) for c in combinations}
+    return [row for row in stock_rows if int(row["id_product_attribute"]) not in live_ids]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findOrphanStockRows(combinations, stockRows) {
+  const liveIds = new Set([0, ...combinations.map((c) => Number(c.id))]);
+  return stockRows.filter((row) => !liveIds.has(Number(row.id_product_attribute)));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Re-diff, then delete, to avoid a creation race</h3>
+      <p>Between the moment you detect an orphan and the moment you delete it, someone could create a new combination. Always re-fetch combinations and stock rows and re-run the pure decision function immediately before deleting, then only delete the ids that are still orphans on that fresh check. This is the only place the script writes anything, and all it removes is a row whose <code>id_product_attribute</code> genuinely matches no live combination.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def delete_stock_row(id_stock_available):
+    r = requests.delete(
+        f"{BASE_URL}/api/stock_availables/{id_stock_available}",
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function deleteStockRow(idStockAvailable) {
+  const res = await fetch(`${BASE_URL}/api/stock_availables/${idStockAvailable}`, {
+    method: "DELETE",
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop pulls the product ids you point it at, finds orphan rows for each, and logs the candidate <code>id_product_attribute</code>, <code>quantity</code>, and <code>id_shop</code> along with how much orphan quantity is inflating that product's displayed total. Leave <code>DRY_RUN</code> on for the first few runs so it only reports. Once you trust the list, switch it off, and the script re-diffs right before each delete.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. The script only ever deletes a <code>stock_available</code> row after confirming, on a fresh re-fetch immediately beforehand, that its <code>id_product_attribute</code> still matches no live combination.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever removes stock rows that a fresh check confirms are orphaned.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/orphaned-stock-rows-after-combination-delete" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">orphaned_stock_rows.py</div>
+      <pre><code class="language-python">"""Find and remove orphaned PrestaShop stock_available rows left behind
+after a product combination is deleted.
+
+There is no enforced cascade between combinations (product_attribute) and
+stock_available, so deleting a combination through the Back Office or the
+combinations webservice resource can leave its stock row behind. The Back
+Office sums quantity across every stock_available row tied to a product, so
+an orphan row with nonzero quantity silently inflates the displayed total
+stock. This lists live combinations and all stock rows for a product, finds
+rows whose id_product_attribute matches no live combination, and deletes
+them only after re-confirming on a fresh fetch immediately beforehand.
+Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("orphaned_stock_rows")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+PRODUCT_IDS = [int(p) for p in os.environ.get("PRODUCT_IDS", "").split(",") if p.strip()]
+
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def live_combinations(id_product):
+    data = api_get("combinations", {"display": "full", "filter[id_product]": id_product})
+    return data.get("combinations") or []
+
+
+def stock_rows_for_product(id_product):
+    data = api_get("stock_availables", {"display": "full", "filter[id_product]": id_product})
+    rows = data.get("stock_availables") or []
+    return [
+        {
+            "id": int(r["id"]),
+            "id_product_attribute": int(r.get("id_product_attribute") or 0),
+            "quantity": int(r.get("quantity") or 0),
+            "out_of_stock": int(r.get("out_of_stock") or 0),
+            "id_shop": int(r.get("id_shop") or 0),
+        }
+        for r in rows
+    ]
+
+
+def find_orphan_stock_rows(combinations, stock_rows):
+    live_ids = {0} | {int(c["id"]) for c in combinations}
+    return [row for row in stock_rows if int(row["id_product_attribute"]) not in live_ids]
+
+
+def delete_stock_row(id_stock_available):
+    r = requests.delete(
+        f"{BASE_URL}/api/stock_availables/{id_stock_available}",
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def run():
+    total_orphan_quantity = 0
+    removed = 0
+    for id_product in PRODUCT_IDS:
+        combinations = live_combinations(id_product)
+        stock_rows = stock_rows_for_product(id_product)
+        orphans = find_orphan_stock_rows(combinations, stock_rows)
+
+        for orphan in orphans:
+            total_orphan_quantity += orphan["quantity"]
+            log.warning(
+                "Product %s orphan stock row id=%s id_product_attribute=%s quantity=%s id_shop=%s (%s)",
+                id_product, orphan["id"], orphan["id_product_attribute"],
+                orphan["quantity"], orphan["id_shop"],
+                "would delete" if DRY_RUN else "deleting",
+            )
+            if not DRY_RUN:
+                # Re-fetch and re-diff right before deleting, to avoid a race
+                # with a combination created between detection and repair.
+                fresh_combinations = live_combinations(id_product)
+                fresh_rows = stock_rows_for_product(id_product)
+                still_orphan_ids = {o["id"] for o in find_orphan_stock_rows(fresh_combinations, fresh_rows)}
+                if orphan["id"] in still_orphan_ids:
+                    delete_stock_row(orphan["id"])
+                    removed += 1
+            else:
+                removed += 1
+
+    log.info(
+        "Done. %d orphan row(s) %s, %d unit(s) of orphaned quantity found.",
+        removed, "to delete" if DRY_RUN else "deleted", total_orphan_quantity,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">orphaned-stock-rows.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and remove orphaned PrestaShop stock_available rows left behind
+ * after a product combination is deleted.
+ *
+ * There is no enforced cascade between combinations (product_attribute) and
+ * stock_available, so deleting a combination through the Back Office or the
+ * combinations webservice resource can leave its stock row behind. The Back
+ * Office sums quantity across every stock_available row tied to a product, so
+ * an orphan row with nonzero quantity silently inflates the displayed total
+ * stock. This lists live combinations and all stock rows for a product, finds
+ * rows whose id_product_attribute matches no live combination, and deletes
+ * them only after re-confirming on a fresh fetch immediately beforehand.
+ * Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/orphaned-stock-rows-after-combination-delete/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://example.test").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "dummy_key";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const PRODUCT_IDS = (process.env.PRODUCT_IDS || "").split(",").map((p) => p.trim()).filter(Boolean).map(Number);
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function liveCombinations(idProduct) {
+  const data = await apiGet("combinations", { display: "full", "filter[id_product]": idProduct });
+  return data.combinations || [];
+}
+
+async function stockRowsForProduct(idProduct) {
+  const data = await apiGet("stock_availables", { display: "full", "filter[id_product]": idProduct });
+  const rows = data.stock_availables || [];
+  return rows.map((r) => ({
+    id: Number(r.id),
+    id_product_attribute: Number(r.id_product_attribute || 0),
+    quantity: Number(r.quantity || 0),
+    out_of_stock: Number(r.out_of_stock || 0),
+    id_shop: Number(r.id_shop || 0),
+  }));
+}
+
+export function findOrphanStockRows(combinations, stockRows) {
+  const liveIds = new Set([0, ...combinations.map((c) => Number(c.id))]);
+  return stockRows.filter((row) => !liveIds.has(Number(row.id_product_attribute)));
+}
+
+async function deleteStockRow(idStockAvailable) {
+  const res = await fetch(`${BASE_URL}/api/stock_availables/${idStockAvailable}`, {
+    method: "DELETE",
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+}
+
+export async function run() {
+  let totalOrphanQuantity = 0;
+  let removed = 0;
+
+  for (const idProduct of PRODUCT_IDS) {
+    const combinations = await liveCombinations(idProduct);
+    const stockRows = await stockRowsForProduct(idProduct);
+    const orphans = findOrphanStockRows(combinations, stockRows);
+
+    for (const orphan of orphans) {
+      totalOrphanQuantity += orphan.quantity;
+      console.warn(
+        `Product ${idProduct} orphan stock row id=${orphan.id} id_product_attribute=${orphan.id_product_attribute} quantity=${orphan.quantity} id_shop=${orphan.id_shop} (${DRY_RUN ? "would delete" : "deleting"})`
+      );
+      if (!DRY_RUN) {
+        // Re-fetch and re-diff right before deleting, to avoid a race
+        // with a combination created between detection and repair.
+        const freshCombinations = await liveCombinations(idProduct);
+        const freshRows = await stockRowsForProduct(idProduct);
+        const stillOrphanIds = new Set(findOrphanStockRows(freshCombinations, freshRows).map((o) => o.id));
+        if (stillOrphanIds.has(orphan.id)) {
+          await deleteStockRow(orphan.id);
+          removed++;
+        }
+      } else {
+        removed++;
+      }
+    }
+  }
+
+  console.log(`Done. ${removed} orphan row(s) ${DRY_RUN ? "to delete" : "deleted"}, ${totalOrphanQuantity} unit(s) of orphaned quantity found.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which stock rows actually get deleted. Because <code>find_orphan_stock_rows</code> is pure, the test needs no PrestaShop instance and no network. It just feeds in plain lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_orphaned_rows.py</div>
+      <pre><code class="language-python">from orphaned_stock_rows import find_orphan_stock_rows
+
+
+def combo(id_):
+    return {"id": id_}
+
+
+def row(**over):
+    base = {"id": 1, "id_product_attribute": 5, "quantity": 0, "out_of_stock": 2}
+    base.update(over)
+    return base
+
+
+def test_no_orphans_when_every_row_matches_a_live_combination():
+    combinations = [combo(5), combo(6)]
+    stock_rows = [row(id_product_attribute=5), row(id=2, id_product_attribute=6)]
+    assert find_orphan_stock_rows(combinations, stock_rows) == []
+
+
+def test_base_product_row_with_zero_attribute_is_never_an_orphan():
+    stock_rows = [row(id=1, id_product_attribute=0)]
+    assert find_orphan_stock_rows([], stock_rows) == []
+
+
+def test_empty_combinations_list_only_keeps_the_zero_row():
+    stock_rows = [row(id=1, id_product_attribute=0), row(id=2, id_product_attribute=7, quantity=4)]
+    result = find_orphan_stock_rows([], stock_rows)
+    assert result == [row(id=2, id_product_attribute=7, quantity=4)]
+
+
+def test_stock_row_for_deleted_combination_is_an_orphan():
+    combinations = [combo(5)]
+    stock_rows = [row(id=1, id_product_attribute=5), row(id=2, id_product_attribute=9, quantity=3)]
+    result = find_orphan_stock_rows(combinations, stock_rows)
+    assert result == [row(id=2, id_product_attribute=9, quantity=3)]
+
+
+def test_duplicate_stock_rows_for_the_same_orphaned_attribute_are_all_returned():
+    stock_rows = [
+        row(id=2, id_product_attribute=9, quantity=3),
+        row(id=3, id_product_attribute=9, quantity=2),
+    ]
+    result = find_orphan_stock_rows([], stock_rows)
+    assert result == stock_rows
+
+
+def test_combination_present_but_stock_row_missing_is_not_flagged_as_orphan():
+    # A live combination with no matching stock row is a different problem,
+    # not something find_orphan_stock_rows reports on.
+    combinations = [combo(5), combo(6)]
+    stock_rows = [row(id=1, id_product_attribute=5)]
+    assert find_orphan_stock_rows(combinations, stock_rows) == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">orphaned-stock-rows.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findOrphanStockRows } from "./orphaned-stock-rows.js";
+
+const combo = (id) => ({ id });
+
+const row = (over = {}) => ({ id: 1, id_product_attribute: 5, quantity: 0, out_of_stock: 2, ...over });
+
+test("no orphans when every row matches a live combination", () =&gt; {
+  const combinations = [combo(5), combo(6)];
+  const stockRows = [row({ id_product_attribute: 5 }), row({ id: 2, id_product_attribute: 6 })];
+  assert.deepEqual(findOrphanStockRows(combinations, stockRows), []);
+});
+
+test("base product row with zero attribute is never an orphan", () =&gt; {
+  const stockRows = [row({ id: 1, id_product_attribute: 0 })];
+  assert.deepEqual(findOrphanStockRows([], stockRows), []);
+});
+
+test("empty combinations list only keeps the zero row", () =&gt; {
+  const stockRows = [row({ id: 1, id_product_attribute: 0 }), row({ id: 2, id_product_attribute: 7, quantity: 4 })];
+  const result = findOrphanStockRows([], stockRows);
+  assert.deepEqual(result, [row({ id: 2, id_product_attribute: 7, quantity: 4 })]);
+});
+
+test("stock row for deleted combination is an orphan", () =&gt; {
+  const combinations = [combo(5)];
+  const stockRows = [row({ id: 1, id_product_attribute: 5 }), row({ id: 2, id_product_attribute: 9, quantity: 3 })];
+  const result = findOrphanStockRows(combinations, stockRows);
+  assert.deepEqual(result, [row({ id: 2, id_product_attribute: 9, quantity: 3 })]);
+});
+
+test("duplicate stock rows for the same orphaned attribute are all returned", () =&gt; {
+  const stockRows = [
+    row({ id: 2, id_product_attribute: 9, quantity: 3 }),
+    row({ id: 3, id_product_attribute: 9, quantity: 2 }),
+  ];
+  const result = findOrphanStockRows([], stockRows);
+  assert.deepEqual(result, stockRows);
+});
+
+test("combination present but stock row missing is not flagged as orphan", () =&gt; {
+  const combinations = [combo(5), combo(6)];
+  const stockRows = [row({ id: 1, id_product_attribute: 5 })];
+  assert.deepEqual(findOrphanStockRows(combinations, stockRows), []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Catalog cleanup</span>
+      <h4>The apparel store that kept "selling out" of colors it no longer had</h4>
+      <p>An apparel brand regularly retired old colorways and added new ones for the season, deleting the old combinations from the product edit screen. Months later, a few products showed high total stock in the Back Office even though the currently listed sizes and colors were all near zero.</p>
+      <p>The reconciler found stock rows tied to <code>id_product_attribute</code> values from colorways deleted two seasons earlier, some still holding dozens of units. Removing the orphan rows brought the displayed total back in line with what customers could actually order.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Webservice cleanup</span>
+      <h4>The integration that deleted combinations in bulk</h4>
+      <p>A PIM integration synced variant changes by deleting and recreating combinations through the <code>combinations</code> webservice resource whenever an attribute set changed upstream. It worked, but every recreate cycle had a chance of leaving the previous cycle's stock row behind.</p>
+      <p>Running the check across the product catalog on a schedule caught the drift early. The fix never touched the integration. It just cleared out stock rows whose <code>id_product_attribute</code> no longer matched anything the <code>combinations</code> resource reported.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a deleted combination never leaves a hidden quantity behind to inflate what a product claims to have in stock. Every <code>stock_available</code> row left standing is tied to a combination that genuinely exists, the displayed total matches the live combinations, and nothing gets removed without a fresh re-check immediately before the delete.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does PrestaShop leave a stock_available row behind after I delete a combination?</summary>
+      <p>There is no enforced cascade between combinations (product_attribute) and stock_available. When a combination is deleted through the Back Office or the combinations webservice resource, its stock_available row, keyed by id_product_attribute, is not reliably removed, so it can be left behind holding whatever quantity it had.</p>
+    </details>
+    <details>
+      <summary>How does an orphaned stock row affect my reported stock?</summary>
+      <p>The Back Office and the product's stock summary sum quantity across every stock_available row tied to a product. An orphan row with a nonzero quantity or an out_of_stock override still gets counted in that sum even though no live combination corresponds to it anymore, so the displayed total stock is inflated versus the true sum over live combinations.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete orphaned stock_available rows automatically?</summary>
+      <p>Yes, once confirmed. An orphan row references an id_product_attribute that no longer exists in the live combinations list, so removing it cannot affect any real combination. The safe pattern is to re-fetch and re-diff immediately before deleting, so a combination created between detection and repair is never mistaken for an orphan.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past a shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Rows not removed from ps_stock_available upon combination removal. Wrong stock quantity. <a href="https://forum.prestashop.com/topic/1079762-rows-not-removed-from-ps_stock_available-upon-combination-removal-wrong-stock-quantity/" rel="noopener">forum.prestashop.com/topic/1079762</a></li>
+      <li>Wrong quantities showing in BO for products with combinations. <a href="https://github.com/PrestaShop/PrestaShop/issues/12814" rel="noopener">github.com/PrestaShop/PrestaShop/issues/12814</a></li>
+      <li>stock_available cleanup for non-existing products. <a href="https://github.com/PrestaShop/PrestaShop/issues/13682" rel="noopener">github.com/PrestaShop/PrestaShop/issues/13682</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Combinations webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/combinations/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/combinations/</a></li>
+      <li>PrestaShop Developer Documentation: Stock availables webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/stock_availables/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/stock_availables/</a></li>
+      <li>PrestaShop Developer Documentation: Webservice reference. <a href="https://devdocs.prestashop-project.org/9/webservice/reference/" rel="noopener">devdocs.prestashop-project.org/9/webservice/reference/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop stock, combinations, orders, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clean up your stock counts?</h3>
+    <p>If this saved you a pile of confused stock numbers or a wrong "in stock" message, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

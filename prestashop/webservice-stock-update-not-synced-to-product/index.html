@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix PrestaShop Webservice Stock Updates Not Synced To Product Quantity</title>
+<meta name="description" content="A PUT to stock_availables updates the real PrestaShop stock, but product.quantity on the product resource stays stale or stuck at zero. Learn why the deprecated column desyncs and build a Python or Node.js reconciler that detects and safely resyncs it.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/webservice-stock-update-not-synced-to-product/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix PrestaShop Webservice Stock Updates Not Synced To Product Quantity">
+<meta property="og:description" content="Why product.quantity stays stale or at zero after a correct stock_availables update, and a safe Python or Node.js reconciler that detects and repairs the mismatch.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/webservice-stock-update-not-synced-to-product/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/webservice-stock-update-not-synced-to-product/#article","headline":"Fix PrestaShop Webservice Stock Updates Not Synced To Product Quantity","description":"Why product.quantity stays stale or at zero after a correct stock_availables update, and a safe Python or Node.js reconciler that detects and repairs the mismatch through PrestaShop's own StockAvailable resync path.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/webservice-stock-update-not-synced-to-product/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Webservice API Data Sync","keywords":"PrestaShop webservice stock, product.quantity deprecated, stock_available.quantity, StockAvailable, PrestaShop Webservice API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Stock update via webservice does not sync back to the product quantity field","item":"https://www.allanninal.dev/prestashop/webservice-stock-update-not-synced-to-product/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does product.quantity stay at zero after I update stock through the webservice?","acceptedAnswer":{"@type":"Answer","text":"Since PrestaShop 1.5, real stock lives in stock_available.quantity, while product.quantity on the products resource is a deprecated, denormalized column kept only for backward compatibility. A correct PUT to stock_availables updates the true stock but does not always refresh that cached column, so product.quantity can sit stale or at zero even though the back office shows the right number."}},{"@type":"Question","name":"Should I fix this by writing directly to the products resource quantity field?","acceptedAnswer":{"@type":"Answer","text":"No. Writing to product.quantity on the products resource is the anti-pattern that caused this bug in the first place. PrestaShop's own Stock FAQ says to treat product.quantity as deprecated and manage stock exclusively through StockAvailable, so all writes should go to stock_availables instead."}},{"@type":"Question","name":"How do I actually resync product.quantity once I find a mismatch?","acceptedAnswer":{"@type":"Answer","text":"Re-PUT the same stock_availables row with its own current, unchanged quantity. That forces PrestaShop's internal Product::updateQuantity() hook to fire and recompute the cached product.quantity column, without you ever writing to the deprecated field directly."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Webservice API Data Sync</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Webservice API Data Sync</p>
+    <h1>Stock update via webservice does not sync back to the product quantity field</h1>
+    <p class="lead">You PUT a new quantity to <code>stock_availables</code>, the back office shows the right number, and then you GET the product back and its own <code>quantity</code> field is stale, or stuck at zero. Nothing is actually broken with your stock. Here is why PrestaShop keeps two numbers for the same thing, and a small script that finds the mismatch and repairs it the safe way.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Since PrestaShop 1.5, real stock lives in <code>stock_available.quantity</code>, while <code>product.quantity</code> on the products resource is a deprecated, denormalized column kept only for backward compatible SQL and exports. Writing to <code>stock_availables</code> updates the true stock but does not always refresh that cached column, so <code>product.quantity</code> can sit stale or stuck at zero even when stock is correct. Run a script that pulls both values per product and combination, flags any pair that disagrees, especially <code>product.quantity == 0</code> with <code>stock_available.quantity &gt; 0</code>, and repairs it by re-PUTting the <code>stock_availables</code> row with its own unchanged quantity to force PrestaShop to recompute the cache. Never write to the deprecated field directly. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>PrestaShop used to keep stock as a single number sitting on the product itself. Since version 1.5, that changed. Real, authoritative stock moved into its own entity, <code>StockAvailable</code>, backed by the <code>stock_available</code> table, with one row per product and combination. The old <code>quantity</code> column on <code>ps_product</code> stayed in the schema, but only as a cached, denormalized copy kept for legacy SQL joins and exports that still expect it.</p>
+  <p>The webservice's <code>products</code> resource reads and writes that legacy column directly. So when you correctly PUT a new quantity to <code>stock_availables</code>, the authoritative number updates, the back office reads <code>StockAvailable</code> and shows the right count, and everything looks fine there. But nothing guarantees that write also refreshes the cached column on <code>ps_product</code>. GET the product back through <code>/api/products/{id}</code> and its own <code>quantity</code> field can still show the old number, or zero, even though the real stock is correct.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A PUT to stock_availables updates the real stock, the back office shows the right number, but the products resource still reads the old cached quantity column, so an integration reading product.quantity sees a stale or zero value.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="175" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="97" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">PUT stock_availables</text>
+      <text x="97" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">real stock updates</text>
+      <line x1="188" y1="105" x2="230" y2="105" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="233" y="70" width="165" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="315" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Back office</text>
+      <text x="315" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">reads StockAvailable, correct</text>
+      <line x1="398" y1="105" x2="450" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="424" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="424" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">ps_product cache not refreshed</text>
+      <rect x="453" y="70" width="180" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="543" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">product.quantity stale</text>
+      <text x="543" y="112" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">old value, or stuck at 0</text>
+      <line x1="636" y1="105" x2="655" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="658" y="70" width="92" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="704" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Integration</text>
+      <text x="704" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">sees wrong qty</text>
+      <text x="380" y="180" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">product.quantity is a deprecated, denormalized column, not the source of truth</text>
+    </svg>
+    <figcaption>The stock write is correct. The problem is that the products resource still exposes a legacy cached column that a good stock_availables write does not reliably refresh.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is not a one-off configuration mistake, it is a documented split between an old data model and a new one that PrestaShop core never fully reconciled at the API layer. A few recurring ways stores and integrations hit it:</p>
+  <ul>
+    <li>An integration writes stock the correct way, PUT or POST to <code>stock_availables</code>, but then reads back <code>product.quantity</code> from <code>/api/products/{id}</code> to confirm the write, and sees a value that was never refreshed.</li>
+    <li>An older integration, written before 1.5 habits died out, still treats <code>product.quantity</code> as the place to write stock, which updates the deprecated column but never touches the real <code>stock_available</code> row the storefront and back office actually use.</li>
+    <li>A product is created or its combinations change, and the cached column is set once at creation time, then never revisited as combinations get their own independent <code>stock_available</code> rows.</li>
+    <li>Multi-shop setups, where a single physical product can have shop-group specific stock rows, so a single <code>product.quantity</code> number cannot represent the real picture in the first place.</li>
+  </ul>
+  <p>PrestaShop's own core issue tracker has confirmed, major-severity reports of exactly this desync, and PrestaShop's developer documentation is direct about it: <code>product.quantity</code> is deprecated, and integrators should manage stock exclusively through <code>StockAvailable</code> and <code>StockMovement</code> rather than relying on it staying in sync. See the citations at the end for the exact reports and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>product.quantity</code> is not a live number you can trust, and it is not something you should write to fix this. That is the exact anti-pattern that caused the bug. <code>stock_available.quantity</code> is authoritative. The safe way to nudge the cached column back into agreement is to make PrestaShop recompute it itself, by re-saving the <code>stock_availables</code> row it already owns.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never write to the products resource to fix quantity. Instead the script pulls each product's own cached value and its real <code>stock_available</code> row, compares them, and for the ones that disagree, re-PUTs the <code>stock_availables</code> resource with its own current, unchanged quantity. That forces PrestaShop's internal <code>Product::updateQuantity()</code> hook to run again and refresh the cache on its own. Anything involving <code>depends_on_stock</code> being off, multi-shop splits, or a negative delta is flagged for a human instead of touched automatically.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. The script reads product.quantity and stock_available.quantity per product, diffs them, and when they disagree and it is safe to touch, re-PUTs the stock_availables row with its own unchanged quantity to force PrestaShop to recompute the cached product quantity, otherwise it flags the row for manual review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">GET product.quantity</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">the cached column</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">GET stock_available.quantity</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">the real, authoritative row</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="170" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Diff the two</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">per product/combination</text>
+      <line x1="445" y1="138" x2="487" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Safe to</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">auto-resync?</text>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#6b4f5b" font-weight="700">no, flag for review</text>
+      <line x1="580" y1="170" x2="580" y2="215" stroke="#6b4f5b" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="605" y="185" width="145" height="65" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="677" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Re-PUT stock_availables</text>
+      <text x="677" y="221" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">same quantity, forces recompute</text>
+      <text x="677" y="236" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">product.quantity cache refreshes</text>
+      <path d="M695,138 C715,138 677,150 677,180" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only touches the display column, and only through PrestaShop's own StockAvailable write path. Anything risky is flagged instead of auto-repaired.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a webservice key with the right permissions</h3>
+      <p>In the backoffice, go to Advanced Parameters, Webservice, and create a key with read access to <code>products</code> and <code>stock_availables</code>, plus write access to <code>stock_availables</code>. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Read the product's cached quantity</h3>
+      <p>Pull the product itself and read its own <code>quantity</code> field. This is the deprecated, denormalized column on <code>ps_product</code> that a webservice consumer sees when it reads <code>/api/products/{id}</code>, and the value most likely to lag behind reality.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def product_cached_quantity(id_product):
+    data = api_get(f"products/{id_product}", {})
+    product = data["product"]
+    return int(product.get("quantity") or 0)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function productCachedQuantity(idProduct) {
+  const data = await apiGet(`products/${idProduct}`, {});
+  return Number(data.product.quantity || 0);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the real stock_available row</h3>
+      <p>Filter <code>stock_availables</code> by <code>id_product</code> and <code>id_product_attribute</code>, using <code>0</code> for a product with no combinations, and read back the authoritative <code>quantity</code>, plus <code>out_of_stock</code> and <code>depends_on_stock</code> so you know whether a mismatch is purely cosmetic or actually affects sellability.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def stock_available_row(id_product, id_product_attribute=0):
+    data = api_get("stock_availables", {
+        "filter[id_product]": id_product,
+        "filter[id_product_attribute]": id_product_attribute,
+        "display": "full",
+    })
+    rows = data.get("stock_availables") or []
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "id_stock_available": int(row["id"]),
+        "id_product": int(row["id_product"]),
+        "id_product_attribute": int(row.get("id_product_attribute") or 0),
+        "quantity": int(row.get("quantity") or 0),
+        "out_of_stock": int(row.get("out_of_stock") or 0),
+        "depends_on_stock": int(row.get("depends_on_stock") or 0),
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function stockAvailableRow(idProduct, idProductAttribute = 0) {
+  const data = await apiGet("stock_availables", {
+    "filter[id_product]": idProduct,
+    "filter[id_product_attribute]": idProductAttribute,
+    display: "full",
+  });
+  const rows = data.stock_availables || [];
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    id_stock_available: Number(row.id),
+    id_product: Number(row.id_product),
+    id_product_attribute: Number(row.id_product_attribute || 0),
+    quantity: Number(row.quantity || 0),
+    out_of_stock: Number(row.out_of_stock || 0),
+    depends_on_stock: Number(row.depends_on_stock || 0),
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the comparison in its own function that takes the two numbers and two flags in, and returns a status and an action out. It never talks to the network and never mutates anything, so it is simple to test with plain values. The rule is deliberately cautious: it only allows an automatic resync when the shop actually depends on <code>StockAvailable</code> for sellability, and it hands everything else to a human.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_reconciliation(product_qty, stock_avail_qty, out_of_stock, depends_on_stock):
+    delta = stock_avail_qty - product_qty
+
+    if delta == 0:
+        return {"status": "in_sync", "action": "none", "delta": 0}
+
+    if product_qty == 0 and stock_avail_qty > 0:
+        action = "resync_display_only" if depends_on_stock == 1 else "flag_for_review"
+        return {"status": "stuck_zero", "action": action, "delta": delta}
+
+    action = "resync_display_only" if depends_on_stock == 1 else "flag_for_review"
+    return {"status": "stale_product_field", "action": action, "delta": delta}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideReconciliation(productQty, stockAvailQty, outOfStock, dependsOnStock) {
+  const delta = stockAvailQty - productQty;
+
+  if (delta === 0) {
+    return { status: "in_sync", action: "none", delta: 0 };
+  }
+
+  if (productQty === 0 && stockAvailQty > 0) {
+    const action = dependsOnStock === 1 ? "resync_display_only" : "flag_for_review";
+    return { status: "stuck_zero", action, delta };
+  }
+
+  const action = dependsOnStock === 1 ? "resync_display_only" : "flag_for_review";
+  return { status: "stale_product_field", action, delta };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair through stock_availables, never through the products resource</h3>
+      <p>For a row that comes back <code>resync_display_only</code>, do not write to <code>/api/products/{id}</code>. That is the anti-pattern that caused the bug. Instead, re-PUT the <code>stock_availables/{id}</code> resource with the same, unchanged quantity plus its <code>id_product</code> and <code>id_product_attribute</code>. That forces PrestaShop to run its own recompute path and refresh the cached column on its own.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def resync_stock_available(row):
+    body = {
+        "stock_available": {
+            "id": row["id_stock_available"],
+            "id_product": row["id_product"],
+            "id_product_attribute": row["id_product_attribute"],
+            "quantity": row["quantity"],
+        }
+    }
+    r = requests.put(
+        f"{BASE_URL}/api/stock_availables/{row['id_stock_available']}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function resyncStockAvailable(row) {
+  const url = new URL(`${BASE_URL}/api/stock_availables/${row.id_stock_available}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      stock_available: {
+        id: row.id_stock_available,
+        id_product: row.id_product,
+        id_product_attribute: row.id_product_attribute,
+        quantity: row.quantity,
+      },
+    }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop pulls a batch of products, reads each one's cached quantity and its real stock row, runs the pure decision function, and logs every mismatch with its status and planned action. Leave <code>DRY_RUN</code> on for the first few runs so it only reports. Once you trust the list, switch it off so it re-PUTs the flagged <code>stock_availables</code> rows and lets PrestaShop refresh the cache itself. Anything marked <code>flag_for_review</code> is never written automatically, no matter what <code>DRY_RUN</code> is set to.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This script never writes to <code>/api/products/{id}</code> to change quantity, it only reposts a <code>stock_availables</code> row's own existing quantity, which is the supported write path PrestaShop's own stock model uses.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only resyncs rows the pure decision function marks safe, and flags everything else for a human.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/webservice-stock-update-not-synced-to-product" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">webservice_stock_resync.py</div>
+      <pre><code class="language-python">"""Find and repair PrestaShop webservice stock updates that never reached product.quantity.
+
+Since PrestaShop 1.5, real stock lives in stock_available.quantity, while product.quantity
+on the products resource is a deprecated, denormalized column kept only for backward
+compatible SQL and exports. A correct PUT to stock_availables updates the true stock but
+does not always refresh that cached column, so product.quantity can sit stale or stuck at
+zero. This pulls both values per product and combination, flags any pair that disagrees,
+and repairs it by reposting the stock_availables row's own unchanged quantity, which forces
+PrestaShop's internal Product::updateQuantity() hook to recompute the cache. Never writes
+to the products resource to fix quantity. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("webservice_stock_resync")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def product_ids(limit="0,50"):
+    data = api_get("products", {"display": "[id]", "limit": limit})
+    products = data.get("products") or []
+    return [int(p["id"]) for p in products]
+
+
+def product_cached_quantity(id_product):
+    data = api_get(f"products/{id_product}", {})
+    product = data["product"]
+    return int(product.get("quantity") or 0)
+
+
+def stock_available_row(id_product, id_product_attribute=0):
+    data = api_get("stock_availables", {
+        "filter[id_product]": id_product,
+        "filter[id_product_attribute]": id_product_attribute,
+        "display": "full",
+    })
+    rows = data.get("stock_availables") or []
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "id_stock_available": int(row["id"]),
+        "id_product": int(row["id_product"]),
+        "id_product_attribute": int(row.get("id_product_attribute") or 0),
+        "quantity": int(row.get("quantity") or 0),
+        "out_of_stock": int(row.get("out_of_stock") or 0),
+        "depends_on_stock": int(row.get("depends_on_stock") or 0),
+    }
+
+
+def decide_reconciliation(product_qty, stock_avail_qty, out_of_stock, depends_on_stock):
+    delta = stock_avail_qty - product_qty
+
+    if delta == 0:
+        return {"status": "in_sync", "action": "none", "delta": 0}
+
+    if product_qty == 0 and stock_avail_qty > 0:
+        action = "resync_display_only" if depends_on_stock == 1 else "flag_for_review"
+        return {"status": "stuck_zero", "action": action, "delta": delta}
+
+    action = "resync_display_only" if depends_on_stock == 1 else "flag_for_review"
+    return {"status": "stale_product_field", "action": action, "delta": delta}
+
+
+def resync_stock_available(row):
+    body = {
+        "stock_available": {
+            "id": row["id_stock_available"],
+            "id_product": row["id_product"],
+            "id_product_attribute": row["id_product_attribute"],
+            "quantity": row["quantity"],
+        }
+    }
+    r = requests.put(
+        f"{BASE_URL}/api/stock_availables/{row['id_stock_available']}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    checked = 0
+    resynced = 0
+    flagged = 0
+
+    for id_product in product_ids():
+        row = stock_available_row(id_product, 0)
+        if row is None:
+            continue
+        product_qty = product_cached_quantity(id_product)
+        checked += 1
+
+        decision = decide_reconciliation(
+            product_qty, row["quantity"], row["out_of_stock"], row["depends_on_stock"]
+        )
+        if decision["status"] == "in_sync":
+            continue
+
+        log.warning(
+            "Product %s: product.quantity=%s stock_available.quantity=%s status=%s action=%s",
+            id_product, product_qty, row["quantity"], decision["status"], decision["action"],
+        )
+
+        if decision["action"] == "resync_display_only":
+            if not DRY_RUN:
+                resync_stock_available(row)
+            resynced += 1
+        elif decision["action"] == "flag_for_review":
+            flagged += 1
+
+    log.info(
+        "Done. %d product(s) checked, %d %s, %d flagged for manual review.",
+        checked, resynced, "to resync" if DRY_RUN else "resynced", flagged,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">webservice-stock-resync.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and repair PrestaShop webservice stock updates that never reached product.quantity.
+ *
+ * Since PrestaShop 1.5, real stock lives in stock_available.quantity, while product.quantity
+ * on the products resource is a deprecated, denormalized column kept only for backward
+ * compatible SQL and exports. A correct PUT to stock_availables updates the true stock but
+ * does not always refresh that cached column, so product.quantity can sit stale or stuck at
+ * zero. This pulls both values per product and combination, flags any pair that disagrees,
+ * and repairs it by reposting the stock_availables row's own unchanged quantity, which forces
+ * PrestaShop's internal Product::updateQuantity() hook to recompute the cache. Never writes
+ * to the products resource to fix quantity. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/webservice-stock-update-not-synced-to-product/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://example.test").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "dummy_key";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function productIds(limit = "0,50") {
+  const data = await apiGet("products", { display: "[id]", limit });
+  const products = data.products || [];
+  return products.map((p) => Number(p.id));
+}
+
+async function productCachedQuantity(idProduct) {
+  const data = await apiGet(`products/${idProduct}`, {});
+  return Number(data.product.quantity || 0);
+}
+
+async function stockAvailableRow(idProduct, idProductAttribute = 0) {
+  const data = await apiGet("stock_availables", {
+    "filter[id_product]": idProduct,
+    "filter[id_product_attribute]": idProductAttribute,
+    display: "full",
+  });
+  const rows = data.stock_availables || [];
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    id_stock_available: Number(row.id),
+    id_product: Number(row.id_product),
+    id_product_attribute: Number(row.id_product_attribute || 0),
+    quantity: Number(row.quantity || 0),
+    out_of_stock: Number(row.out_of_stock || 0),
+    depends_on_stock: Number(row.depends_on_stock || 0),
+  };
+}
+
+export function decideReconciliation(productQty, stockAvailQty, outOfStock, dependsOnStock) {
+  const delta = stockAvailQty - productQty;
+
+  if (delta === 0) {
+    return { status: "in_sync", action: "none", delta: 0 };
+  }
+
+  if (productQty === 0 && stockAvailQty > 0) {
+    const action = dependsOnStock === 1 ? "resync_display_only" : "flag_for_review";
+    return { status: "stuck_zero", action, delta };
+  }
+
+  const action = dependsOnStock === 1 ? "resync_display_only" : "flag_for_review";
+  return { status: "stale_product_field", action, delta };
+}
+
+async function resyncStockAvailable(row) {
+  const url = new URL(`${BASE_URL}/api/stock_availables/${row.id_stock_available}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      stock_available: {
+        id: row.id_stock_available,
+        id_product: row.id_product,
+        id_product_attribute: row.id_product_attribute,
+        quantity: row.quantity,
+      },
+    }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+export async function run() {
+  let checked = 0;
+  let resynced = 0;
+  let flagged = 0;
+
+  for (const idProduct of await productIds()) {
+    const row = await stockAvailableRow(idProduct, 0);
+    if (!row) continue;
+    const productQty = await productCachedQuantity(idProduct);
+    checked++;
+
+    const decision = decideReconciliation(productQty, row.quantity, row.out_of_stock, row.depends_on_stock);
+    if (decision.status === "in_sync") continue;
+
+    console.warn(
+      `Product ${idProduct}: product.quantity=${productQty} stock_available.quantity=${row.quantity} status=${decision.status} action=${decision.action}`
+    );
+
+    if (decision.action === "resync_display_only") {
+      if (!DRY_RUN) await resyncStockAvailable(row);
+      resynced++;
+    } else if (decision.action === "flag_for_review") {
+      flagged++;
+    }
+  }
+
+  console.log(
+    `Done. ${checked} product(s) checked, ${resynced} ${DRY_RUN ? "to resync" : "resynced"}, ${flagged} flagged for manual review.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which mismatches get an automatic resync versus a flag for a human. Because <code>decide_reconciliation</code> is pure, the test needs no PrestaShop instance and no network. It just feeds in plain numbers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_webservice_reconciliation.py</div>
+      <pre><code class="language-python">from webservice_stock_resync import decide_reconciliation
+
+
+def test_in_sync_when_values_match():
+    result = decide_reconciliation(10, 10, 0, 1)
+    assert result == {"status": "in_sync", "action": "none", "delta": 0}
+
+
+def test_stuck_zero_resyncs_when_depends_on_stock():
+    result = decide_reconciliation(0, 25, 0, 1)
+    assert result == {"status": "stuck_zero", "action": "resync_display_only", "delta": 25}
+
+
+def test_stuck_zero_flags_when_not_depends_on_stock():
+    result = decide_reconciliation(0, 25, 0, 0)
+    assert result == {"status": "stuck_zero", "action": "flag_for_review", "delta": 25}
+
+
+def test_stale_product_field_resyncs_when_depends_on_stock():
+    result = decide_reconciliation(8, 12, 0, 1)
+    assert result == {"status": "stale_product_field", "action": "resync_display_only", "delta": 4}
+
+
+def test_stale_product_field_flags_when_not_depends_on_stock():
+    result = decide_reconciliation(8, 12, 0, 0)
+    assert result == {"status": "stale_product_field", "action": "flag_for_review", "delta": 4}
+
+
+def test_negative_delta_is_stale_product_field_not_stuck_zero():
+    result = decide_reconciliation(20, 5, 0, 1)
+    assert result == {"status": "stale_product_field", "action": "resync_display_only", "delta": -15}
+
+
+def test_zero_and_zero_is_in_sync():
+    result = decide_reconciliation(0, 0, 0, 1)
+    assert result == {"status": "in_sync", "action": "none", "delta": 0}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">webservice-stock-resync.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideReconciliation } from "./webservice-stock-resync.js";
+
+test("in sync when values match", () => {
+  assert.deepEqual(decideReconciliation(10, 10, 0, 1), { status: "in_sync", action: "none", delta: 0 });
+});
+
+test("stuck zero resyncs when depends on stock", () => {
+  assert.deepEqual(decideReconciliation(0, 25, 0, 1), { status: "stuck_zero", action: "resync_display_only", delta: 25 });
+});
+
+test("stuck zero flags when not depends on stock", () => {
+  assert.deepEqual(decideReconciliation(0, 25, 0, 0), { status: "stuck_zero", action: "flag_for_review", delta: 25 });
+});
+
+test("stale product field resyncs when depends on stock", () => {
+  assert.deepEqual(decideReconciliation(8, 12, 0, 1), { status: "stale_product_field", action: "resync_display_only", delta: 4 });
+});
+
+test("stale product field flags when not depends on stock", () => {
+  assert.deepEqual(decideReconciliation(8, 12, 0, 0), { status: "stale_product_field", action: "flag_for_review", delta: 4 });
+});
+
+test("negative delta is stale product field not stuck zero", () => {
+  assert.deepEqual(decideReconciliation(20, 5, 0, 1), { status: "stale_product_field", action: "resync_display_only", delta: -15 });
+});
+
+test("zero and zero is in sync", () => {
+  assert.deepEqual(decideReconciliation(0, 0, 0, 1), { status: "in_sync", action: "none", delta: 0 });
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Marketplace feed</span>
+      <h4>The channel that thought everything was out of stock</h4>
+      <p>A homeware store fed live availability to a marketplace by reading <code>product.quantity</code> from the webservice after every stock update. The store's own warehouse team was updating real stock correctly through <code>stock_availables</code>, but the marketplace kept delisting items as out of stock because the cached field it was reading never moved off zero.</p>
+      <p>Switching the feed to read <code>stock_available.quantity</code> fixed the read side immediately. Running the reconciler once cleaned up the existing stuck-at-zero rows so any other integration reading the old field would see correct numbers too.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Legacy import script</span>
+      <h4>The nightly script still writing to the wrong place</h4>
+      <p>A store's nightly stock import, written years earlier, PUT its quantities to <code>/api/products/{id}</code> because that was the field the original developer found first. Real stock on the storefront and back office silently drifted from what the import script believed it had set, and nobody noticed until a bestseller oversold.</p>
+      <p>Moving the import to write <code>stock_availables</code> instead stopped new drift. The reconciler then found and safely resynced every product where the deprecated column and the real stock had already diverged, without ever touching the products resource again.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, <code>product.quantity</code> stops being a trap for integrations that read it out of habit. Every write goes through <code>stock_availables</code>, the one supported path, and any mismatch that is safe to touch gets nudged back into agreement automatically, while anything involving multi-shop splits, negative deltas, or <code>depends_on_stock</code> being off waits for a human to look at it. Real stock was never wrong, only the legacy mirror of it.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does product.quantity stay at zero after I update stock through the webservice?</summary>
+      <p>Since PrestaShop 1.5, real stock lives in stock_available.quantity, while product.quantity on the products resource is a deprecated, denormalized column kept only for backward compatibility. A correct PUT to stock_availables updates the true stock but does not always refresh that cached column, so product.quantity can sit stale or at zero even though the back office shows the right number.</p>
+    </details>
+    <details>
+      <summary>Should I fix this by writing directly to the products resource quantity field?</summary>
+      <p>No. Writing to product.quantity on the products resource is the anti-pattern that caused this bug in the first place. PrestaShop's own Stock FAQ says to treat product.quantity as deprecated and manage stock exclusively through StockAvailable, so all writes should go to stock_availables instead.</p>
+    </details>
+    <details>
+      <summary>How do I actually resync product.quantity once I find a mismatch?</summary>
+      <p>Re-PUT the same stock_availables row with its own current, unchanged quantity. That forces PrestaShop's internal Product::updateQuantity() hook to fire and recompute the cached product.quantity column, without you ever writing to the deprecated field directly.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past a shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>WS - Products - you can't get or set the product quantity (always zero). <a href="https://github.com/PrestaShop/PrestaShop/issues/18953" rel="noopener">github.com/PrestaShop/PrestaShop/issues/18953</a></li>
+      <li>Bug Web Service Api Prestashop when create or update the quantity of a product. <a href="https://github.com/PrestaShop/PrestaShop/issues/24520" rel="noopener">github.com/PrestaShop/PrestaShop/issues/24520</a></li>
+      <li>WebService Prestashop: unable to update attributes product quantities. <a href="https://www.prestashop.com/forums/topic/1018596-webservice-prestashop-unable-to-update-attributes-product-quantities/" rel="noopener">prestashop.com/forums/topic/1018596-webservice-prestashop-unable-to-update-attributes-product-quantities</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Stock FAQ. <a href="https://devdocs.prestashop-project.org/9/faq/stock/" rel="noopener">devdocs.prestashop-project.org/9/faq/stock/</a></li>
+      <li>PrestaShop Developer Documentation: Create a product from start to finish with Webservices. <a href="https://devdocs.prestashop-project.org/9/webservice/tutorials/create-product-az/" rel="noopener">devdocs.prestashop-project.org/9/webservice/tutorials/create-product-az/</a></li>
+      <li>PrestaShop Developer Documentation: Webservice reference, resources, filters, and output_format. <a href="https://devdocs.prestashop-project.org/9/webservice/" rel="noopener">devdocs.prestashop-project.org/9/webservice/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop stock, orders, order states, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this settle your stock numbers?</h3>
+    <p>If this saved you a confusing "why is it zero" support ticket or a wrong out of stock listing, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

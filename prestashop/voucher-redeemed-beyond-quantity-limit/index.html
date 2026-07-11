@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Single Use Voucher Redeemed More Than Its Allowed Quantity</title>
+<meta name="description" content="A PrestaShop cart rule set to quantity 1 or a strict quantity_per_user still ends up used on more paid orders than it should. Learn why CartRule::checkValidity is not race safe and build a Python or Node.js auditor that finds every order that overused the voucher.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/voucher-redeemed-beyond-quantity-limit/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Single Use Voucher Redeemed More Than Its Allowed Quantity">
+<meta property="og:description" content="Why concurrent checkouts let a single-use PrestaShop cart rule get applied to more orders than its quantity allows, and a safe auditor script that finds every offending order.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/voucher-redeemed-beyond-quantity-limit/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/voucher-redeemed-beyond-quantity-limit/#article","headline":"Single use voucher redeemed more than its allowed quantity","description":"PrestaShop checks a cart rule's remaining quantity and quantity_per_user when the code is applied and again at order validation, but the two reads and writes are not wrapped in a lock. Under concurrent checkouts two orders can both pass the check before either decrements the used count, so a single-use voucher ends up on more than one paid order. A Python or Node.js auditor finds every order that overused it so a human can decide what to do.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/voucher-redeemed-beyond-quantity-limit/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Vouchers & Cart Rules","keywords":"PrestaShop cart rule quantity, quantity_per_user, CartRule checkValidity, order_cart_rules, voucher used twice, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Single use voucher redeemed more than its allowed quantity","item":"https://www.allanninal.dev/prestashop/voucher-redeemed-beyond-quantity-limit/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did a single-use voucher get used on more than one order?","acceptedAnswer":{"@type":"Answer","text":"PrestaShop checks a cart rule's remaining quantity and quantity_per_user when the code is applied to the cart, and again when the order is placed, but those reads and writes are not wrapped in a locking transaction. Under concurrent checkouts, two customers can both pass the quantity remaining check before either order's validation step decrements the cart rule's used count, so both orders get created against the same single-use voucher."}},{"@type":"Question","name":"Is it safe to auto cancel the extra orders that used the voucher?","acceptedAnswer":{"@type":"Answer","text":"No. The orders are already placed and often already paid, so cancelling or editing them automatically would mutate financial state without a human involved. The safe pattern is to report every order using the voucher beyond its quantity or quantity_per_user limit, honor the discount on the first valid order by date_add, and let a human decide on a refund, adjustment, or customer contact for the rest."}},{"@type":"Question","name":"Does quantity_per_user protect guest checkouts too?","acceptedAnswer":{"@type":"Answer","text":"Not reliably. quantity_per_user is checked against id_customer, and guest orders are not tied to a persistent customer id the same way a logged in account is, so a guest can bypass the per-user cap even when the overall quantity has not run out. Treat guest orders as a separate group when auditing quantity_per_user violations."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Vouchers &amp; Cart Rules</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Vouchers &amp; Cart Rules</p>
+    <h1>Single use voucher redeemed more than its allowed quantity</h1>
+    <p class="lead">The cart rule says quantity 1. One code, one use, ever. Then two, three, sometimes a dozen paid orders show up in the back office all discounted by the same "single use" voucher. Nobody edited the rule and nobody found a second code. The gap is timing, not configuration. Here is why PrestaShop lets a single-use voucher slip past its own limit under concurrent checkouts, how to find every order it happened to, and a script that reports the damage without touching a single already-paid order.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Report only (no order writes)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>PrestaShop's cart rule validity check, <code>CartRule::checkValidity</code>, reads the voucher's remaining <code>quantity</code> and each customer's <code>quantity_per_user</code> usage when the code is applied to the cart, and again when the order is placed. Those two reads-then-writes are not wrapped in a locking transaction. Under concurrent checkouts, two customers can each pass "quantity remaining greater than zero" before either order's validation step decrements the cart rule's used count, so both orders get created referencing the same single-use voucher. A related gap is that <code>quantity_per_user</code> is checked against <code>id_customer</code>, so guest checkouts can bypass the per-user cap entirely. Run a small Python or Node.js script that pulls the cart rule, pulls every valid order that actually used it through <code>order_cart_rules</code>, counts distinct uses against <code>quantity</code> and <code>quantity_per_user</code>, and reports every offending voucher with the order ids and customers involved. It never cancels or edits an order. Full code, tests, and the decision function are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A cart rule with <code>quantity</code> set to 1 is supposed to mean exactly one order, ever, gets the discount. PrestaShop enforces that by checking, at the moment a code is applied and again when the order is validated, whether the rule still has quantity left and whether this customer is still under their <code>quantity_per_user</code> cap.</p>
+  <p>The trouble is that check-then-decrement is two separate steps with nothing locking them together. Customer A applies the code. Customer B applies the same code a second later. Both checks read "quantity remaining: 1" because neither order has finished validating yet. Both carts proceed to payment. Both orders get created and both reference the cart rule. Only after both are written does anyone notice the rule that was supposed to allow one use now shows two, three, or more orders against it. The voucher configuration was correct the whole time. The race between the check and the decrement is what let it through twice.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Two customers apply the same single use voucher at nearly the same time, both pass the quantity remaining check because neither order has been validated yet, and both orders are created referencing the same cart rule.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="16" width="185" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="102" y="40" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Customer A applies code</text>
+      <text x="102" y="58" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">reads quantity remaining: 1</text>
+      <rect x="10" y="150" width="185" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="102" y="174" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Customer B applies code</text>
+      <text x="102" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">reads quantity remaining: 1</text>
+      <line x1="198" y1="46" x2="238" y2="90" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="198" y1="180" x2="238" y2="120" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="241" y="75" width="170" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="326" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">No locking between</text>
+      <text x="326" y="116" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">check and decrement</text>
+      <line x1="414" y1="95" x2="450" y2="60" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <line x1="414" y1="115" x2="450" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="453" y="16" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="40" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Order A validated</text>
+      <text x="528" y="58" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">rule used, quantity=0</text>
+      <rect x="453" y="150" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="174" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Order B validated</text>
+      <text x="528" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">rule used again anyway</text>
+      <line x1="606" y1="46" x2="642" y2="90" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <line x1="606" y1="180" x2="642" y2="120" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="645" y="75" width="105" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="697" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#cf4b3f">Two paid</text>
+      <text x="697" y="116" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="800" fill="#cf4b3f">orders, one code</text>
+    </svg>
+    <figcaption>Both customers pass the same "quantity remaining greater than zero" check because neither order has finished validating yet. The check and the decrement are never atomic.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a documented gap in PrestaShop core, not a store misconfiguration. A few concrete ways stores end up with a voucher overused:</p>
+  <ul>
+    <li>Two customers race to apply the same promo code within the same window, for example during a flash sale or an influencer post that drives a burst of traffic to one code at once.</li>
+    <li><code>CartRule::checkValidity()</code> reads the rule's <code>quantity</code> and the customer's prior use count, but nothing locks that row until the order that used it is fully written, so a second checkout in flight reads the same "still available" state.</li>
+    <li>Guest checkouts are a second gap on top of the first. <code>quantity_per_user</code> is enforced against <code>id_customer</code>, so a guest without a persistent customer id tied the same way can reuse a code that a logged-in account would have been blocked from, compounding the overuse.</li>
+    <li>Abandoned cart recovery, multiple browser tabs, or a customer refreshing checkout can also create more simultaneous "in-flight" applications of the same code than the store ever expected.</li>
+  </ul>
+  <p>See the citations at the end for the exact issue threads this behavior is reported and reproduced in.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Only valid, paid or processing orders count against a voucher's limit. An order that was cancelled or errored before payment should not be counted as a use, even if <code>order_cart_rules</code> still has a row for it. So the audit has to filter to orders in a "valid" <code>order_state</code> first, then count how many of those reference the cart rule, then compare that count to <code>quantity</code> overall and to <code>quantity_per_user</code> per customer. Either cap being exceeded is what makes a voucher worth flagging.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch an already-placed order. The script pulls the cart rule's definition, pulls every order that used it through <code>order_cart_rules</code>, keeps only the ones sitting in a valid, paid order state, counts total uses and per-customer uses, and reports the voucher the moment either the overall <code>quantity</code> or a customer's <code>quantity_per_user</code> is exceeded. A human then decides whether to honor the first order by date and refund or contact the customer for the rest.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script reads the cart rule definition, reads every order that used it through order cart rules, filters to valid paid orders, counts total and per customer uses, checks whether either limit is exceeded, and if so reports the voucher with offending order ids for manual review, otherwise it does nothing.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">Auditor job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">runs on demand</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="117" y="130" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Read cart rule</text>
+      <text x="117" y="147" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">quantity, quantity_per_user</text>
+      <line x1="225" y1="138" x2="262" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="265" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="365" y="130" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Read valid orders using it</text>
+      <text x="365" y="147" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">order_cart_rules, paid states</text>
+      <line x1="465" y1="138" x2="500" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="588,106 672,138 588,170 504,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="588" y="130" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#2b101c">Total or per-user</text>
+      <text x="588" y="145" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#2b101c">count exceeds cap?</text>
+      <text x="675" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="672" y1="138" x2="700" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#6b4f5b" font-weight="700">no, within limits, skip</text>
+      <line x1="588" y1="170" x2="588" y2="205" stroke="#6b4f5b" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="628" y="185" width="122" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="689" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Report overage</text>
+      <text x="689" y="220" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">for manual review</text>
+      <path d="M700,138 C718,138 689,150 689,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Only vouchers where a valid order count exceeds quantity or quantity_per_user get reported, and the report is for a human to review, never an automatic order edit.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Enable the Webservice API and get a key</h3>
+      <p>In the PrestaShop admin, go to Advanced Parameters, Webservice, and turn it on. Create a key with access to the <code>cart_rules</code>, <code>order_cart_rules</code>, and <code>orders</code> resources. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export CART_RULE_ID="42"
+export DRY_RUN="true"   # start safe, logs the intended PUT instead of sending it</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export CART_RULE_ID="42"
+export DRY_RUN="true"   // start safe, logs the intended PUT instead of sending it</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Webservice API</h3>
+      <p>Every call goes to <code>{PRESTASHOP_URL}/api/&lt;resource&gt;</code> with the key sent as the HTTP Basic username and a blank password, plus <code>?output_format=JSON</code> since PrestaShop replies in XML by default. A small helper wraps GET and PUT and raises on a bad status.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def api_put(path, body):
+    r = requests.put(
+        f"{BASE_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY;
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${BASE_URL}/api/${path}?${qs}`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, body) {
+  const res = await fetch(`${BASE_URL}/api/${path}?output_format=JSON`, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the voucher and every order that used it</h3>
+      <p>Pull the cart rule for its <code>quantity</code>, <code>quantity_per_user</code>, and <code>code</code>. Then pull every order-to-rule link from <code>order_cart_rules</code> filtered to this <code>id_cart_rule</code>, and cross-check each referenced order's <code>current_state</code> against the valid, paid order states so cancelled or errored orders never count as a use.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">VALID_STATE_IDS = {2, 3, 4, 5}  # payment accepted, processing, shipped, delivered
+
+def get_cart_rule(cart_rule_id):
+    data = api_get(f"cart_rules/{cart_rule_id}")
+    rule = data["cart_rule"]
+    return {
+        "id": int(rule["id"]),
+        "code": rule.get("code") or "",
+        "quantity": int(rule["quantity"]),
+        "quantity_per_user": int(rule["quantity_per_user"]),
+    }
+
+def orders_using_rule(cart_rule_id):
+    data = api_get("order_cart_rules", {"filter[id_cart_rule]": cart_rule_id, "display": "full"})
+    links = data.get("order_cart_rules") or []
+    rows = []
+    for link in links:
+        order_id = int(link["id_order"])
+        order_data = api_get(f"orders/{order_id}", {"display": "full"})["order"]
+        rows.append({
+            "id_order": order_id,
+            "id_customer": int(order_data["id_customer"]) if order_data.get("id_customer") else None,
+            "current_state": int(order_data["current_state"]),
+            "date_add": order_data["date_add"],
+        })
+    return [r for r in rows if r["current_state"] in VALID_STATE_IDS]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const VALID_STATE_IDS = new Set([2, 3, 4, 5]); // payment accepted, processing, shipped, delivered
+
+async function getCartRule(cartRuleId) {
+  const data = await apiGet(`cart_rules/${cartRuleId}`);
+  const rule = data.cart_rule;
+  return {
+    id: Number(rule.id),
+    code: rule.code || "",
+    quantity: Number(rule.quantity),
+    quantityPerUser: Number(rule.quantity_per_user),
+  };
+}
+
+async function ordersUsingRule(cartRuleId) {
+  const data = await apiGet("order_cart_rules", { "filter[id_cart_rule]": cartRuleId, display: "full" });
+  const links = data.order_cart_rules || [];
+  const rows = [];
+  for (const link of links) {
+    const orderId = Number(link.id_order);
+    const order = (await apiGet(`orders/${orderId}`, { display: "full" })).order;
+    rows.push({
+      idOrder: orderId,
+      idCustomer: order.id_customer ? Number(order.id_customer) : null,
+      currentState: Number(order.current_state),
+      dateAdd: order.date_add,
+    });
+  }
+  return rows.filter((r) =&gt; VALID_STATE_IDS.has(r.currentState));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the cart rule and the pre-filtered list of valid orders using it, and returns the overage report or nothing. It counts total valid uses against <code>quantity</code>, groups by <code>id_customer</code> and compares each group against <code>quantity_per_user</code>, and flags the voucher if either cap is exceeded.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_voucher_overuse(cart_rule, orders_using_rule):
+    total_uses = len(orders_using_rule)
+    per_user_counts = {}
+    for order in orders_using_rule:
+        cust = order.get("id_customer")
+        per_user_counts[cust] = per_user_counts.get(cust, 0) + 1
+
+    per_user_violations = {
+        cust: count for cust, count in per_user_counts.items()
+        if count > cart_rule["quantity_per_user"]
+    }
+
+    total_overage = total_uses > cart_rule["quantity"]
+    if not total_overage and not per_user_violations:
+        return None
+
+    offending_ids = sorted(o["id_order"] for o in orders_using_rule)
+    return {
+        "cart_rule_id": cart_rule["id"],
+        "code": cart_rule["code"],
+        "quantity_limit": cart_rule["quantity"],
+        "total_uses": total_uses,
+        "overage_count": max(0, total_uses - cart_rule["quantity"]),
+        "offending_order_ids": offending_ids,
+        "per_user_violations": per_user_violations,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findVoucherOveruse(cartRule, ordersUsingRule) {
+  const totalUses = ordersUsingRule.length;
+  const perUserCounts = new Map();
+  for (const order of ordersUsingRule) {
+    const cust = order.idCustomer;
+    perUserCounts.set(cust, (perUserCounts.get(cust) || 0) + 1);
+  }
+
+  const perUserViolations = {};
+  for (const [cust, count] of perUserCounts) {
+    if (count > cartRule.quantityPerUser) perUserViolations[cust] = count;
+  }
+
+  const totalOverage = totalUses > cartRule.quantity;
+  if (!totalOverage &amp;&amp; Object.keys(perUserViolations).length === 0) return null;
+
+  const offendingOrderIds = ordersUsingRule.map((o) =&gt; o.idOrder).sort((a, b) =&gt; a - b);
+  return {
+    cartRuleId: cartRule.id,
+    code: cartRule.code,
+    quantityLimit: cartRule.quantity,
+    totalUses,
+    overageCount: Math.max(0, totalUses - cartRule.quantity),
+    offendingOrderIds,
+    perUserViolations,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report, and only optionally disable further use</h3>
+      <p>Always log the full overage report for a human to review. Never cancel or edit an already-paid order automatically. The only optional write is disabling the cart rule for any future, not-yet-validated cart, and it only fires when <code>DRY_RUN</code> is false, sending <code>PUT cart_rules/{id}</code> with <code>quantity=0</code>. With <code>DRY_RUN</code> true it only logs the PUT body it would have sent.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Orders that already used the voucher are not touched by this script under any setting. The only write this script can ever make is setting the cart rule's <code>quantity</code> to 0 to stop future use, and even that only fires when <code>DRY_RUN</code> is explicitly turned off after a human reviews the report.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and the only write it can ever make is disabling further use of an already-overused voucher.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/voucher-redeemed-beyond-quantity-limit" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">audit_voucher_overuse.py</div>
+      <pre><code class="language-python">"""Find PrestaShop single-use cart rules that were redeemed on more orders than their
+quantity or quantity_per_user allows.
+
+CartRule::checkValidity reads a voucher's remaining quantity and a customer's prior
+quantity_per_user usage at apply time and again at order validation, but those reads
+and writes are not wrapped in a locking transaction. Under concurrent checkouts, two
+orders can each pass the check before either one's validation decrements the used
+count, so a single-use voucher can end up referenced by more than one paid order.
+quantity_per_user is also checked against id_customer, so guest checkouts can bypass
+the per-user cap.
+
+This script only reports. The optional, DRY_RUN-guarded corrective step only disables
+further use of the voucher by setting quantity to 0; it never cancels, edits, or
+refunds an order that already used it. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("audit_voucher_overuse")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+CART_RULE_ID = int(os.environ["CART_RULE_ID"])
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+VALID_STATE_IDS = {2, 3, 4, 5}  # payment accepted, processing, shipped, delivered
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_put(path, body):
+    r = requests.put(
+        f"{BASE_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def get_cart_rule(cart_rule_id):
+    data = api_get(f"cart_rules/{cart_rule_id}")
+    rule = data["cart_rule"]
+    return {
+        "id": int(rule["id"]),
+        "code": rule.get("code") or "",
+        "quantity": int(rule["quantity"]),
+        "quantity_per_user": int(rule["quantity_per_user"]),
+    }
+
+
+def orders_using_rule(cart_rule_id):
+    data = api_get("order_cart_rules", {"filter[id_cart_rule]": cart_rule_id, "display": "full"})
+    links = data.get("order_cart_rules") or []
+    rows = []
+    for link in links:
+        order_id = int(link["id_order"])
+        order_data = api_get(f"orders/{order_id}", {"display": "full"})["order"]
+        rows.append({
+            "id_order": order_id,
+            "id_customer": int(order_data["id_customer"]) if order_data.get("id_customer") else None,
+            "current_state": int(order_data["current_state"]),
+            "date_add": order_data["date_add"],
+        })
+    return [r for r in rows if r["current_state"] in VALID_STATE_IDS]
+
+
+def find_voucher_overuse(cart_rule, orders_using_rule_list):
+    total_uses = len(orders_using_rule_list)
+    per_user_counts = {}
+    for order in orders_using_rule_list:
+        cust = order.get("id_customer")
+        per_user_counts[cust] = per_user_counts.get(cust, 0) + 1
+
+    per_user_violations = {
+        cust: count for cust, count in per_user_counts.items()
+        if count > cart_rule["quantity_per_user"]
+    }
+
+    total_overage = total_uses > cart_rule["quantity"]
+    if not total_overage and not per_user_violations:
+        return None
+
+    offending_ids = sorted(o["id_order"] for o in orders_using_rule_list)
+    return {
+        "cart_rule_id": cart_rule["id"],
+        "code": cart_rule["code"],
+        "quantity_limit": cart_rule["quantity"],
+        "total_uses": total_uses,
+        "overage_count": max(0, total_uses - cart_rule["quantity"]),
+        "offending_order_ids": offending_ids,
+        "per_user_violations": per_user_violations,
+    }
+
+
+def disable_further_use(cart_rule_id):
+    body = {"cart_rule": {"id": cart_rule_id, "quantity": 0}}
+    if DRY_RUN:
+        log.info("Dry run: would PUT cart_rules/%s %s", cart_rule_id, body)
+        return None
+    return api_put(f"cart_rules/{cart_rule_id}", body)
+
+
+def run():
+    cart_rule = get_cart_rule(CART_RULE_ID)
+    valid_orders = orders_using_rule(CART_RULE_ID)
+
+    report = find_voucher_overuse(cart_rule, valid_orders)
+    if report is None:
+        log.info("Cart rule %s (%s) is within its quantity and quantity_per_user limits.",
+                  cart_rule["id"], cart_rule["code"])
+        return
+
+    log.warning("Voucher overuse detected: %s", report)
+    disable_further_use(CART_RULE_ID)
+    log.info("Done. Report ready for manual review.")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">audit-voucher-overuse.js</div>
+      <pre><code class="language-javascript">/**
+ * Find PrestaShop single-use cart rules that were redeemed on more orders than their
+ * quantity or quantity_per_user allows.
+ *
+ * CartRule::checkValidity reads a voucher's remaining quantity and a customer's prior
+ * quantity_per_user usage at apply time and again at order validation, but those reads
+ * and writes are not wrapped in a locking transaction. Under concurrent checkouts, two
+ * orders can each pass the check before either one's validation decrements the used
+ * count, so a single-use voucher can end up referenced by more than one paid order.
+ * quantity_per_user is also checked against id_customer, so guest checkouts can bypass
+ * the per-user cap.
+ *
+ * This script only reports. The optional, DRY_RUN-guarded corrective step only disables
+ * further use of the voucher by setting quantity to 0; it never cancels, edits, or
+ * refunds an order that already used it. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/voucher-redeemed-beyond-quantity-limit/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://demo.example.com").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "WSKEYDUMMY";
+const CART_RULE_ID = Number(process.env.CART_RULE_ID || 42);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const VALID_STATE_IDS = new Set([2, 3, 4, 5]); // payment accepted, processing, shipped, delivered
+
+export function findVoucherOveruse(cartRule, ordersUsingRule) {
+  const totalUses = ordersUsingRule.length;
+  const perUserCounts = new Map();
+  for (const order of ordersUsingRule) {
+    const cust = order.idCustomer;
+    perUserCounts.set(cust, (perUserCounts.get(cust) || 0) + 1);
+  }
+
+  const perUserViolations = {};
+  for (const [cust, count] of perUserCounts) {
+    if (count > cartRule.quantityPerUser) perUserViolations[cust] = count;
+  }
+
+  const totalOverage = totalUses > cartRule.quantity;
+  if (!totalOverage &amp;&amp; Object.keys(perUserViolations).length === 0) return null;
+
+  const offendingOrderIds = ordersUsingRule.map((o) =&gt; o.idOrder).sort((a, b) =&gt; a - b);
+  return {
+    cartRuleId: cartRule.id,
+    code: cartRule.code,
+    quantityLimit: cartRule.quantity,
+    totalUses,
+    overageCount: Math.max(0, totalUses - cartRule.quantity),
+    offendingOrderIds,
+    perUserViolations,
+  };
+}
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${BASE_URL}/api/${path}?${qs}`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, body) {
+  const res = await fetch(`${BASE_URL}/api/${path}?output_format=JSON`, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function getCartRule(cartRuleId) {
+  const data = await apiGet(`cart_rules/${cartRuleId}`);
+  const rule = data.cart_rule;
+  return {
+    id: Number(rule.id),
+    code: rule.code || "",
+    quantity: Number(rule.quantity),
+    quantityPerUser: Number(rule.quantity_per_user),
+  };
+}
+
+async function ordersUsingRule(cartRuleId) {
+  const data = await apiGet("order_cart_rules", { "filter[id_cart_rule]": cartRuleId, display: "full" });
+  const links = data.order_cart_rules || [];
+  const rows = [];
+  for (const link of links) {
+    const orderId = Number(link.id_order);
+    const order = (await apiGet(`orders/${orderId}`, { display: "full" })).order;
+    rows.push({
+      idOrder: orderId,
+      idCustomer: order.id_customer ? Number(order.id_customer) : null,
+      currentState: Number(order.current_state),
+      dateAdd: order.date_add,
+    });
+  }
+  return rows.filter((r) => VALID_STATE_IDS.has(r.currentState));
+}
+
+async function disableFurtherUse(cartRuleId) {
+  const body = { cart_rule: { id: cartRuleId, quantity: 0 } };
+  if (DRY_RUN) {
+    console.log(`Dry run: would PUT cart_rules/${cartRuleId}`, body);
+    return null;
+  }
+  return apiPut(`cart_rules/${cartRuleId}`, body);
+}
+
+export async function run() {
+  const cartRule = await getCartRule(CART_RULE_ID);
+  const validOrders = await ordersUsingRule(CART_RULE_ID);
+
+  const report = findVoucherOveruse(cartRule, validOrders);
+  if (report === null) {
+    console.log(`Cart rule ${cartRule.id} (${cartRule.code}) is within its quantity and quantity_per_user limits.`);
+    return;
+  }
+
+  console.warn("Voucher overuse detected:", report);
+  await disableFurtherUse(CART_RULE_ID);
+  console.log("Done. Report ready for manual review.");
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which vouchers get reported as overused. Because <code>find_voucher_overuse</code> is pure, the test needs no network and no PrestaShop store. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_voucher_overuse.py</div>
+      <pre><code class="language-python">from audit_voucher_overuse import find_voucher_overuse
+
+RULE = {"id": 42, "code": "SUMMER1", "quantity": 1, "quantity_per_user": 1}
+
+
+def order(**over):
+    base = {"id_order": 1, "id_customer": 10, "current_state": 2, "date_add": "2026-07-01 10:00:00"}
+    base.update(over)
+    return base
+
+
+def test_no_overage_when_single_use_within_quantity():
+    orders = [order()]
+    assert find_voucher_overuse(RULE, orders) is None
+
+
+def test_overage_when_quantity_one_used_twice():
+    orders = [order(id_order=1, id_customer=10), order(id_order=2, id_customer=11)]
+    result = find_voucher_overuse(RULE, orders)
+    assert result is not None
+    assert result["overage_count"] == 1
+    assert result["offending_order_ids"] == [1, 2]
+
+
+def test_per_user_violation_flagged_even_under_total_quantity():
+    rule = {"id": 7, "code": "VIP5", "quantity": 5, "quantity_per_user": 1}
+    orders = [order(id_order=1, id_customer=10), order(id_order=2, id_customer=10)]
+    result = find_voucher_overuse(rule, orders)
+    assert result is not None
+    assert result["per_user_violations"] == {10: 2}
+    assert result["overage_count"] == 0
+
+
+def test_no_flag_when_orders_empty():
+    assert find_voucher_overuse(RULE, []) is None
+
+
+def test_offending_order_ids_are_sorted():
+    orders = [order(id_order=5, id_customer=1), order(id_order=2, id_customer=2), order(id_order=9, id_customer=3)]
+    rule = {"id": 8, "code": "X", "quantity": 1, "quantity_per_user": 1}
+    result = find_voucher_overuse(rule, orders)
+    assert result["offending_order_ids"] == [2, 5, 9]
+
+
+def test_guest_orders_without_customer_id_are_grouped_together():
+    orders = [order(id_order=1, id_customer=None), order(id_order=2, id_customer=None)]
+    rule = {"id": 9, "code": "GUEST1", "quantity": 5, "quantity_per_user": 1}
+    result = find_voucher_overuse(rule, orders)
+    assert result is not None
+    assert result["per_user_violations"] == {None: 2}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">voucher-overuse.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findVoucherOveruse } from "./audit-voucher-overuse.js";
+
+const RULE = { id: 42, code: "SUMMER1", quantity: 1, quantityPerUser: 1 };
+
+const order = (over = {}) =&gt; ({ idOrder: 1, idCustomer: 10, currentState: 2, dateAdd: "2026-07-01 10:00:00", ...over });
+
+test("no overage when single use is within quantity", () =&gt; {
+  const orders = [order()];
+  assert.equal(findVoucherOveruse(RULE, orders), null);
+});
+
+test("overage when quantity one is used twice", () =&gt; {
+  const orders = [order({ idOrder: 1, idCustomer: 10 }), order({ idOrder: 2, idCustomer: 11 })];
+  const result = findVoucherOveruse(RULE, orders);
+  assert.ok(result);
+  assert.equal(result.overageCount, 1);
+  assert.deepEqual(result.offendingOrderIds, [1, 2]);
+});
+
+test("per user violation flagged even under total quantity", () =&gt; {
+  const rule = { id: 7, code: "VIP5", quantity: 5, quantityPerUser: 1 };
+  const orders = [order({ idOrder: 1, idCustomer: 10 }), order({ idOrder: 2, idCustomer: 10 })];
+  const result = findVoucherOveruse(rule, orders);
+  assert.ok(result);
+  assert.deepEqual(result.perUserViolations, { 10: 2 });
+  assert.equal(result.overageCount, 0);
+});
+
+test("no flag when orders list is empty", () =&gt; {
+  assert.equal(findVoucherOveruse(RULE, []), null);
+});
+
+test("offending order ids are sorted", () =&gt; {
+  const orders = [order({ idOrder: 5, idCustomer: 1 }), order({ idOrder: 2, idCustomer: 2 }), order({ idOrder: 9, idCustomer: 3 })];
+  const rule = { id: 8, code: "X", quantity: 1, quantityPerUser: 1 };
+  const result = findVoucherOveruse(rule, orders);
+  assert.deepEqual(result.offendingOrderIds, [2, 5, 9]);
+});
+
+test("guest orders without a customer id are grouped together", () =&gt; {
+  const orders = [order({ idOrder: 1, idCustomer: null }), order({ idOrder: 2, idCustomer: null })];
+  const rule = { id: 9, code: "GUEST1", quantity: 5, quantityPerUser: 1 };
+  const result = findVoucherOveruse(rule, orders);
+  assert.ok(result);
+  assert.deepEqual(result.perUserViolations, { null: 2 });
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash sale</span>
+      <h4>One influencer code, six paid orders</h4>
+      <p>A skincare brand handed a single-use code to an influencer for one giveaway winner. The post went out, and within ninety seconds six different followers had it applied and paid. The cart rule's <code>quantity</code> was correctly set to 1 the entire time; the checkouts simply raced past the check before any of them finished validating.</p>
+      <p>The audit script pulled <code>order_cart_rules</code> for that cart rule id, found six valid paid orders against a quantity of one, and reported the full list sorted by <code>date_add</code>. The brand honored the discount for the earliest order and reached out individually to the other five with a small store credit instead of a blanket cancellation.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Guest checkout</span>
+      <h4>quantity_per_user did nothing for guests</h4>
+      <p>A subscription box store gave every new signup a welcome code capped at <code>quantity_per_user</code> 1. Logged-in accounts were blocked correctly on a second attempt, but guest checkouts kept slipping through, since the cap keyed off <code>id_customer</code> and guest orders were not tied to one consistently.</p>
+      <p>Running the auditor weekly grouped valid orders by <code>id_customer</code>, including the null-customer guest group, and surfaced a growing cluster of guest orders reusing the same welcome code well past its intended per-user limit. The store added a required account step at checkout for that promotion going forward.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs, a single-use voucher that slipped past its own limit is never a surprise buried in a discount report. Every overused cart rule comes with the exact orders and customers involved, sorted so the earliest legitimate use is obvious, and no order that already used the code is ever cancelled or edited automatically. A human reviews the report and decides the fair outcome for the rest.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did a single-use voucher get used on more than one order?</summary>
+      <p>PrestaShop checks a cart rule's remaining quantity and quantity_per_user when the code is applied to the cart, and again when the order is placed, but those reads and writes are not wrapped in a locking transaction. Under concurrent checkouts, two customers can both pass the quantity remaining check before either order's validation step decrements the cart rule's used count, so both orders get created against the same single-use voucher.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto cancel the extra orders that used the voucher?</summary>
+      <p>No. The orders are already placed and often already paid, so cancelling or editing them automatically would mutate financial state without a human involved. The safe pattern is to report every order using the voucher beyond its quantity or quantity_per_user limit, honor the discount on the first valid order by date_add, and let a human decide on a refund, adjustment, or customer contact for the rest.</p>
+    </details>
+    <details>
+      <summary>Does quantity_per_user protect guest checkouts too?</summary>
+      <p>Not reliably. quantity_per_user is checked against id_customer, and guest orders are not tied to a persistent customer id the same way a logged in account is, so a guest can bypass the per-user cap even when the overall quantity has not run out. Treat guest orders as a separate group when auditing quantity_per_user violations.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past the shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop GitHub Issue #9839: Cart rules can be reused under concurrent access. <a href="https://github.com/PrestaShop/PrestaShop/issues/9839" rel="noopener">github.com/PrestaShop/PrestaShop/issues/9839</a></li>
+      <li>PrestaShop GitHub Issue #29493: Cart rule discount with quantity 1 can be used more than once. <a href="https://github.com/PrestaShop/PrestaShop/issues/29493" rel="noopener">github.com/PrestaShop/PrestaShop/issues/29493</a></li>
+      <li>PrestaShop GitHub Issue #16370: "Quantity per user" is not considered for guests orders. <a href="https://github.com/PrestaShop/PrestaShop/issues/16370" rel="noopener">github.com/PrestaShop/PrestaShop/issues/16370</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: the cart_rules Webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/cart_rules/" rel="noopener">devdocs.prestashop-project.org webservice resources cart_rules</a></li>
+      <li>PrestaShop Developer Documentation: the order_cart_rules Webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_cart_rules/" rel="noopener">devdocs.prestashop-project.org webservice resources order_cart_rules</a></li>
+      <li>PrestaShop 9 documentation: Cart Rules user guide. <a href="https://docs.prestashop-project.org/v.9-documentation/user-guide/selling/managing-catalog/managing-discounts/cart-rules" rel="noopener">docs.prestashop-project.org user guide cart rules</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop vouchers, cart rules, orders, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a voucher before it cost you more?</h3>
+    <p>If this saved you from an overused discount or an awkward customer conversation, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

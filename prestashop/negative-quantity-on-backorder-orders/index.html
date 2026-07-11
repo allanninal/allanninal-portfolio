@@ -1,0 +1,897 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Negative Stock Quantities on PrestaShop Backorder Paid Orders</title>
+<meta name="description" content="PrestaShop decrements stock_available.quantity at order validation without a lock tied to the final payment confirmation, so backorder and race condition orders can drive quantity below zero and it never self heals. Learn why and build a Python or Node.js reconciler that flags or clamps it safely.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/negative-quantity-on-backorder-orders/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Negative Stock Quantities on PrestaShop Backorder Paid Orders">
+<meta property="og:description" content="Why stock_available.quantity can go negative and stay negative on backorder paid orders, and a safe Python or Node.js reconciler that tells real oversell demand apart from drift and repairs only the drift.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/negative-quantity-on-backorder-orders/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/negative-quantity-on-backorder-orders/#article","headline":"Fix Negative Stock Quantities on PrestaShop Backorder Paid Orders","description":"Why stock_available.quantity can go negative and stay negative on backorder paid orders, and a safe Python or Node.js reconciler that tells real oversell demand apart from drift and repairs only the drift.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/negative-quantity-on-backorder-orders/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Stock & Inventory","keywords":"PrestaShop negative stock quantity, backorder paid, StockAvailable::updateQuantity, ps_stock_available, PrestaShop Webservice API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Negative quantities recorded on backorder paid orders","item":"https://www.allanninal.dev/prestashop/negative-quantity-on-backorder-orders/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does PrestaShop let stock_available.quantity go negative on a backorder paid order?","acceptedAnswer":{"@type":"Answer","text":"PrestaShop decrements stock_available.quantity at order validation without a transactional row lock tied to the final payment confirmation. When a product allows backorders, or stock enforcement is momentarily bypassed, two concurrent checkouts or an order moving through a backorder paid state can each subtract the ordered amount from an already-zero or already-reserved stock line, driving quantity below zero. Nothing in core self heals it afterward."}},{"@type":"Question","name":"Is a negative stock quantity always a bug I should fix?","acceptedAnswer":{"@type":"Answer","text":"No. If the product explicitly allows backorders and there is a genuine open backorder paid order still waiting for stock, the negative number is an accurate signal of real oversell depth, not corruption. Zeroing it out would silently hide that liability from the merchant. It only counts as drift worth clamping when backorders should have been denied or there is no matching open backorder paid order to justify the deficit."}},{"@type":"Question","name":"Can I fix this with a single PUT to stock_availables?","acceptedAnswer":{"@type":"Answer","text":"Only for rows that a pure decision function classifies as drift, not for rows that represent real backorder demand. For a drift row you GET the existing stock_availables resource, patch only the quantity field to 0 while leaving depends_on_stock, out_of_stock, id_product, and id_product_attribute untouched, and PUT it back. Rows flagged for manual review are never written through the API since core exposes no safe way to re-derive the correct number from order_detail history alone."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Stock &amp; Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Stock &amp; Inventory</p>
+    <h1>Negative quantities recorded on backorder paid orders</h1>
+    <p class="lead">A product's <code>stock_available</code> row shows a quantity like -3 or -12, and it has sat that way for weeks. Nobody sold stock they did not have on purpose, but the number will not come back on its own. Here is why PrestaShop can drive stock below zero on backorder paid orders and race conditions, and a small script that tells real oversell demand apart from drift and repairs only the drift.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>PrestaShop decrements <code>ps_stock_available.quantity</code> at order validation without a transactional row lock tied to the final payment confirmation, so when a product allows backorders, or stock enforcement is momentarily bypassed, concurrent checkouts or an order transitioning through a backorder paid state can each subtract from an already-zero or already-reserved line and drive <code>quantity</code> below zero, with nothing in core to self heal it. Run a script that pulls every negative <code>stock_availables</code> row, cross-references the orders and order states that touch it, and feeds the result into a pure function that decides <code>clamp_to_zero</code> or <code>flag_manual_review</code> per row. Only the drift rows get a <code>PUT</code> to reset <code>quantity</code> to 0. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When an order is validated, PrestaShop subtracts the ordered quantity from the product's <code>stock_available</code> row through <code>StockAvailable::updateQuantity</code>. That subtraction is meant to happen once per order, at the moment the order becomes real.</p>
+  <p>The trouble is that this decrement is not tied to a transactional row lock against the final payment confirmation. If a product allows backorders, or if stock enforcement gets bypassed for a moment during checkout, two shoppers can check out for the last unit at nearly the same time, or an order can pass through a non-logable or backorder-paid state that still triggers a subtraction. Each of those subtracts the ordered amount from a stock line that is already at zero or already fully reserved. The result is a <code>quantity</code>, and sometimes a <code>physical_quantity</code>, that goes negative. Nothing in core reconciles that number against <code>reserved_quantity</code> or the order_detail history afterward, so once a line goes negative it stays negative indefinitely until someone manually corrects it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. Two concurrent checkouts, or an order passing through a backorder paid state, each subtract the ordered amount from the same stock line without a transactional lock, driving quantity below zero with nothing to self heal it.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Checkout A validates</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">quantity 0 minus 1</text>
+      <rect x="10" y="140" width="185" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="102" y="166" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Checkout B validates</text>
+      <text x="102" y="183" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">quantity 0 minus 1</text>
+      <line x1="195" y1="50" x2="245" y2="90" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="195" y1="170" x2="245" y2="120" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <text x="270" y="45" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="235" y="150" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">no row lock tied</text>
+      <text x="235" y="164" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">to payment</text>
+      <rect x="255" y="90" width="205" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="357" y="112" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Both subtract</text>
+      <text x="357" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">from the same stock line</text>
+      <line x1="460" y1="120" x2="502" y2="120" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="505" y="90" width="145" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="577" y="112" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">quantity = -1</text>
+      <text x="577" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">or worse</text>
+      <line x1="655" y1="120" x2="672" y2="120" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="675" y="90" width="75" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="712" y="112" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Stuck</text>
+      <text x="712" y="130" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">forever</text>
+      <text x="380" y="195" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">Core never reconciles quantity against reserved_quantity or order_detail history</text>
+    </svg>
+    <figcaption>Two subtractions race against the same stock line with no lock tied to final payment confirmation. The line goes negative and nothing in core brings it back.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>PrestaShop's stock decrement was built to be fast at the moment of order validation, not to serialize against every other checkout touching the same line or to distinguish a real payment confirmation from an in-progress order state. That tradeoff shows up in a few recurring ways:</p>
+  <ul>
+    <li>A product allows backorders, so <code>StockAvailable::updateQuantity</code> keeps subtracting past zero on purpose, and the resulting negative number then gets treated the same as accidental drift by anyone glancing at a report.</li>
+    <li>Two concurrent checkouts validate for the same product at nearly the same moment, and each decrement runs against the stock line without a transactional lock tied to the final payment confirmation, so both subtractions land even though only one unit existed.</li>
+    <li>An order transitions through a non-logable or backorder-paid order state, for example <code>PS_OS_OUTOFSTOCK_PAID</code>, and the stock hook fires again on a line that was already reserved or already zero.</li>
+    <li>Stock enforcement is momentarily bypassed, for example by a custom module, an import, or a webservice call that writes an order without going through the normal validation path that would otherwise check availability first.</li>
+  </ul>
+  <p>This is a long-standing, reproducible core bug rather than a one-off misconfiguration. It has been confirmed across PrestaShop 1.7.5.x through 1.7.7.x and is still reported in later trackers: the stock deduction logic in <code>StockAvailable::updateQuantity</code> and the order state change hooks do not reconcile against <code>reserved_quantity</code> or order_detail history, so once a line goes negative it stays negative indefinitely unless someone corrects it by hand. See the citations at the end for the exact reports.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A negative <code>quantity</code> is not automatically a bug. If a product explicitly allows backorders and there is a genuine open backorder paid order still waiting on stock, the negative number is an honest signal of real oversell depth, and zeroing it out would quietly erase that liability from the merchant's view. The number only counts as drift worth repairing when backorders should have been denied, or when there is no matching open backorder paid order left to justify the deficit. That distinction is exactly what the decision function below encodes, so the script never overwrites a real backorder queue by mistake.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch every negative row the same way. The script pulls the negative <code>stock_availables</code> rows, cross-references each one against the orders and order states that plausibly caused it, and passes the result through a pure function that classifies each row as no correction needed, safe to clamp to zero, or needing a human to reconcile stock or trigger a reorder. Only the clamp rows get written, and only when dry run is off.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. The script pulls negative stock_availables rows, cross-references the linked orders and order states, classifies each row with a pure function as noop, clamp to zero, or flag for manual review, and only in live mode PUTs quantity to 0 for the clamp rows.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="195" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="107" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Pull negative rows</text>
+      <text x="107" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">stock_availables quantity &lt; 0</text>
+      <line x1="107" y1="80" x2="107" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="235" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="127" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Cross-reference orders</text>
+      <text x="127" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">order_details, order_states</text>
+      <line x1="245" y1="138" x2="287" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="290" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="385" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">clamp_negative_stock</text>
+      <text x="385" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">pure decision function</text>
+      <line x1="480" y1="138" x2="522" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="610,106 697,138 610,170 523,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="610" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">Real backorder</text>
+      <text x="610" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">demand or</text>
+      <text x="610" y="156" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">drift?</text>
+      <text x="605" y="198" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b" font-weight="700">real demand: flag_manual_review</text>
+      <line x1="610" y1="170" x2="610" y2="205" stroke="#6b4f5b" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="700" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">drift</text>
+      <line x1="697" y1="138" x2="725" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="640" y="185" width="105" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="692" y="207" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">clamp_to_zero</text>
+      <text x="692" y="223" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">PUT quantity=0</text>
+      <path d="M725,138 C745,138 692,150 692,180" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Only rows the pure function classifies as drift get written. Rows that represent real, still-open backorder demand are flagged for a human, never zeroed.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a webservice key with the right permissions</h3>
+      <p>In the backoffice, go to Advanced Parameters, Webservice, and create a key with read access to <code>stock_availables</code>, <code>orders</code>, <code>order_details</code>, and <code>order_states</code>, plus write access to <code>stock_availables</code>. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Pull every stock row and filter to the negative ones</h3>
+      <p>PrestaShop's filter range syntax on signed integers is unreliable, so rather than trust <code>?filter[quantity]=[,-1]</code> on the server, fetch the full <code>stock_availables</code> list and filter client side. For each hit, capture <code>id</code>, <code>id_product</code>, <code>id_product_attribute</code>, <code>quantity</code>, <code>out_of_stock</code>, and <code>depends_on_stock</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def negative_stock_rows():
+    data = api_get("stock_availables", {"display": "full", "limit": "0,1000"})
+    rows = data.get("stock_availables") or []
+    out = []
+    for r in rows:
+        quantity = int(r.get("quantity") or 0)
+        if quantity >= 0:
+            continue
+        out.append({
+            "id": int(r["id"]),
+            "id_product": int(r["id_product"]),
+            "id_product_attribute": int(r.get("id_product_attribute") or 0),
+            "quantity": quantity,
+            "out_of_stock": int(r.get("out_of_stock") or 0),
+            "depends_on_stock": str(r.get("depends_on_stock")) in ("1", "true", "True"),
+        })
+    return out</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function negativeStockRows() {
+  const data = await apiGet("stock_availables", { display: "full", limit: "0,1000" });
+  const rows = data.stock_availables || [];
+  return rows
+    .map((r) => ({
+      id: Number(r.id),
+      id_product: Number(r.id_product),
+      id_product_attribute: Number(r.id_product_attribute || 0),
+      quantity: Number(r.quantity || 0),
+      out_of_stock: Number(r.out_of_stock || 0),
+      depends_on_stock: String(r.depends_on_stock) === "1" || r.depends_on_stock === true,
+    }))
+    .filter((r) => r.quantity < 0);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Cross-reference the orders that plausibly caused it</h3>
+      <p>For each negative row, pull the <code>order_details</code> lines for that product, join to the parent order to read <code>current_state</code>, then look up that state in <code>order_states</code> by name and flags, not by an assumed id, to see whether it resolves to a paid, backorder style status such as <code>PS_OS_OUTOFSTOCK_PAID</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def order_details_for_product(id_product):
+    data = api_get("order_details", {"display": "full", "filter[product_id]": id_product})
+    return data.get("order_details") or []
+
+def order_by_id(id_order):
+    data = api_get(f"orders/{id_order}", {"display": "full"})
+    return data.get("order") or {}
+
+def order_state_by_id(id_order_state):
+    data = api_get(f"order_states/{id_order_state}", {"display": "full"})
+    return data.get("order_state") or {}
+
+def has_open_backorder_paid_order(id_product):
+    for line in order_details_for_product(id_product):
+        order = order_by_id(line["id_order"])
+        state = order_state_by_id(order.get("current_state"))
+        paid = str(state.get("paid")) in ("1", "true", "True")
+        name = str(state.get("name") or "")
+        product_quantity = int(line.get("product_quantity") or 0)
+        if paid and "backorder" in name.lower() and product_quantity < 0:
+            return True
+    return False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function orderDetailsForProduct(idProduct) {
+  const data = await apiGet("order_details", { display: "full", "filter[product_id]": idProduct });
+  return data.order_details || [];
+}
+
+async function orderById(idOrder) {
+  const data = await apiGet(`orders/${idOrder}`, { display: "full" });
+  return data.order || {};
+}
+
+async function orderStateById(idOrderState) {
+  const data = await apiGet(`order_states/${idOrderState}`, { display: "full" });
+  return data.order_state || {};
+}
+
+async function hasOpenBackorderPaidOrder(idProduct) {
+  for (const line of await orderDetailsForProduct(idProduct)) {
+    const order = await orderById(line.id_order);
+    const state = await orderStateById(order.current_state);
+    const paid = String(state.paid) === "1" || state.paid === true;
+    const name = String(state.name || "");
+    const productQuantity = Number(line.product_quantity || 0);
+    if (paid &amp;&amp; name.toLowerCase().includes("backorder") &amp;&amp; productQuantity < 0) return true;
+  }
+  return false;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the actual decision in its own function that takes the current quantity and the product's backorder policy and returns a corrected quantity plus an action tag. If the quantity is not negative there is nothing to do. If <code>depends_on_stock</code> is off, the value is meaningless for decrement purposes, so it is left alone but flagged. If backorders are explicitly allowed and a genuine open backorder paid order still justifies the deficit, it is flagged for a human or a replenishment workflow rather than zeroed. Everything else negative is drift, and gets clamped to zero.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def clamp_negative_stock(quantity, depends_on_stock, out_of_stock_policy, has_pending_backorder_paid):
+    """
+    out_of_stock_policy: 0 = deny, 1 = allow (backorder), 2 = use global default
+    Returns (new_quantity, action) where action in {"noop", "clamp_to_zero", "flag_manual_review"}.
+    """
+    if quantity >= 0:
+        return (quantity, "noop")
+    if not depends_on_stock:
+        return (quantity, "flag_manual_review")
+    if out_of_stock_policy == 1 and has_pending_backorder_paid:
+        return (quantity, "flag_manual_review")
+    return (0, "clamp_to_zero")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">// outOfStockPolicy: 0 = deny, 1 = allow (backorder), 2 = use global default
+// Returns [newQuantity, action] where action is "noop", "clamp_to_zero", or "flag_manual_review".
+export function clampNegativeStock(quantity, dependsOnStock, outOfStockPolicy, hasPendingBackorderPaid) {
+  if (quantity >= 0) return [quantity, "noop"];
+  if (!dependsOnStock) return [quantity, "flag_manual_review"];
+  if (outOfStockPolicy === 1 &amp;&amp; hasPendingBackorderPaid) return [quantity, "flag_manual_review"];
+  return [0, "clamp_to_zero"];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair only the clamp rows, through the documented schema</h3>
+      <p>For a row classified <code>clamp_to_zero</code>, fetch the resource's schema once with <code>?schema=synopsis</code>, then <code>GET</code> the existing row, patch only the <code>quantity</code> field to 0, and leave <code>depends_on_stock</code>, <code>out_of_stock</code>, <code>id_product</code>, and <code>id_product_attribute</code> untouched before you <code>PUT</code> it back. Rows classified <code>flag_manual_review</code> are never written through the API. They only go into a report for a human to reconcile stock or trigger a supplier reorder, since core offers no safe, idempotent webservice call to selectively re-derive the correct quantity from order_detail history.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def clamp_stock_row_to_zero(id_stock_available):
+    schema = api_get("stock_availables", {"schema": "synopsis"})
+    current = api_get(f"stock_availables/{id_stock_available}", {"display": "full"})
+    row = current.get("stock_available") or {}
+    row["quantity"] = 0  # only quantity changes; depends_on_stock and out_of_stock stay as-is
+    r = requests.put(
+        f"{BASE_URL}/api/stock_availables/{id_stock_available}",
+        params={"output_format": "JSON"},
+        json={"stock_available": row},
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function clampStockRowToZero(idStockAvailable) {
+  await apiGet("stock_availables", { schema: "synopsis" });
+  const current = await apiGet(`stock_availables/${idStockAvailable}`, { display: "full" });
+  const row = current.stock_available || {};
+  row.quantity = 0; // only quantity changes; depends_on_stock and out_of_stock stay as-is
+  const url = new URL(`${BASE_URL}/api/stock_availables/${idStockAvailable}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ stock_available: row }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop pulls every negative row, cross-references orders and order states to decide the backorder policy and whether a genuine open backorder paid order exists, runs the pure function, and logs every row with its action. Leave <code>DRY_RUN</code> on for the first few runs so it only reports. Once you trust the split between clamp and flag, switch it off so it writes only the clamp rows.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This script never writes a row classified <code>flag_manual_review</code>, and for rows it does write, it only ever changes <code>quantity</code>, never <code>depends_on_stock</code>, <code>out_of_stock</code>, <code>id_product</code>, or <code>id_product_attribute</code>.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever writes rows the pure function classifies as drift, never rows that represent real, still-open backorder demand.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/negative-quantity-on-backorder-orders" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">negative_quantity_backorder.py</div>
+      <pre><code class="language-python">"""Find and repair negative PrestaShop stock quantities from backorder paid orders.
+
+PrestaShop decrements ps_stock_available.quantity at order validation without a
+transactional row lock tied to the final payment confirmation. When a product allows
+backorders, or stock enforcement is momentarily bypassed, concurrent checkouts or an
+order passing through a backorder paid state can each subtract from an already-zero or
+already-reserved line, driving quantity below zero with nothing in core to self heal it.
+
+This pulls every negative stock_availables row, cross-references the orders and order
+states that plausibly caused it, and classifies each row as no correction needed, safe
+to clamp to zero, or needing a human to reconcile stock or trigger a reorder. Only the
+clamp rows are ever written, and only quantity changes. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("negative_quantity_backorder")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def negative_stock_rows():
+    data = api_get("stock_availables", {"display": "full", "limit": "0,1000"})
+    rows = data.get("stock_availables") or []
+    out = []
+    for r in rows:
+        quantity = int(r.get("quantity") or 0)
+        if quantity >= 0:
+            continue
+        out.append({
+            "id": int(r["id"]),
+            "id_product": int(r["id_product"]),
+            "id_product_attribute": int(r.get("id_product_attribute") or 0),
+            "quantity": quantity,
+            "out_of_stock": int(r.get("out_of_stock") or 0),
+            "depends_on_stock": str(r.get("depends_on_stock")) in ("1", "true", "True"),
+        })
+    return out
+
+
+def order_details_for_product(id_product):
+    data = api_get("order_details", {"display": "full", "filter[product_id]": id_product})
+    return data.get("order_details") or []
+
+
+def order_by_id(id_order):
+    data = api_get(f"orders/{id_order}", {"display": "full"})
+    return data.get("order") or {}
+
+
+def order_state_by_id(id_order_state):
+    data = api_get(f"order_states/{id_order_state}", {"display": "full"})
+    return data.get("order_state") or {}
+
+
+def has_open_backorder_paid_order(id_product):
+    for line in order_details_for_product(id_product):
+        order = order_by_id(line["id_order"])
+        state = order_state_by_id(order.get("current_state"))
+        paid = str(state.get("paid")) in ("1", "true", "True")
+        name = str(state.get("name") or "")
+        product_quantity = int(line.get("product_quantity") or 0)
+        if paid and "backorder" in name.lower() and product_quantity < 0:
+            return True
+    return False
+
+
+def clamp_negative_stock(quantity, depends_on_stock, out_of_stock_policy, has_pending_backorder_paid):
+    """
+    out_of_stock_policy: 0 = deny, 1 = allow (backorder), 2 = use global default
+    Returns (new_quantity, action) where action in {"noop", "clamp_to_zero", "flag_manual_review"}.
+    """
+    if quantity >= 0:
+        return (quantity, "noop")
+    if not depends_on_stock:
+        return (quantity, "flag_manual_review")
+    if out_of_stock_policy == 1 and has_pending_backorder_paid:
+        return (quantity, "flag_manual_review")
+    return (0, "clamp_to_zero")
+
+
+def clamp_stock_row_to_zero(id_stock_available):
+    api_get("stock_availables", {"schema": "synopsis"})
+    current = api_get(f"stock_availables/{id_stock_available}", {"display": "full"})
+    row = current.get("stock_available") or {}
+    row["quantity"] = 0
+    r = requests.put(
+        f"{BASE_URL}/api/stock_availables/{id_stock_available}",
+        params={"output_format": "JSON"},
+        json={"stock_available": row},
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    rows = negative_stock_rows()
+    clamped = 0
+    flagged = 0
+    for row in rows:
+        has_backorder = has_open_backorder_paid_order(row["id_product"])
+        _, action = clamp_negative_stock(
+            row["quantity"], row["depends_on_stock"], row["out_of_stock"], has_backorder
+        )
+        if action == "noop":
+            continue
+        if action == "flag_manual_review":
+            log.warning(
+                "Flag for review: stock_available %s product %s attribute %s quantity %s",
+                row["id"], row["id_product"], row["id_product_attribute"], row["quantity"],
+            )
+            flagged += 1
+            continue
+        log.warning(
+            "Drift: stock_available %s product %s attribute %s quantity %s -> 0 (%s)",
+            row["id"], row["id_product"], row["id_product_attribute"], row["quantity"],
+            "would clamp" if DRY_RUN else "clamping",
+        )
+        if not DRY_RUN:
+            clamp_stock_row_to_zero(row["id"])
+        clamped += 1
+    log.info(
+        "Done. %d row(s) %s, %d row(s) flagged for manual review.",
+        clamped, "to clamp" if DRY_RUN else "clamped", flagged,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">negative-quantity-backorder.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and repair negative PrestaShop stock quantities from backorder paid orders.
+ *
+ * PrestaShop decrements ps_stock_available.quantity at order validation without a
+ * transactional row lock tied to the final payment confirmation. When a product allows
+ * backorders, or stock enforcement is momentarily bypassed, concurrent checkouts or an
+ * order passing through a backorder paid state can each subtract from an already-zero or
+ * already-reserved line, driving quantity below zero with nothing in core to self heal it.
+ *
+ * This pulls every negative stock_availables row, cross-references the orders and order
+ * states that plausibly caused it, and classifies each row as no correction needed, safe
+ * to clamp to zero, or needing a human to reconcile stock or trigger a reorder. Only the
+ * clamp rows are ever written, and only quantity changes. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/negative-quantity-on-backorder-orders/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://example.test").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "dummy_key";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function negativeStockRows() {
+  const data = await apiGet("stock_availables", { display: "full", limit: "0,1000" });
+  const rows = data.stock_availables || [];
+  return rows
+    .map((r) => ({
+      id: Number(r.id),
+      id_product: Number(r.id_product),
+      id_product_attribute: Number(r.id_product_attribute || 0),
+      quantity: Number(r.quantity || 0),
+      out_of_stock: Number(r.out_of_stock || 0),
+      depends_on_stock: String(r.depends_on_stock) === "1" || r.depends_on_stock === true,
+    }))
+    .filter((r) => r.quantity < 0);
+}
+
+async function orderDetailsForProduct(idProduct) {
+  const data = await apiGet("order_details", { display: "full", "filter[product_id]": idProduct });
+  return data.order_details || [];
+}
+
+async function orderById(idOrder) {
+  const data = await apiGet(`orders/${idOrder}`, { display: "full" });
+  return data.order || {};
+}
+
+async function orderStateById(idOrderState) {
+  const data = await apiGet(`order_states/${idOrderState}`, { display: "full" });
+  return data.order_state || {};
+}
+
+async function hasOpenBackorderPaidOrder(idProduct) {
+  for (const line of await orderDetailsForProduct(idProduct)) {
+    const order = await orderById(line.id_order);
+    const state = await orderStateById(order.current_state);
+    const paid = String(state.paid) === "1" || state.paid === true;
+    const name = String(state.name || "");
+    const productQuantity = Number(line.product_quantity || 0);
+    if (paid &amp;&amp; name.toLowerCase().includes("backorder") &amp;&amp; productQuantity < 0) return true;
+  }
+  return false;
+}
+
+// outOfStockPolicy: 0 = deny, 1 = allow (backorder), 2 = use global default
+// Returns [newQuantity, action] where action is "noop", "clamp_to_zero", or "flag_manual_review".
+export function clampNegativeStock(quantity, dependsOnStock, outOfStockPolicy, hasPendingBackorderPaid) {
+  if (quantity >= 0) return [quantity, "noop"];
+  if (!dependsOnStock) return [quantity, "flag_manual_review"];
+  if (outOfStockPolicy === 1 &amp;&amp; hasPendingBackorderPaid) return [quantity, "flag_manual_review"];
+  return [0, "clamp_to_zero"];
+}
+
+async function clampStockRowToZero(idStockAvailable) {
+  await apiGet("stock_availables", { schema: "synopsis" });
+  const current = await apiGet(`stock_availables/${idStockAvailable}`, { display: "full" });
+  const row = current.stock_available || {};
+  row.quantity = 0;
+  const url = new URL(`${BASE_URL}/api/stock_availables/${idStockAvailable}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ stock_available: row }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+export async function run() {
+  const rows = await negativeStockRows();
+  let clamped = 0;
+  let flagged = 0;
+  for (const row of rows) {
+    const hasBackorder = await hasOpenBackorderPaidOrder(row.id_product);
+    const [, action] = clampNegativeStock(row.quantity, row.depends_on_stock, row.out_of_stock, hasBackorder);
+    if (action === "noop") continue;
+    if (action === "flag_manual_review") {
+      console.warn(
+        `Flag for review: stock_available ${row.id} product ${row.id_product} attribute ${row.id_product_attribute} quantity ${row.quantity}`
+      );
+      flagged++;
+      continue;
+    }
+    console.warn(
+      `Drift: stock_available ${row.id} product ${row.id_product} attribute ${row.id_product_attribute} quantity ${row.quantity} -> 0 (${DRY_RUN ? "would clamp" : "clamping"})`
+    );
+    if (!DRY_RUN) await clampStockRowToZero(row.id);
+    clamped++;
+  }
+  console.log(`Done. ${clamped} row(s) ${DRY_RUN ? "to clamp" : "clamped"}, ${flagged} row(s) flagged for manual review.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which rows get zeroed and which get preserved as real oversell demand. Because <code>clamp_negative_stock</code> is pure, the test needs no PrestaShop instance and no network. It just feeds in plain values and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_negative_quantity_backorder.py</div>
+      <pre><code class="language-python">from negative_quantity_backorder import clamp_negative_stock
+
+
+def test_noop_when_quantity_is_not_negative():
+    assert clamp_negative_stock(5, True, 0, False) == (5, "noop")
+
+
+def test_noop_when_quantity_is_exactly_zero():
+    assert clamp_negative_stock(0, True, 1, False) == (0, "noop")
+
+
+def test_flag_when_not_tracked_by_depends_on_stock():
+    assert clamp_negative_stock(-2, False, 0, False) == (-2, "flag_manual_review")
+
+
+def test_flag_when_backorders_allowed_and_real_demand_open():
+    assert clamp_negative_stock(-4, True, 1, True) == (-4, "flag_manual_review")
+
+
+def test_clamp_when_backorders_denied():
+    assert clamp_negative_stock(-3, True, 0, False) == (0, "clamp_to_zero")
+
+
+def test_clamp_when_backorders_allowed_but_no_open_backorder_paid_order():
+    assert clamp_negative_stock(-1, True, 1, False) == (0, "clamp_to_zero")
+
+
+def test_clamp_when_global_default_policy_and_no_open_demand():
+    assert clamp_negative_stock(-7, True, 2, False) == (0, "clamp_to_zero")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">negative-quantity-backorder.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { clampNegativeStock } from "./negative-quantity-backorder.js";
+
+test("noop when quantity is not negative", () => {
+  assert.deepEqual(clampNegativeStock(5, true, 0, false), [5, "noop"]);
+});
+
+test("noop when quantity is exactly zero", () => {
+  assert.deepEqual(clampNegativeStock(0, true, 1, false), [0, "noop"]);
+});
+
+test("flag when not tracked by depends_on_stock", () => {
+  assert.deepEqual(clampNegativeStock(-2, false, 0, false), [-2, "flag_manual_review"]);
+});
+
+test("flag when backorders allowed and real demand open", () => {
+  assert.deepEqual(clampNegativeStock(-4, true, 1, true), [-4, "flag_manual_review"]);
+});
+
+test("clamp when backorders denied", () => {
+  assert.deepEqual(clampNegativeStock(-3, true, 0, false), [0, "clamp_to_zero"]);
+});
+
+test("clamp when backorders allowed but no open backorder paid order", () => {
+  assert.deepEqual(clampNegativeStock(-1, true, 1, false), [0, "clamp_to_zero"]);
+});
+
+test("clamp when global default policy and no open demand", () => {
+  assert.deepEqual(clampNegativeStock(-7, true, 2, false), [0, "clamp_to_zero"]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash sale</span>
+      <h4>The drop that oversold by nine units</h4>
+      <p>A sneaker store ran a timed drop on a limited colorway with backorders switched off in principle, but a caching layer in front of checkout let a burst of near-simultaneous submits through before the stock check settled. By the time the drop ended, the product's <code>stock_available</code> row read -9, and the merchant assumed it was a display bug.</p>
+      <p>The reconciler confirmed there was no open backorder paid order left to justify the deficit and no explicit backorder policy on the product, so it classified all nine units as drift. Clamping the row to zero matched the real fulfillable count, and the merchant used the flagged report separately to decide which of the oversold orders to refund.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Genuine backorder</span>
+      <h4>The preorder that looked broken but was not</h4>
+      <p>A hardware brand sold a preorder item with backorders explicitly allowed, expecting to fulfill from an incoming shipment. Its <code>stock_available.quantity</code> sat at -40 for weeks, and a new operations hire almost zeroed it out during a routine stock cleanup, thinking it was corruption.</p>
+      <p>Running the reconciler first stopped that mistake. It found forty units of quantity tied to genuinely open, paid backorder orders, so every row was flagged for manual review instead of clamped. The -40 stayed exactly as it was, an honest count of real demand waiting on the shipment.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a negative <code>stock_available.quantity</code> stops being a mystery. Drift from race conditions or a denied backorder policy gets clamped back to zero automatically, while genuine oversell demand from an allowed backorder policy stays visible and untouched until a human reconciles stock or triggers a reorder. Nobody accidentally erases a real backorder queue, and nobody has to keep staring at a negative number wondering if it is safe to fix.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does PrestaShop let stock_available.quantity go negative on a backorder paid order?</summary>
+      <p>PrestaShop decrements stock_available.quantity at order validation without a transactional row lock tied to the final payment confirmation. When a product allows backorders, or stock enforcement is momentarily bypassed, two concurrent checkouts or an order moving through a backorder paid state can each subtract the ordered amount from an already-zero or already-reserved stock line, driving quantity below zero. Nothing in core self heals it afterward.</p>
+    </details>
+    <details>
+      <summary>Is a negative stock quantity always a bug I should fix?</summary>
+      <p>No. If the product explicitly allows backorders and there is a genuine open backorder paid order still waiting for stock, the negative number is an accurate signal of real oversell depth, not corruption. Zeroing it out would silently hide that liability from the merchant. It only counts as drift worth clamping when backorders should have been denied or there is no matching open backorder paid order to justify the deficit.</p>
+    </details>
+    <details>
+      <summary>Can I fix this with a single PUT to stock_availables?</summary>
+      <p>Only for rows that a pure decision function classifies as drift, not for rows that represent real backorder demand. For a drift row you GET the existing stock_availables resource, patch only the quantity field to 0 while leaving depends_on_stock, out_of_stock, id_product, and id_product_attribute untouched, and PUT it back. Rows flagged for manual review are never written through the API since core exposes no safe way to re-derive the correct number from order_detail history alone.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past a shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>negative qty in orders ( On backorder (paid) ). <a href="https://github.com/PrestaShop/PrestaShop/issues/18700" rel="noopener">github.com/PrestaShop/PrestaShop/issues/18700</a></li>
+      <li>ps_stock_available updated wrongly on order when products out of stocks. <a href="https://github.com/PrestaShop/PrestaShop/issues/27631" rel="noopener">github.com/PrestaShop/PrestaShop/issues/27631</a></li>
+      <li>Stock quantity are not verified at the last step of the checkout. <a href="https://github.com/PrestaShop/PrestaShop/issues/10762" rel="noopener">github.com/PrestaShop/PrestaShop/issues/10762</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Stock availables webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/stock_availables/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/stock_availables/</a></li>
+      <li>PrestaShop Developer Documentation: Order details webservice resource. <a href="https://devdocs.prestashop-project.org/8/webservice/resources/order_details/" rel="noopener">devdocs.prestashop-project.org/8/webservice/resources/order_details/</a></li>
+      <li>PrestaShop Developer Documentation: Order states webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_states/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_states/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop stock, orders, order states, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this settle your negative stock?</h3>
+    <p>If this saved you a pile of confused stock counts or a wrongly zeroed backorder queue, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

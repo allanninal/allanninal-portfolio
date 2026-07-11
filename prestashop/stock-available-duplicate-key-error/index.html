@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix PrestaShop Duplicate Key Error on Stock Available Updates</title>
+<meta name="description" content="Two near-simultaneous stock updates in PrestaShop can both try to insert a stock_available row and hit a duplicate entry error on product_sqlstock. Learn why it happens and build a Python or Node.js script that finds and safely reports the duplicate rows.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/stock-available-duplicate-key-error/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix PrestaShop Duplicate Key Error on Stock Available Updates">
+<meta property="og:description" content="Why concurrent stock_available writes throw a duplicate entry error on product_sqlstock, and a safe Python or Node.js script that finds the duplicate rows via the Webservice API.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/stock-available-duplicate-key-error/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/stock-available-duplicate-key-error/#article","headline":"Fix PrestaShop Duplicate Key Error on Stock Available Updates","description":"Why concurrent stock_available writes throw a duplicate entry error on product_sqlstock, and a safe Python or Node.js script that finds the duplicate rows via the Webservice API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/stock-available-duplicate-key-error/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Stock & Inventory","keywords":"PrestaShop duplicate entry product_sqlstock, stock_available unique key, StockAvailable setQuantity, PrestaShop multistore stock, Webservice API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Duplicate key error when updating stock quantity concurrently","item":"https://www.allanninal.dev/prestashop/stock-available-duplicate-key-error/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does PrestaShop throw a duplicate entry error for product_sqlstock?","acceptedAnswer":{"@type":"Answer","text":"ps_stock_available has a unique key named product_sqlstock on the combination of id_product, id_product_attribute, id_shop, and id_shop_group. StockAvailable::setQuantity() first checks for an existing row for that key and then decides to update or insert. When two requests run that check at nearly the same moment, both can miss each other's row and both try to insert, so the second insert collides with the unique key and MySQL raises a duplicate entry error."}},{"@type":"Question","name":"Can I safely auto-merge duplicate stock_available rows?","acceptedAnswer":{"@type":"Answer","text":"Not blindly. Collapsing two rows into one means picking a quantity, and picking wrong can under-sell or over-sell stock. The safe pattern is to run the script in DRY_RUN first so it only reports the duplicate groups, review the before and after quantities yourself, and only let it write and delete once a human has confirmed the merge is correct."}},{"@type":"Question","name":"Why do duplicate stock rows show id_shop 0 and id_shop_group 0?","acceptedAnswer":{"@type":"Answer","text":"In a multistore setup, the shop context can resolve incorrectly during a race between two writes, and PrestaShop inserts a stock row scoped to id_shop=0 and id_shop_group=0 instead of the real shop. That orphan row still collides with or shadows the correct per-shop row, which is why multistore installs see this error more often than single shop stores."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Stock &amp; Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Stock &amp; Inventory</p>
+    <h1>Duplicate key error when updating stock quantity concurrently</h1>
+    <p class="lead">Two stock updates land at almost the same moment, maybe a webservice PUT racing a checkout, and PrestaShop throws a duplicate entry error for key product_sqlstock. The row you expected to update never gets touched, and somewhere there is now an orphan stock row fighting the real one. Here is why the check-then-act pattern in StockAvailable lets this happen and a script that finds the duplicate rows so you can review and merge them safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>The <code>ps_stock_available</code> table has a unique key named <code>product_sqlstock</code> on <code>id_product</code>, <code>id_product_attribute</code>, <code>id_shop</code>, and <code>id_shop_group</code>. <code>StockAvailable::setQuantity()</code> selects a row for that key first, then decides whether to update or insert. Two near-simultaneous writes can both miss each other's row and both try to insert, so the second one hits a duplicate entry error. Run a small Python or Node.js script that pulls every <code>stock_availables</code> row for a product, groups them by that same natural key, and flags any group with more than one row as a true duplicate for you to review before merging. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>PrestaShop keeps one stock row per product, per combination, per shop, and per shop group in <code>ps_stock_available</code>. A unique key called <code>product_sqlstock</code> is supposed to guarantee there is never more than one row for a given <code>id_product</code>, <code>id_product_attribute</code>, <code>id_shop</code>, and <code>id_shop_group</code>.</p>
+  <p>The trouble is how PrestaShop decides whether to write that row. <code>StockAvailable::setQuantity()</code>, and the lookup behind it in <code>getStockAvailableByProduct()</code>, first runs a SELECT to see if a matching row already exists, and only afterward decides to UPDATE it or INSERT a new one. That is a check, then an act, done as two separate steps. If two requests run this sequence close enough together, both SELECTs can run before either INSERT lands, so both requests conclude no row exists yet and both try to insert one. The database only lets one of those inserts succeed. The other one collides with the unique key and MySQL throws a duplicate entry error on <code>product_sqlstock</code>.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Two concurrent stock writes each select for the same key, see no row, and both try to insert. The first insert succeeds, the second collides with the unique key product_sqlstock and errors.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="15" width="210" height="50" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="115" y="35" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Request A</text>
+      <text x="115" y="51" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">webservice PUT stock</text>
+      <rect x="10" y="150" width="210" height="50" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="115" y="170" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Request B</text>
+      <text x="115" y="186" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">order state change</text>
+      <line x1="220" y1="40" x2="270" y2="90" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="220" y1="175" x2="270" y2="115" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="273" y="80" width="185" height="55" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="365" y="102" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">Both SELECT the</text>
+      <text x="365" y="118" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">same key, see no row</text>
+      <line x1="458" y1="95" x2="500" y2="95" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="458" y1="120" x2="500" y2="120" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="503" y="65" width="120" height="45" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="563" y="86" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">INSERT A</text>
+      <text x="563" y="101" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a">succeeds</text>
+      <rect x="503" y="118" width="120" height="45" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="563" y="139" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">INSERT B</text>
+      <text x="563" y="154" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">collides</text>
+      <line x1="623" y1="140" x2="665" y2="140" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="633" y="10" width="117" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="32" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Duplicate entry</text>
+      <text x="691" y="48" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">product_sqlstock</text>
+      <line x1="691" y1="65" x2="691" y2="107" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5"></line>
+      <rect x="628" y="175" width="122" height="45" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="196" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Orphan row</text>
+      <text x="689" y="211" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">id_shop=0/0</text>
+    </svg>
+    <figcaption>Both requests select the same key, see nothing yet, and both try to insert. One insert wins, the other collides with the unique key or lands as an orphan row scoped to shop 0.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The root cause is a classic check-then-act race sitting on top of a unique key that is otherwise doing its job correctly. A few situations make it show up in real stores:</p>
+  <ul>
+    <li>Two near-simultaneous webservice PUT calls updating the stock of the same product or combination, for example a sync job and a manual correction firing close together.</li>
+    <li>A webservice stock update racing a checkout or an order state transition that also decrements or restores stock for the same product through <code>StockAvailable::setQuantity()</code>.</li>
+    <li>A retried request. A client times out waiting for a response, assumes it failed, and retries while the first call is still finishing its SELECT and INSERT.</li>
+    <li>Multistore installs where the shop context resolves incorrectly mid-request to <code>id_shop=0</code> and <code>id_shop_group=0</code>. That produces an insert that collides with, or worse orphans alongside, the real per-shop stock row.</li>
+  </ul>
+  <p>This is a documented pattern, not a one-off bug in your store. The core team has tracked the duplicate entry on <code>product_sqlstock</code> as a race in <code>StockAvailable</code>, and a separate report covers the multistore case where changing an order status with a warehouse per shop throws the same error. See the citations at the end for both.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot fix a race after the fact by writing faster. Once the duplicate rows exist, the safest move is not to guess which one is right and blindly delete the other. It is to enumerate every <code>stock_availables</code> row for the affected product, group them by the same natural key the unique index uses, and only act on a group once you can see both rows side by side and a human agrees on the merge.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not try to prevent the race inside PrestaShop's core code. We detect its aftermath. A script pulls the <code>stock_availables</code> for a product from the Webservice API, groups them by <code>id_product</code>, <code>id_product_attribute</code>, <code>id_shop</code>, and <code>id_shop_group</code>, and any group with more than one row is a true duplicate the unique index should have prevented. We also cross-check against <code>combinations</code> so a stock row pointing at a combination that no longer exists is flagged too. Everything is reported first; nothing is deleted until <code>DRY_RUN</code> is turned off and a human has looked at the before and after quantities.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the solution. A script fetches stock_availables and combinations for a product, groups stock rows by the natural key, flags groups with more than one row as duplicates, and in dry run only reports them, otherwise merges and deletes the extra row after confirmation.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">GET stock_availables</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">and combinations</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="102" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Group by natural key</text>
+      <text x="102" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">product, combo, shop, group</text>
+      <line x1="195" y1="138" x2="237" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="240" y="108" width="175" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="327" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Any group with</text>
+      <text x="327" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">more than one row?</text>
+      <line x1="415" y1="138" x2="457" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="550,106 637,138 550,170 463,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="550" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Dry run?</text>
+      <text x="550" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">off?</text>
+      <text x="640" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="637" y1="138" x2="665" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="555" y="198" font-family="sans-serif" font-size="10.5" fill="#6b4f5b" font-weight="700">no, report only</text>
+      <line x1="550" y1="170" x2="550" y2="205" stroke="#6b4f5b" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="593" y="185" width="132" height="50" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="659" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Log duplicate</text>
+      <text x="659" y="222" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">group for review</text>
+      <rect x="618" y="185" width="132" height="50" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="207" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">PUT keep row</text>
+      <text x="684" y="222" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a">then DELETE extra</text>
+      <path d="M665,138 C700,138 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports duplicate groups by default. Merging the keep row and deleting the extra one only happens with DRY_RUN off, after a human reviews the quantities.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a Webservice key</h3>
+      <p>In the PrestaShop back office, go to Advanced Parameters, Webservice, and create a key with access to the <code>stock_availables</code> and <code>combinations</code> resources. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Webservice API</h3>
+      <p>Every call is plain HTTP with the key as the Basic auth username. Ask for JSON with <code>output_format=JSON</code>, since the default is XML. A small helper sends the request and raises if PrestaShop returns an error status.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+PRESTASHOP_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(
+        f"{PRESTASHOP_URL}/api/{path}",
+        params=params,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY;
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${PRESTASHOP_URL}/api/${path}?${qs}`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Enumerate the stock rows and the live combinations</h3>
+      <p>Pull every <code>stock_availables</code> row for the product with <code>display=full</code> so you get the quantity and shop fields, and pull the product's <code>combinations</code> so you know which <code>id_product_attribute</code> values should legitimately exist.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def stock_rows_for_product(id_product):
+    data = api_get("stock_availables", {
+        "filter[id_product]": id_product,
+        "display": "full",
+    })
+    return data.get("stock_availables") or []
+
+def live_combination_ids(id_product):
+    data = api_get("combinations", {
+        "filter[id_product]": id_product,
+        "display": "full",
+    })
+    rows = data.get("combinations") or []
+    return {int(row["id"]) for row in rows}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function stockRowsForProduct(idProduct) {
+  const data = await apiGet("stock_availables", {
+    "filter[id_product]": idProduct,
+    display: "full",
+  });
+  return data.stock_availables || [];
+}
+
+async function liveCombinationIds(idProduct) {
+  const data = await apiGet("combinations", {
+    "filter[id_product]": idProduct,
+    display: "full",
+  });
+  const rows = data.combinations || [];
+  return new Set(rows.map((row) => Number(row.id)));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>The decision that matters is grouping rows by the same natural key the unique index uses, and keeping only the groups with more than one row. Within each duplicate group, sort so the row with a real <code>id_shop</code> (not 0) and the highest <code>id</code> sits first, since that is usually the row to keep. Keeping this pure and free of any HTTP call means we can test it with plain lists.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def natural_key(row):
+    return (
+        int(row["id_product"]),
+        int(row["id_product_attribute"]),
+        int(row["id_shop"]),
+        int(row["id_shop_group"]),
+    )
+
+def find_duplicate_stock_rows(rows):
+    groups = {}
+    for row in rows:
+        key = natural_key(row)
+        groups.setdefault(key, []).append(row)
+
+    duplicates = []
+    for key, group in groups.items():
+        if len(group) <= 1:
+            continue
+        ordered = sorted(
+            group,
+            key=lambda r: (int(r["id_shop"]) != 0, int(r["id"])),
+            reverse=True,
+        )
+        duplicates.append(ordered)
+    return duplicates</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">function naturalKey(row) {
+  return [
+    Number(row.id_product),
+    Number(row.id_product_attribute),
+    Number(row.id_shop),
+    Number(row.id_shop_group),
+  ].join("|");
+}
+
+export function findDuplicateStockRows(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = naturalKey(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+
+  const duplicates = [];
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue;
+    const ordered = [...group].sort((a, b) => {
+      const aKeep = Number(a.id_shop) !== 0 ? 1 : 0;
+      const bKeep = Number(b.id_shop) !== 0 ? 1 : 0;
+      if (aKeep !== bKeep) return bKeep - aKeep;
+      return Number(b.id) - Number(a.id);
+    });
+    duplicates.push(ordered);
+  }
+  return duplicates;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Cross-check against live combinations</h3>
+      <p>A stock row can also be an orphan on its own, with only one row, if it references an <code>id_product_attribute</code> that no longer exists on the product. Flag those the same way, since they will not show up as a duplicate group but are still wrong.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">orphans.py</div>
+      <pre><code class="language-python">def find_orphaned_combination_rows(rows, live_ids):
+    orphans = []
+    for row in rows:
+        attr_id = int(row["id_product_attribute"])
+        if attr_id != 0 and attr_id not in live_ids:
+            orphans.append(row)
+    return orphans</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">orphans.js</div>
+      <pre><code class="language-javascript">export function findOrphanedCombinationRows(rows, liveIds) {
+  return rows.filter((row) => {
+    const attrId = Number(row.id_product_attribute);
+    return attrId !== 0 && !liveIds.has(attrId);
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report by default, merge only when confirmed</h3>
+      <p>By default the job only logs each duplicate group and each orphan, with the before quantities, so a human can decide the right merged quantity. Only when <code>DRY_RUN</code> is false does it PUT the merged body to the keep row and DELETE the rest, and it still logs every quantity it touches.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Collapsing two stock rows into one means choosing a quantity, and choosing wrong can under-sell or over-sell real stock. Read the reported groups, agree on the right quantity per your own business rule, then switch <code>DRY_RUN</code> off to let it write and delete.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and is safe to run again and again because merging and deleting only happen for groups it already reported and only once you turn dry run off.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/stock-available-duplicate-key-error" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_duplicate_stock.py</div>
+      <pre><code class="language-python">"""Find and, if confirmed, merge duplicate PrestaShop stock_available rows.
+
+ps_stock_available has a unique key (product_sqlstock) on id_product,
+id_product_attribute, id_shop, and id_shop_group. StockAvailable::setQuantity()
+selects a row for that key then decides to update or insert. Two near
+simultaneous writes can both miss each other's row and both try to insert,
+so the second one hits a duplicate entry error on product_sqlstock, or in
+multistore installs lands as an orphan row scoped to id_shop=0/id_shop_group=0.
+
+This script enumerates stock_availables for a product, groups them by that
+same natural key, and reports any group with more than one row. It also
+flags stock rows whose id_product_attribute no longer exists on the product.
+By default it only reports. Set DRY_RUN=false to let it PUT the merged
+keep row and DELETE the extra rows, after you confirm the quantities.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_duplicate_stock")
+
+PRESTASHOP_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(
+        f"{PRESTASHOP_URL}/api/{path}",
+        params=params,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def api_put(path, body):
+    r = requests.put(
+        f"{PRESTASHOP_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def api_delete(path):
+    r = requests.delete(
+        f"{PRESTASHOP_URL}/api/{path}",
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def natural_key(row):
+    return (
+        int(row["id_product"]),
+        int(row["id_product_attribute"]),
+        int(row["id_shop"]),
+        int(row["id_shop_group"]),
+    )
+
+
+def find_duplicate_stock_rows(rows):
+    groups = {}
+    for row in rows:
+        key = natural_key(row)
+        groups.setdefault(key, []).append(row)
+
+    duplicates = []
+    for key, group in groups.items():
+        if len(group) <= 1:
+            continue
+        ordered = sorted(
+            group,
+            key=lambda r: (int(r["id_shop"]) != 0, int(r["id"])),
+            reverse=True,
+        )
+        duplicates.append(ordered)
+    return duplicates
+
+
+def find_orphaned_combination_rows(rows, live_ids):
+    orphans = []
+    for row in rows:
+        attr_id = int(row["id_product_attribute"])
+        if attr_id != 0 and attr_id not in live_ids:
+            orphans.append(row)
+    return orphans
+
+
+def stock_rows_for_product(id_product):
+    data = api_get("stock_availables", {
+        "filter[id_product]": id_product,
+        "display": "full",
+    })
+    return data.get("stock_availables") or []
+
+
+def live_combination_ids(id_product):
+    data = api_get("combinations", {
+        "filter[id_product]": id_product,
+        "display": "full",
+    })
+    rows = data.get("combinations") or []
+    return {int(row["id"]) for row in rows}
+
+
+def merge_duplicate_group(group):
+    keep, *rest = group
+    quantities = [int(row["quantity"]) for row in group]
+    merged_quantity = max(quantities)
+    body = dict(keep)
+    body["quantity"] = merged_quantity
+    log.info(
+        "Merging stock rows for product %s attribute %s: keep id=%s quantity %s -> %s, dropping id(s) %s",
+        keep["id_product"], keep["id_product_attribute"], keep["id"],
+        keep["quantity"], merged_quantity, [row["id"] for row in rest],
+    )
+    if not DRY_RUN:
+        api_put(f"stock_availables/{keep['id']}", body)
+        for row in rest:
+            api_delete(f"stock_availables/{row['id']}")
+    return keep["id"], merged_quantity
+
+
+def run(id_product):
+    rows = stock_rows_for_product(id_product)
+    live_ids = live_combination_ids(id_product)
+
+    duplicates = find_duplicate_stock_rows(rows)
+    orphans = find_orphaned_combination_rows(rows, live_ids)
+
+    for group in duplicates:
+        log.warning(
+            "Duplicate stock rows for key %s: %s",
+            natural_key(group[0]), [row["id"] for row in group],
+        )
+        merge_duplicate_group(group)
+
+    for row in orphans:
+        log.warning(
+            "Orphaned stock row id=%s references missing combination id_product_attribute=%s",
+            row["id"], row["id_product_attribute"],
+        )
+
+    log.info(
+        "Done. %d duplicate group(s), %d orphaned row(s) for product %s.",
+        len(duplicates), len(orphans), id_product,
+    )
+
+
+if __name__ == "__main__":
+    target_product = os.environ.get("TARGET_ID_PRODUCT")
+    if not target_product:
+        raise SystemExit("Set TARGET_ID_PRODUCT to the product id to check.")
+    run(int(target_product))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-duplicate-stock.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and, if confirmed, merge duplicate PrestaShop stock_available rows.
+ *
+ * ps_stock_available has a unique key (product_sqlstock) on id_product,
+ * id_product_attribute, id_shop, and id_shop_group. StockAvailable::setQuantity()
+ * selects a row for that key then decides to update or insert. Two near
+ * simultaneous writes can both miss each other's row and both try to insert,
+ * so the second one hits a duplicate entry error on product_sqlstock, or in
+ * multistore installs lands as an orphan row scoped to id_shop=0/id_shop_group=0.
+ *
+ * This script enumerates stock_availables for a product, groups them by that
+ * same natural key, and reports any group with more than one row. By default
+ * it only reports. Set DRY_RUN=false to let it PUT the merged keep row and
+ * DELETE the extra rows, after you confirm the quantities.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/stock-available-duplicate-key-error/
+ */
+import { pathToFileURL } from "node:url";
+
+const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "https://demo.example.com").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "WSKEYDUMMY";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+function naturalKey(row) {
+  return [
+    Number(row.id_product),
+    Number(row.id_product_attribute),
+    Number(row.id_shop),
+    Number(row.id_shop_group),
+  ].join("|");
+}
+
+export function findDuplicateStockRows(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = naturalKey(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+
+  const duplicates = [];
+  for (const group of groups.values()) {
+    if (group.length <= 1) continue;
+    const ordered = [...group].sort((a, b) => {
+      const aKeep = Number(a.id_shop) !== 0 ? 1 : 0;
+      const bKeep = Number(b.id_shop) !== 0 ? 1 : 0;
+      if (aKeep !== bKeep) return bKeep - aKeep;
+      return Number(b.id) - Number(a.id);
+    });
+    duplicates.push(ordered);
+  }
+  return duplicates;
+}
+
+export function findOrphanedCombinationRows(rows, liveIds) {
+  return rows.filter((row) => {
+    const attrId = Number(row.id_product_attribute);
+    return attrId !== 0 && !liveIds.has(attrId);
+  });
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${PRESTASHOP_URL}/api/${path}?${qs}`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, body) {
+  const res = await fetch(`${PRESTASHOP_URL}/api/${path}?output_format=JSON`, {
+    method: "PUT",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiDelete(path) {
+  const res = await fetch(`${PRESTASHOP_URL}/api/${path}`, {
+    method: "DELETE",
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+}
+
+async function stockRowsForProduct(idProduct) {
+  const data = await apiGet("stock_availables", {
+    "filter[id_product]": idProduct,
+    display: "full",
+  });
+  return data.stock_availables || [];
+}
+
+async function liveCombinationIds(idProduct) {
+  const data = await apiGet("combinations", {
+    "filter[id_product]": idProduct,
+    display: "full",
+  });
+  const rows = data.combinations || [];
+  return new Set(rows.map((row) => Number(row.id)));
+}
+
+async function mergeDuplicateGroup(group) {
+  const [keep, ...rest] = group;
+  const quantities = group.map((row) => Number(row.quantity));
+  const mergedQuantity = Math.max(...quantities);
+  const body = { ...keep, quantity: mergedQuantity };
+  console.warn(
+    `Merging stock rows for product ${keep.id_product} attribute ${keep.id_product_attribute}: ` +
+    `keep id=${keep.id} quantity ${keep.quantity} -> ${mergedQuantity}, dropping id(s) ${rest.map((r) => r.id)}`
+  );
+  if (!DRY_RUN) {
+    await apiPut(`stock_availables/${keep.id}`, body);
+    for (const row of rest) await apiDelete(`stock_availables/${row.id}`);
+  }
+  return { keepId: keep.id, mergedQuantity };
+}
+
+export async function run(idProduct) {
+  const rows = await stockRowsForProduct(idProduct);
+  const liveIds = await liveCombinationIds(idProduct);
+
+  const duplicates = findDuplicateStockRows(rows);
+  const orphans = findOrphanedCombinationRows(rows, liveIds);
+
+  for (const group of duplicates) {
+    console.warn(`Duplicate stock rows for key ${naturalKey(group[0])}: ${group.map((r) => r.id)}`);
+    await mergeDuplicateGroup(group);
+  }
+
+  for (const row of orphans) {
+    console.warn(`Orphaned stock row id=${row.id} references missing combination id_product_attribute=${row.id_product_attribute}`);
+  }
+
+  console.log(`Done. ${duplicates.length} duplicate group(s), ${orphans.length} orphaned row(s) for product ${idProduct}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const targetProduct = process.env.TARGET_ID_PRODUCT;
+  if (!targetProduct) {
+    console.error("Set TARGET_ID_PRODUCT to the product id to check.");
+    process.exit(1);
+  }
+  run(Number(targetProduct)).catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The grouping decision is the part most worth testing, because it decides which rows get treated as duplicates and which row is kept. Because we kept <code>find_duplicate_stock_rows</code> pure, the test needs no network and no PrestaShop store. It just feeds in plain lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_stock_duplicates.py</div>
+      <pre><code class="language-python">from find_duplicate_stock import find_duplicate_stock_rows, find_orphaned_combination_rows
+
+
+def row(**over):
+    base = {"id": 1, "id_product": 10, "id_product_attribute": 0, "id_shop": 1, "id_shop_group": 1, "quantity": 5}
+    base.update(over)
+    return base
+
+
+def test_no_duplicates_when_all_keys_unique():
+    rows = [row(id=1), row(id=2, id_product_attribute=2)]
+    assert find_duplicate_stock_rows(rows) == []
+
+
+def test_finds_duplicate_group_for_same_key():
+    rows = [row(id=1, quantity=5), row(id=2, quantity=8)]
+    groups = find_duplicate_stock_rows(rows)
+    assert len(groups) == 1
+    assert len(groups[0]) == 2
+
+
+def test_keep_candidate_is_highest_id_within_a_group():
+    rows = [row(id=1, id_shop=0, id_shop_group=0), row(id=2, id_shop=0, id_shop_group=0)]
+    groups = find_duplicate_stock_rows(rows)
+    assert groups[0][0]["id"] == 2  # highest id wins, both rows share the same shop scope
+
+
+def test_rows_with_different_shop_scope_are_not_grouped_together():
+    rows = [row(id=9, id_shop=0, id_shop_group=0), row(id=2, id_shop=1, id_shop_group=1)]
+    assert find_duplicate_stock_rows(rows) == []  # different id_shop means a different natural key
+
+
+def test_orphaned_rows_flagged_when_combination_missing():
+    rows = [row(id=1, id_product_attribute=99)]
+    assert find_orphaned_combination_rows(rows, {1, 2}) == rows
+
+
+def test_no_orphan_for_simple_product_row():
+    rows = [row(id=1, id_product_attribute=0)]
+    assert find_orphaned_combination_rows(rows, {1, 2}) == []
+
+
+def test_no_orphan_when_combination_still_live():
+    rows = [row(id=1, id_product_attribute=2)]
+    assert find_orphaned_combination_rows(rows, {1, 2}) == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">stock-duplicates.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findDuplicateStockRows, findOrphanedCombinationRows } from "./find-duplicate-stock.js";
+
+const row = (over = {}) =&gt; ({
+  id: 1, id_product: 10, id_product_attribute: 0, id_shop: 1, id_shop_group: 1, quantity: 5,
+  ...over,
+});
+
+test("no duplicates when all keys are unique", () =&gt; {
+  const rows = [row({ id: 1 }), row({ id: 2, id_product_attribute: 2 })];
+  assert.deepEqual(findDuplicateStockRows(rows), []);
+});
+
+test("finds a duplicate group for the same natural key", () =&gt; {
+  const rows = [row({ id: 1, quantity: 5 }), row({ id: 2, quantity: 8 })];
+  const groups = findDuplicateStockRows(rows);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].length, 2);
+});
+
+test("keep candidate is the highest id when shop is tied", () =&gt; {
+  const rows = [row({ id: 1, id_shop: 0, id_shop_group: 0 }), row({ id: 2, id_shop: 0, id_shop_group: 0 })];
+  const groups = findDuplicateStockRows(rows);
+  assert.equal(groups[0][0].id, 2);
+});
+
+test("orphaned rows are flagged when the combination is missing", () =&gt; {
+  const rows = [row({ id: 1, id_product_attribute: 99 })];
+  assert.deepEqual(findOrphanedCombinationRows(rows, new Set([1, 2])), rows);
+});
+
+test("no orphan for a simple product row with attribute 0", () =&gt; {
+  const rows = [row({ id: 1, id_product_attribute: 0 })];
+  assert.deepEqual(findOrphanedCombinationRows(rows, new Set([1, 2])), []);
+});
+
+test("no orphan when the combination is still live", () =&gt; {
+  const rows = [row({ id: 1, id_product_attribute: 2 })];
+  assert.deepEqual(findOrphanedCombinationRows(rows, new Set([1, 2])), []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Webservice sync</span>
+      <h4>Two integrations updating the same SKU</h4>
+      <p>A store ran a nightly stock sync from its warehouse system alongside a same-day correction tool a warehouse manager used during the day. On the days both happened to fire within a few seconds of each other, the second webservice PUT started failing with a duplicate entry error on <code>product_sqlstock</code>, and nobody could tell which write actually landed.</p>
+      <p>Running the reconciler against the affected product ids showed exactly two rows sharing the same key, one with the warehouse quantity and one with the manual correction. Once the team agreed the warehouse number was the source of truth, they let the script merge with that quantity and delete the extra row, and the duplicate entry errors stopped.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Multistore</span>
+      <h4>Orphan rows scoped to shop zero</h4>
+      <p>A multistore install had orders coming in on two shops sharing a warehouse. Under load, some order state changes left behind stock rows with <code>id_shop=0</code> and <code>id_shop_group=0</code> instead of the real shop id, alongside the legitimate per-shop row for the same product and combination.</p>
+      <p>The script's grouping caught these because both rows shared the same <code>id_product</code> and <code>id_product_attribute</code>, differing only in shop scope, which is still the same natural key PrestaShop's unique index protects. The team reviewed each group, confirmed the shop-zero row was the orphan, and let the script keep the real per-shop row and delete the rest.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After running this as a periodic check, duplicate and orphaned stock rows get caught within a day instead of surfacing as a confusing error mid-checkout. The report shows exactly which rows collided and what their quantities were, so merging is a reviewed decision instead of a guess, and the unique key on <code>product_sqlstock</code> goes back to doing what it was meant to do.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does PrestaShop throw a duplicate entry error for product_sqlstock?</summary>
+      <p>ps_stock_available has a unique key named product_sqlstock on the combination of id_product, id_product_attribute, id_shop, and id_shop_group. StockAvailable::setQuantity() first checks for an existing row for that key and then decides to update or insert. When two requests run that check at nearly the same moment, both can miss each other's row and both try to insert, so the second insert collides with the unique key and MySQL raises a duplicate entry error.</p>
+    </details>
+    <details>
+      <summary>Can I safely auto-merge duplicate stock_available rows?</summary>
+      <p>Not blindly. Collapsing two rows into one means picking a quantity, and picking wrong can under-sell or over-sell stock. The safe pattern is to run the script in DRY_RUN first so it only reports the duplicate groups, review the before and after quantities yourself, and only let it write and delete once a human has confirmed the merge is correct.</p>
+    </details>
+    <details>
+      <summary>Why do duplicate stock rows show id_shop 0 and id_shop_group 0?</summary>
+      <p>In a multistore setup, the shop context can resolve incorrectly during a race between two writes, and PrestaShop inserts a stock row scoped to id_shop=0 and id_shop_group=0 instead of the real shop. That orphan row still collides with or shadows the correct per-shop row, which is why multistore installs see this error more often than single shop stores.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past a shipping SLA</a>
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop GitHub: StockAvailable setQuantity duplicate data on key product_sqlstock. <a href="https://github.com/PrestaShop/PrestaShop/issues/11806" rel="noopener">github.com/PrestaShop/PrestaShop/issues/11806</a></li>
+      <li>PrestaShop GitHub: error when changing order status in multishop with a separate warehouse. <a href="https://github.com/PrestaShop/PrestaShop/issues/38869" rel="noopener">github.com/PrestaShop/PrestaShop/issues/38869</a></li>
+      <li>PrestaShop Forums: duplicate entry xx-xxx-0-0 for key product_sqlstock. <a href="https://www.prestashop.com/forums/topic/1054644-duplicate-entry-xx-xxx-0-0-for-key-product_sqlstock/" rel="noopener">prestashop.com/forums/topic/1054644</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: the stock_availables resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/stock_availables/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/stock_availables</a></li>
+      <li>PrestaShop Developer Documentation: Stock FAQ. <a href="https://devdocs.prestashop-project.org/9/faq/stock/" rel="noopener">devdocs.prestashop-project.org/9/faq/stock</a></li>
+      <li>PrestaShop Developer Documentation: create a product from start to finish with Webservices. <a href="https://devdocs.prestashop-project.org/9/webservice/tutorials/create-product-az/" rel="noopener">devdocs.prestashop-project.org/9/webservice/tutorials/create-product-az</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop stock, orders, order states, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle your duplicate stock rows?</h3>
+    <p>If this saved you a scary manual SQL fix or a real duplicate entry error, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

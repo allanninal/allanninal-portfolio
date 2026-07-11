@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Created via Webservice With No Current State Set at All</title>
+<meta name="description" content="A POST to the PrestaShop orders webservice can create an order with current_state left at 0 and zero order_history rows, because the webservice bypasses OrderHistory::changeIdOrderState(). Learn why it happens and build a Python or Node.js script that finds and safely backfills every stateless order.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/webservice-order-created-without-state/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Order Created via Webservice With No Current State Set at All">
+<meta property="og:description" content="Why POSTing to /api/orders can leave current_state at 0 with zero order_history rows, and a Python or Node.js script that finds and safely backfills every stateless order via order_histories.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/webservice-order-created-without-state/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/webservice-order-created-without-state/#article","headline":"Order Created via Webservice With No Current State Set at All","description":"Why POSTing to /api/orders can leave current_state at 0 with zero order_history rows, and a Python or Node.js script that finds and safely backfills every stateless order via order_histories.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/webservice-order-created-without-state/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders & Order States","keywords":"PrestaShop webservice orders, current_state, order_histories, OrderHistory changeIdOrderState, POST /api/orders, orphaned order, PrestaShop webservice, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"PrestaShop field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Order created via webservice with no current state set at all","item":"https://www.allanninal.dev/prestashop/webservice-order-created-without-state/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does an order created through the PrestaShop webservice have no state at all?","acceptedAnswer":{"@type":"Answer","text":"The webservice orders resource exposes current_state as a plain writable field on the order object, but POSTing to /api/orders does not run the order through OrderHistory::changeIdOrderState(), which is the only code path that both sets current_state and writes the matching order_history row. A client that omits current_state or sets it directly gets an order stored with current_state at 0 or an unintended value and zero rows in order_history, because only a follow-up POST to order_histories actually triggers a real state transition."}},{"@type":"Question","name":"Is it safe to fix these orders by setting current_state directly on the order?","acceptedAnswer":{"@type":"Answer","text":"No. PUTting current_state directly onto /api/orders is the exact bug being fixed, since it bypasses the invoice, email, and stock side effects that only run through OrderHistory::changeIdOrderState(). The safe repair is to POST a new resource to /api/order_histories with the order id and the resolved state id, the same call the back office makes internally, so the order gets a real history row and its current_state is refreshed as a side effect."}},{"@type":"Question","name":"How do I detect orders that were created without a real state?","acceptedAnswer":{"@type":"Answer","text":"List orders with current_state=0 using GET /api/orders?filter[current_state]=0, then for each candidate call GET /api/order_histories?filter[id_order]=[id]&limit=1. If that returns an empty order_histories array, the order is confirmed stateless regardless of what current_state shows, since current_state can be stale or denormalized. Cross-check GET /api/order_states to resolve a sane default state to backfill."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Orders &amp; Order States</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span></p>
+    <h1>Order created via webservice with no current state set at all</h1>
+    <p class="lead">An order comes in through the webservice, and it looks fine at a glance: a real id, a real reference, real order lines. But open it and current_state reads 0, or something that never actually happened, and the order_history timeline underneath is completely empty. Not stale, not mismatched, just missing from the start. Here is why POSTing to /api/orders can create an order that never really entered the state machine, and a script that finds every one of these and backfills it the safe way.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>The authoritative way to change an order's status in PrestaShop is <code>OrderHistory::changeIdOrderState()</code>, which writes a row to <code>order_history</code> and updates the denormalized <code>orders.current_state</code> column together, while also firing emails and stock and invoice logic. The webservice orders resource, however, exposes <code>current_state</code> as a plain writable field on the order object itself, and a POST to <code>/api/orders</code> does not go through that service layer at all. Omit <code>current_state</code> or set it directly and PrestaShop stores the order with no matching <code>order_history</code> row, sometimes at <code>current_state=0</code>. Run a Python or Node.js script that lists orders with <code>filter[current_state]=0</code>, confirms each one is truly stateless with an empty <code>GET /api/order_histories</code> result, resolves a sane state from the order's own payment facts, and repairs it with a POST to <code>order_histories</code>, never a direct write to the order. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In the PrestaShop back office, an order never changes status by itself. Something always calls <code>OrderHistory::changeIdOrderState()</code>, and that one call does three things at once: it inserts a row into <code>order_history</code> recording exactly what happened and when, it updates the fast-read <code>current_state</code> column on the order, and it fires whatever emails, stock adjustments, and invoice generation that state is supposed to trigger.</p>
+  <p>The webservice does not know about that contract. When it exposes the <code>orders</code> resource for reading and writing, <code>current_state</code> shows up as just another field on the order object, the same as <code>reference</code> or <code>total_paid</code>. A client building an order integration can reasonably assume that setting <code>current_state</code> on the order it POSTs is enough, the same way setting any other field is enough. It is not. The order gets created, but nothing runs the state machine, so <code>order_history</code> stays empty and <code>current_state</code> is whatever got stored, often 0, sometimes a value that was never actually applied through a real transition.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A client POSTs an order to the webservice with current_state set directly on the order object, the order is created, but the state machine and order_history are skipped entirely, leaving the order stateless.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="200" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="110" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Client POSTs order</text>
+      <text x="110" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">current_state set on the order</text>
+      <line x1="210" y1="50" x2="252" y2="50" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="255" y="20" width="190" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="350" y="43" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">/api/orders resource</text>
+      <text x="350" y="60" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">writes the row directly</text>
+      <line x1="350" y1="80" x2="350" y2="100" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="370" y="96" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="255" y="102" width="190" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="350" y="124" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">changeIdOrderState()</text>
+      <text x="350" y="141" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">never called at all</text>
+      <line x1="450" y1="129" x2="492" y2="129" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="495" y="100" width="255" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="622" y="123" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">order_history stays empty</text>
+      <text x="622" y="140" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">current_state=0 or unapplied</text>
+      <rect x="60" y="185" width="640" height="30" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="205" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">the order was never actually run through the state machine</text>
+    </svg>
+    <figcaption>Setting current_state on the order object looks like it should work, the same as any other field. It does not run the state machine, so the order is created with no history behind it.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The webservice's <code>orders</code> resource is a generic CRUD mapping over the <code>orders</code> table's columns, not a wrapper around the order lifecycle. Documented and reported ways this gap shows up:</p>
+  <ul>
+    <li>A POST to <code>/api/orders</code> with <code>current_state</code> included in the body stores that value on the row, but never triggers the insert into <code>order_history</code> that the back office always performs alongside it, as reported on the PrestaShop forums under "Create order via webservice won't set current state."</li>
+    <li>A POST to <code>/api/orders</code> that omits <code>current_state</code> entirely leaves the order at whatever default the schema falls back to, commonly 0, with no history row explaining how it got there.</li>
+    <li>Integrators reasonably expect that setting the state at creation time should work the same way it does through the admin form, and are surprised to learn the webservice does not honor it, a question raised directly in "How set a state for an order at creation time?" on the PrestaShop forums.</li>
+    <li>The inverse problem is also documented: updating an order through the webservice can add an unexpected new <code>order_history</code> row rather than adjusting the existing state cleanly, tracked as GitHub issue #11154, which is more evidence that the webservice's order-state handling does not mirror <code>changeIdOrderState()</code>'s behavior.</li>
+  </ul>
+  <p>Either way, the order exists in the database without ever entering the real state machine, so nothing about payment confirmation, stock reservation tied to a state, or transition emails ever ran for it. See the citations at the end for the exact threads and issues.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>An order with no history at all is not a formatting problem, it is an order the state machine has never seen. You cannot fix that by writing a nicer value into <code>current_state</code>, because that repeats the same mistake that created the gap. The only correct fix is to give the order the state transition it was supposed to get in the first place, by POSTing to <code>order_histories</code>, the same call <code>changeIdOrderState()</code> makes internally, so the order finally gets a real history row and its <code>current_state</code> is refreshed as a side effect, not as a direct write.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never PUT <code>current_state</code> onto an order. We add a job that lists candidate orders at <code>current_state=0</code>, confirms each is truly stateless by checking that <code>order_histories</code> is empty for it, resolves a sane state from the order's own payment facts, and posts that resolution through <code>order_histories</code>, exactly the endpoint the back office uses.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists orders with current_state 0, confirms each has zero order_histories rows, resolves a safe state from payment facts, and posts a new order_histories resource, never writing current_state directly.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">List candidates</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">GET orders, current_state=0</text>
+      <line x1="180" y1="50" x2="222" y2="50" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="225" y="20" width="190" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="320" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Confirm stateless</text>
+      <text x="320" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">GET order_histories empty?</text>
+      <line x1="320" y1="80" x2="320" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="155" y="108" width="330" height="55" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="320" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">resolve_backfill_state</text>
+      <text x="320" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">paid amount vs. total, order_states</text>
+      <line x1="485" y1="135" x2="527" y2="135" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,103 667,135 580,167 493,135" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="580" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">Resolved?</text>
+      <text x="675" y="125" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <text x="600" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#8a9a92" font-weight="700">no, flag for review</text>
+      <line x1="580" y1="167" x2="580" y2="200" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="675" y="107" width="75" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="712" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">POST</text>
+      <text x="712" y="145" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">history</text>
+      <line x1="667" y1="135" x2="673" y2="135" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="420" y="200" width="250" height="35" rx="8" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="545" y="215" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#4c9a2a">Only via order_histories, never</text>
+      <text x="545" y="228" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#4c9a2a">a direct write to orders.current_state</text>
+    </svg>
+    <figcaption>The job only backfills through order_histories, the same call the back office makes. When the correct state cannot be resolved with confidence, the order is flagged for a human instead of guessed at.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Enable the webservice and get a key</h3>
+      <p>In the back office, go to Advanced Parameters, Webservice, and create a key with read access to <code>orders</code>, <code>order_histories</code>, and <code>order_states</code>, plus write access to <code>order_histories</code> for the repair step. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, only logs by default</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, only logs by default</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List orders that look stateless</h3>
+      <p>Call <code>GET /api/orders?output_format=JSON&amp;display=full&amp;filter[current_state]=0&amp;limit=200</code> to find candidates whose <code>current_state</code> reads 0. Treat this as a candidate list, not a final answer, since <code>current_state</code> can be denormalized and stale in other ways too.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+PRESTASHOP_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+PRESTASHOP_WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+AUTH = (PRESTASHOP_WS_KEY, "")
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{PRESTASHOP_URL}/api/{path}", params=params, auth=AUTH, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def candidate_orders():
+    data = api_get("orders", params={"display": "full", "filter[current_state]": "0", "limit": "200"})
+    return data.get("orders") or []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "").replace(/\/+$/, "");
+const PRESTASHOP_WS_KEY = process.env.PRESTASHOP_WS_KEY;
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${PRESTASHOP_WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${PRESTASHOP_URL}/api/${path}`);
+  url.searchParams.set("output_format", "JSON");
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: basicAuthHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function candidateOrders() {
+  const data = await apiGet("orders", { display: "full", "filter[current_state]": "0", limit: "200" });
+  return data.orders || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Confirm each candidate is truly stateless</h3>
+      <p>For every candidate id, call <code>GET /api/order_histories?output_format=JSON&amp;display=full&amp;filter[id_order]=[id]&amp;limit=1</code>. Only treat the order as confirmed stateless when this comes back empty. This matters because <code>current_state</code> alone can be misleading, an order can carry a stale or denormalized value while still having history rows behind it, which is a different problem with a different fix.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def is_stateless(id_order):
+    data = api_get("order_histories", params={
+        "display": "full",
+        "filter[id_order]": id_order,
+        "limit": "1",
+    })
+    rows = data.get("order_histories") or []
+    return len(rows) == 0
+
+def order_states():
+    data = api_get("order_states", params={"display": "full"})
+    return data.get("order_states") or []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function isStateless(idOrder) {
+  const data = await apiGet("order_histories", {
+    display: "full",
+    "filter[id_order]": idOrder,
+    limit: "1",
+  });
+  const rows = data.order_histories || [];
+  return rows.length === 0;
+}
+
+async function orderStates() {
+  const data = await apiGet("order_states", { display: "full" });
+  return data.order_states || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the resolution in its own function that takes the order's plain fields and the list of available order states and returns the id to backfill, or <code>None</code> when it cannot decide safely. It never calls the network. If <code>total_paid_real</code> covers <code>total_paid</code> and there is a logable, non-hidden state that reads as a paid confirmation, use that. Otherwise fall back to the lowest-id logable, non-hidden state that reads as an awaiting-payment state. Anything ambiguous, such as no matching states at all, returns <code>None</code> so the order gets flagged for a human instead of guessed at.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">PAID_HINTS = ("payment accepted", "paiement accepté", "paid")
+AWAITING_HINTS = ("awaiting", "en attente")
+
+def resolve_backfill_state(order, order_states):
+    if order.get("current_state") not in (0, None):
+        return None
+
+    def usable(s):
+        return str(s.get("logable", "0")) in ("1", "true", "True") and \
+               str(s.get("hidden", "0")) not in ("1", "true", "True")
+
+    candidates = [s for s in order_states if usable(s)]
+    if not candidates:
+        return None
+
+    total_paid = float(order.get("total_paid") or 0)
+    total_paid_real = float(order.get("total_paid_real") or 0)
+
+    if total_paid &gt; 0 and total_paid_real &gt;= total_paid:
+        paid_states = [s for s in candidates if any(h in str(s.get("name", "")).lower() for h in PAID_HINTS)]
+        if len(paid_states) == 1:
+            return int(paid_states[0]["id"])
+        return None
+
+    awaiting_states = [s for s in candidates if any(h in str(s.get("name", "")).lower() for h in AWAITING_HINTS)]
+    if not awaiting_states:
+        return None
+    return int(min(awaiting_states, key=lambda s: int(s["id"]))["id"])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const PAID_HINTS = ["payment accepted", "paiement accepté", "paid"];
+const AWAITING_HINTS = ["awaiting", "en attente"];
+
+function usable(s) {
+  const logable = String(s.logable ?? "0");
+  const hidden = String(s.hidden ?? "0");
+  return ["1", "true", "True"].includes(logable) && !["1", "true", "True"].includes(hidden);
+}
+
+export function resolveBackfillState(order, orderStates) {
+  if (order.current_state !== 0 && order.current_state != null) return null;
+
+  const candidates = orderStates.filter(usable);
+  if (candidates.length === 0) return null;
+
+  const totalPaid = Number(order.total_paid || 0);
+  const totalPaidReal = Number(order.total_paid_real || 0);
+
+  if (totalPaid &gt; 0 &amp;&amp; totalPaidReal &gt;= totalPaid) {
+    const paidStates = candidates.filter((s) =&gt;
+      PAID_HINTS.some((h) =&gt; String(s.name || "").toLowerCase().includes(h))
+    );
+    if (paidStates.length === 1) return Number(paidStates[0].id);
+    return null;
+  }
+
+  const awaitingStates = candidates.filter((s) =&gt;
+    AWAITING_HINTS.some((h) =&gt; String(s.name || "").toLowerCase().includes(h))
+  );
+  if (awaitingStates.length === 0) return null;
+  return Number(awaitingStates.reduce((a, b) =&gt; (Number(b.id) &lt; Number(a.id) ? b : a)).id);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair through order_histories, never the order directly</h3>
+      <p>When a state resolves, POST a new resource to <code>/api/order_histories</code> with <code>{"order_history": {"id_order": id, "id_order_state": resolved_state_id}}</code>. This is the same call <code>OrderHistory::changeIdOrderState()</code> triggers internally, so it inserts the history row and refreshes <code>current_state</code> as a side effect, along with whatever emails and stock logic that state carries. Never PUT <code>current_state</code> straight onto <code>/api/orders</code>, that is the exact bug this fix exists for.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair.py</div>
+      <pre><code class="language-python">def backfill_via_history(id_order, resolved_state_id):
+    body = {"order_history": {"id_order": id_order, "id_order_state": resolved_state_id}}
+    r = requests.post(
+        f"{PRESTASHOP_URL}/api/order_histories",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=AUTH,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair.js</div>
+      <pre><code class="language-javascript">async function backfillViaHistory(idOrder, resolvedStateId) {
+  const url = new URL(`${PRESTASHOP_URL}/api/order_histories`);
+  url.searchParams.set("output_format", "JSON");
+  const body = { order_history: { id_order: idOrder, id_order_state: resolvedStateId } };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: basicAuthHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on POST order_histories`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: list candidates, confirm each is stateless, resolve a state from its payment facts and the shop's order states, and log the pair. <code>DRY_RUN</code> defaults to true, so the script only ever logs the <code>(id_order, resolved_state_id)</code> pairs it would create until you flip it off. Run it on a schedule that matches how often your integration creates orders, for example once an hour.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never PUT <code>current_state</code> directly onto <code>/api/orders</code>, since that repeats the exact mistake this fix exists to correct. When <code>resolve_backfill_state</code> returns <code>None</code>, leave the order alone and let a human decide, rather than guessing at a state the order never actually reached.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, confirms every candidate is truly stateless before touching it, resolves a safe state from payment facts, respects the dry run flag, and only ever writes through <code>order_histories</code>.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/webservice-order-created-without-state" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">backfill_stateless_orders.py</div>
+      <pre><code class="language-python">"""Find and backfill PrestaShop orders created via webservice with no state at all.
+
+OrderHistory::changeIdOrderState() is the only code path that both writes an
+order_history row and updates the denormalized orders.current_state column, while
+also firing the emails, stock, and invoice logic tied to that state. The webservice
+orders resource exposes current_state as a plain writable field on the order object,
+so a POST to /api/orders that omits it, or sets it directly, never runs the state
+machine at all. The order is created with current_state at 0 (or an unapplied value)
+and zero rows in order_history. This is documented on the PrestaShop forums under
+"Create order via webservice won't set current state," and the reverse case, an
+update adding an unexpected history row, is tracked as GitHub issue #11154.
+
+This script only ever repairs through order_histories, the same call the back
+office makes internally. It never writes current_state directly onto an order,
+since that is the exact bug being fixed. Run on a schedule. Safe to run again
+and again, because a repaired order will show up with a real history row on the
+next pass and no longer match the stateless filter.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("backfill_stateless_orders")
+
+PRESTASHOP_URL = os.environ.get("PRESTASHOP_URL", "https://demo.example.com").rstrip("/")
+PRESTASHOP_WS_KEY = os.environ.get("PRESTASHOP_WS_KEY", "WSKEYDUMMY")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+AUTH = (PRESTASHOP_WS_KEY, "")
+
+PAID_HINTS = ("payment accepted", "paiement accepté", "paid")
+AWAITING_HINTS = ("awaiting", "en attente")
+
+
+def resolve_backfill_state(order, order_states):
+    """Pure decision function, no I/O.
+
+    order: dict with id_order, current_state, total_paid, total_paid_real, payment, valid.
+    order_states: list of dicts, each with id, name, logable, hidden.
+    Returns the id_order_state to backfill, or None when no safe decision can be made.
+    """
+    if order.get("current_state") not in (0, None):
+        return None
+
+    def usable(s):
+        return str(s.get("logable", "0")) in ("1", "true", "True") and \
+               str(s.get("hidden", "0")) not in ("1", "true", "True")
+
+    candidates = [s for s in order_states if usable(s)]
+    if not candidates:
+        return None
+
+    total_paid = float(order.get("total_paid") or 0)
+    total_paid_real = float(order.get("total_paid_real") or 0)
+
+    if total_paid &gt; 0 and total_paid_real &gt;= total_paid:
+        paid_states = [s for s in candidates if any(h in str(s.get("name", "")).lower() for h in PAID_HINTS)]
+        if len(paid_states) == 1:
+            return int(paid_states[0]["id"])
+        return None
+
+    awaiting_states = [s for s in candidates if any(h in str(s.get("name", "")).lower() for h in AWAITING_HINTS)]
+    if not awaiting_states:
+        return None
+    return int(min(awaiting_states, key=lambda s: int(s["id"]))["id"])
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{PRESTASHOP_URL}/api/{path}", params=params, auth=AUTH, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def candidate_orders():
+    data = api_get("orders", params={"display": "full", "filter[current_state]": "0", "limit": "200"})
+    return data.get("orders") or []
+
+
+def is_stateless(id_order):
+    data = api_get("order_histories", params={
+        "display": "full",
+        "filter[id_order]": id_order,
+        "limit": "1",
+    })
+    rows = data.get("order_histories") or []
+    return len(rows) == 0
+
+
+def order_states():
+    data = api_get("order_states", params={"display": "full"})
+    return data.get("order_states") or []
+
+
+def backfill_via_history(id_order, resolved_state_id):
+    body = {"order_history": {"id_order": id_order, "id_order_state": resolved_state_id}}
+    r = requests.post(
+        f"{PRESTASHOP_URL}/api/order_histories",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=AUTH,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    states = order_states()
+    flagged = 0
+    repaired = 0
+    for order in candidate_orders():
+        id_order = order["id"]
+        if not is_stateless(id_order):
+            continue
+        flagged += 1
+        resolved = resolve_backfill_state(order, states)
+        if resolved is None:
+            log.warning("Order id_order=%s is stateless but could not be safely resolved. Flagging for review.", id_order)
+            continue
+        log.info("Order id_order=%s stateless. %s id_order_state=%s",
+                  id_order, "would backfill to" if DRY_RUN else "backfilling to", resolved)
+        if not DRY_RUN:
+            backfill_via_history(id_order, resolved)
+            repaired += 1
+    log.info("Done. %d stateless order(s) found, %d repaired. DRY_RUN=%s", flagged, repaired, DRY_RUN)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">backfill-stateless-orders.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and backfill PrestaShop orders created via webservice with no state at all.
+ *
+ * OrderHistory::changeIdOrderState() is the only code path that both writes an
+ * order_history row and updates the denormalized orders.current_state column, while
+ * also firing the emails, stock, and invoice logic tied to that state. The webservice
+ * orders resource exposes current_state as a plain writable field on the order object,
+ * so a POST to /api/orders that omits it, or sets it directly, never runs the state
+ * machine at all. The order is created with current_state at 0 (or an unapplied value)
+ * and zero rows in order_history. This is documented on the PrestaShop forums under
+ * "Create order via webservice won't set current state," and the reverse case, an
+ * update adding an unexpected history row, is tracked as GitHub issue #11154.
+ *
+ * This script only ever repairs through order_histories, the same call the back
+ * office makes internally. It never writes current_state directly onto an order,
+ * since that is the exact bug being fixed. Run on a schedule. Safe to run again
+ * and again, because a repaired order will show up with a real history row on the
+ * next pass and no longer match the stateless filter.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/webservice-order-created-without-state/
+ */
+import { pathToFileURL } from "node:url";
+
+const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "https://demo.example.com").replace(/\/+$/, "");
+const PRESTASHOP_WS_KEY = process.env.PRESTASHOP_WS_KEY || "WSKEYDUMMY";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const PAID_HINTS = ["payment accepted", "paiement accepté", "paid"];
+const AWAITING_HINTS = ["awaiting", "en attente"];
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${PRESTASHOP_WS_KEY}:`).toString("base64");
+}
+
+function usable(s) {
+  const logable = String(s.logable ?? "0");
+  const hidden = String(s.hidden ?? "0");
+  return ["1", "true", "True"].includes(logable) && !["1", "true", "True"].includes(hidden);
+}
+
+/**
+ * Pure decision function, no I/O.
+ *
+ * order: object with id_order, current_state, total_paid, total_paid_real, payment, valid.
+ * orderStates: array of objects, each with id, name, logable, hidden.
+ * Returns the id_order_state to backfill, or null when no safe decision can be made.
+ */
+export function resolveBackfillState(order, orderStates) {
+  if (order.current_state !== 0 && order.current_state != null) return null;
+
+  const candidates = orderStates.filter(usable);
+  if (candidates.length === 0) return null;
+
+  const totalPaid = Number(order.total_paid || 0);
+  const totalPaidReal = Number(order.total_paid_real || 0);
+
+  if (totalPaid &gt; 0 &amp;&amp; totalPaidReal &gt;= totalPaid) {
+    const paidStates = candidates.filter((s) =&gt;
+      PAID_HINTS.some((h) =&gt; String(s.name || "").toLowerCase().includes(h))
+    );
+    if (paidStates.length === 1) return Number(paidStates[0].id);
+    return null;
+  }
+
+  const awaitingStates = candidates.filter((s) =&gt;
+    AWAITING_HINTS.some((h) =&gt; String(s.name || "").toLowerCase().includes(h))
+  );
+  if (awaitingStates.length === 0) return null;
+  return Number(awaitingStates.reduce((a, b) =&gt; (Number(b.id) &lt; Number(a.id) ? b : a)).id);
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${PRESTASHOP_URL}/api/${path}`);
+  url.searchParams.set("output_format", "JSON");
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: basicAuthHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function candidateOrders() {
+  const data = await apiGet("orders", { display: "full", "filter[current_state]": "0", limit: "200" });
+  return data.orders || [];
+}
+
+async function isStateless(idOrder) {
+  const data = await apiGet("order_histories", {
+    display: "full",
+    "filter[id_order]": idOrder,
+    limit: "1",
+  });
+  const rows = data.order_histories || [];
+  return rows.length === 0;
+}
+
+async function orderStates() {
+  const data = await apiGet("order_states", { display: "full" });
+  return data.order_states || [];
+}
+
+async function backfillViaHistory(idOrder, resolvedStateId) {
+  const url = new URL(`${PRESTASHOP_URL}/api/order_histories`);
+  url.searchParams.set("output_format", "JSON");
+  const body = { order_history: { id_order: idOrder, id_order_state: resolvedStateId } };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: basicAuthHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on POST order_histories`);
+  return res.json();
+}
+
+export async function run() {
+  const states = await orderStates();
+  let flagged = 0;
+  let repaired = 0;
+  for (const order of await candidateOrders()) {
+    const idOrder = order.id;
+    if (!(await isStateless(idOrder))) continue;
+    flagged++;
+    const resolved = resolveBackfillState(order, states);
+    if (resolved === null) {
+      console.warn(`Order id_order=${idOrder} is stateless but could not be safely resolved. Flagging for review.`);
+      continue;
+    }
+    console.log(`Order id_order=${idOrder} stateless. ${DRY_RUN ? "would backfill to" : "backfilling to"} id_order_state=${resolved}`);
+    if (!DRY_RUN) {
+      await backfillViaHistory(idOrder, resolved);
+      repaired++;
+    }
+  }
+  console.log(`Done. ${flagged} stateless order(s) found, ${repaired} repaired. DRY_RUN=${DRY_RUN}`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which state gets written back to a real order. Because we kept <code>resolve_backfill_state</code> pure, the test needs no network and no PrestaShop store. It just feeds in plain dicts and lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_webservice_backfill.py</div>
+      <pre><code class="language-python">from backfill_stateless_orders import resolve_backfill_state
+
+STATES = [
+    {"id": "1", "name": "Awaiting check payment", "logable": "1", "hidden": "0"},
+    {"id": "2", "name": "Payment accepted", "logable": "1", "hidden": "0"},
+    {"id": "3", "name": "Awaiting bank wire payment", "logable": "1", "hidden": "0"},
+    {"id": "6", "name": "Canceled", "logable": "0", "hidden": "0"},
+    {"id": "7", "name": "Refunded", "logable": "0", "hidden": "1"},
+]
+
+
+def order(**over):
+    base = {"id_order": 42, "current_state": 0, "total_paid": 100.0, "total_paid_real": 0.0,
+            "payment": "Bank wire", "valid": False}
+    base.update(over)
+    return base
+
+
+def test_returns_none_when_current_state_is_already_set():
+    assert resolve_backfill_state(order(current_state=2), STATES) is None
+
+
+def test_resolves_paid_state_when_fully_paid():
+    assert resolve_backfill_state(order(total_paid_real=100.0), STATES) == 2
+
+
+def test_resolves_paid_state_when_overpaid():
+    assert resolve_backfill_state(order(total_paid_real=105.0), STATES) == 2
+
+
+def test_resolves_lowest_awaiting_state_when_unpaid():
+    assert resolve_backfill_state(order(), STATES) == 1
+
+
+def test_returns_none_when_no_awaiting_states_exist():
+    no_awaiting = [s for s in STATES if "wire" not in s["name"].lower() and "check" not in s["name"].lower()]
+    assert resolve_backfill_state(order(), no_awaiting) is None
+
+
+def test_returns_none_when_no_logable_states_exist():
+    hidden_only = [dict(s, logable="0") for s in STATES]
+    assert resolve_backfill_state(order(total_paid_real=100.0), hidden_only) is None
+
+
+def test_returns_none_when_current_state_is_none():
+    assert resolve_backfill_state(order(current_state=0), []) is None
+
+
+def test_zero_total_paid_falls_back_to_awaiting():
+    assert resolve_backfill_state(order(total_paid=0.0, total_paid_real=0.0), STATES) == 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">webservice-backfill.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { resolveBackfillState } from "./backfill-stateless-orders.js";
+
+const STATES = [
+  { id: "1", name: "Awaiting check payment", logable: "1", hidden: "0" },
+  { id: "2", name: "Payment accepted", logable: "1", hidden: "0" },
+  { id: "3", name: "Awaiting bank wire payment", logable: "1", hidden: "0" },
+  { id: "6", name: "Canceled", logable: "0", hidden: "0" },
+  { id: "7", name: "Refunded", logable: "0", hidden: "1" },
+];
+
+const order = (over = {}) =&gt; ({
+  id_order: 42,
+  current_state: 0,
+  total_paid: 100.0,
+  total_paid_real: 0.0,
+  payment: "Bank wire",
+  valid: false,
+  ...over,
+});
+
+test("returns null when current_state is already set", () =&gt; {
+  assert.equal(resolveBackfillState(order({ current_state: 2 }), STATES), null);
+});
+
+test("resolves paid state when fully paid", () =&gt; {
+  assert.equal(resolveBackfillState(order({ total_paid_real: 100.0 }), STATES), 2);
+});
+
+test("resolves paid state when overpaid", () =&gt; {
+  assert.equal(resolveBackfillState(order({ total_paid_real: 105.0 }), STATES), 2);
+});
+
+test("resolves lowest awaiting state when unpaid", () =&gt; {
+  assert.equal(resolveBackfillState(order(), STATES), 1);
+});
+
+test("returns null when no awaiting states exist", () =&gt; {
+  const noAwaiting = STATES.filter((s) =&gt; !/wire|check/i.test(s.name));
+  assert.equal(resolveBackfillState(order(), noAwaiting), null);
+});
+
+test("returns null when no logable states exist", () =&gt; {
+  const hiddenOnly = STATES.map((s) =&gt; ({ ...s, logable: "0" }));
+  assert.equal(resolveBackfillState(order({ total_paid_real: 100.0 }), hiddenOnly), null);
+});
+
+test("returns null when current_state is 0 and no states given", () =&gt; {
+  assert.equal(resolveBackfillState(order({ current_state: 0 }), []), null);
+});
+
+test("zero total paid falls back to awaiting", () =&gt; {
+  assert.equal(resolveBackfillState(order({ total_paid: 0.0, total_paid_real: 0.0 }), STATES), 1);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Marketplace sync</span>
+      <h4>The connector that only set current_state on the order</h4>
+      <p>A marketplace integration pushed orders into PrestaShop through <code>/api/orders</code>, setting <code>current_state</code> in the same request body as everything else, the same way it worked on the platform it was ported from. Weeks later, finance noticed a batch of orders that back-office reports treated as unpaid even though the connector logs showed a state value had been sent.</p>
+      <p>Running the diagnostic against <code>filter[current_state]=0</code> only caught part of it, since some of these orders had a non-zero value with still no history behind them, until the team also checked <code>order_histories</code> directly for every recent connector order. Once confirmed stateless, the resolver used each order's <code>total_paid_real</code> to backfill the correct state through <code>order_histories</code>, and the connector was fixed to POST a history record after creation instead of setting the field directly.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Draft order import</span>
+      <h4>The bulk import that left current_state at 0</h4>
+      <p>A migration script imported thousands of historical orders through the webservice, omitting <code>current_state</code> entirely because the source system did not track it the same way. Every imported order sat at <code>current_state=0</code> with an empty history, and the back office's default order list quietly excluded them from the usual status filters, so nobody noticed until a customer asked about an order that "did not exist" in support's view.</p>
+      <p>The script ran in dry run first across the whole import batch, logging the resolved state for every order based on its recorded payment totals. The team reviewed the log, confirmed the payment-based resolution looked right, and ran it for real, giving every imported order the history entry the migration never wrote.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no order the webservice created can sit indefinitely with an empty history and a meaningless current_state. Every repair goes through <code>order_histories</code>, the same path the back office uses, so invoices, emails, and stock effects fire the way they would for any normal transition. Orders the resolver cannot confidently place are left alone for a human, so nothing gets a guessed state it never earned.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does an order created through the PrestaShop webservice have no state at all?</summary>
+      <p>The webservice orders resource exposes current_state as a plain writable field on the order object, but POSTing to /api/orders does not run the order through OrderHistory::changeIdOrderState(), which is the only code path that both sets current_state and writes the matching order_history row. A client that omits current_state or sets it directly gets an order stored with current_state at 0 or an unintended value and zero rows in order_history, because only a follow-up POST to order_histories actually triggers a real state transition.</p>
+    </details>
+    <details>
+      <summary>Is it safe to fix these orders by setting current_state directly on the order?</summary>
+      <p>No. PUTting current_state directly onto /api/orders is the exact bug being fixed, since it bypasses the invoice, email, and stock side effects that only run through OrderHistory::changeIdOrderState(). The safe repair is to POST a new resource to /api/order_histories with the order id and the resolved state id, the same call the back office makes internally, so the order gets a real history row and its current_state is refreshed as a side effect.</p>
+    </details>
+    <details>
+      <summary>How do I detect orders that were created without a real state?</summary>
+      <p>List orders with current_state=0 using GET /api/orders?filter[current_state]=0, then for each candidate call GET /api/order_histories?filter[id_order]=[id]&amp;limit=1. If that returns an empty order_histories array, the order is confirmed stateless regardless of what current_state shows, since current_state can be stale or denormalized. Cross-check GET /api/order_states to resolve a sane default state to backfill.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop Forums: Create order via webservice won't set current state. <a href="https://forum.prestashop.com/topic/1023675-create-order-via-webservice-wont-set-current-state/" rel="noopener">forum.prestashop.com/topic/1023675-create-order-via-webservice-wont-set-current-state/</a></li>
+      <li>PrestaShop Forums: How set a state for an order at creation time? <a href="https://forum.prestashop.com/topic/840953-how-set-a-state-for-an-order-at-creation-time/" rel="noopener">forum.prestashop.com/topic/840953-how-set-a-state-for-an-order-at-creation-time/</a></li>
+      <li>PrestaShop GitHub: Update order with Webservice adds new order's status line. Issue #11154. <a href="https://github.com/PrestaShop/PrestaShop/issues/11154" rel="noopener">github.com/PrestaShop/PrestaShop/issues/11154</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Order histories webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_histories/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_histories/</a></li>
+      <li>PrestaShop Developer Documentation: Orders webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/orders/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/orders/</a></li>
+      <li>PrestaShop Developer Documentation: Order states webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_states/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_states/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop orders, order states, stock, or the webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a stateless order?</h3>
+    <p>If this saved you a confusing support ticket or a manual audit of the order book, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>
