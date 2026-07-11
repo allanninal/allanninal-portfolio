@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Medusa Workflow Executions Stuck in the Invoking State</title>
+<meta name="description" content="A long running Medusa v2 workflow's workflow_execution row never leaves the invoking state because an async step never got its completion signal. Learn why it happens and build a Python or Node.js script that flags the stuck rows for an operator to retry safely.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/workflow-execution-stuck-invoking/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Medusa Workflow Executions Stuck in the Invoking State">
+<meta property="og:description" content="Why a Medusa v2 workflow_execution row can be stuck on invoking forever, and a safe Python or Node.js script that flags the stuck transactions for an operator to retry.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/workflow-execution-stuck-invoking/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/workflow-execution-stuck-invoking/#article","headline":"Fix Medusa Workflow Executions Stuck in the Invoking State","description":"Why a Medusa v2 workflow_execution row can sit on the invoking state forever when an async step never gets its completion signal, and a safe Python or Node.js script that flags the stuck transactions for an operator to retry.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/workflow-execution-stuck-invoking/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Workflows & Background Jobs","keywords":"Medusa workflow_execution, invoking state, async step, retryStep, Workflow Engine Module, store: true, retentionTime, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Long running workflow executions get stuck in invoking state","item":"https://www.allanninal.dev/medusa/workflow-execution-stuck-invoking/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a Medusa workflow_execution row stay on invoking forever?","acceptedAnswer":{"@type":"Answer","text":"Medusa only persists a workflow_execution row when the workflow is marked store: true, which long running workflows get automatically, and that row is meant to move through invoking to done, failed, or compensating as its async steps complete. An async step, one marked async: true or one with a retryInterval, only advances the row when it receives its external completion signal, such as a webhook calling setStepSuccess. If that webhook never arrives, the worker crashes mid step, or a subscriber never fires, the row is left mid invoke with no built in TTL to expire it, so it can sit there indefinitely."}},{"@type":"Question","name":"How do I find stuck workflow executions in Medusa?","acceptedAnswer":{"@type":"Answer","text":"Resolve the Workflow Engine Module in a server side script or job with req.scope.resolve(Modules.WORKFLOW_ENGINE) and call listWorkflowExecutions({ state: \"invoking\" }, { select: [\"id\",\"workflow_id\",\"transaction_id\",\"state\",\"execution\",\"retention_time\",\"created_at\",\"updated_at\"] }). There is no public /admin/workflow-executions REST route in v2, so this same table is what the Admin UI's Settings, Workflows view reads server side. For each row, compare now minus updated_at against the workflow's retentionTime or a conservative default, and flag anything still invoking past that threshold."}},{"@type":"Question","name":"Is it safe to delete a stuck workflow_execution row directly?","acceptedAnswer":{"@type":"Answer","text":"No. Forcibly deleting or updating that row risks orphaning an in-flight compensation or double-triggering a side effect tied to that transaction, such as a payment capture or a fulfillment. The safe path is the Workflow Engine Module's documented retryStep call for the specific stalled step, and if the underlying async action can truly never complete, an operator should fail or cancel the transaction through the workflow's own compensation logic, never a raw DELETE or UPDATE on workflow_execution."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Workflows &amp; Background Jobs</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Workflows &amp; Background Jobs</p>
+    <h1>Long running workflow executions get stuck in invoking state</h1>
+    <p class="lead">You go looking at a long running workflow days after it started and its workflow_execution row still says invoking. It never moved to done, never moved to failed, it is just sitting there. The step waiting on an external signal, a webhook, a worker, a subscriber, never got its answer, and Medusa has no built in clock to give up on it. Here is why that row gets stuck and a small script that finds the stuck ones and reports them for an operator to retry safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa only writes a <code>workflow_execution</code> row when a workflow is marked <code>store: true</code>, which long running workflows get automatically, and that row's <code>state</code> is meant to move through <code>invoking</code> to <code>done</code>, <code>failed</code>, or <code>compensating</code> as async steps finish. A step marked <code>async: true</code>, or one with a <code>retryInterval</code>, only advances that row when it gets its external completion signal, a webhook calling <code>setStepSuccess</code>, a worker checking in, a subscriber firing. If that signal never comes, the row is stuck mid invoke, and because there is no built in TTL sweep without an explicit <code>retentionTime</code>, it can sit there indefinitely (GitHub #9077, #11175). Run a script that lists rows still in <code>invoking</code>, compares their age against an expected TTL, and reports the stuck transaction ids for a human to retry with <code>retryStep</code>. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Most workflow steps run and finish in the same tick. Medusa calls the step, the step does its work, and the workflow moves on. A long running workflow is different on purpose. It marks itself <code>store: true</code> so Medusa writes a row to the <code>workflow_execution</code> table, and it can contain a step that does not finish right away, an async step waiting on something outside the process.</p>
+  <p>That something outside the process is exactly the part Medusa cannot control. A payment provider is supposed to call a webhook once the charge clears. A background worker is supposed to check back in once a long job finishes. A subscriber is supposed to fire once an event lands. When any of those never happens, because the webhook was misconfigured, the worker crashed halfway through, or the subscriber silently failed to register, the step never calls <code>setStepSuccess</code>, and the workflow has no way to know it should move on. The <code>workflow_execution</code> row just sits there with <code>state: "invoking"</code>, and in some versions the row is deleted and reinserted on every step transition rather than updated in place, so on a fast poll you can even watch it flicker out of existence and back, which is the exact flapping behavior reported in GitHub issue #9077.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A long running workflow invokes an async step that waits for an external signal such as a webhook, the signal never arrives, so the step never calls setStepSuccess and the workflow_execution row stays on the invoking state with no TTL to expire it.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="165" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="92" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Workflow invokes</text>
+      <text x="92" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">async step, store: true</text>
+      <line x1="92" y1="86" x2="92" y2="112" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="114" width="230" height="72" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="125" y="140" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Waits on external signal</text>
+      <text x="125" y="157" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">webhook, worker, or subscriber</text>
+      <text x="125" y="174" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">to call setStepSuccess</text>
+      <line x1="240" y1="150" x2="282" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="261" y="112" text-anchor="middle" font-family="sans-serif" font-size="21" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="261" y="200" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">signal never arrives</text>
+      <rect x="285" y="118" width="200" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="385" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Step never completes</text>
+      <text x="385" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">no setStepSuccess call</text>
+      <line x1="485" y1="150" x2="527" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="530" y="112" width="220" height="76" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="640" y="136" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">workflow_execution stuck</text>
+      <text x="640" y="153" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">state: "invoking" forever</text>
+      <text x="640" y="169" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">no TTL sweep without retentionTime</text>
+    </svg>
+    <figcaption>An async step waits on a signal from outside the process. When that signal never comes, the step never calls setStepSuccess, and the workflow_execution row is left on invoking with nothing to expire it.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Medusa's workflow engine gives async steps the ability to pause and wait, but it puts the responsibility for resuming them entirely outside the workflow itself. A few common ways rows end up stuck on <code>invoking</code>:</p>
+  <ul>
+    <li>A webhook that is supposed to call <code>setStepSuccess</code> is misconfigured, points at the wrong URL, or the provider retries it in a way Medusa never receives.</li>
+    <li>A worker process crashes or is redeployed mid step, so the in-process promise that was going to resolve the step is gone and nothing ever tells the workflow to continue.</li>
+    <li>A subscriber that was meant to fire on an event never registers, or throws before it reaches the call that would advance the step.</li>
+    <li>The row is rewritten, delete then reinsert, on every step transition in some versions rather than updated in place, so on rapid polling it can appear to disappear and reappear between reads, the flapping symptom from GitHub issue #9077.</li>
+    <li>No explicit <code>retentionTime</code> was set on the workflow, so Medusa has no built in TTL sweep to expire or reap a dangling row, and these rows accumulate indefinitely, as reported in GitHub issue #11175.</li>
+  </ul>
+  <p>The net effect is the same in every case. Nothing inside Medusa is watching the clock on that row, so a signal that never arrives leaves it stuck for as long as the table exists. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A stuck row on <code>invoking</code> is a symptom, not the disease. The disease is whatever kept the async step from ever hearing back, a dead webhook, a crashed worker, a subscriber that never fired. So the safe move is never to force that row into a different state or delete it directly, since the transaction id it holds may still be tied to a real in-flight compensation, or to a side effect like a payment capture that has not actually resolved yet. The safe move is to flag it, with its age and its workflow id, so an operator can look at the specific stalled step and retry it through Medusa's own <code>retryStep</code> path.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the <code>workflow_execution</code> table directly. The job lists rows still in <code>invoking</code>, compares each row's age against an expected TTL with a pure function, and reports every row that has been stuck too long. Nothing is retried or deleted automatically. That is left to an operator using Medusa's own retry path.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists workflow_execution rows in the invoking state, computes elapsed time since the row last updated, checks that against the workflow's TTL with a pure function, then reports every row that is stuck past the threshold for an operator to retry with retryStep, otherwise it is left alone as still within its normal window.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List invoking rows</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">state: "invoking"</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Compute elapsed time</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">now minus updated_at</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pure decision fn</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">isStuckInvoking</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Past workflow's</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">TTL?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, flag it</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">no, still normal</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="204" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report to operator</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">retryStep, never a raw delete</text>
+    </svg>
+    <figcaption>Every invoking row is measured against its expected TTL. Only rows stuck past that threshold are reported, with the exact transaction id and workflow id an operator needs to retry the stalled step safely.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. There is no public <code>/admin/workflow-executions</code> REST route in v2, so this script talks to Postgres directly with a read only query, the same table Medusa's own Settings, Workflows view reads server side. Keep every credential in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install psycopg2-binary
+
+export MEDUSA_DATABASE_URL="postgres://user:pass@localhost:5432/medusa"
+export DEFAULT_TTL_MINUTES="20"
+export DRY_RUN="true"   # start safe, this script only reports either way</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install pg
+
+export MEDUSA_DATABASE_URL="postgres://user:pass@localhost:5432/medusa"
+export DEFAULT_TTL_MINUTES="20"
+export DRY_RUN="true"   // start safe, this script only reports either way</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List rows still in the invoking state</h3>
+      <p>Query <code>workflow_execution</code> directly, since there is no public REST route for it. Read back the fields the decision needs: the workflow id, the transaction id, the state, and both timestamps. Inside Medusa's own code this same data comes back from <code>listWorkflowExecutions({ state: "invoking" })</code> on the Workflow Engine Module, so either path reads the same underlying rows.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os
+import psycopg2
+import psycopg2.extras
+
+DATABASE_URL = os.environ["MEDUSA_DATABASE_URL"]
+
+INVOKING_QUERY = """
+    SELECT id, workflow_id, transaction_id, state, retention_time, created_at, updated_at
+    FROM workflow_execution
+    WHERE state = 'invoking'
+"""
+
+def list_invoking_rows():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(INVOKING_QUERY)
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import pg from "pg";
+
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.MEDUSA_DATABASE_URL });
+
+const INVOKING_QUERY = `
+  SELECT id, workflow_id, transaction_id, state, retention_time, created_at, updated_at
+  FROM workflow_execution
+  WHERE state = 'invoking'
+`;
+
+async function listInvokingRows() {
+  const { rows } = await pool.query(INVOKING_QUERY);
+  return rows;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a plain row, the current time, a map of TTL overrides per workflow id, and a default TTL, then returns true or false. It never touches the network or the database, so it is trivial to unit test with fixed clock values. A row only counts as stuck when its state is <code>invoking</code> and the time since its last update (falling back to <code>created_at</code>) is past the TTL for that workflow.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def is_stuck_invoking(row, now_ms, ttl_ms_by_workflow, default_ttl_ms):
+    """Pure decision function. No I/O.
+
+    row: {"state": str, "created_at": datetime, "updated_at": datetime | None, "workflow_id": str}
+    now_ms: int (epoch milliseconds)
+    ttl_ms_by_workflow: dict[str, int]
+    default_ttl_ms: int
+
+    Returns True only when row["state"] == "invoking" and the row has been
+    sitting past its TTL since it was last updated (or created, if never updated).
+    """
+    if row.get("state") != "invoking":
+        return False
+
+    reference = row.get("updated_at") or row.get("created_at")
+    if reference is None:
+        return False
+
+    ttl_ms = ttl_ms_by_workflow.get(row.get("workflow_id"), default_ttl_ms)
+    elapsed_ms = now_ms - reference.timestamp() * 1000
+    return elapsed_ms &gt; ttl_ms</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ state: string, createdAt: Date, updatedAt: Date | null, workflowId: string }} row
+ * @param {number} nowMs
+ * @param {Record&lt;string, number&gt;} ttlMsByWorkflow
+ * @param {number} defaultTtlMs
+ * @returns {boolean}
+ */
+export function isStuckInvoking(row, nowMs, ttlMsByWorkflow, defaultTtlMs) {
+  if (row.state !== "invoking") return false;
+
+  const reference = row.updatedAt ?? row.createdAt;
+  if (!reference) return false;
+
+  const ttlMs = ttlMsByWorkflow[row.workflowId] ?? defaultTtlMs;
+  const elapsedMs = nowMs - reference.getTime();
+  return elapsedMs &gt; ttlMs;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Also watch for the flapping symptom</h3>
+      <p>Some versions rewrite the row, delete then reinsert, on every step transition instead of updating it in place, so a transaction id can be present on one poll, absent on the next, then present again, exactly the behavior reported in GitHub issue #9077. Keep the last two polls' transaction id sets in memory and flag any id that disappears and later reappears, separately from the TTL check.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flapping.py</div>
+      <pre><code class="language-python">def detect_flapping(previous_ids, current_ids, ever_seen_ids):
+    """Pure. Returns the set of transaction_ids seen before, missing last poll,
+    and present again now (present -&gt; absent -&gt; present)."""
+    reappeared = (ever_seen_ids - previous_ids) & current_ids
+    return reappeared</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flapping.js</div>
+      <pre><code class="language-javascript">export function detectFlapping(previousIds, currentIds, everSeenIds) {
+  const missingLastPoll = [...everSeenIds].filter((id) =&gt; !previousIds.has(id));
+  return new Set(missingLastPoll.filter((id) =&gt; currentIds.has(id)));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report, never repair automatically</h3>
+      <p>Log every row flagged as stuck, with its <code>transaction_id</code>, <code>workflow_id</code>, and elapsed time. This script never deletes or updates <code>workflow_execution</code> directly, since doing so risks orphaning an in-flight compensation or double-triggering a side effect. When <code>DRY_RUN</code> is false, the only action taken is printing the confirmed list clearly enough for an operator to act on with Medusa's own <code>retryStep</code> path.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script is flag and report only. It never calls <code>retryStep</code>, never deletes a row, and never updates <code>workflow_execution</code> directly. <code>DRY_RUN=false</code> only changes whether it prints a confirmation banner before the list, since there is nothing destructive to gate. The actual repair, retrying the specific stalled step or cancelling the transaction through the workflow's own compensation logic, is a decision for a human who can see what that transaction was doing.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, connects read only to Postgres, and is safe to run again and again on a schedule because it never writes to <code>workflow_execution</code> at all.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/workflow-execution-stuck-invoking" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_stuck_invoking.py</div>
+      <pre><code class="language-python">"""Flag Medusa workflow_execution rows stuck in the invoking state.
+
+Medusa only persists a workflow_execution row when a workflow is marked store: true,
+which long running workflows get automatically, and the row's state is meant to move
+through invoking to done, failed, or compensating as async steps complete. An async
+step (async: true, or one with a retryInterval) only advances the row when it gets its
+external completion signal: a webhook calling setStepSuccess, a worker checking back in,
+a subscriber firing. If that signal never arrives, the row is stuck mid invoke, and
+without an explicit retentionTime there is no built in TTL sweep to expire it, so it can
+sit there indefinitely (GitHub #9077, #11175).
+
+This connects read only to Postgres, lists rows still in the invoking state, flags the
+ones stuck past an expected TTL with a pure function, and reports the transaction ids
+for an operator to retry with the Workflow Engine Module's retryStep. It never deletes
+or updates workflow_execution directly. Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import psycopg2
+import psycopg2.extras
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_stuck_invoking")
+
+DATABASE_URL = os.environ["MEDUSA_DATABASE_URL"]
+DEFAULT_TTL_MINUTES = float(os.environ.get("DEFAULT_TTL_MINUTES", "20"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+# Per workflow_id TTL overrides, in minutes. Extend this if a workflow legitimately
+# needs longer than DEFAULT_TTL_MINUTES to receive its async completion signal.
+TTL_MINUTES_BY_WORKFLOW = {}
+
+INVOKING_QUERY = """
+    SELECT id, workflow_id, transaction_id, state, retention_time, created_at, updated_at
+    FROM workflow_execution
+    WHERE state = 'invoking'
+"""
+
+
+def is_stuck_invoking(row, now_ms, ttl_ms_by_workflow, default_ttl_ms):
+    """Pure decision function. No I/O.
+
+    row: {"state": str, "created_at": datetime, "updated_at": datetime | None, "workflow_id": str}
+    now_ms: int (epoch milliseconds)
+    ttl_ms_by_workflow: dict[str, int]
+    default_ttl_ms: int
+
+    Returns True only when row["state"] == "invoking" and the row has been
+    sitting past its TTL since it was last updated (or created, if never updated).
+    """
+    if row.get("state") != "invoking":
+        return False
+
+    reference = row.get("updated_at") or row.get("created_at")
+    if reference is None:
+        return False
+
+    ttl_ms = ttl_ms_by_workflow.get(row.get("workflow_id"), default_ttl_ms)
+    elapsed_ms = now_ms - reference.timestamp() * 1000
+    return elapsed_ms &gt; ttl_ms
+
+
+def detect_flapping(previous_ids, current_ids, ever_seen_ids):
+    """Pure. Returns the set of transaction_ids seen before, missing last poll,
+    and present again now (present -&gt; absent -&gt; present)."""
+    reappeared = (ever_seen_ids - previous_ids) & current_ids
+    return reappeared
+
+
+def list_invoking_rows():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(INVOKING_QUERY)
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def run():
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000
+    ttl_ms_by_workflow = {k: v * 60000 for k, v in TTL_MINUTES_BY_WORKFLOW.items()}
+    default_ttl_ms = DEFAULT_TTL_MINUTES * 60000
+
+    rows = list_invoking_rows()
+    stuck = [row for row in rows if is_stuck_invoking(row, now_ms, ttl_ms_by_workflow, default_ttl_ms)]
+
+    if DRY_RUN:
+        log.info("Dry run. Reporting only, no state is ever changed by this script.")
+
+    for row in stuck:
+        reference = row.get("updated_at") or row.get("created_at")
+        elapsed_minutes = (now_ms - reference.timestamp() * 1000) / 60000
+        log.warning(
+            "Stuck invoking: transaction_id=%s workflow_id=%s elapsed=%.1fmin. "
+            "Operator action: retryStep, or cancel via the workflow's own compensation.",
+            row["transaction_id"], row["workflow_id"], elapsed_minutes,
+        )
+
+    log.info("Done. %d workflow_execution row(s) stuck on invoking out of %d total in that state.",
+              len(stuck), len(rows))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-stuck-invoking.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Medusa workflow_execution rows stuck in the invoking state.
+ *
+ * Medusa only persists a workflow_execution row when a workflow is marked store: true,
+ * which long running workflows get automatically, and the row's state is meant to move
+ * through invoking to done, failed, or compensating as async steps complete. An async
+ * step (async: true, or one with a retryInterval) only advances the row when it gets its
+ * external completion signal: a webhook calling setStepSuccess, a worker checking back in,
+ * a subscriber firing. If that signal never arrives, the row is stuck mid invoke, and
+ * without an explicit retentionTime there is no built in TTL sweep to expire it, so it can
+ * sit there indefinitely (GitHub #9077, #11175).
+ *
+ * This connects read only to Postgres, lists rows still in the invoking state, flags the
+ * ones stuck past an expected TTL with a pure function, and reports the transaction ids
+ * for an operator to retry with the Workflow Engine Module's retryStep. It never deletes
+ * or updates workflow_execution directly. Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/workflow-execution-stuck-invoking/
+ */
+import { pathToFileURL } from "node:url";
+import pg from "pg";
+
+const DATABASE_URL = process.env.MEDUSA_DATABASE_URL || "postgres://user:pass@localhost:5432/medusa";
+const DEFAULT_TTL_MINUTES = Number(process.env.DEFAULT_TTL_MINUTES || 20);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+// Per workflow_id TTL overrides, in minutes. Extend this if a workflow legitimately
+// needs longer than DEFAULT_TTL_MINUTES to receive its async completion signal.
+const TTL_MINUTES_BY_WORKFLOW = {};
+
+const INVOKING_QUERY = `
+  SELECT id, workflow_id, transaction_id, state, retention_time, created_at, updated_at
+  FROM workflow_execution
+  WHERE state = 'invoking'
+`;
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ state: string, createdAt: Date, updatedAt: Date | null, workflowId: string }} row
+ * @param {number} nowMs
+ * @param {Record&lt;string, number&gt;} ttlMsByWorkflow
+ * @param {number} defaultTtlMs
+ * @returns {boolean}
+ */
+export function isStuckInvoking(row, nowMs, ttlMsByWorkflow, defaultTtlMs) {
+  if (row.state !== "invoking") return false;
+
+  const reference = row.updatedAt ?? row.createdAt;
+  if (!reference) return false;
+
+  const ttlMs = ttlMsByWorkflow[row.workflowId] ?? defaultTtlMs;
+  const elapsedMs = nowMs - reference.getTime();
+  return elapsedMs &gt; ttlMs;
+}
+
+export function detectFlapping(previousIds, currentIds, everSeenIds) {
+  const missingLastPoll = [...everSeenIds].filter((id) =&gt; !previousIds.has(id));
+  return new Set(missingLastPoll.filter((id) =&gt; currentIds.has(id)));
+}
+
+async function listInvokingRows() {
+  const pool = new pg.Pool({ connectionString: DATABASE_URL });
+  try {
+    const { rows } = await pool.query(INVOKING_QUERY);
+    return rows;
+  } finally {
+    await pool.end();
+  }
+}
+
+export async function run() {
+  const nowMs = Date.now();
+  const ttlMsByWorkflow = Object.fromEntries(
+    Object.entries(TTL_MINUTES_BY_WORKFLOW).map(([k, v]) =&gt; [k, v * 60000])
+  );
+  const defaultTtlMs = DEFAULT_TTL_MINUTES * 60000;
+
+  const rows = await listInvokingRows();
+  const stuck = rows.filter((row) =&gt;
+    isStuckInvoking(
+      {
+        state: row.state,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        workflowId: row.workflow_id,
+      },
+      nowMs,
+      ttlMsByWorkflow,
+      defaultTtlMs
+    )
+  );
+
+  if (DRY_RUN) {
+    console.log("Dry run. Reporting only, no state is ever changed by this script.");
+  }
+
+  for (const row of stuck) {
+    const reference = row.updated_at || row.created_at;
+    const elapsedMinutes = (nowMs - new Date(reference).getTime()) / 60000;
+    console.warn(
+      `Stuck invoking: transaction_id=${row.transaction_id} workflow_id=${row.workflow_id} elapsed=${elapsedMinutes.toFixed(1)}min. ` +
+      `Operator action: retryStep, or cancel via the workflow's own compensation.`
+    );
+  }
+
+  console.log(`Done. ${stuck.length} workflow_execution row(s) stuck on invoking out of ${rows.length} total in that state.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>isStuckInvoking</code> is the part most worth testing, because it decides which transactions get surfaced to an operator at all. It is pure, so the test needs no database and no Medusa backend. It just feeds in plain data and a fixed clock, and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_workflow_stuck.py</div>
+      <pre><code class="language-python">from datetime import datetime, timezone
+
+from flag_stuck_invoking import is_stuck_invoking
+
+NOW = datetime(2026, 7, 10, 0, 20, 0, tzinfo=timezone.utc)
+NOW_MS = NOW.timestamp() * 1000
+
+
+def row(**over):
+    base = {
+        "state": "invoking",
+        "workflow_id": "create-order",
+        "created_at": datetime(2026, 7, 10, 0, 0, 0, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 7, 10, 0, 0, 0, tzinfo=timezone.utc),
+    }
+    base.update(over)
+    return base
+
+
+def test_stuck_when_invoking_past_default_ttl():
+    assert is_stuck_invoking(row(), NOW_MS, {}, 10 * 60000) is True
+
+
+def test_not_stuck_when_within_ttl():
+    assert is_stuck_invoking(row(), NOW_MS, {}, 30 * 60000) is False
+
+
+def test_not_stuck_when_state_is_done():
+    assert is_stuck_invoking(row(state="done"), NOW_MS, {}, 5 * 60000) is False
+
+
+def test_not_stuck_when_state_is_failed():
+    assert is_stuck_invoking(row(state="failed"), NOW_MS, {}, 5 * 60000) is False
+
+
+def test_uses_per_workflow_ttl_override():
+    ttl_overrides = {"create-order": 30 * 60000}
+    assert is_stuck_invoking(row(), NOW_MS, ttl_overrides, 10 * 60000) is False
+
+
+def test_falls_back_to_created_at_when_updated_at_missing():
+    r = row(updated_at=None, created_at=datetime(2026, 7, 10, 0, 0, 0, tzinfo=timezone.utc))
+    assert is_stuck_invoking(r, NOW_MS, {}, 10 * 60000) is True
+
+
+def test_not_stuck_when_no_timestamps_at_all():
+    r = row(updated_at=None, created_at=None)
+    assert is_stuck_invoking(r, NOW_MS, {}, 1) is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">stuck-invoking.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isStuckInvoking } from "./flag-stuck-invoking.js";
+
+const NOW_MS = Date.parse("2026-07-10T00:20:00Z");
+
+const row = (over = {}) =&gt; ({
+  state: "invoking",
+  workflowId: "create-order",
+  createdAt: new Date("2026-07-10T00:00:00Z"),
+  updatedAt: new Date("2026-07-10T00:00:00Z"),
+  ...over,
+});
+
+test("stuck when invoking past default TTL", () =&gt; {
+  assert.equal(isStuckInvoking(row(), NOW_MS, {}, 10 * 60000), true);
+});
+
+test("not stuck when within TTL", () =&gt; {
+  assert.equal(isStuckInvoking(row(), NOW_MS, {}, 30 * 60000), false);
+});
+
+test("not stuck when state is done", () =&gt; {
+  assert.equal(isStuckInvoking(row({ state: "done" }), NOW_MS, {}, 5 * 60000), false);
+});
+
+test("not stuck when state is failed", () =&gt; {
+  assert.equal(isStuckInvoking(row({ state: "failed" }), NOW_MS, {}, 5 * 60000), false);
+});
+
+test("uses per workflow TTL override", () =&gt; {
+  const ttlOverrides = { "create-order": 30 * 60000 };
+  assert.equal(isStuckInvoking(row(), NOW_MS, ttlOverrides, 10 * 60000), false);
+});
+
+test("falls back to createdAt when updatedAt missing", () =&gt; {
+  const r = row({ updatedAt: null, createdAt: new Date("2026-07-10T00:00:00Z") });
+  assert.equal(isStuckInvoking(r, NOW_MS, {}, 10 * 60000), true);
+});
+
+test("not stuck when no timestamps at all", () =&gt; {
+  const r = row({ updatedAt: null, createdAt: null });
+  assert.equal(isStuckInvoking(r, NOW_MS, {}, 1), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Dead webhook</span>
+      <h4>A payment provider that changed its callback URL</h4>
+      <p>A store's custom payment integration used an async step to wait for a provider's webhook before marking a workflow's capture step complete. The provider rotated its webhook signing setup during a routine update, and the callback silently stopped reaching the store's endpoint. Nobody noticed right away, because the checkout itself had already returned success to the customer.</p>
+      <p>The script's dry run surfaced a growing list of transaction ids all pointing at the same workflow id, all elapsed well past the TTL. That pattern, many stuck rows on one workflow, was the tell. The team fixed the webhook URL, then had an operator retry each stalled step individually with <code>retryStep</code> rather than touching the table.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Crashed worker</span>
+      <h4>A background export job that never checked back in</h4>
+      <p>A long running workflow kicked off a background job to generate a large export, with a step marked <code>async: true</code> that expected the job to call <code>setStepSuccess</code> when it finished. A worker redeploy killed the in-progress job mid run, and because the job never resumed, that one step, and the workflow behind it, never got a completion signal.</p>
+      <p>Running the script hourly caught it inside of two cycles instead of weeks later. It reported a single stuck transaction, comfortably past its TTL, with nothing else affected. An operator queued a fresh export job and let the original transaction get cancelled through the workflow's own compensation logic.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a dead webhook or a crashed worker gets caught within one polling cycle instead of being discovered by accident weeks later. The report gives an operator exactly the transaction id, workflow id, and elapsed time they need to retry the one stalled step, or to cancel it cleanly through the workflow's own compensation. Nothing in <code>workflow_execution</code> is ever touched by a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a Medusa workflow_execution row stay on invoking forever?</summary>
+      <p>Medusa only persists a workflow_execution row when the workflow is marked store: true, which long running workflows get automatically, and that row is meant to move through invoking to done, failed, or compensating as its async steps complete. An async step, one marked async: true or one with a retryInterval, only advances the row when it receives its external completion signal, such as a webhook calling setStepSuccess. If that webhook never arrives, the worker crashes mid step, or a subscriber never fires, the row is left mid invoke with no built in TTL to expire it, so it can sit there indefinitely.</p>
+    </details>
+    <details>
+      <summary>How do I find stuck workflow executions in Medusa?</summary>
+      <p>Resolve the Workflow Engine Module in a server side script or job with req.scope.resolve(Modules.WORKFLOW_ENGINE) and call listWorkflowExecutions({ state: "invoking" }, { select: ["id","workflow_id","transaction_id","state","execution","retention_time","created_at","updated_at"] }). There is no public /admin/workflow-executions REST route in v2, so this same table is what the Admin UI's Settings, Workflows view reads server side. For each row, compare now minus updated_at against the workflow's retentionTime or a conservative default, and flag anything still invoking past that threshold.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete a stuck workflow_execution row directly?</summary>
+      <p>No. Forcibly deleting or updating that row risks orphaning an in-flight compensation or double-triggering a side effect tied to that transaction, such as a payment capture or a fulfillment. The safe path is the Workflow Engine Module's documented retryStep call for the specific stalled step, and if the underlying async action can truly never complete, an operator should fail or cancel the transaction through the workflow's own compensation logic, never a raw DELETE or UPDATE on workflow_execution.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Long-running workflows don't save correctly in workflow_execution table. Medusa GitHub Issue #9077. <a href="https://github.com/medusajs/medusa/issues/9077" rel="noopener">github.com/medusajs/medusa/issues/9077</a></li>
+      <li>[Bug]: workflow execution table size grows too large (workflow_execution). Medusa GitHub Issue #11175. <a href="https://github.com/medusajs/medusa/issues/11175" rel="noopener">github.com/medusajs/medusa/issues/11175</a></li>
+      <li>Medusa Documentation: Store Workflow Executions. <a href="https://docs.medusajs.com/learn/fundamentals/workflows/store-executions" rel="noopener">docs.medusajs.com/learn/fundamentals/workflows/store-executions</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Retry Failed Steps. <a href="https://docs.medusajs.com/learn/fundamentals/workflows/retry-failed-steps" rel="noopener">docs.medusajs.com/learn/fundamentals/workflows/retry-failed-steps</a></li>
+      <li>Medusa Documentation: Workflow Engine Module. <a href="https://docs.medusajs.com/resources/infrastructure-modules/workflow-engine" rel="noopener">docs.medusajs.com/resources/infrastructure-modules/workflow-engine</a></li>
+      <li>Medusa Documentation: Debug Workflows. <a href="https://docs.medusajs.com/learn/debugging-and-testing/debug-workflows" rel="noopener">docs.medusajs.com/learn/debugging-and-testing/debug-workflows</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa storefront access, pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a stuck workflow?</h3>
+    <p>If this saved you from staring at a workflow_execution row that would not budge, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

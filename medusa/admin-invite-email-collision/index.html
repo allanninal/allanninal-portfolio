@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Admin Invite Fails When the Email Already Belongs to a Customer in Medusa</title>
+<meta name="description" content="A Medusa v2 admin invite is sent and looks fine, but the invitee's accept step fails with 401 Identity with email already exists because the email already has a customer AuthIdentity. Learn why and build a Python or Node.js script that detects the collision before you send the invite.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/admin-invite-email-collision/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Admin Invite Fails When the Email Already Belongs to a Customer in Medusa">
+<meta property="og:description" content="Why a Medusa v2 admin invite silently fails at accept time when the email already has a customer AuthIdentity, and a Python or Node.js script that flags the collision before you send the invite.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/admin-invite-email-collision/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/admin-invite-email-collision/#article","headline":"Fix Admin Invite Fails When the Email Already Belongs to a Customer in Medusa","description":"Why a Medusa v2 admin invite is sent successfully but the invitee's POST /admin/invites/accept fails with 401 Identity with email already exists when the email already has a customer AuthIdentity, and a Python or Node.js script that detects the collision before you send the invite.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/admin-invite-email-collision/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Customer & Auth","keywords":"Medusa admin invite fails, Identity with email already exists, AuthIdentity actor_type, POST /admin/invites, POST /admin/invites/accept, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Admin invite fails when the email already belongs to a customer","item":"https://www.allanninal.dev/medusa/admin-invite-email-collision/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does accepting a Medusa admin invite fail with Identity with email already exists?","acceptedAnswer":{"@type":"Answer","text":"Both customer registration and admin invite acceptance call the same auth provider register method, which looks up a single AuthIdentity row by email. If that email already registered as a customer, the AuthIdentity already exists with app_metadata pointing to a customer actor, and the register flow has no actor_type awareness, so it cannot tell an admin identity apart from the existing customer one. It returns a 401 instead of creating a separate admin identity, so the invite was sent but can never be accepted."}},{"@type":"Question","name":"How do I detect that an admin invite will fail before I send it?","acceptedAnswer":{"@type":"Answer","text":"Medusa's admin API has no direct route to list auth identities by actor_type, so check the reliable proxy signal instead. Call GET /admin/customers with the target email and fields=id,email,has_account. If has_account is true, that email already owns a customer AuthIdentity and any admin invite to it will fail at accept time. Also check GET /admin/users for an existing admin, and GET /admin/invites for a pending unaccepted invite to the same email."}},{"@type":"Question","name":"Can I fix the collision by deleting the customer's auth identity to free up the email?","acceptedAnswer":{"@type":"Answer","text":"No, that is not a safe API-level fix. Medusa does not support one email owning both a customer and an admin AuthIdentity in the affected versions, and forcing a delete or edit of the customer's identity risks locking a real storefront customer out of their account. The documented workaround is to invite a different email address for the admin user, never to mutate the existing customer identity."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Customer &amp; Auth</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Customer &amp; Auth</p>
+    <h1>Admin invite fails when the email already belongs to a customer</h1>
+    <p class="lead">You send the invite through <code>POST /admin/invites</code>, the email arrives, and everything looks fine. Then the person you invited clicks the link, fills in a password, hits accept, and gets a 401 that says the identity with that email already exists. The invite is dead on arrival, and it will stay dead no matter how many times they retry, because the email was already used to register as a customer. Here is why Medusa cannot tell those two identities apart and a script that flags the collision before you ever send the invite.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Flag and block, never auto-fix</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, both customer registration and admin invite acceptance ultimately call the same auth provider register method, for example <code>POST /auth/user/emailpass/register</code>, which looks up a single <code>AuthIdentity</code> row by email. When a customer already registered with that email, the identity already exists with <code>app_metadata</code> linking it to a customer actor, and the register flow has no <code>actor_type</code> awareness, so it cannot tell "this email already has a customer identity" apart from "this email needs a new admin identity." It short-circuits with a 401 <code>Identity with email already exists</code> instead of creating a separate identity for the admin actor type. <code>POST /admin/invites</code> succeeds and the email goes out, but the invitee's <code>POST /admin/invites/accept</code> fails at that same register step, forever, for that email. There is no safe API fix, only detection. Before sending an invite, check <code>GET /admin/customers?email=...&amp;fields=id,email,has_account</code>: if <code>has_account</code> is true, the invite will fail at accept time and you should use a different email instead. Full code and tests below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Medusa keeps authentication in one table, the <code>AuthIdentity</code>, and it is keyed by the auth provider and the email. A customer who registers through the storefront gets a row there, and Medusa attaches <code>app_metadata</code> that says this identity belongs to a <code>customer</code> actor. That is the whole account, one row, one actor link.</p>
+  <p>An admin invite is a separate concept on paper. You call <code>POST /admin/invites</code> with an email and a role, Medusa creates an invite record and emails a token. But accepting that invite still has to create a login, and Medusa creates admin logins the exact same way it creates customer logins: it calls the auth provider's register method for that email. The register method does one thing, look up the email, and if a row is already there, refuse. It never asks which actor type the existing row belongs to. So the moment a customer has already claimed an email, any later admin invite to that same email is set up to fail, and nothing about sending the invite warns you.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A customer registers first and claims an email in the AuthIdentity table. Later an admin invite is sent to the same email and appears to succeed. When the invitee accepts, the register call finds the existing identity and returns 401 Identity with email already exists, so the invite can never be accepted.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="18" width="190" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="105" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Customer registers</text>
+      <text x="105" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">jane@example.com</text>
+      <line x1="105" y1="78" x2="105" y2="104" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="106" width="190" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="105" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">AuthIdentity row</text>
+      <text x="105" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">actor_type: customer</text>
+      <line x1="213" y1="136" x2="255" y2="136" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="258" y="106" width="185" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">POST /admin/invites</text>
+      <text x="350" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">same email, looks fine</text>
+      <line x1="446" y1="136" x2="488" y2="136" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="491" y="106" width="195" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="588" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Invite accept</text>
+      <text x="588" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">calls register(), no actor check</text>
+      <line x1="588" y1="166" x2="588" y2="190" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="640" y="182" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="450" y="192" width="290" height="34" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="595" y="214" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">401 Identity with email already exists</text>
+    </svg>
+    <figcaption>The customer identity was created first and claimed the email. The admin invite sends fine, but accepting it hits the same register call, finds the row, and refuses, permanently, for that email.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a gap in how Medusa v2's auth flows share one lookup, not a bug in any single endpoint:</p>
+  <ul>
+    <li>Both storefront customer registration and admin invite acceptance route through the same auth provider register method, for example <code>POST /auth/user/emailpass/register</code>, which is keyed purely on email with no <code>actor_type</code> parameter in the lookup.</li>
+    <li>An <code>AuthIdentity</code> row does carry <code>app_metadata</code> that links it to a <code>customer</code> or <code>user</code> actor, but the register method's own duplicate check never reads that field before deciding to refuse.</li>
+    <li><code>POST /admin/invites</code> has no awareness of this either. It creates the invite record and sends the email regardless of whether the target email already has a customer identity, so the failure is invisible until someone actually tries to accept.</li>
+    <li>This is documented directly in <a href="https://github.com/medusajs/medusa/issues/12521" rel="noopener">medusajs/medusa issue #12521</a>, where an admin invitation fails specifically because the email is already used by a customer, and in <a href="https://github.com/medusajs/medusa/issues/10607" rel="noopener">issue #10607</a>, which reports the same collision in both directions, a customer cannot register with an email an admin already owns, and vice versa, on the same authentication provider.</li>
+    <li>The result is a support ticket that looks like a broken invite link, when the real cause is an email address doing double duty across two actor types that Medusa's auth module was not built to separate.</li>
+  </ul>
+  <p>This is a common source of confusion because <code>POST /admin/invites</code> returns 200 and the email genuinely sends. Everything about the invite creation step looks successful. The failure only shows up one step later, on the invitee's machine, at accept time, which makes it look like a client-side or email problem rather than what it really is: an email that was never available to invite as an admin in the first place. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot ask Medusa's admin API directly whether an email already has a customer or admin <code>AuthIdentity</code>, because there is no exposed auth-identity or actor_type listing route. So detection has to use a reliable proxy: <code>GET /admin/customers?email=...&amp;fields=id,email,has_account</code>. A <code>has_account: true</code> hit means that email owns a customer identity, and any admin invite to it is guaranteed to fail at accept time with the exact same 401. Check that before you call <code>POST /admin/invites</code>, not after the invitee complains.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not try to make Medusa merge or delete identities, because there is no safe way to do that without risking a real customer's account. Instead we check the target email against customers, admin users, and pending invites before the invite is ever created, and block the invite outright when a collision is found.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script takes a target email, checks it against existing customers, admin users, and pending invites, and if any of those match it blocks the invite creation and reports the reason, otherwise it proceeds to call POST admin invites.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Target email</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">to invite as admin</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="120" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Check customers, users,</text>
+      <text x="120" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">and pending invites</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="365,106 452,138 365,170 278,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="365" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Collision</text>
+      <text x="365" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">found?</text>
+      <text x="380" y="196" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes, block</text>
+      <line x1="365" y1="170" x2="365" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="290" y="185" width="150" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="365" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Report and stop</text>
+      <text x="365" y="224" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">no invite created</text>
+      <text x="470" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, safe</text>
+      <line x1="452" y1="138" x2="494" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="497" y="108" width="243" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="618" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">POST /admin/invites</text>
+      <text x="618" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">only when email is clear</text>
+    </svg>
+    <figcaption>The script never mutates an existing identity. It only decides whether the invite is safe to send, and blocks it before creation when the email already belongs to a customer, an admin, or a pending invite.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend and an admin user with rights to read customers, users, and invites. Exchange the email and password for a JWT once, then send it as a Bearer token on every admin call. Keep everything in environment variables, never hardcoded, and default to <code>DRY_RUN=true</code> so the script only reports, it never sends an invite on your behalf.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export TARGET_EMAIL="jane@example.com"   # the email you want to invite as admin
+export INVITE_ROLE="admin"
+export DRY_RUN="true"   # start safe, only reports the collision check</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export TARGET_EMAIL="jane@example.com"   // the email you want to invite as admin
+export INVITE_ROLE="admin"
+export DRY_RUN="true"   // start safe, only reports the collision check</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>POST /auth/user/emailpass</code>, then send it as <code>Authorization: Bearer &lt;token&gt;</code> on every following call. Both languages do this the same way.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+async function getToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Look up customers, admin users, and pending invites</h3>
+      <p>There is no direct auth-identity or actor_type listing route, so we use <code>has_account</code> on <code>/admin/customers</code> as the reliable proxy signal. We also check <code>/admin/users</code> for an existing admin on that email, and <code>/admin/invites</code> for a pending, unaccepted invite already sitting there.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def find_customers(token, email):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/customers",
+        params={"email": email, "fields": "id,email,has_account"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["customers"]
+
+
+def find_admin_users(token, email):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/users",
+        params={"email": email, "fields": "id,email"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["users"]
+
+
+def list_pending_invites(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/invites",
+        params={"fields": "id,email,accepted,expires_at"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["invites"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function apiGet(token, path, params) {
+  const url = new URL(`${BASE_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function findCustomers(token, email) {
+  const body = await apiGet(token, "/admin/customers", { email, fields: "id,email,has_account" });
+  return body.customers;
+}
+
+async function findAdminUsers(token, email) {
+  const body = await apiGet(token, "/admin/users", { email, fields: "id,email" });
+  return body.users;
+}
+
+async function listPendingInvites(token) {
+  const body = await apiGet(token, "/admin/invites", { fields: "id,email,accepted,expires_at" });
+  return body.invites;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no network calls. It normalizes the target email, then checks it against the three lists in order, a matching customer with <code>has_account: true</code> first, then a matching admin user, then a pending, unaccepted invite. Anything found there means an admin invite to that email is guaranteed to fail at accept time, so we say so and stop before creation.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def will_invite_collide(target_email, customers, admin_users, pending_invites):
+    email = target_email.strip().lower()
+
+    for customer in customers:
+        if customer.get("email", "").strip().lower() == email and customer.get("has_account") is True:
+            return {"safe": False, "reason": "customer_account_exists"}
+
+    for admin_user in admin_users:
+        if admin_user.get("email", "").strip().lower() == email:
+            return {"safe": False, "reason": "admin_user_exists"}
+
+    for invite in pending_invites:
+        if invite.get("email", "").strip().lower() == email and invite.get("accepted") is not True:
+            return {"safe": False, "reason": "invite_pending"}
+
+    return {"safe": True, "reason": "ok"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function willInviteCollide(targetEmail, customers, adminUsers, pendingInvites) {
+  const email = targetEmail.trim().toLowerCase();
+
+  const customerHit = customers.find(
+    (c) => (c.email || "").trim().toLowerCase() === email &amp;&amp; c.has_account === true
+  );
+  if (customerHit) return { safe: false, reason: "customer_account_exists" };
+
+  const adminHit = adminUsers.find((u) => (u.email || "").trim().toLowerCase() === email);
+  if (adminHit) return { safe: false, reason: "admin_user_exists" };
+
+  const inviteHit = pendingInvites.find(
+    (i) => (i.email || "").trim().toLowerCase() === email &amp;&amp; i.accepted !== true
+  );
+  if (inviteHit) return { safe: false, reason: "invite_pending" };
+
+  return { safe: true, reason: "ok" };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Only create the invite when the check is clear</h3>
+      <p>When <code>willInviteCollide</code> comes back safe, call <code>POST /admin/invites</code> with the email and role, the same way you would by hand. When it is not safe, never call that endpoint at all, report the reason, and point the operator at the documented workaround: invite a different email address. Never touch the existing customer or admin identity.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def create_invite(token, email, role):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/invites",
+        json={"email": email, "role": role},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["invite"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function createInvite(token, email, role) {
+  const res = await fetch(`${BASE_URL}/admin/invites`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, role }),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.invite;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports whether the target email would collide and why. Read the output, and if it says <code>ok</code>, switch <code>DRY_RUN</code> off to let it actually call <code>POST /admin/invites</code>. If it flags a collision, do not force it, invite a different email instead.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never delete, edit, or otherwise force a customer's existing <code>AuthIdentity</code> to free up an email for an admin invite. That risks locking a real storefront customer out of their own account. Treat a collision purely as flag and block. The only supported repair is to invite a different email address for the admin user.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, checks the target email against customers, admin users, and pending invites with a pure decision function, and either blocks the invite and reports the reason, or creates it when the check is clear, all gated by <code>DRY_RUN</code>.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/admin-invite-email-collision" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">check_invite_collision.py</div>
+      <pre><code class="language-python">"""Flag a Medusa v2 admin invite that will fail at accept time because the
+target email already has a customer AuthIdentity. Both customer registration
+and invite acceptance call the same auth provider register method, which is
+keyed only on email with no actor_type awareness, so a customer identity on
+that email guarantees a 401 Identity with email already exists when the
+invite is accepted. This never mutates an existing identity. DRY_RUN=true
+only reports the collision check. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("check_invite_collision")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+TARGET_EMAIL = os.environ.get("TARGET_EMAIL", "jane@example.com")
+INVITE_ROLE = os.environ.get("INVITE_ROLE", "admin")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def find_customers(token, email):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/customers",
+        params={"email": email, "fields": "id,email,has_account"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["customers"]
+
+
+def find_admin_users(token, email):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/users",
+        params={"email": email, "fields": "id,email"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["users"]
+
+
+def list_pending_invites(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/invites",
+        params={"fields": "id,email,accepted,expires_at"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["invites"]
+
+
+def will_invite_collide(target_email, customers, admin_users, pending_invites):
+    """Pure: no I/O. Returns {"safe": bool, "reason": str}."""
+    email = target_email.strip().lower()
+
+    for customer in customers:
+        if customer.get("email", "").strip().lower() == email and customer.get("has_account") is True:
+            return {"safe": False, "reason": "customer_account_exists"}
+
+    for admin_user in admin_users:
+        if admin_user.get("email", "").strip().lower() == email:
+            return {"safe": False, "reason": "admin_user_exists"}
+
+    for invite in pending_invites:
+        if invite.get("email", "").strip().lower() == email and invite.get("accepted") is not True:
+            return {"safe": False, "reason": "invite_pending"}
+
+    return {"safe": True, "reason": "ok"}
+
+
+def create_invite(token, email, role):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/invites",
+        json={"email": email, "role": role},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["invite"]
+
+
+def run():
+    token = get_token()
+    customers = find_customers(token, TARGET_EMAIL)
+    admin_users = find_admin_users(token, TARGET_EMAIL)
+    pending_invites = list_pending_invites(token)
+
+    decision = will_invite_collide(TARGET_EMAIL, customers, admin_users, pending_invites)
+
+    if not decision["safe"]:
+        log.warning(
+            "Blocked: invite to %s would collide (%s). Invite a different email instead.",
+            TARGET_EMAIL, decision["reason"],
+        )
+        return
+
+    log.info("Email %s is clear. %s", TARGET_EMAIL, "would create invite" if DRY_RUN else "creating invite")
+    if not DRY_RUN:
+        invite = create_invite(token, TARGET_EMAIL, INVITE_ROLE)
+        log.info("Invite created: %s", invite["id"])
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">check-invite-collision.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag a Medusa v2 admin invite that will fail at accept time because the
+ * target email already has a customer AuthIdentity. Both customer registration
+ * and invite acceptance call the same auth provider register method, which is
+ * keyed only on email with no actor_type awareness, so a customer identity on
+ * that email guarantees a 401 Identity with email already exists when the
+ * invite is accepted. This never mutates an existing identity. DRY_RUN=true
+ * only reports the collision check. Safe to run again and again.
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const TARGET_EMAIL = process.env.TARGET_EMAIL || "jane@example.com";
+const INVITE_ROLE = process.env.INVITE_ROLE || "admin";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function willInviteCollide(targetEmail, customers, adminUsers, pendingInvites) {
+  // Pure: no I/O. Returns { safe, reason }.
+  const email = targetEmail.trim().toLowerCase();
+
+  const customerHit = customers.find(
+    (c) => (c.email || "").trim().toLowerCase() === email &amp;&amp; c.has_account === true
+  );
+  if (customerHit) return { safe: false, reason: "customer_account_exists" };
+
+  const adminHit = adminUsers.find((u) => (u.email || "").trim().toLowerCase() === email);
+  if (adminHit) return { safe: false, reason: "admin_user_exists" };
+
+  const inviteHit = pendingInvites.find(
+    (i) => (i.email || "").trim().toLowerCase() === email &amp;&amp; i.accepted !== true
+  );
+  if (inviteHit) return { safe: false, reason: "invite_pending" };
+
+  return { safe: true, reason: "ok" };
+}
+
+async function getToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function apiGet(token, path, params) {
+  const url = new URL(`${BASE_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function findCustomers(token, email) {
+  const body = await apiGet(token, "/admin/customers", { email, fields: "id,email,has_account" });
+  return body.customers;
+}
+
+async function findAdminUsers(token, email) {
+  const body = await apiGet(token, "/admin/users", { email, fields: "id,email" });
+  return body.users;
+}
+
+async function listPendingInvites(token) {
+  const body = await apiGet(token, "/admin/invites", { fields: "id,email,accepted,expires_at" });
+  return body.invites;
+}
+
+async function createInvite(token, email, role) {
+  const res = await fetch(`${BASE_URL}/admin/invites`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ email, role }),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.invite;
+}
+
+export async function run() {
+  const token = await getToken();
+  const [customers, adminUsers, pendingInvites] = await Promise.all([
+    findCustomers(token, TARGET_EMAIL),
+    findAdminUsers(token, TARGET_EMAIL),
+    listPendingInvites(token),
+  ]);
+
+  const decision = willInviteCollide(TARGET_EMAIL, customers, adminUsers, pendingInvites);
+
+  if (!decision.safe) {
+    console.warn(
+      `Blocked: invite to ${TARGET_EMAIL} would collide (${decision.reason}). Invite a different email instead.`
+    );
+    return;
+  }
+
+  console.log(`Email ${TARGET_EMAIL} is clear. ${DRY_RUN ? "would create invite" : "creating invite"}`);
+  if (!DRY_RUN) {
+    const invite = await createInvite(token, TARGET_EMAIL, INVITE_ROLE);
+    console.log(`Invite created: ${invite.id}`);
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the one that decides the outcome, <code>will_invite_collide</code>. It is pure, no network and no Medusa instance, just plain arrays in and a decision out, so the tests feed in fixture customers, admin users, and invites and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_admin_invite_collision.py</div>
+      <pre><code class="language-python">from check_invite_collision import will_invite_collide
+
+
+def test_ok_when_no_matches_anywhere():
+    result = will_invite_collide("new@example.com", [], [], [])
+    assert result == {"safe": True, "reason": "ok"}
+
+
+def test_blocked_when_customer_has_account():
+    customers = [{"email": "jane@example.com", "has_account": True}]
+    result = will_invite_collide("jane@example.com", customers, [], [])
+    assert result == {"safe": False, "reason": "customer_account_exists"}
+
+
+def test_not_blocked_when_customer_has_no_account():
+    customers = [{"email": "jane@example.com", "has_account": False}]
+    result = will_invite_collide("jane@example.com", customers, [], [])
+    assert result == {"safe": True, "reason": "ok"}
+
+
+def test_blocked_when_admin_user_already_exists():
+    admin_users = [{"email": "jane@example.com"}]
+    result = will_invite_collide("jane@example.com", [], admin_users, [])
+    assert result == {"safe": False, "reason": "admin_user_exists"}
+
+
+def test_blocked_when_invite_already_pending():
+    invites = [{"email": "jane@example.com", "accepted": False}]
+    result = will_invite_collide("jane@example.com", [], [], invites)
+    assert result == {"safe": False, "reason": "invite_pending"}
+
+
+def test_not_blocked_when_invite_already_accepted():
+    invites = [{"email": "jane@example.com", "accepted": True}]
+    result = will_invite_collide("jane@example.com", [], [], invites)
+    assert result == {"safe": True, "reason": "ok"}
+
+
+def test_normalizes_case_and_whitespace():
+    customers = [{"email": "Jane@Example.com", "has_account": True}]
+    result = will_invite_collide("  jane@example.com  ", customers, [], [])
+    assert result == {"safe": False, "reason": "customer_account_exists"}
+
+
+def test_customer_check_wins_over_other_reasons():
+    customers = [{"email": "jane@example.com", "has_account": True}]
+    admin_users = [{"email": "jane@example.com"}]
+    result = will_invite_collide("jane@example.com", customers, admin_users, [])
+    assert result["reason"] == "customer_account_exists"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">collision.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { willInviteCollide } from "./check-invite-collision.js";
+
+test("ok when no matches anywhere", () =&gt; {
+  const result = willInviteCollide("new@example.com", [], [], []);
+  assert.deepEqual(result, { safe: true, reason: "ok" });
+});
+
+test("blocked when customer has account", () =&gt; {
+  const customers = [{ email: "jane@example.com", has_account: true }];
+  const result = willInviteCollide("jane@example.com", customers, [], []);
+  assert.deepEqual(result, { safe: false, reason: "customer_account_exists" });
+});
+
+test("not blocked when customer has no account", () =&gt; {
+  const customers = [{ email: "jane@example.com", has_account: false }];
+  const result = willInviteCollide("jane@example.com", customers, [], []);
+  assert.deepEqual(result, { safe: true, reason: "ok" });
+});
+
+test("blocked when admin user already exists", () =&gt; {
+  const adminUsers = [{ email: "jane@example.com" }];
+  const result = willInviteCollide("jane@example.com", [], adminUsers, []);
+  assert.deepEqual(result, { safe: false, reason: "admin_user_exists" });
+});
+
+test("blocked when invite already pending", () =&gt; {
+  const invites = [{ email: "jane@example.com", accepted: false }];
+  const result = willInviteCollide("jane@example.com", [], [], invites);
+  assert.deepEqual(result, { safe: false, reason: "invite_pending" });
+});
+
+test("not blocked when invite already accepted", () =&gt; {
+  const invites = [{ email: "jane@example.com", accepted: true }];
+  const result = willInviteCollide("jane@example.com", [], [], invites);
+  assert.deepEqual(result, { safe: true, reason: "ok" });
+});
+
+test("normalizes case and whitespace", () =&gt; {
+  const customers = [{ email: "Jane@Example.com", has_account: true }];
+  const result = willInviteCollide("  jane@example.com  ", customers, [], []);
+  assert.deepEqual(result, { safe: false, reason: "customer_account_exists" });
+});
+
+test("customer check wins over other reasons", () =&gt; {
+  const customers = [{ email: "jane@example.com", has_account: true }];
+  const adminUsers = [{ email: "jane@example.com" }];
+  const result = willInviteCollide("jane@example.com", customers, adminUsers, []);
+  assert.equal(result.reason, "customer_account_exists");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Support handoff</span>
+      <h4>The support lead who was already a customer</h4>
+      <p>A store promoted its most active customer support volunteer to an admin role. The invite went out through <code>POST /admin/invites</code>, HR confirmed the email in the inbox, and everyone assumed it was done. The volunteer clicked accept, set a password, and got a 401 that made no sense to anyone on the team, because nothing in the invite flow had ever complained.</p>
+      <p>Running the collision check against that email showed <code>customer_account_exists</code>, tied to the account they had used for years to place orders. The team invited their work email instead, which was clear on every check, and the admin role landed in minutes instead of another afternoon of confused back and forth with support.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Bulk onboarding</span>
+      <h4>The agency onboarding a batch of client admins</h4>
+      <p>An agency running Medusa storefronts for clients invited a batch of ten client contacts as admins in one sitting. Two of those emails had, months earlier, been used to place a test order on the storefront during a demo, quietly creating customer identities nobody remembered.</p>
+      <p>Running the check across the whole batch before sending anything flagged those two immediately with <code>customer_account_exists</code>, while the other eight came back <code>ok</code>. The agency invited alias addresses for those two contacts instead of guessing why two invites out of ten would fail later, and no invite went out that was destined to fail.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this check before every admin invite, not after a confused support ticket. It never touches an existing <code>AuthIdentity</code> and never guesses at a merge, it only tells you, using the same proxy signal Medusa itself would eventually fail on, whether the email is safe to invite. When it says <code>ok</code>, send the invite exactly as you always have. When it flags a collision, the fix is always the same and always safe: use a different email address for the admin account, and leave the existing customer alone.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does accepting a Medusa admin invite fail with Identity with email already exists?</summary>
+      <p>Both customer registration and admin invite acceptance call the same auth provider register method, which looks up a single AuthIdentity row by email. If that email already registered as a customer, the AuthIdentity already exists with app_metadata pointing to a customer actor, and the register flow has no actor_type awareness, so it cannot tell an admin identity apart from the existing customer one. It returns a 401 instead of creating a separate admin identity, so the invite was sent but can never be accepted.</p>
+    </details>
+    <details>
+      <summary>How do I detect that an admin invite will fail before I send it?</summary>
+      <p>Medusa's admin API has no direct route to list auth identities by actor_type, so check the reliable proxy signal instead. Call GET /admin/customers with the target email and fields=id,email,has_account. If has_account is true, that email already owns a customer AuthIdentity and any admin invite to it will fail at accept time. Also check GET /admin/users for an existing admin, and GET /admin/invites for a pending unaccepted invite to the same email.</p>
+    </details>
+    <details>
+      <summary>Can I fix the collision by deleting the customer's auth identity to free up the email?</summary>
+      <p>No, that is not a safe API-level fix. Medusa does not support one email owning both a customer and an admin AuthIdentity in the affected versions, and forcing a delete or edit of the customer's identity risks locking a real storefront customer out of their account. The documented workaround is to invite a different email address for the admin user, never to mutate the existing customer identity.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #12521: Admin user invitation fails if email is already used by a customer (Identity with email already exists). <a href="https://github.com/medusajs/medusa/issues/12521" rel="noopener">github.com/medusajs/medusa/issues/12521</a></li>
+      <li>medusajs/medusa GitHub issue #10607: Can not register a customer which already has an admin account, and vice versa, with the same authentication provider. <a href="https://github.com/medusajs/medusa/issues/10607" rel="noopener">github.com/medusajs/medusa/issues/10607</a></li>
+      <li>Medusa Documentation: Customer Accounts. <a href="https://docs.medusajs.com/resources/commerce-modules/customer/customer-accounts" rel="noopener">docs.medusajs.com/resources/commerce-modules/customer/customer-accounts</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Authentication Flows with the Auth Module. <a href="https://docs.medusajs.com/resources/commerce-modules/auth/auth-flows" rel="noopener">docs.medusajs.com/resources/commerce-modules/auth/auth-flows</a></li>
+      <li>Medusa Documentation: Manage Invites in Medusa Admin. <a href="https://docs.medusajs.com/modules/users/admin/manage-invites" rel="noopener">docs.medusajs.com/modules/users/admin/manage-invites</a></li>
+      <li>Medusa Documentation: Admin API Reference. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this save you a dead-on-arrival invite?</h3>
+    <p>If this saved you from a confusing support ticket or a wasted afternoon chasing a 401 that made no sense, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

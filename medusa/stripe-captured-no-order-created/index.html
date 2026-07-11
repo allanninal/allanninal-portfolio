@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Stripe Capture Succeeds but No Medusa Order Is Created</title>
+<meta name="description" content="Stripe shows a captured PaymentIntent, but the cart never became a Medusa order. Learn why completeCartWorkflow never ran and build a Python or Node.js script that reconciles Stripe captures against Medusa and safely retries the stalled completion.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/stripe-captured-no-order-created/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Stripe Capture Succeeds but No Medusa Order Is Created">
+<meta property="og:description" content="Why Stripe can capture a payment while completeCartWorkflow never runs, and a Python or Node.js reconciler that flags the orphaned capture and safely retries cart completion.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/stripe-captured-no-order-created/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/stripe-captured-no-order-created/#article","headline":"Fix Stripe Capture Succeeds but No Medusa Order Is Created","description":"Why Stripe can capture a payment while Medusa v2's completeCartWorkflow never runs, leaving a captured PaymentIntent with no matching order, and a Python or Node.js script that flags the orphaned capture and safely retries cart completion.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/stripe-captured-no-order-created/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments & Refunds","keywords":"Medusa completeCartWorkflow, Stripe payment_intent.succeeded, orphaned capture, cart complete retry, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Stripe capture succeeds but no Medusa order is created","item":"https://www.allanninal.dev/medusa/stripe-captured-no-order-created/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did Stripe capture the payment but Medusa never created an order?","acceptedAnswer":{"@type":"Answer","text":"Medusa v2 only creates an order when completeCartWorkflow runs to completion, which normally happens through the storefront's POST /store/carts/{id}/complete call right after Stripe confirms the PaymentIntent. If the browser tab or network drops between that confirmation and the completion request reaching Medusa, or the async payment_intent.succeeded webhook races the synchronous completion call, Stripe has the money but Medusa never ran the workflow that turns the cart into an order."}},{"@type":"Question","name":"Is it safe to auto-create an order for an orphaned Stripe capture?","acceptedAnswer":{"@type":"Answer","text":"No, not by fabricating one. Auto-completing a cart touches inventory reservations, tax and shipping recalculation, and can double-charge if misdiagnosed, so the safe default is to flag and report first. The one safe repair is calling the same POST /store/carts/{id}/complete route the storefront already calls, since Medusa's own completeCartWorkflow is designed to be retried."}},{"@type":"Question","name":"What if retrying cart completion still fails after a confirmed Stripe capture?","acceptedAnswer":{"@type":"Answer","text":"Do not fabricate an order through the Admin API, since that bypasses inventory and tax workflows and risks double fulfillment. Surface the cart and the Stripe PaymentIntent id to support for manual reconciliation through /admin/draft-orders instead, most commonly because stock is no longer available for the retry."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Payments &amp; Refunds</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Payments &amp; Refunds</p>
+    <h1>Stripe capture succeeds but no Medusa order is created</h1>
+    <p class="lead">Stripe's dashboard shows the charge as succeeded. The customer's card was debited. But there is no order in Medusa Admin, the cart is still sitting there with no <code>completed_at</code>, and support has no idea what to tell the customer who is asking where their confirmation email is. The money moved. Medusa never turned that cart into an order. Here is why that gap exists and a reconciler that finds it and repairs it the safe way.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Stripe API + Medusa Admin API</span>
+      <span class="chip">Flag first, DRY_RUN-guarded repair</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2 only creates an order when <code>completeCartWorkflow</code> runs to completion, normally triggered by the storefront's <code>POST /store/carts/{id}/complete</code> call right after Stripe confirms the PaymentIntent client side. If the browser tab or network drops between that confirmation and the completion request reaching Medusa, or the async <code>payment_intent.succeeded</code> webhook races ahead of or instead of the synchronous completion call, Stripe has captured the money but Medusa never ran the workflow that creates the order. This exact scenario is called out in Medusa's own payment webhook-events documentation. Run a small Python or Node.js script that cross-references recent Stripe PaymentIntents against Medusa's <code>/admin/payments</code>, flags any captured PaymentIntent with no matching cart completion as an orphaned capture, and behind a <code>DRY_RUN</code> guard retries the exact same <code>/store/carts/{id}/complete</code> route the storefront would have called. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In Medusa v2, an order does not exist just because a payment succeeded. A cart becomes an order only when <code>completeCartWorkflow</code> runs end to end: it confirms the payment session, creates the order record, sets up fulfillment, and stamps <code>completed_at</code> on the cart. The storefront kicks that workflow off with one call, <code>POST /store/carts/{id}/complete</code>, right after the client-side Stripe confirmation resolves.</p>
+  <p>That call is synchronous and it depends on the customer's browser actually making it. If the tab closes, the network drops, or the page navigates away in the half second between Stripe confirming the PaymentIntent and that completion request landing at Medusa, the workflow simply never runs. Stripe already has the money. Medusa never got the signal to do anything with it. Separately, Stripe also sends an asynchronous <code>payment_intent.succeeded</code> webhook, and if that webhook races ahead of or instead of the synchronous completion call, the same gap opens: a captured PaymentIntent with metadata pointing at a cart that never got completed.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. The customer confirms payment with Stripe and the PaymentIntent succeeds, but the browser tab or network drops before the storefront's cart complete call reaches Medusa, so completeCartWorkflow never runs and no order is created.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="170" height="70" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Stripe confirms</text>
+      <text x="95" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">PaymentIntent succeeded</text>
+      <line x1="183" y1="105" x2="225" y2="105" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="228" y="70" width="175" height="70" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="315" y="93" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Tab or network drops</text>
+      <text x="315" y="110" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">before /carts/{id}/complete</text>
+      <text x="315" y="126" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">reaches Medusa</text>
+      <line x1="403" y1="105" x2="457" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="430" y="63" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="430" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">workflow never runs</text>
+      <rect x="460" y="70" width="160" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="540" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">completeCartWorkflow</text>
+      <text x="540" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">never triggered</text>
+      <rect x="643" y="70" width="107" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="696" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">No order</text>
+      <text x="696" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">cart orphaned</text>
+      <line x1="622" y1="105" x2="640" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Stripe already has the money. The cart never got the signal to become an order, so it sits with no completed_at and no order relation.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Every one of these is a real gap in how the pieces connect, not a single bug with one cause:</p>
+  <ul>
+    <li>An order is only created when <code>completeCartWorkflow</code> runs to completion, and the storefront is the one that triggers it with <code>POST /store/carts/{id}/complete</code> right after the client-side payment confirms.</li>
+    <li>Medusa's own payment webhook-events documentation names this exact use case: "a payment action on the frontend was interrupted, leading the payment to be processed without an order being created."</li>
+    <li>The asynchronous <code>payment_intent.succeeded</code> webhook and the synchronous completion call are two independent paths. If the webhook fires and the completion call never does, or the two race in the wrong order, Stripe's PaymentIntent metadata still points at a <code>cart_id</code> that never got its <code>completed_at</code> set.</li>
+    <li>Multiple GitHub issues (#12790, #12481, #12399) confirm this in the wild across Medusa v2.7 through v2.11, with reports of a successful Stripe Payment Element charge and no matching order in the Admin panel.</li>
+    <li>Medusa's v2.8.0 changelog acknowledges the underlying fragility directly: it changed <code>completeCartWorkflow</code>'s <code>idempotent</code> flag from <code>true</code> to <code>false</code> specifically so a stalled completion can be retried instead of permanently returning a cached failure.</li>
+  </ul>
+  <p>This is a common source of confusion because Stripe's own dashboard shows the charge as settled, so it looks like a Medusa display bug rather than a workflow that simply never ran. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot safely fabricate an order to match a Stripe capture. Completing a cart on behalf of a customer touches inventory reservations, tax and shipping recalculation, and the exact totals Medusa itself would have produced, and inserting an order directly through the Admin API skips all of that and risks double fulfillment. The safe pattern is to call the real completion path Medusa already exposes for this recovery case, <code>POST /store/carts/{id}/complete</code>, the same route the storefront calls, which is designed to be retried since <code>idempotent</code> was set to <code>false</code> in v2.8.0 for exactly this reason.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout and we do not insert a synthetic order. We pull recent Stripe PaymentIntents, match each one against Medusa's <code>/admin/payments</code> by the Stripe id stored in <code>Payment.data.id</code>, and flag any captured PaymentIntent whose cart has no <code>completed_at</code> and no order relation. Behind <code>DRY_RUN</code>, the repair step re-verifies the cart is still incomplete and then calls <code>/store/carts/{id}/complete</code>, the same route the storefront would have called.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script pulls recent Stripe PaymentIntents, matches each against Medusa admin payments by the Stripe id, flags an orphaned capture when the cart has no completed_at and no order, then either logs it in dry run or retries cart complete, otherwise flags to support for manual draft order reconciliation.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pull Stripe PIs</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">status: succeeded</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="210" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="115" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Match Medusa payments</text>
+      <text x="115" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">payment.data.id</text>
+      <line x1="220" y1="138" x2="262" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="265" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Check cart state</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">completed_at, order_id</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 677,138 590,170 503,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Orphaned</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">capture?</text>
+      <text x="680" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="677" y1="138" x2="705" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, already reconciled</text>
+      <line x1="590" y1="170" x2="590" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="633" y="185" width="127" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="696" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Retry cart complete</text>
+      <text x="696" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">or flag to support</text>
+      <path d="M705,138 C725,138 696,150 696,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script flags first. Repair retries the same cart completion route the storefront uses, and reports what it cannot fix instead of fabricating an order.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get Stripe and Medusa credentials in one place</h3>
+      <p>You need a Stripe secret key to list PaymentIntents, and a Medusa admin session to read payments and carts, plus a storefront publishable API key to call the store completion route during repair. Keep all four in environment variables, never in the file, and leave <code>DRY_RUN</code> on until you have reviewed the flagged list.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export MEDUSA_PUBLISHABLE_KEY="pk_..."
+export GRACE_MINUTES="10"   # ignore captures younger than this
+export DRY_RUN="true"       # start safe, only logs orphaned captures</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export STRIPE_SECRET_KEY="sk_live_..."
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export MEDUSA_PUBLISHABLE_KEY="pk_..."
+export GRACE_MINUTES="10"   // ignore captures younger than this
+export DRY_RUN="true"       // start safe, only logs orphaned captures</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Pull recent succeeded Stripe PaymentIntents</h3>
+      <p>List PaymentIntents from the Stripe API filtered to a recent window, keeping the id, the captured timestamp, the amount, and any <code>cart_id</code> metadata Medusa attached during <code>initiatePayment</code>. This is the source list every check runs against.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, time, requests
+
+STRIPE_KEY = os.environ["STRIPE_SECRET_KEY"]
+STRIPE_API = "https://api.stripe.com/v1"
+
+def recent_succeeded_payment_intents(lookback_hours=24):
+    out, starting_after = [], None
+    since = int(time.time()) - lookback_hours * 3600
+    while True:
+        params = {"limit": 100, "created[gte]": since}
+        if starting_after:
+            params["starting_after"] = starting_after
+        r = requests.get(
+            f"{STRIPE_API}/payment_intents",
+            params=params,
+            auth=(STRIPE_KEY, ""),
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        for pi in body["data"]:
+            if pi["status"] == "succeeded":
+                out.append(pi)
+        if not body.get("has_more"):
+            return out
+        starting_after = body["data"][-1]["id"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STRIPE_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_API = "https://api.stripe.com/v1";
+
+async function recentSucceededPaymentIntents(lookbackHours = 24) {
+  const out = [];
+  let startingAfter = null;
+  const since = Math.floor(Date.now() / 1000) - lookbackHours * 3600;
+  while (true) {
+    const params = new URLSearchParams({ limit: "100", "created[gte]": String(since) });
+    if (startingAfter) params.set("starting_after", startingAfter);
+    const res = await fetch(`${STRIPE_API}/payment_intents?${params}`, {
+      headers: { Authorization: `Basic ${Buffer.from(STRIPE_KEY + ":").toString("base64")}` },
+    });
+    if (!res.ok) throw new Error(`Stripe ${res.status}`);
+    const body = await res.json();
+    for (const pi of body.data) if (pi.status === "succeeded") out.push(pi);
+    if (!body.has_more) return out;
+    startingAfter = body.data[body.data.length - 1].id;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Match against Medusa payments and read the cart's state</h3>
+      <p>Medusa stores the Stripe PaymentIntent id inside the Payment's own <code>data</code> JSONB blob, so read <code>/admin/payments</code> with <code>data</code> expanded, page through, and collect every <code>payment.data.id</code> you see. For any Stripe id not in that set, use the PaymentIntent's <code>cart_id</code> metadata to look up the cart directly with <code>GET /store/carts/{cart_id}</code> and read <code>completed_at</code> and whether an order resolved.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+PUBLISHABLE_KEY = os.environ.get("MEDUSA_PUBLISHABLE_KEY", "pk_dummy")
+
+def get_admin_token(email, password):
+    r = requests.post(f"{BASE_URL}/auth/user/emailpass",
+                       json={"email": email, "password": password}, timeout=30)
+    r.raise_for_status()
+    return r.json()["token"]
+
+def all_medusa_payment_data_ids(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    ids, offset, limit = [], 0, 100
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/payments",
+            params={"fields": "id,data", "limit": limit, "offset": offset},
+            headers=headers, timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        for payment in body["payments"]:
+            pid = (payment.get("data") or {}).get("id")
+            if pid:
+                ids.append(pid)
+        offset += limit
+        if offset &gt;= body["count"]:
+            return ids
+
+def get_cart(cart_id):
+    r = requests.get(
+        f"{BASE_URL}/store/carts/{cart_id}",
+        headers={"x-publishable-api-key": PUBLISHABLE_KEY},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["cart"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const PUBLISHABLE_KEY = process.env.MEDUSA_PUBLISHABLE_KEY || "pk_dummy";
+
+async function getAdminToken(email, password) {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  return (await res.json()).token;
+}
+
+async function allMedusaPaymentDataIds(token) {
+  const ids = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const res = await fetch(
+      `${BASE_URL}/admin/payments?fields=id,data&limit=${limit}&offset=${offset}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) throw new Error(`Medusa ${res.status}`);
+    const body = await res.json();
+    for (const payment of body.payments) {
+      const pid = payment.data?.id;
+      if (pid) ids.push(pid);
+    }
+    offset += limit;
+    if (offset &gt;= body.count) return ids;
+  }
+}
+
+async function getCart(cartId) {
+  const res = await fetch(`${BASE_URL}/store/carts/${cartId}`, {
+    headers: { "x-publishable-api-key": PUBLISHABLE_KEY },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  return (await res.json()).cart;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no network calls. It takes the Stripe PaymentIntent's status and timing, the full list of Medusa <code>payment.data.id</code> values, and the cart's <code>completed_at</code> and order relation, and returns one of four outcomes: <code>ok</code>, <code>too_recent</code>, <code>orphaned_capture_needs_manual_complete</code>, or <code>already_reconciled</code>. The grace window keeps it from flagging a capture whose webhook simply has not landed yet.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_reconciliation(
+    stripe_payment_intent_id,
+    stripe_status,
+    captured_at_ms,
+    now_ms,
+    grace_ms,
+    medusa_payment_data_ids,
+    cart_completed_at,
+    cart_has_order_id,
+):
+    """Pure: no I/O. Returns one of ok, too_recent,
+    orphaned_capture_needs_manual_complete, already_reconciled."""
+    matched_in_medusa = stripe_payment_intent_id in medusa_payment_data_ids
+
+    if matched_in_medusa and (cart_completed_at is not None or cart_has_order_id):
+        return "already_reconciled"
+
+    if stripe_status != "succeeded":
+        return "ok"  # nothing captured yet, not our problem
+
+    if now_ms - captured_at_ms &lt; grace_ms:
+        return "too_recent"  # webhook may still be in flight, don't flag yet
+
+    if not matched_in_medusa and cart_completed_at is None and not cart_has_order_id:
+        return "orphaned_capture_needs_manual_complete"
+
+    return "ok"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideReconciliation({
+  stripePaymentIntentId,
+  stripeStatus,
+  capturedAtMs,
+  nowMs,
+  graceMs,
+  medusaPaymentDataIds,
+  cartCompletedAt,
+  cartHasOrderId,
+}) {
+  const matchedInMedusa = medusaPaymentDataIds.includes(stripePaymentIntentId);
+
+  if (matchedInMedusa && (cartCompletedAt !== null || cartHasOrderId)) {
+    return "already_reconciled";
+  }
+  if (stripeStatus !== "succeeded") {
+    return "ok"; // nothing captured yet, not our problem
+  }
+  if (nowMs - capturedAtMs &lt; graceMs) {
+    return "too_recent"; // webhook may still be in flight, don't flag yet
+  }
+  if (!matchedInMedusa && cartCompletedAt === null && !cartHasOrderId) {
+    return "orphaned_capture_needs_manual_complete";
+  }
+  return "ok";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair by retrying cart completion, never by inserting an order</h3>
+      <p>For each orphaned capture, re-verify with a fresh <code>GET /store/carts/{cart_id}</code> that <code>completed_at</code> is still null, since the cart may have completed between detection and repair. Then call <code>POST /store/carts/{cart_id}/complete</code> with the storefront's <code>x-publishable-api-key</code> header, the exact route the storefront calls after checkout. If that call itself fails, for example because stock is no longer available, stop there and surface it to support with the Stripe PaymentIntent id attached rather than inserting a synthetic order.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def complete_cart(cart_id):
+    r = requests.post(
+        f"{BASE_URL}/store/carts/{cart_id}/complete",
+        headers={"x-publishable-api-key": PUBLISHABLE_KEY},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("type") == "order":
+        return body["order"]
+    raise RuntimeError(f"cart {cart_id} did not complete into an order: {body}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function completeCart(cartId) {
+  const res = await fetch(`${BASE_URL}/store/carts/${cartId}/complete`, {
+    method: "POST",
+    headers: { "x-publishable-api-key": PUBLISHABLE_KEY },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  if (body.type === "order") return body.order;
+  throw new Error(`cart ${cartId} did not complete into an order: ${JSON.stringify(body)}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports the <code>{stripe_payment_intent_id, cart_id, amount, captured_at, medusa_status}</code> records it would repair. Read the output, agree with it, then switch it off to let it re-verify each cart and retry completion for real. Anything that fails the retry gets logged for a human with the Stripe PaymentIntent id attached.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never insert an order directly through the Admin API to match a Stripe capture. That skips inventory reservations, tax and shipping recalculation, and risks double fulfillment. Always start with <code>DRY_RUN=true</code>, and if the retried cart completion itself fails, hand it to support for manual reconciliation through <code>/admin/draft-orders</code> instead of forcing a fix.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It pulls recent succeeded Stripe PaymentIntents, matches them against Medusa's payments, flags every orphaned capture with a pure function, and either logs the repair or retries cart completion depending on <code>DRY_RUN</code>, confirming the result after.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/stripe-captured-no-order-created" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_orphaned_captures.py</div>
+      <pre><code class="language-python">"""Find Stripe PaymentIntents that captured money with no matching Medusa order,
+and repair them the safe way. Never inserts a synthetic order through the Admin
+API. DRY_RUN=true only logs the reconciliation records it would act on. The one
+safe repair is retrying POST /store/carts/{id}/complete, the same route the
+storefront already calls, since completeCartWorkflow's idempotent flag was set
+to false in Medusa v2.8.0 specifically so a stalled completion can be retried.
+"""
+import os
+import time
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_orphaned_captures")
+
+STRIPE_KEY = os.environ.get("STRIPE_SECRET_KEY", "sk_test_dummy")
+STRIPE_API = "https://api.stripe.com/v1"
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+PUBLISHABLE_KEY = os.environ.get("MEDUSA_PUBLISHABLE_KEY", "pk_dummy")
+
+GRACE_MS = float(os.environ.get("GRACE_MINUTES", "10")) * 60 * 1000
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def decide_reconciliation(
+    stripe_payment_intent_id,
+    stripe_status,
+    captured_at_ms,
+    now_ms,
+    grace_ms,
+    medusa_payment_data_ids,
+    cart_completed_at,
+    cart_has_order_id,
+):
+    """Pure: no I/O. Returns one of ok, too_recent,
+    orphaned_capture_needs_manual_complete, already_reconciled."""
+    matched_in_medusa = stripe_payment_intent_id in medusa_payment_data_ids
+
+    if matched_in_medusa and (cart_completed_at is not None or cart_has_order_id):
+        return "already_reconciled"
+
+    if stripe_status != "succeeded":
+        return "ok"  # nothing captured yet, not our problem
+
+    if now_ms - captured_at_ms &lt; grace_ms:
+        return "too_recent"  # webhook may still be in flight, don't flag yet
+
+    if not matched_in_medusa and cart_completed_at is None and not cart_has_order_id:
+        return "orphaned_capture_needs_manual_complete"
+
+    return "ok"
+
+
+def recent_succeeded_payment_intents(lookback_hours=24):
+    out, starting_after = [], None
+    since = int(time.time()) - lookback_hours * 3600
+    while True:
+        params = {"limit": 100, "created[gte]": since}
+        if starting_after:
+            params["starting_after"] = starting_after
+        r = requests.get(
+            f"{STRIPE_API}/payment_intents",
+            params=params,
+            auth=(STRIPE_KEY, ""),
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        for pi in body["data"]:
+            if pi["status"] == "succeeded":
+                out.append(pi)
+        if not body.get("has_more"):
+            return out
+        starting_after = body["data"][-1]["id"]
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def all_medusa_payment_data_ids(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    ids, offset, limit = [], 0, 100
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/payments",
+            params={"fields": "id,data", "limit": limit, "offset": offset},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        for payment in body["payments"]:
+            pid = (payment.get("data") or {}).get("id")
+            if pid:
+                ids.append(pid)
+        offset += limit
+        if offset &gt;= body["count"]:
+            return ids
+
+
+def get_cart(cart_id):
+    r = requests.get(
+        f"{BASE_URL}/store/carts/{cart_id}",
+        headers={"x-publishable-api-key": PUBLISHABLE_KEY},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["cart"]
+
+
+def complete_cart(cart_id):
+    r = requests.post(
+        f"{BASE_URL}/store/carts/{cart_id}/complete",
+        headers={"x-publishable-api-key": PUBLISHABLE_KEY},
+        timeout=30,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("type") == "order":
+        return body["order"]
+    raise RuntimeError(f"cart {cart_id} did not complete into an order: {body}")
+
+
+def run():
+    token = get_admin_token()
+    medusa_payment_data_ids = all_medusa_payment_data_ids(token)
+    payment_intents = recent_succeeded_payment_intents()
+    now_ms = time.time() * 1000
+
+    flagged = []
+    for pi in payment_intents:
+        cart_id = (pi.get("metadata") or {}).get("cart_id")
+        if not cart_id:
+            continue
+        cart = get_cart(cart_id)
+        outcome = decide_reconciliation(
+            stripe_payment_intent_id=pi["id"],
+            stripe_status=pi["status"],
+            captured_at_ms=pi["created"] * 1000,
+            now_ms=now_ms,
+            grace_ms=GRACE_MS,
+            medusa_payment_data_ids=medusa_payment_data_ids,
+            cart_completed_at=cart.get("completed_at"),
+            cart_has_order_id=bool(cart.get("order")),
+        )
+        if outcome == "orphaned_capture_needs_manual_complete":
+            flagged.append((pi, cart_id))
+
+    if not flagged:
+        log.info("No orphaned captures found across %d succeeded PaymentIntent(s).", len(payment_intents))
+        return
+
+    for pi, cart_id in flagged:
+        log.warning(
+            "Orphaned capture: PI %s amount=%s cart=%s captured_at=%s. %s",
+            pi["id"], pi["amount"], cart_id, pi["created"],
+            "Would retry cart complete" if DRY_RUN else "Retrying cart complete",
+        )
+        if DRY_RUN:
+            continue
+
+        fresh_cart = get_cart(cart_id)
+        if fresh_cart.get("completed_at") or fresh_cart.get("order"):
+            log.info("Cart %s completed between detection and repair. Skipping.", cart_id)
+            continue
+
+        try:
+            order = complete_cart(cart_id)
+            log.info("Cart %s completed into order %s.", cart_id, order.get("id"))
+        except Exception as exc:
+            log.error(
+                "Cart %s failed to complete for PI %s: %s. "
+                "Flagging to support for manual /admin/draft-orders reconciliation.",
+                cart_id, pi["id"], exc,
+            )
+
+    log.info("Done. %d orphaned capture(s) %s.", len(flagged), "to review" if DRY_RUN else "processed")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-orphaned-captures.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Stripe PaymentIntents that captured money with no matching Medusa order,
+ * and repair them the safe way. Never inserts a synthetic order through the
+ * Admin API. DRY_RUN=true only logs the reconciliation records it would act
+ * on. The one safe repair is retrying POST /store/carts/{id}/complete, the
+ * same route the storefront already calls, since completeCartWorkflow's
+ * idempotent flag was set to false in Medusa v2.8.0 specifically so a stalled
+ * completion can be retried.
+ */
+import { pathToFileURL } from "node:url";
+
+const STRIPE_KEY = process.env.STRIPE_SECRET_KEY || "sk_test_dummy";
+const STRIPE_API = "https://api.stripe.com/v1";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const PUBLISHABLE_KEY = process.env.MEDUSA_PUBLISHABLE_KEY || "pk_dummy";
+
+const GRACE_MS = Number(process.env.GRACE_MINUTES || 10) * 60 * 1000;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function decideReconciliation({
+  stripePaymentIntentId,
+  stripeStatus,
+  capturedAtMs,
+  nowMs,
+  graceMs,
+  medusaPaymentDataIds,
+  cartCompletedAt,
+  cartHasOrderId,
+}) {
+  const matchedInMedusa = medusaPaymentDataIds.includes(stripePaymentIntentId);
+
+  if (matchedInMedusa && (cartCompletedAt !== null || cartHasOrderId)) {
+    return "already_reconciled";
+  }
+  if (stripeStatus !== "succeeded") {
+    return "ok"; // nothing captured yet, not our problem
+  }
+  if (nowMs - capturedAtMs &lt; graceMs) {
+    return "too_recent"; // webhook may still be in flight, don't flag yet
+  }
+  if (!matchedInMedusa && cartCompletedAt === null && !cartHasOrderId) {
+    return "orphaned_capture_needs_manual_complete";
+  }
+  return "ok";
+}
+
+async function recentSucceededPaymentIntents(lookbackHours = 24) {
+  const out = [];
+  let startingAfter = null;
+  const since = Math.floor(Date.now() / 1000) - lookbackHours * 3600;
+  while (true) {
+    const params = new URLSearchParams({ limit: "100", "created[gte]": String(since) });
+    if (startingAfter) params.set("starting_after", startingAfter);
+    const res = await fetch(`${STRIPE_API}/payment_intents?${params}`, {
+      headers: { Authorization: `Basic ${Buffer.from(STRIPE_KEY + ":").toString("base64")}` },
+    });
+    if (!res.ok) throw new Error(`Stripe ${res.status}`);
+    const body = await res.json();
+    for (const pi of body.data) if (pi.status === "succeeded") out.push(pi);
+    if (!body.has_more) return out;
+    startingAfter = body.data[body.data.length - 1].id;
+  }
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  return (await res.json()).token;
+}
+
+async function allMedusaPaymentDataIds(token) {
+  const ids = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const res = await fetch(
+      `${BASE_URL}/admin/payments?fields=id,data&limit=${limit}&offset=${offset}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) throw new Error(`Medusa ${res.status}`);
+    const body = await res.json();
+    for (const payment of body.payments) {
+      const pid = payment.data?.id;
+      if (pid) ids.push(pid);
+    }
+    offset += limit;
+    if (offset &gt;= body.count) return ids;
+  }
+}
+
+async function getCart(cartId) {
+  const res = await fetch(`${BASE_URL}/store/carts/${cartId}`, {
+    headers: { "x-publishable-api-key": PUBLISHABLE_KEY },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  return (await res.json()).cart;
+}
+
+async function completeCart(cartId) {
+  const res = await fetch(`${BASE_URL}/store/carts/${cartId}/complete`, {
+    method: "POST",
+    headers: { "x-publishable-api-key": PUBLISHABLE_KEY },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  if (body.type === "order") return body.order;
+  throw new Error(`cart ${cartId} did not complete into an order: ${JSON.stringify(body)}`);
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const medusaPaymentDataIds = await allMedusaPaymentDataIds(token);
+  const paymentIntents = await recentSucceededPaymentIntents();
+  const nowMs = Date.now();
+
+  const flagged = [];
+  for (const pi of paymentIntents) {
+    const cartId = pi.metadata?.cart_id;
+    if (!cartId) continue;
+    const cart = await getCart(cartId);
+    const outcome = decideReconciliation({
+      stripePaymentIntentId: pi.id,
+      stripeStatus: pi.status,
+      capturedAtMs: pi.created * 1000,
+      nowMs,
+      graceMs: GRACE_MS,
+      medusaPaymentDataIds,
+      cartCompletedAt: cart.completed_at ?? null,
+      cartHasOrderId: Boolean(cart.order),
+    });
+    if (outcome === "orphaned_capture_needs_manual_complete") {
+      flagged.push([pi, cartId]);
+    }
+  }
+
+  if (flagged.length === 0) {
+    console.log(`No orphaned captures found across ${paymentIntents.length} succeeded PaymentIntent(s).`);
+    return;
+  }
+
+  for (const [pi, cartId] of flagged) {
+    console.warn(
+      `Orphaned capture: PI ${pi.id} amount=${pi.amount} cart=${cartId} captured_at=${pi.created}. ${DRY_RUN ? "Would retry cart complete" : "Retrying cart complete"}`
+    );
+    if (DRY_RUN) continue;
+
+    const freshCart = await getCart(cartId);
+    if (freshCart.completed_at || freshCart.order) {
+      console.log(`Cart ${cartId} completed between detection and repair. Skipping.`);
+      continue;
+    }
+
+    try {
+      const order = await completeCart(cartId);
+      console.log(`Cart ${cartId} completed into order ${order.id}.`);
+    } catch (err) {
+      console.error(
+        `Cart ${cartId} failed to complete for PI ${pi.id}: ${err.message}. Flagging to support for manual /admin/draft-orders reconciliation.`
+      );
+    }
+  }
+
+  console.log(`Done. ${flagged.length} orphaned capture(s) ${DRY_RUN ? "to review" : "processed"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the one that decides the outcome, <code>decide_reconciliation</code>. It is pure, no network and no Stripe or Medusa account, so the tests feed in plain values and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_orphaned_capture.py</div>
+      <pre><code class="language-python">from reconcile_orphaned_captures import decide_reconciliation
+
+GRACE_MS = 10 * 60 * 1000
+NOW_MS = 1_800_000_000_000
+
+
+def call(**over):
+    base = dict(
+        stripe_payment_intent_id="pi_123",
+        stripe_status="succeeded",
+        captured_at_ms=NOW_MS - GRACE_MS * 2,
+        now_ms=NOW_MS,
+        grace_ms=GRACE_MS,
+        medusa_payment_data_ids=[],
+        cart_completed_at=None,
+        cart_has_order_id=False,
+    )
+    base.update(over)
+    return decide_reconciliation(**base)
+
+
+def test_orphaned_when_captured_unmatched_and_cart_incomplete():
+    assert call() == "orphaned_capture_needs_manual_complete"
+
+
+def test_already_reconciled_when_matched_and_cart_completed():
+    result = call(medusa_payment_data_ids=["pi_123"], cart_completed_at="2026-07-10T00:00:00Z")
+    assert result == "already_reconciled"
+
+
+def test_already_reconciled_when_matched_and_has_order():
+    result = call(medusa_payment_data_ids=["pi_123"], cart_has_order_id=True)
+    assert result == "already_reconciled"
+
+
+def test_ok_when_stripe_status_not_succeeded():
+    assert call(stripe_status="processing") == "ok"
+
+
+def test_too_recent_within_grace_window():
+    result = call(captured_at_ms=NOW_MS - 1000)
+    assert result == "too_recent"
+
+
+def test_ok_when_matched_but_cart_still_incomplete():
+    # matched in Medusa payments, but the cart genuinely has no completed_at/order
+    # yet is not orphaned since the first branch only triggers on completion
+    result = call(medusa_payment_data_ids=["pi_123"])
+    assert result == "ok"
+
+
+def test_exactly_at_grace_boundary_is_flagged():
+    result = call(captured_at_ms=NOW_MS - GRACE_MS)
+    assert result == "orphaned_capture_needs_manual_complete"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">orphaned-capture.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideReconciliation } from "./reconcile-orphaned-captures.js";
+
+const GRACE_MS = 10 * 60 * 1000;
+const NOW_MS = 1_800_000_000_000;
+
+const call = (over = {}) =&gt; decideReconciliation({
+  stripePaymentIntentId: "pi_123",
+  stripeStatus: "succeeded",
+  capturedAtMs: NOW_MS - GRACE_MS * 2,
+  nowMs: NOW_MS,
+  graceMs: GRACE_MS,
+  medusaPaymentDataIds: [],
+  cartCompletedAt: null,
+  cartHasOrderId: false,
+  ...over,
+});
+
+test("orphaned when captured, unmatched, and cart incomplete", () =&gt; {
+  assert.equal(call(), "orphaned_capture_needs_manual_complete");
+});
+
+test("already reconciled when matched and cart completed", () =&gt; {
+  const result = call({ medusaPaymentDataIds: ["pi_123"], cartCompletedAt: "2026-07-10T00:00:00Z" });
+  assert.equal(result, "already_reconciled");
+});
+
+test("already reconciled when matched and has order", () =&gt; {
+  const result = call({ medusaPaymentDataIds: ["pi_123"], cartHasOrderId: true });
+  assert.equal(result, "already_reconciled");
+});
+
+test("ok when stripe status is not succeeded", () =&gt; {
+  assert.equal(call({ stripeStatus: "processing" }), "ok");
+});
+
+test("too recent within grace window", () =&gt; {
+  const result = call({ capturedAtMs: NOW_MS - 1000 });
+  assert.equal(result, "too_recent");
+});
+
+test("ok when matched but cart still incomplete", () =&gt; {
+  const result = call({ medusaPaymentDataIds: ["pi_123"] });
+  assert.equal(result, "ok");
+});
+
+test("exactly at grace boundary is flagged", () =&gt; {
+  const result = call({ capturedAtMs: NOW_MS - GRACE_MS });
+  assert.equal(result, "orphaned_capture_needs_manual_complete");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Mobile checkout</span>
+      <h4>The customer who closed the tab too early</h4>
+      <p>A store selling on mobile saw a cluster of support tickets asking where the confirmation email was, while the customer's bank statement clearly showed the charge. The pattern was always the same: a slow mobile network, a Stripe confirmation that succeeded, and a tab the customer closed a second too early, before the storefront's completion call finished.</p>
+      <p>Running the reconciler on a schedule caught every one of these within the hour. Each flagged PaymentIntent's <code>cart_id</code> metadata pointed at a cart still sitting with no <code>completed_at</code>. Retrying <code>/store/carts/{id}/complete</code> turned every one of them into a real order, with inventory reservations and tax recalculated exactly the way the original checkout would have done it.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Webhook race</span>
+      <h4>The webhook that arrived before the completion call</h4>
+      <p>A team running a busy storefront noticed a handful of orphaned captures appeared right after a deploy that briefly slowed down their backend response times. The async <code>payment_intent.succeeded</code> webhook from Stripe was landing and being processed, while the synchronous completion call from the same checkout was still queued behind the slowdown and eventually timed out client side.</p>
+      <p>The grace window kept the reconciler from flagging captures that were simply still in flight. Past that window, the ones that stayed unmatched were genuine gaps. Most cleared on the first retry of cart completion. One did not, because the last unit of a limited edition item had sold out in the meantime, and that one went straight to support with the Stripe PaymentIntent id attached for a manual draft order.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this reconciler on a schedule against your recent Stripe captures. It never fabricates an order, so it can never create a mismatch between what Stripe charged and what Medusa's inventory and tax workflows actually processed. It repairs the same way the storefront's own checkout does, by retrying <code>/store/carts/{id}/complete</code> on the cart that actually has the captured payment, then confirms an order came out the other side. Anything that still fails after that gets handed to support with the Stripe PaymentIntent id, because that is a stock or data problem, not a timing gap a script should paper over.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did Stripe capture the payment but Medusa never created an order?</summary>
+      <p>Medusa v2 only creates an order when completeCartWorkflow runs to completion, which normally happens through the storefront's POST /store/carts/{id}/complete call right after Stripe confirms the PaymentIntent. If the browser tab or network drops between that confirmation and the completion request reaching Medusa, or the async payment_intent.succeeded webhook races the synchronous completion call, Stripe has the money but Medusa never ran the workflow that turns the cart into an order.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-create an order for an orphaned Stripe capture?</summary>
+      <p>No, not by fabricating one. Auto-completing a cart touches inventory reservations, tax and shipping recalculation, and can double-charge if misdiagnosed, so the safe default is to flag and report first. The one safe repair is calling the same POST /store/carts/{id}/complete route the storefront already calls, since Medusa's own completeCartWorkflow is designed to be retried.</p>
+    </details>
+    <details>
+      <summary>What if retrying cart completion still fails after a confirmed Stripe capture?</summary>
+      <p>Do not fabricate an order through the Admin API, since that bypasses inventory and tax workflows and risks double fulfillment. Surface the cart and the Stripe PaymentIntent id to support for manual reconciliation through /admin/draft-orders instead, most commonly because stock is no longer available for the retry.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/medusa/">Browse all Medusa field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Medusa Documentation: Payment Webhook Events, including the case of a payment processed without an order being created. <a href="https://docs.medusajs.com/resources/commerce-modules/payment/webhook-events" rel="noopener">docs.medusajs.com/resources/commerce-modules/payment/webhook-events</a></li>
+      <li>medusajs/medusa GitHub issue #12790: Stripe Payment succeeds but no order in Medusa Admin Panel with the Stripe Payment Element. <a href="https://github.com/medusajs/medusa/issues/12790" rel="noopener">github.com/medusajs/medusa/issues/12790</a></li>
+      <li>medusajs/medusa GitHub issue #12481: Unable to complete cart a second time after failing at the authorize-payment-session step in completeCartWorkflow on v2.8.0. <a href="https://github.com/medusajs/medusa/issues/12481" rel="noopener">github.com/medusajs/medusa/issues/12481</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Core Workflows Reference: completeCartWorkflow. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/completeCartWorkflow" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/completeCartWorkflow</a></li>
+      <li>Medusa Documentation: Checkout Step 5, Complete Cart. <a href="https://docs.medusajs.com/resources/storefront-development/checkout/complete-cart" rel="noopener">docs.medusajs.com/resources/storefront-development/checkout/complete-cart</a></li>
+      <li>Medusa Documentation: Stripe Module Provider. <a href="https://docs.medusajs.com/resources/commerce-modules/payment/payment-provider/stripe" rel="noopener">docs.medusajs.com/resources/commerce-modules/payment/payment-provider/stripe</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up an orphaned capture?</h3>
+    <p>If this saved you a confusing support ticket or a scary manual order, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

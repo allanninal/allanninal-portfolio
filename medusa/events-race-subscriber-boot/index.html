@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Events That Fire Before Subscribers Finish Loading on Boot in Medusa</title>
+<meta name="description" content="Right after a Medusa v2 restart, the Redis event bus worker can start processing queued events before src/subscribers has finished registering, logging 0 subscribers and permanently losing the delivery. Learn why and build a Python or Node.js script that finds the gap in your boot logs and reports it safely.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/events-race-subscriber-boot/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Events That Fire Before Subscribers Finish Loading on Boot in Medusa">
+<meta property="og:description" content="Why the Medusa v2 Redis event bus can process an event before src/subscribers finishes loading, and a Python or Node.js script that finds the gap in your boot logs and reports it under a dry run guard.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/events-race-subscriber-boot/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/events-race-subscriber-boot/#article","headline":"Fix Events That Fire Before Subscribers Finish Loading on Boot in Medusa","description":"Right after a Medusa v2 restart, the Redis event bus module and its BullMQ worker can start consuming queued events before the later src/subscribers loader phase finishes registering handlers, so the worker logs 0 subscribers and marks the job complete, permanently losing that delivery. A Python or Node.js script that log-correlates the boot window and reports the gap under a DRY_RUN guard.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/events-race-subscriber-boot/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Events & Notifications","keywords":"Medusa event bus race condition, event-bus-redis, 0 subscribers, subscriber loader, BullMQ, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Events fire before subscribers finish loading on boot","item":"https://www.allanninal.dev/medusa/events-race-subscriber-boot/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Medusa log 0 subscribers for an event right after a restart?","acceptedAnswer":{"@type":"Answer","text":"In Medusa v2's Redis event bus, the event-bus-redis module and its BullMQ worker start consuming queued jobs as soon as the module loader resolves, but custom subscribers in src/subscribers are registered by a separate, later loader phase. If an event was already queued in Redis before that later phase finishes, the worker dequeues it early, logs Processing which has 0 subscribers, and marks the job complete, so no subscriber ever runs for it."}},{"@type":"Question","name":"How do I detect events that were lost to this boot race condition?","acceptedAnswer":{"@type":"Answer","text":"There is no API that shows missing events after the fact, since BullMQ marks the job complete even when zero subscribers ran. The practical method is log correlation right after a restart: capture the process start time, find the timestamp where the subscriber loader finishes registering handlers, then grep the same window for 0 subscribers lines. Any such line timestamped before the loader finished is a confirmed gap, which you can then cross-check against the Admin API, for example diffing /admin/orders against /admin/notifications for the affected window."}},{"@type":"Question","name":"Is it safe to automatically re-emit a missed Medusa event?","acceptedAnswer":{"@type":"Answer","text":"Not by default, because re-emitting can duplicate side effects like emails or webhook calls if the original handler actually ran partially or if it is not idempotent. The safe pattern is DRY_RUN=true by default, which only logs and reports the gap for manual review. Only with DRY_RUN=false, after confirming the handler is idempotent, should you re-publish the event through the Event Module using fresh data pulled from the current Admin API state of the affected entity, not the original stale payload."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Events &amp; Notifications</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Events &amp; Notifications</p>
+    <h1>Events fire before subscribers finish loading on boot</h1>
+    <p class="lead">A redeploy or a horizontal-scale restart brings a Medusa instance back up, and for a brief window right after boot, an event that was already sitting in Redis gets processed with zero subscribers attached. No error, no retry, no trace. The webhook that should have fired never fires, the notification that should have gone out never goes out, and BullMQ has already marked the job complete. Here is why the Redis event bus can race ahead of your own subscribers, and a script that finds the gap in your boot logs and reports it safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Log correlation, not a live query</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2's Redis event bus, the <code>event-bus-redis</code> module and its BullMQ worker are instantiated and start consuming queued jobs as soon as the module loader resolves, but custom subscribers in <code>src/subscribers</code> are registered by a separate, later loader phase. If events were already queued in Redis before or during that window, for example from before a redeploy or a horizontal-scale restart, the worker dequeues them immediately, logs <code>Processing &lt;event&gt; which has 0 subscribers</code>, and marks the job complete, permanently losing that delivery. There is no subscriber-aware retry for a job BullMQ considers successfully processed. This is confirmed as a real bug in <code>medusajs/medusa#10822</code>. Detection is log correlation right after a restart, comparing the timestamp of each 0 subscribers line against the subscriber loader's own done marker. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When a Medusa instance boots, several loader phases run in sequence to wire up the modules, the API routes, the workflows, and the subscribers. The Redis event bus is one of the earliest modules to come online, because it needs to be ready before almost anything else can emit an event. As soon as its loader resolves, its BullMQ worker attaches to the queue and starts pulling jobs, whether or not anything is listening for them yet.</p>
+  <p>Custom subscribers, the files you write in <code>src/subscribers</code> that call <code>subscribe()</code> for a given event name, are registered later, in their own loader phase. Between the moment the event bus worker starts consuming and the moment the subscriber loader finishes registering every handler, there is a real window where a dequeued job has nowhere to go. If Redis already had events queued from before the restart, perhaps because the previous process was mid-flight when it was killed for a deploy, or a second instance came up faster than expected during a scale-out, the worker happily processes them anyway. It logs that the event has zero subscribers, and because BullMQ only tracks whether the job function threw or completed, not whether any handler actually ran, it marks the job a success. The event is gone. Nothing will ever retry it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. On restart, the Redis event bus module loads first and its BullMQ worker starts consuming queued events immediately, while the subscriber loader is still registering handlers in a separate later phase. An event dequeued in that window is processed with zero subscribers and marked complete, so the expected side effect never happens and nothing retries it.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="175" height="62" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Instance restarts</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">events already queued in Redis</text>
+      <line x1="97" y1="82" x2="97" y2="108" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="110" width="205" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">event-bus-redis loads</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">BullMQ worker starts consuming</text>
+      <line x1="218" y1="141" x2="262" y2="141" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="265" y="110" width="185" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="357" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Processing event</text>
+      <text x="357" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">which has 0 subscribers</text>
+      <line x1="450" y1="141" x2="492" y2="141" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="495" y="110" width="150" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="570" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Job marked</text>
+      <text x="570" y="151" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">complete</text>
+      <rect x="10" y="192" width="620" height="30" rx="8" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="320" y="212" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">meanwhile, in a separate later phase: src/subscribers is still registering handlers</text>
+      <text x="695" y="63" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="655" y="110" width="95" height="62" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="702" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Event lost</text>
+      <text x="702" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">no retry</text>
+      <line x1="648" y1="141" x2="652" y2="141" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The event bus worker starts consuming before the subscriber loader has finished. Whatever gets dequeued in that gap is processed with zero handlers and marked done, so it is lost for good.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a real ordering bug in the module loading sequence, not a configuration mistake in your project. A few things make it worse in production:</p>
+  <ul>
+    <li>The event-bus-redis module and its BullMQ worker are instantiated and begin consuming as soon as the module loader resolves, which happens well before the loader phase that registers <code>src/subscribers</code> files finishes.</li>
+    <li>A redeploy or a horizontal-scale restart is exactly the moment this matters most, since Redis may already be holding events queued by the previous process, or by a sibling instance, that get dequeued the instant the new worker attaches.</li>
+    <li>BullMQ has no concept of "zero subscribers ran," it only tracks whether the job function completed without throwing. Medusa's event bus does not throw in that case, it logs a warning and returns, so the job is marked successfully processed.</li>
+    <li>Because the job is marked complete, there is no subscriber-aware retry mechanism to fall back on. The event does not go to a dead letter queue, it does not get flagged anywhere, it is simply gone.</li>
+    <li>This is confirmed and tracked as <code>medusajs/medusa#10822</code>: "Events should not be processed until all subscribers are loaded," and related community reports describe subscribers that appear to silently not fire around deploys and restarts.</li>
+  </ul>
+  <p>This is a common source of confusion because everything else about the deploy looks completely healthy. The new instance boots, the health check passes, the admin and storefront routes all respond, and the only symptom is a handful of missing side effects clustered right around the restart timestamp. See the citations at the end for the exact issue and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot ask Medusa or Redis "which events were dropped," because BullMQ already recorded those jobs as complete. Detection has to happen by correlating your own boot log: find the timestamp where the subscriber loader finished registering every handler, then find every <code>Processing &lt;event&gt; which has 0 subscribers</code> line, and anything timestamped before the loader finished is a confirmed gap, not a guess. Repair is the same story as detection, careful and manual by default. Re-emitting an event can duplicate side effects, so the fix defaults to reporting the gap under <code>DRY_RUN=true</code> and only re-publishes when an operator has confirmed the handler is idempotent.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the event bus or try to reorder the loaders ourselves. We parse the boot log for the subscriber-loader-done marker and every 0 subscribers line, keep only the ones that happened strictly before the loader finished, and either report each gap or, under an explicit flag, re-emit the event from fresh Admin API state.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script parses the boot log for the subscriber loader done marker and every 0 subscribers processing line, filters to the ones timestamped before the loader finished, and for each confirmed gap either logs it for review in dry run or re-emits the event from current Admin API state and reports it.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Parse boot log</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">loader-done + 0-subscriber lines</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Compare timestamps</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">event time vs loader-done time</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="370" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Before loader done?</text>
+      <text x="370" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">strictly earlier in time</text>
+      <line x1="465" y1="138" x2="507" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="600,106 687,138 600,170 513,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="600" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Confirmed</text>
+      <text x="600" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">gap?</text>
+      <text x="690" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="687" y1="138" x2="715" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, ignore</text>
+      <line x1="600" y1="170" x2="600" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="643" y="185" width="127" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="706" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report, then</text>
+      <text x="706" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">guarded re-emit</text>
+      <path d="M715,138 C735,138 706,150 706,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only confirms a gap by comparing timestamps already in the boot log. Repair only re-emits the event from fresh data, guarded by DRY_RUN, and never runs on a guess.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend and an admin user with rights to read the entities your subscribers act on. Exchange the email and password for a JWT once, then send it as a Bearer token on every admin call. Keep everything in environment variables, never hardcoded.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export BOOT_LOG_PATH="/var/log/medusa/boot.log"
+export DRY_RUN="true"   # start safe, only reports the confirmed gaps</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install @medusajs/js-sdk
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export BOOT_LOG_PATH="/var/log/medusa/boot.log"
+export DRY_RUN="true"   // start safe, only reports the confirmed gaps</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Both languages exchange credentials for a token the same way. The Python version talks to the REST route directly with <code>requests</code>. The Node version uses the official <code>@medusajs/js-sdk</code>, which wraps the same login call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import Medusa from "@medusajs/js-sdk";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+
+async function login() {
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Parse the boot log for the two markers that matter</h3>
+      <p>Medusa logs each subscriber file it registers, then a done marker once the <code>loaders/subscribers</code> phase finishes. The event-bus-redis processor logs a distinct line, <code>Processing &lt;event.name&gt; which has 0 subscribers</code>, whenever it dequeues a job with nothing listening. Read the log once per restart and pull out both kinds of line with their timestamps.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import re
+from datetime import datetime, timezone
+
+LOG_LINE = re.compile(r"^\[(?P&lt;ts&gt;[^\]]+)\]\s+(?P&lt;msg&gt;.*)$")
+ZERO_SUB = re.compile(r"Processing\s+(?P&lt;event&gt;\S+)\s+which has 0 subscribers")
+LOADER_DONE = re.compile(r"subscribers loaded", re.IGNORECASE)
+
+def _to_epoch_ms(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000
+
+def parse_boot_log(path):
+    """Read the boot log once. Returns (bootLog, subscriberLoaderDoneAtMs)."""
+    boot_log = []
+    loader_done_at_ms = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = LOG_LINE.match(line.strip())
+            if not m:
+                continue
+            at_ms = _to_epoch_ms(m.group("ts"))
+            msg = m.group("msg")
+            zero = ZERO_SUB.search(msg)
+            if zero:
+                boot_log.append({"event": zero.group("event"), "atMs": at_ms})
+            elif LOADER_DONE.search(msg) and loader_done_at_ms is None:
+                loader_done_at_ms = at_ms
+    return boot_log, loader_done_at_ms</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">import { readFileSync } from "node:fs";
+
+const LOG_LINE = /^\[(?&lt;ts&gt;[^\]]+)\]\s+(?&lt;msg&gt;.*)$/;
+const ZERO_SUB = /Processing\s+(?&lt;event&gt;\S+)\s+which has 0 subscribers/;
+const LOADER_DONE = /subscribers loaded/i;
+
+function toEpochMs(ts) {
+  return Date.parse(ts);
+}
+
+export function parseBootLog(path) {
+  // Read the boot log once. Returns { bootLog, subscriberLoaderDoneAtMs }.
+  const text = readFileSync(path, "utf-8");
+  const bootLog = [];
+  let subscriberLoaderDoneAtMs = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const m = line.match(LOG_LINE);
+    if (!m) continue;
+    const atMs = toEpochMs(m.groups.ts);
+    const msg = m.groups.msg;
+    const zero = msg.match(ZERO_SUB);
+    if (zero) {
+      bootLog.push({ event: zero.groups.event, atMs });
+    } else if (LOADER_DONE.test(msg) && subscriberLoaderDoneAtMs === null) {
+      subscriberLoaderDoneAtMs = atMs;
+    }
+  }
+  return { bootLog, subscriberLoaderDoneAtMs };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no I/O. It takes the parsed boot log entries and the subscriber-loader-done timestamp, and returns every event that was processed strictly before the loader finished, each with how big the gap was. This is the exact question the whole fix is trying to answer, and it is fully testable with plain arrays and numbers, no log file and no Medusa instance required.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_missed_event_windows(boot_log, subscriber_loader_done_at_ms):
+    """Pure: no I/O. boot_log is a list of {"event", "atMs"} dicts already parsed
+    from lines like "Processing &lt;eventName&gt; which has 0 subscribers".
+    An event was missed iff it was processed strictly before the subscriber
+    loader finished registering handlers."""
+    return [
+        {"event": e["event"], "atMs": e["atMs"], "gapMs": subscriber_loader_done_at_ms - e["atMs"]}
+        for e in boot_log
+        if e["atMs"] < subscriber_loader_done_at_ms
+    ]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findMissedEventWindows(bootLog, subscriberLoaderDoneAtMs) {
+  // Pure: no I/O. bootLog is a plain array of { event, atMs } already parsed
+  // from lines like "Processing &lt;eventName&gt; which has 0 subscribers".
+  // An event was missed iff it was processed strictly before the subscriber
+  // loader finished registering handlers.
+  return bootLog
+    .filter((e) => e.atMs &lt; subscriberLoaderDoneAtMs)
+    .map((e) => ({ event: e.event, atMs: e.atMs, gapMs: subscriberLoaderDoneAtMs - e.atMs }));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Cross-check business impact, then repair under a dry run guard</h3>
+      <p>A confirmed gap is not yet proof of business impact on its own, so cross-check it against the Admin API. For an <code>order.placed</code> gap, diff <code>/admin/orders</code> around the restart timestamp against <code>/admin/notifications</code> for the same window, any order with no matching notification record is the observable symptom. Only with <code>DRY_RUN=false</code>, and only once the operator has confirmed the handler is idempotent, re-publish the event through the Event Module using data pulled fresh from the Admin API, never the original stale payload.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def orders_missing_notifications(token, restart_iso):
+    """Diff orders created since the restart against notifications sent since
+    the restart, for order.placed style gaps. Returns order ids with no
+    matching notification record."""
+    headers = {"Authorization": f"Bearer {token}"}
+
+    orders = requests.get(
+        f"{BASE_URL}/admin/orders",
+        params={"fields": "id,status,*fulfillments,*payment_collection",
+                "created_at[$gte]": restart_iso},
+        headers=headers, timeout=30,
+    ).json()["orders"]
+
+    notifications = requests.get(
+        f"{BASE_URL}/admin/notifications",
+        params={"fields": "id,to,template,data",
+                "created_at[$gte]": restart_iso},
+        headers=headers, timeout=30,
+    ).json()["notifications"]
+
+    notified_order_ids = {n["data"].get("id") for n in notifications if n.get("data")}
+    return [o["id"] for o in orders if o["id"] not in notified_order_ids]
+
+
+def reemit_order_placed(token, order_id):
+    """Only called when DRY_RUN=false and the operator confirmed the handler
+    is idempotent. Sources fresh payload from the Admin API, not the
+    original stale event."""
+    headers = {"Authorization": f"Bearer {token}"}
+    order = requests.get(
+        f"{BASE_URL}/admin/orders/{order_id}",
+        params={"fields": "id,*items,*customer"},
+        headers=headers, timeout=30,
+    ).json()["order"]
+    # In the Medusa backend process itself:
+    #   const eventModuleService = container.resolve(Modules.EVENT)
+    #   await eventModuleService.emit({ name: "order.placed", data: order })
+    return order</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function ordersMissingNotifications(sdk, restartIso) {
+  // Diff orders created since the restart against notifications sent since
+  // the restart, for order.placed style gaps. Returns order ids with no
+  // matching notification record.
+  const { orders } = await sdk.client.fetch("/admin/orders", {
+    query: { fields: "id,status,*fulfillments,*payment_collection", "created_at[$gte]": restartIso },
+  });
+  const { notifications } = await sdk.client.fetch("/admin/notifications", {
+    query: { fields: "id,to,template,data", "created_at[$gte]": restartIso },
+  });
+  const notifiedOrderIds = new Set(notifications.map((n) => n.data?.id).filter(Boolean));
+  return orders.filter((o) => !notifiedOrderIds.has(o.id)).map((o) => o.id);
+}
+
+async function reemitOrderPlaced(sdk, orderId) {
+  // Only called when DRY_RUN=false and the operator confirmed the handler
+  // is idempotent. Sources fresh payload from the Admin API, not the
+  // original stale event.
+  const { order } = await sdk.client.fetch(`/admin/orders/${orderId}`, {
+    query: { fields: "id,*items,*customer" },
+  });
+  // In the Medusa backend process itself, inside a workflow:
+  //   import { emitEventStep } from "@medusajs/medusa/core-flows"
+  //   emitEventStep({ eventName: "order.placed", data: order })
+  return order;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop parses the log once, finds every confirmed gap with the pure function, and reports each one with its event name and gap size. Leave <code>DRY_RUN</code> on for every early run, since the safe default is to only log and report for manual review. Only switch it off, per event, once you have both confirmed business impact through the Admin API cross-check and verified the handler tolerates being called twice.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never auto-re-emit blindly. A duplicate <code>order.placed</code> can mean a duplicate confirmation email or a duplicate webhook call to a fulfillment partner. Keep <code>DRY_RUN=true</code> as the default, cross-check impact against the Admin API before touching anything, and only re-publish an event with data pulled fresh from the entity's current state, never the original stale payload that might now be out of date.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It parses the boot log, finds every event processed before the subscriber loader finished with a pure function, and either reports the batch or, once <code>DRY_RUN</code> is off, cross-checks business impact and re-emits from fresh Admin API state.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/events-race-subscriber-boot" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_missed_events.py</div>
+      <pre><code class="language-python">"""Find Medusa v2 events that the Redis event bus processed with 0
+subscribers because the event-bus-redis module's BullMQ worker started
+consuming before the later src/subscribers loader phase finished
+registering handlers, typically right after a redeploy or a
+horizontal-scale restart. Never auto-re-emits by default. DRY_RUN=true
+only reports the confirmed gaps found in the boot log. Repair only
+re-publishes an event under DRY_RUN=false, using data pulled fresh from
+the Admin API, and only once the operator has confirmed the handler is
+idempotent.
+"""
+import os
+import re
+import logging
+from datetime import datetime
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_missed_events")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+BOOT_LOG_PATH = os.environ.get("BOOT_LOG_PATH", "/var/log/medusa/boot.log")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+LOG_LINE = re.compile(r"^\[(?P&lt;ts&gt;[^\]]+)\]\s+(?P&lt;msg&gt;.*)$")
+ZERO_SUB = re.compile(r"Processing\s+(?P&lt;event&gt;\S+)\s+which has 0 subscribers")
+LOADER_DONE = re.compile(r"subscribers loaded", re.IGNORECASE)
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def _to_epoch_ms(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000
+
+
+def parse_boot_log(path):
+    """Read the boot log once. Returns (bootLog, subscriberLoaderDoneAtMs)."""
+    boot_log = []
+    loader_done_at_ms = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            m = LOG_LINE.match(line.strip())
+            if not m:
+                continue
+            at_ms = _to_epoch_ms(m.group("ts"))
+            msg = m.group("msg")
+            zero = ZERO_SUB.search(msg)
+            if zero:
+                boot_log.append({"event": zero.group("event"), "atMs": at_ms})
+            elif LOADER_DONE.search(msg) and loader_done_at_ms is None:
+                loader_done_at_ms = at_ms
+    return boot_log, loader_done_at_ms
+
+
+def find_missed_event_windows(boot_log, subscriber_loader_done_at_ms):
+    """Pure: no I/O. boot_log is a list of {"event", "atMs"} dicts already parsed
+    from lines like "Processing &lt;eventName&gt; which has 0 subscribers".
+    An event was missed iff it was processed strictly before the subscriber
+    loader finished registering handlers."""
+    return [
+        {"event": e["event"], "atMs": e["atMs"], "gapMs": subscriber_loader_done_at_ms - e["atMs"]}
+        for e in boot_log
+        if e["atMs"] < subscriber_loader_done_at_ms
+    ]
+
+
+def orders_missing_notifications(token, restart_iso):
+    """Diff orders created since the restart against notifications sent since
+    the restart, for order.placed style gaps. Returns order ids with no
+    matching notification record."""
+    headers = {"Authorization": f"Bearer {token}"}
+
+    orders = requests.get(
+        f"{BASE_URL}/admin/orders",
+        params={"fields": "id,status,*fulfillments,*payment_collection",
+                "created_at[$gte]": restart_iso},
+        headers=headers, timeout=30,
+    ).json()["orders"]
+
+    notifications = requests.get(
+        f"{BASE_URL}/admin/notifications",
+        params={"fields": "id,to,template,data",
+                "created_at[$gte]": restart_iso},
+        headers=headers, timeout=30,
+    ).json()["notifications"]
+
+    notified_order_ids = {n["data"].get("id") for n in notifications if n.get("data")}
+    return [o["id"] for o in orders if o["id"] not in notified_order_ids]
+
+
+def reemit_order_placed(token, order_id):
+    """Only called when DRY_RUN=false and the operator confirmed the handler
+    is idempotent. Sources fresh payload from the Admin API, not the
+    original stale event."""
+    headers = {"Authorization": f"Bearer {token}"}
+    order = requests.get(
+        f"{BASE_URL}/admin/orders/{order_id}",
+        params={"fields": "id,*items,*customer"},
+        headers=headers, timeout=30,
+    ).json()["order"]
+    # In the Medusa backend process itself:
+    #   const eventModuleService = container.resolve(Modules.EVENT)
+    #   await eventModuleService.emit({ name: "order.placed", data: order })
+    return order
+
+
+def run():
+    boot_log, loader_done_at_ms = parse_boot_log(BOOT_LOG_PATH)
+    if loader_done_at_ms is None:
+        log.warning("Subscriber loader done marker not found in %s. Nothing to compare.", BOOT_LOG_PATH)
+        return
+
+    missed = find_missed_event_windows(boot_log, loader_done_at_ms)
+    if not missed:
+        log.info("No confirmed gaps. %d event(s) processed, all after the subscriber loader finished.", len(boot_log))
+        return
+
+    for item in missed:
+        log.warning(
+            "Event %s processed %.0f ms before subscribers finished loading. Confirmed gap.",
+            item["event"], item["gapMs"],
+        )
+
+    if not DRY_RUN:
+        token = get_token()
+        restart_iso = datetime.utcfromtimestamp(min(e["atMs"] for e in missed) / 1000).isoformat() + "Z"
+        order_ids = orders_missing_notifications(token, restart_iso)
+        for order_id in order_ids:
+            log.info("Order %s has no matching notification. Re-emitting order.placed.", order_id)
+            reemit_order_placed(token, order_id)
+
+    log.info("Done. %d event(s) %s.", len(missed), "to review" if DRY_RUN else "reported and cross-checked")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-missed-events.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Medusa v2 events that the Redis event bus processed with 0
+ * subscribers because the event-bus-redis module's BullMQ worker started
+ * consuming before the later src/subscribers loader phase finished
+ * registering handlers, typically right after a redeploy or a
+ * horizontal-scale restart. Never auto-re-emits by default. DRY_RUN=true
+ * only reports the confirmed gaps found in the boot log. Repair only
+ * re-publishes an event under DRY_RUN=false, using data pulled fresh from
+ * the Admin API, and only once the operator has confirmed the handler is
+ * idempotent.
+ */
+import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const BOOT_LOG_PATH = process.env.BOOT_LOG_PATH || "/var/log/medusa/boot.log";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const LOG_LINE = /^\[(?&lt;ts&gt;[^\]]+)\]\s+(?&lt;msg&gt;.*)$/;
+const ZERO_SUB = /Processing\s+(?&lt;event&gt;\S+)\s+which has 0 subscribers/;
+const LOADER_DONE = /subscribers loaded/i;
+
+function toEpochMs(ts) {
+  return Date.parse(ts);
+}
+
+export function parseBootLog(path) {
+  // Read the boot log once. Returns { bootLog, subscriberLoaderDoneAtMs }.
+  const text = readFileSync(path, "utf-8");
+  const bootLog = [];
+  let subscriberLoaderDoneAtMs = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const m = line.match(LOG_LINE);
+    if (!m) continue;
+    const atMs = toEpochMs(m.groups.ts);
+    const msg = m.groups.msg;
+    const zero = msg.match(ZERO_SUB);
+    if (zero) {
+      bootLog.push({ event: zero.groups.event, atMs });
+    } else if (LOADER_DONE.test(msg) && subscriberLoaderDoneAtMs === null) {
+      subscriberLoaderDoneAtMs = atMs;
+    }
+  }
+  return { bootLog, subscriberLoaderDoneAtMs };
+}
+
+export function findMissedEventWindows(bootLog, subscriberLoaderDoneAtMs) {
+  // Pure: no I/O. bootLog is a plain array of { event, atMs } already parsed
+  // from lines like "Processing &lt;eventName&gt; which has 0 subscribers".
+  // An event was missed iff it was processed strictly before the subscriber
+  // loader finished registering handlers.
+  return bootLog
+    .filter((e) => e.atMs &lt; subscriberLoaderDoneAtMs)
+    .map((e) => ({ event: e.event, atMs: e.atMs, gapMs: subscriberLoaderDoneAtMs - e.atMs }));
+}
+
+async function login() {
+  const { default: Medusa } = await import("@medusajs/js-sdk");
+  const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}
+
+async function ordersMissingNotifications(sdk, restartIso) {
+  // Diff orders created since the restart against notifications sent since
+  // the restart, for order.placed style gaps. Returns order ids with no
+  // matching notification record.
+  const { orders } = await sdk.client.fetch("/admin/orders", {
+    query: { fields: "id,status,*fulfillments,*payment_collection", "created_at[$gte]": restartIso },
+  });
+  const { notifications } = await sdk.client.fetch("/admin/notifications", {
+    query: { fields: "id,to,template,data", "created_at[$gte]": restartIso },
+  });
+  const notifiedOrderIds = new Set(notifications.map((n) => n.data?.id).filter(Boolean));
+  return orders.filter((o) => !notifiedOrderIds.has(o.id)).map((o) => o.id);
+}
+
+async function reemitOrderPlaced(sdk, orderId) {
+  // Only called when DRY_RUN=false and the operator confirmed the handler
+  // is idempotent. Sources fresh payload from the Admin API, not the
+  // original stale event.
+  const { order } = await sdk.client.fetch(`/admin/orders/${orderId}`, {
+    query: { fields: "id,*items,*customer" },
+  });
+  // In the Medusa backend process itself, inside a workflow:
+  //   import { emitEventStep } from "@medusajs/medusa/core-flows"
+  //   emitEventStep({ eventName: "order.placed", data: order })
+  return order;
+}
+
+export async function run() {
+  const { bootLog, subscriberLoaderDoneAtMs } = parseBootLog(BOOT_LOG_PATH);
+  if (subscriberLoaderDoneAtMs === null) {
+    console.warn(`Subscriber loader done marker not found in ${BOOT_LOG_PATH}. Nothing to compare.`);
+    return;
+  }
+
+  const missed = findMissedEventWindows(bootLog, subscriberLoaderDoneAtMs);
+  if (missed.length === 0) {
+    console.log(`No confirmed gaps. ${bootLog.length} event(s) processed, all after the subscriber loader finished.`);
+    return;
+  }
+
+  for (const item of missed) {
+    console.warn(`Event ${item.event} processed ${Math.round(item.gapMs)} ms before subscribers finished loading. Confirmed gap.`);
+  }
+
+  if (!DRY_RUN) {
+    const sdk = await login();
+    const restartIso = new Date(Math.min(...missed.map((e) => e.atMs))).toISOString();
+    const orderIds = await ordersMissingNotifications(sdk, restartIso);
+    for (const orderId of orderIds) {
+      console.log(`Order ${orderId} has no matching notification. Re-emitting order.placed.`);
+      await reemitOrderPlaced(sdk, orderId);
+    }
+  }
+
+  console.log(`Done. ${missed.length} event(s) ${DRY_RUN ? "to review" : "reported and cross-checked"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the one that decides the outcome, <code>find_missed_event_windows</code>. It is pure, no log file and no network, just a comparison of timestamps already parsed into plain records, so the tests feed in a small boot log and a loader-done time and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_events_missed_windows.py</div>
+      <pre><code class="language-python">from find_missed_events import find_missed_event_windows
+
+LOADER_DONE_AT_MS = 1_000_000
+
+
+def entry(**over):
+    base = {"event": "order.placed", "atMs": 900_000}
+    base.update(over)
+    return base
+
+
+def test_event_before_loader_done_is_missed():
+    result = find_missed_event_windows([entry()], LOADER_DONE_AT_MS)
+    assert len(result) == 1
+    assert result[0]["event"] == "order.placed"
+    assert result[0]["gapMs"] == 100_000
+
+
+def test_event_after_loader_done_is_not_missed():
+    result = find_missed_event_windows([entry(atMs=1_100_000)], LOADER_DONE_AT_MS)
+    assert result == []
+
+
+def test_event_exactly_at_loader_done_is_not_missed():
+    result = find_missed_event_windows([entry(atMs=LOADER_DONE_AT_MS)], LOADER_DONE_AT_MS)
+    assert result == []
+
+
+def test_handles_multiple_events_independently():
+    early = entry(event="cart.completed", atMs=500_000)
+    late = entry(event="customer.created", atMs=1_200_000)
+    result = find_missed_event_windows([entry(), early, late], LOADER_DONE_AT_MS)
+    events = [r["event"] for r in result]
+    assert events == ["order.placed", "cart.completed"]
+
+
+def test_empty_boot_log_returns_empty():
+    assert find_missed_event_windows([], LOADER_DONE_AT_MS) == []
+
+
+def test_gap_ms_matches_the_difference_exactly():
+    result = find_missed_event_windows([entry(atMs=250_000)], LOADER_DONE_AT_MS)
+    assert result[0]["gapMs"] == 750_000</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">missed-events.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findMissedEventWindows } from "./find-missed-events.js";
+
+const LOADER_DONE_AT_MS = 1_000_000;
+
+const entry = (over = {}) => ({ event: "order.placed", atMs: 900_000, ...over });
+
+test("event before loader done is missed", () => {
+  const result = findMissedEventWindows([entry()], LOADER_DONE_AT_MS);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].event, "order.placed");
+  assert.equal(result[0].gapMs, 100_000);
+});
+
+test("event after loader done is not missed", () => {
+  const result = findMissedEventWindows([entry({ atMs: 1_100_000 })], LOADER_DONE_AT_MS);
+  assert.deepEqual(result, []);
+});
+
+test("event exactly at loader done is not missed", () => {
+  const result = findMissedEventWindows([entry({ atMs: LOADER_DONE_AT_MS })], LOADER_DONE_AT_MS);
+  assert.deepEqual(result, []);
+});
+
+test("handles multiple events independently", () => {
+  const early = entry({ event: "cart.completed", atMs: 500_000 });
+  const late = entry({ event: "customer.created", atMs: 1_200_000 });
+  const result = findMissedEventWindows([entry(), early, late], LOADER_DONE_AT_MS);
+  assert.deepEqual(result.map((r) => r.event), ["order.placed", "cart.completed"]);
+});
+
+test("empty boot log returns empty", () => {
+  assert.deepEqual(findMissedEventWindows([], LOADER_DONE_AT_MS), []);
+});
+
+test("gapMs matches the difference exactly", () => {
+  const result = findMissedEventWindows([entry({ atMs: 250_000 })], LOADER_DONE_AT_MS);
+  assert.equal(result[0].gapMs, 750_000);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Redeploy</span>
+      <h4>The confirmation emails that never went out</h4>
+      <p>A store rolled out a routine backend redeploy during a moderately busy hour. The old process was killed mid-request while a few checkouts were completing, leaving a handful of <code>order.placed</code> events queued in Redis. The new process came up healthy within seconds, passed its health check, and started serving traffic normally.</p>
+      <p>Three customers never received an order confirmation email. Nothing in the deploy pipeline flagged an issue, since every route responded correctly and no error was thrown anywhere. Correlating the new instance's boot log found three <code>Processing order.placed which has 0 subscribers</code> lines, all timestamped seconds before the subscribers loaded marker, exactly matching the three missing emails once cross-checked against <code>/admin/notifications</code>.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Horizontal scale-out</span>
+      <h4>The new replica that raced its own siblings</h4>
+      <p>A traffic spike triggered an autoscaler to add a second Medusa instance sharing the same Redis event bus as the first. The new replica's event-bus-redis module attached to the queue and began pulling jobs within a second of boot, while its own subscriber loader was still a few hundred milliseconds from finishing.</p>
+      <p>A handful of webhook-triggering events landed on the new replica during that window and were processed with zero subscribers before being marked complete. The team now runs this script against every instance's boot log immediately after any scale-out event, confirming there were exactly two missed events in the crossover window, both surfaced for manual review rather than silently lost.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this right after every redeploy or scale-out event, against the new instance's boot log. It never guesses, it only confirms a gap by comparing two timestamps that are already in your own logs, and it never re-emits anything unless you explicitly turn off <code>DRY_RUN</code> after confirming both business impact and handler idempotency. The durable fix stays structural: set <code>WORKER_MODE=worker</code> only on instances that come up after subscriber loaders resolve, or track Medusa issue <code>#10822</code> for the upstream fix that gates event-bus-redis's queue consumption behind the subscriber-loader-done signal.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Medusa log 0 subscribers for an event right after a restart?</summary>
+      <p>In Medusa v2's Redis event bus, the event-bus-redis module and its BullMQ worker start consuming queued jobs as soon as the module loader resolves, but custom subscribers in src/subscribers are registered by a separate, later loader phase. If an event was already queued in Redis before that later phase finishes, the worker dequeues it early, logs Processing which has 0 subscribers, and marks the job complete, so no subscriber ever runs for it.</p>
+    </details>
+    <details>
+      <summary>How do I detect events that were lost to this boot race condition?</summary>
+      <p>There is no API that shows missing events after the fact, since BullMQ marks the job complete even when zero subscribers ran. The practical method is log correlation right after a restart: capture the process start time, find the timestamp where the subscriber loader finishes registering handlers, then grep the same window for 0 subscribers lines. Any such line timestamped before the loader finished is a confirmed gap, which you can then cross-check against the Admin API, for example diffing /admin/orders against /admin/notifications for the affected window.</p>
+    </details>
+    <details>
+      <summary>Is it safe to automatically re-emit a missed Medusa event?</summary>
+      <p>Not by default, because re-emitting can duplicate side effects like emails or webhook calls if the original handler actually ran partially or if it is not idempotent. The safe pattern is DRY_RUN=true by default, which only logs and reports the gap for manual review. Only with DRY_RUN=false, after confirming the handler is idempotent, should you re-publish the event through the Event Module using fresh data pulled from the current Admin API state of the affected entity, not the original stale payload.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/medusa/">Browse all Medusa field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #10822: event-bus-redis processor executes event before subscribers are loaded. <a href="https://github.com/medusajs/medusa/issues/10822" rel="noopener">github.com/medusajs/medusa/issues/10822</a></li>
+      <li>Medusa Documentation: Subscribers Not Working, troubleshooting. <a href="https://docs.medusajs.com/resources/troubleshooting/subscribers/not-working" rel="noopener">docs.medusajs.com/resources/troubleshooting/subscribers/not-working</a></li>
+      <li>medusajs/medusa GitHub issue #7850: events in Redis event bus not triggering subscribers (notification service). <a href="https://github.com/medusajs/medusa/issues/7850" rel="noopener">github.com/medusajs/medusa/issues/7850</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Emit Workflow and Service Events. <a href="https://docs.medusajs.com/learn/fundamentals/events-and-subscribers/emit-event" rel="noopener">docs.medusajs.com/learn/fundamentals/events-and-subscribers/emit-event</a></li>
+      <li>Medusa Documentation: emitEventStep, Core Workflows Reference. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/steps/emitEventStep" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/steps/emitEventStep</a></li>
+      <li>Medusa Documentation: Events and Subscribers. <a href="https://docs.medusajs.com/learn/fundamentals/events-and-subscribers" rel="noopener">docs.medusajs.com/learn/fundamentals/events-and-subscribers</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silently lost event?</h3>
+    <p>If this saved you from a swallowed notification or a webhook that never fired, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

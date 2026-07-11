@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix New Payment Collection Ignoring Amounts Already Captured in Medusa</title>
+<meta name="description" content="After an order edit in Medusa v2, the new payment collection is sized off the order's new total instead of what is still outstanding, so a partly paid order gets billed again for the full amount. Learn why and build a Python or Node.js script that flags and safely reconciles it.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix New Payment Collection Ignoring Amounts Already Captured in Medusa">
+<meta property="og:description" content="Why an order-edit-triggered payment collection in Medusa v2 is sized off the current total instead of pending_difference, and a Python or Node.js script that flags and safely reconciles the stale open collection.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/#article","headline":"Fix New Payment Collection Ignoring Amounts Already Captured in Medusa","description":"In Medusa v2, when an order-edit or order-change workflow needs a new payment collection, createOrderPaymentCollectionWorkflow builds the collection amount from the order's current total rather than from order.summary.pending_difference, so a partially paid order that gets a price bump produces a new collection for the full new total instead of just what remains outstanding. A Python or Node.js script detects the mismatch and, under an explicit flag, safely reconciles it.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments & Refunds","keywords":"Medusa new payment collection, pending_difference, createOrderPaymentCollectionWorkflow, order edit, order-change, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"New payment collection ignores amounts already captured","item":"https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Medusa create a new payment collection for the full order total instead of what is still owed?","acceptedAnswer":{"@type":"Answer","text":"When an order edit raises the price and Medusa needs a new payment collection to cover the difference, createOrderPaymentCollectionWorkflow builds the collection's amount from the order's current total rather than from order.summary.pending_difference, which already accounts for what was paid and refunded. The workflow does not query the order's existing payment_collections and transactions to net out prior captures, so on a partially paid order the new collection is sized for the whole new total instead of only the outstanding balance."}},{"@type":"Question","name":"How do I detect an order affected by this payment collection bug?","acceptedAnswer":{"@type":"Answer","text":"Fetch the order with GET /admin/orders and fields=id,display_id,status,*summary,*payment_collections,*payment_collections.payments,*transactions. Sum the amount of any payment_collections with status not_paid or awaiting into new_collection_total, and compare it against summary.pending_difference. If new_collection_total is greater than pending_difference by more than a cent, and the order already has a payment_collection with status completed or a transaction with reference capture, that combination is the signature of this bug: a prior capture exists and the new open collection was sized off the current total instead of what remains unpaid."}},{"@type":"Question","name":"Is it safe to auto-fix the payment collection once I find a mismatch?","acceptedAnswer":{"@type":"Answer","text":"Not by default. Canceling and recreating a live payment collection can orphan an in-flight customer payment session, so the script only flags by default. Under an explicit DRY_RUN=false operator flag, and only when exactly one open collection exists, it cancels the stale one with mark-as-canceled, re-fetches summary.pending_difference fresh to avoid racing further edits, and creates a corrected collection scoped to that amount. Orders with pending_difference at or below zero or with more than one open collection are always left for a human to review."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Payments &amp; Refunds</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Payments &amp; Refunds</p>
+    <h1>New payment collection ignores amounts already captured</h1>
+    <p class="lead">A customer already paid for their order. Then a price edit bumps the total, Medusa opens a new payment collection to cover the difference, and that new collection is sized for the entire new total, not the small amount actually left owing. The customer either gets asked to pay twice or a staff member sees a scary number and assumes nothing was ever collected. Here is why the order-edit path builds the new collection off the wrong number, and a script that finds every order where this happened and can reconcile it safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Flag by default, guarded repair</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>When an order edit or order-change workflow raises the price and Medusa needs a new payment collection, <code>createOrderPaymentCollectionWorkflow</code> builds the collection's <code>amount</code> from the order's current total, not from <code>order.summary.pending_difference</code>, the field that already nets out <code>paid_total</code> and <code>refunded_total</code>. The workflow never queries the order's existing <code>payment_collections</code> or <code>transactions</code> to subtract what is already captured, so a partially paid order that gets a price bump ends up with a new collection demanding the full new total instead of just the outstanding balance. This is a confirmed upstream pattern, see <a href="https://github.com/medusajs/medusa/issues/11591" rel="noopener">medusajs/medusa issue #11591</a> and related reports below. Pull each order with its <code>summary</code>, <code>payment_collections</code>, and <code>transactions</code> expanded, sum the open collections and compare that against <code>pending_difference</code>, and flag any order where a prior capture exists alongside an over-sized open collection. Full code and a guarded repair path are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>An order's <code>summary</code> in Medusa v2 already knows how to answer "what is still owed." <code>pending_difference</code> is computed as the current order total, minus what has been paid, minus what has been refunded. It is exactly the number a new payment collection should be built from whenever the price changes after some money has already come in.</p>
+  <p>But the workflow that actually creates that new collection, <code>createOrderPaymentCollectionWorkflow</code>, does not reach for <code>pending_difference</code>. It reads the order's current total directly and uses that as the collection amount. On a brand new order with no prior payment, current total and pending difference are the same number, so nothing looks wrong. The gap only shows up once an order has already been partly paid and then gets edited, because the workflow never looks at the order's existing <code>payment_collections</code> or <code>transactions</code> to net out the capture that already happened.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. An order is captured for its original total, then an order edit raises the price. Medusa's createOrderPaymentCollectionWorkflow reads the new current total instead of pending_difference, so the new payment collection is created for the full new total instead of just the remaining outstanding balance.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="14" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="38" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Order captured</text>
+      <text x="102" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">paid_total = 100</text>
+      <line x1="102" y1="74" x2="102" y2="100" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="102" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="125" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Order edit runs</text>
+      <text x="102" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">new total = 120</text>
+      <line x1="198" y1="132" x2="240" y2="132" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="243" y="102" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="353" y="125" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">createOrderPaymentCollectionWorkflow</text>
+      <text x="353" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">reads current_order_total, not pending_difference</text>
+      <line x1="468" y1="132" x2="510" y2="132" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="489" y="118" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="513" y="102" width="230" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="628" y="125" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">New collection = 120</text>
+      <text x="628" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">should have been 20</text>
+      <rect x="10" y="180" width="463" height="52" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="241" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Prior capture of 100 was never netted out</text>
+      <text x="241" y="220" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">customer is billed for the whole new total again</text>
+      <line x1="628" y1="162" x2="628" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="513" y="180" width="230" height="52" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="628" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Open collection: 120</text>
+      <text x="628" y="220" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">actual pending_difference: 20</text>
+    </svg>
+    <figcaption>The order was already captured for 100. After an edit raises the total to 120, the workflow builds the new collection from the new total instead of the 20 that is actually still owed.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This traces back to how the order-edit-triggered payment collection creation is wired, not to anything wrong with the summary itself:</p>
+  <ul>
+    <li><code>order.summary.pending_difference</code> is already computed correctly, as <code>current_order_total</code> minus <code>paid_total</code> minus <code>refunded_total</code>, adjusted for <code>transaction_total</code>. It is the right number for a new collection to target.</li>
+    <li><code>createOrderPaymentCollectionWorkflow</code>, the workflow the order-edit and order-change paths call when a price bump needs new money collected, builds its <code>amount</code> from the order's current total instead of reading <code>pending_difference</code> off the summary.</li>
+    <li>The workflow never queries the order's existing <code>payment_collections</code> or <code>transactions</code> to check whether anything has already been captured, so it has no way to net out a prior payment even if it wanted to.</li>
+    <li>On a fresh order with nothing paid yet, current total and pending difference happen to be equal, so the bug is invisible until an order is partly paid and then edited, which is exactly the order-edit flow this logic exists for.</li>
+    <li>This matches the pattern reported across several upstream issues, including <a href="https://github.com/medusajs/medusa/issues/11591" rel="noopener">issue #11591</a>, <a href="https://github.com/medusajs/medusa/issues/10686" rel="noopener">issue #10686</a>, and <a href="https://github.com/medusajs/medusa/issues/13068" rel="noopener">issue #13068</a>, all pointing at order-edit-triggered payment collections not being outstanding-amount-aware.</li>
+  </ul>
+  <p>This is a common source of confusion because nothing errors and the new collection is technically valid, it is just sized wrong. Staff see a large "amount due" on an order that was mostly paid already, and either chase the customer for money that is not owed, or a script blindly charges the new collection in full and takes a duplicate payment. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Never trust a new open payment collection's <code>amount</code> at face value on an order that has any prior capture. Always compare the sum of open collections against <code>order.summary.pending_difference</code> first. If the open total is bigger than what pending_difference says is actually owed, and a capture already happened, that is the bug fingerprint, not a legitimate balance due. Canceling and recreating a live collection is not something to do automatically, since it can orphan a customer's in-flight payment session, so repair stays behind an explicit flag.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We list candidate orders that have both recent edits and payments, compute what is actually owed from each order's own summary, and compare it against the open collections Medusa created. Anything that does not match, with a prior capture in the picture, gets flagged. Only under an explicit operator flag, and only when the picture is unambiguous, do we cancel the stale collection and create a correctly sized one.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists orders with summary and payment collections expanded, computes pending_difference and the open collection total, and if the open total exceeds pending_difference with a prior capture present it flags for review, or under an explicit DRY_RUN false flag with exactly one open collection it cancels the stale collection and creates one sized correctly, otherwise it moves on.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List orders</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">summary, collections, transactions</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="102" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Compute</text>
+      <text x="102" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">pending_difference vs open total</text>
+      <line x1="198" y1="138" x2="240" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="333,106 420,138 333,170 246,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="333" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Over-sized and</text>
+      <text x="333" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">prior capture?</text>
+      <text x="345" y="196" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes, flag</text>
+      <line x1="333" y1="170" x2="333" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="238" y="185" width="190" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="333" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Flag for review</text>
+      <text x="333" y="221" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b5a70">DRY_RUN=false and one open collection: recreate</text>
+      <text x="450" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, matches</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="465" y="108" width="270" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="600" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Move on</text>
+      <text x="600" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">collection is sized correctly</text>
+    </svg>
+    <figcaption>Flagging is always the default. Only with an explicit operator flag, and only when exactly one open collection exists, does the script cancel the stale collection and create one sized to the real pending_difference.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend with an admin account that can read and write orders and payment collections. Exchange the email and password for a JWT once and reuse it. <code>DRY_RUN</code> defaults to true, since the repair path cancels and recreates a live payment collection.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, change to false to cancel and recreate</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, change to false to cancel and recreate</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>POST /auth/user/emailpass</code>, then send it as <code>Authorization: Bearer &lt;token&gt;</code> on every following call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List orders with summary, payment collections, and transactions expanded</h3>
+      <p>Ask for <code>summary</code>, <code>payment_collections</code>, the payments on each collection, and <code>transactions</code>. This gives us <code>pending_difference</code>, every open collection's amount and status, and enough evidence of prior captures to fingerprint the bug. Page through with <code>offset</code> and <code>limit</code> so the job covers the whole store.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_FIELDS = (
+    "id,display_id,status,*summary,*payment_collections,"
+    "*payment_collections.payments,*transactions"
+)
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_orders_with_collections(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_FIELDS =
+  "id,display_id,status,*summary,*payment_collections," +
+  "*payment_collections.payments,*transactions";
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function listOrdersWithCollections(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the whole decision in a function with no network calls. It takes the order's summary numbers and its open payment collections, sums the open collections, and compares that against <code>pending_difference</code>. It only recommends a repair when exactly one open collection exists and a prior capture happened, since more than one open collection is ambiguous and needs a human. Anything with nothing owed is left alone.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">OPEN_STATUSES = {"not_paid", "awaiting"}
+DEFAULT_EPSILON = 0.01
+
+def reconcile_outstanding_amount(summary, open_collections, epsilon=DEFAULT_EPSILON):
+    pending_difference = (
+        summary["currentOrderTotal"] - summary["paidTotal"] - summary["refundedTotal"]
+    )
+
+    candidates = [c for c in open_collections if c["status"] in OPEN_STATUSES]
+    open_total = sum(c["amount"] for c in candidates)
+
+    if pending_difference <= epsilon:
+        return {"action": "none", "correctAmount": max(pending_difference, 0), "staleCollectionIds": []}
+
+    over_sized = (open_total - pending_difference) > epsilon
+    prior_capture = summary["paidTotal"] > 0
+
+    if not (over_sized and prior_capture):
+        return {"action": "none", "correctAmount": max(pending_difference, 0), "staleCollectionIds": []}
+
+    if len(candidates) == 1:
+        return {
+            "action": "recreate",
+            "correctAmount": max(pending_difference, 0),
+            "staleCollectionIds": [candidates[0]["id"]],
+        }
+
+    return {
+        "action": "flag",
+        "correctAmount": max(pending_difference, 0),
+        "staleCollectionIds": [c["id"] for c in candidates],
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const OPEN_STATUSES = new Set(["not_paid", "awaiting"]);
+const DEFAULT_EPSILON = 0.01;
+
+export function reconcileOutstandingAmount(summary, openCollections, epsilon = DEFAULT_EPSILON) {
+  const pendingDifference = summary.currentOrderTotal - summary.paidTotal - summary.refundedTotal;
+
+  const candidates = openCollections.filter((c) => OPEN_STATUSES.has(c.status));
+  const openTotal = candidates.reduce((sum, c) => sum + c.amount, 0);
+
+  if (pendingDifference <= epsilon) {
+    return { action: "none", correctAmount: Math.max(pendingDifference, 0), staleCollectionIds: [] };
+  }
+
+  const overSized = openTotal - pendingDifference > epsilon;
+  const priorCapture = summary.paidTotal > 0;
+
+  if (!(overSized && priorCapture)) {
+    return { action: "none", correctAmount: Math.max(pendingDifference, 0), staleCollectionIds: [] };
+  }
+
+  if (candidates.length === 1) {
+    return {
+      action: "recreate",
+      correctAmount: Math.max(pendingDifference, 0),
+      staleCollectionIds: [candidates[0].id],
+    };
+  }
+
+  return {
+    action: "flag",
+    correctAmount: Math.max(pendingDifference, 0),
+    staleCollectionIds: candidates.map((c) => c.id),
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Shape the raw order into what the decision function needs</h3>
+      <p>The Admin API response nests the numbers the decision needs inside <code>summary</code> and inside each <code>payment_collections</code> entry. Flatten that into the plain <code>summary</code> and <code>openCollections</code> shape the pure function expects. Nothing here calls the network, it only reshapes data already in hand.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">shape.py</div>
+      <pre><code class="language-python">def to_decision_input(raw_order):
+    summary = raw_order.get("summary") or {}
+    collections = raw_order.get("payment_collections") or []
+
+    decision_summary = {
+        "currentOrderTotal": summary.get("current_order_total", 0),
+        "paidTotal": summary.get("paid_total", 0),
+        "refundedTotal": summary.get("refunded_total", 0),
+        "transactionTotal": summary.get("transaction_total", 0),
+    }
+    open_collections = [
+        {"id": c.get("id"), "amount": c.get("amount", 0), "status": c.get("status")}
+        for c in collections
+    ]
+
+    return {
+        "id": raw_order.get("id"),
+        "displayId": raw_order.get("display_id"),
+        "summary": decision_summary,
+        "openCollections": open_collections,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">shape.js</div>
+      <pre><code class="language-javascript">function toDecisionInput(rawOrder) {
+  const summary = rawOrder.summary || {};
+  const collections = rawOrder.payment_collections || [];
+
+  const decisionSummary = {
+    currentOrderTotal: summary.current_order_total || 0,
+    paidTotal: summary.paid_total || 0,
+    refundedTotal: summary.refunded_total || 0,
+    transactionTotal: summary.transaction_total || 0,
+  };
+  const openCollections = collections.map((c) => ({
+    id: c.id,
+    amount: c.amount || 0,
+    status: c.status,
+  }));
+
+  return {
+    id: rawOrder.id,
+    displayId: rawOrder.display_id,
+    summary: decisionSummary,
+    openCollections,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop lists orders, shapes each one, runs the decision, and logs the <code>{order_id, old_amount, reconciled_amount, prior_captured_total}</code> triple for anything not clean. When the action is <code>recreate</code> and <code>DRY_RUN=false</code>, it re-fetches <code>pending_difference</code> fresh immediately before writing, to avoid racing a further edit, then cancels the stale collection and creates one sized to that fresh amount. Anything ambiguous stays <code>flag</code> only, for a human.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def cancel_collection(token, collection_id):
+    r = requests.post(
+        f"{BACKEND_URL}/admin/payment-collections/{collection_id}/mark-as-canceled",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def create_collection(token, order_id, amount, currency_code):
+    r = requests.post(
+        f"{BACKEND_URL}/admin/payment-collections",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"order_id": order_id, "amount": amount, "currency_code": currency_code},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def refetch_pending_difference(token, order_id):
+    data = admin_get(token, f"/admin/orders/{order_id}", {"fields": "id,*summary"})
+    return data["order"]["summary"].get("pending_difference", 0)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function cancelCollection(token, collectionId) {
+  const res = await fetch(
+    `${BACKEND_URL}/admin/payment-collections/${collectionId}/mark-as-canceled`,
+    { method: "POST", headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Medusa cancel ${res.status}`);
+  return res.json();
+}
+
+async function createCollection(token, orderId, amount, currencyCode) {
+  const res = await fetch(`${BACKEND_URL}/admin/payment-collections`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ order_id: orderId, amount, currency_code: currencyCode }),
+  });
+  if (!res.ok) throw new Error(`Medusa create-collection ${res.status}`);
+  return res.json();
+}
+
+async function refetchPendingDifference(token, orderId) {
+  const data = await adminGet(token, `/admin/orders/${orderId}`, { fields: "id,*summary" });
+  return data.order.summary.pending_difference || 0;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Leave <code>DRY_RUN=true</code> until you have read the flagged list and trust it. The repair path cancels a live payment collection, which can orphan an in-flight customer payment session, so it only ever runs on an order with exactly one open collection and a prior capture, and it always re-reads <code>pending_difference</code> immediately before writing. Orders with more than one open collection, or with nothing owed, are always left for a human.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists every order with its summary and payment collections, runs the pure reconciliation decision, logs the full before-and-after triple, and only under an explicit flag cancels and recreates the one stale collection on an unambiguous order.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/new-collection-ignores-prior-capture" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_new_collection.py</div>
+      <pre><code class="language-python">"""Flag, and optionally repair, Medusa v2 orders where an order-edit-triggered
+payment collection was sized off the order's current total instead of
+order.summary.pending_difference. createOrderPaymentCollectionWorkflow does not
+net out prior captures recorded in payment_collections and transactions, so a
+partially paid order that gets a price bump ends up with a new collection
+demanding the full new total instead of just what remains outstanding
+(see medusajs/medusa#11591, #10686, #13068). This script is report-only by
+default. Under an explicit DRY_RUN=false, it repairs only unambiguous cases:
+exactly one open collection, a prior capture, and something genuinely owed.
+Safe to run again and again.
+
+Guide: https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_new_collection")
+
+BACKEND_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+ADMIN_EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+ADMIN_PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+OPEN_STATUSES = {"not_paid", "awaiting"}
+DEFAULT_EPSILON = 0.01
+
+ORDER_FIELDS = (
+    "id,display_id,status,*summary,*payment_collections,"
+    "*payment_collections.payments,*transactions"
+)
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def reconcile_outstanding_amount(summary, open_collections, epsilon=DEFAULT_EPSILON):
+    """Pure decision function. No I/O.
+
+    summary: {currentOrderTotal, paidTotal, refundedTotal, transactionTotal}
+    open_collections: [{id, amount, status}]
+
+    Returns {"action": "none" | "flag" | "recreate", "correctAmount", "staleCollectionIds"}.
+    """
+    pending_difference = (
+        summary["currentOrderTotal"] - summary["paidTotal"] - summary["refundedTotal"]
+    )
+
+    candidates = [c for c in open_collections if c["status"] in OPEN_STATUSES]
+    open_total = sum(c["amount"] for c in candidates)
+
+    if pending_difference <= epsilon:
+        return {"action": "none", "correctAmount": max(pending_difference, 0), "staleCollectionIds": []}
+
+    over_sized = (open_total - pending_difference) > epsilon
+    prior_capture = summary["paidTotal"] > 0
+
+    if not (over_sized and prior_capture):
+        return {"action": "none", "correctAmount": max(pending_difference, 0), "staleCollectionIds": []}
+
+    if len(candidates) == 1:
+        return {
+            "action": "recreate",
+            "correctAmount": max(pending_difference, 0),
+            "staleCollectionIds": [candidates[0]["id"]],
+        }
+
+    return {
+        "action": "flag",
+        "correctAmount": max(pending_difference, 0),
+        "staleCollectionIds": [c["id"] for c in candidates],
+    }
+
+
+def to_decision_input(raw_order):
+    summary = raw_order.get("summary") or {}
+    collections = raw_order.get("payment_collections") or []
+
+    decision_summary = {
+        "currentOrderTotal": summary.get("current_order_total", 0),
+        "paidTotal": summary.get("paid_total", 0),
+        "refundedTotal": summary.get("refunded_total", 0),
+        "transactionTotal": summary.get("transaction_total", 0),
+    }
+    open_collections = [
+        {"id": c.get("id"), "amount": c.get("amount", 0), "status": c.get("status")}
+        for c in collections
+    ]
+
+    return {
+        "id": raw_order.get("id"),
+        "displayId": raw_order.get("display_id"),
+        "currencyCode": raw_order.get("currency_code"),
+        "summary": decision_summary,
+        "openCollections": open_collections,
+    }
+
+
+def list_orders_with_collections(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders
+
+
+def refetch_pending_difference(token, order_id):
+    data = admin_get(token, f"/admin/orders/{order_id}", {"fields": "id,*summary"})
+    return data["order"]["summary"].get("pending_difference", 0)
+
+
+def cancel_collection(token, collection_id):
+    r = requests.post(
+        f"{BACKEND_URL}/admin/payment-collections/{collection_id}/mark-as-canceled",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def create_collection(token, order_id, amount, currency_code):
+    r = requests.post(
+        f"{BACKEND_URL}/admin/payment-collections",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"order_id": order_id, "amount": amount, "currency_code": currency_code},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    token = get_admin_token()
+    raw_orders = list_orders_with_collections(token)
+
+    flagged = 0
+    repaired = 0
+    for raw_order in raw_orders:
+        decision_input = to_decision_input(raw_order)
+        outcome = reconcile_outstanding_amount(
+            decision_input["summary"], decision_input["openCollections"]
+        )
+        if outcome["action"] == "none":
+            continue
+
+        old_amount = sum(
+            c["amount"] for c in decision_input["openCollections"] if c["status"] in OPEN_STATUSES
+        )
+        log.warning(
+            "Order %s action=%s old_amount=%s reconciled_amount=%s prior_captured_total=%s "
+            "stale_collection_ids=%s",
+            decision_input["displayId"] or decision_input["id"],
+            outcome["action"], old_amount, outcome["correctAmount"],
+            decision_input["summary"]["paidTotal"], outcome["staleCollectionIds"],
+        )
+        flagged += 1
+
+        if outcome["action"] == "recreate" and not DRY_RUN:
+            fresh_amount = refetch_pending_difference(token, decision_input["id"])
+            cancel_collection(token, outcome["staleCollectionIds"][0])
+            create_collection(
+                token, decision_input["id"], fresh_amount, decision_input["currencyCode"]
+            )
+            repaired += 1
+
+    log.info(
+        "Done. %d order(s) flagged, %d repaired. %s",
+        flagged, repaired,
+        "Dry run, no writes made." if DRY_RUN else "Repairs applied where unambiguous.",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-new-collection.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag, and optionally repair, Medusa v2 orders where an order-edit-triggered
+ * payment collection was sized off the order's current total instead of
+ * order.summary.pending_difference. createOrderPaymentCollectionWorkflow does
+ * not net out prior captures recorded in payment_collections and
+ * transactions, so a partially paid order that gets a price bump ends up with
+ * a new collection demanding the full new total instead of just what remains
+ * outstanding (see medusajs/medusa#11591, #10686, #13068). This script is
+ * report-only by default. Under an explicit DRY_RUN=false, it repairs only
+ * unambiguous cases: exactly one open collection, a prior capture, and
+ * something genuinely owed. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/new-collection-ignores-prior-capture/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const OPEN_STATUSES = new Set(["not_paid", "awaiting"]);
+const DEFAULT_EPSILON = 0.01;
+
+const ORDER_FIELDS =
+  "id,display_id,status,*summary,*payment_collections," +
+  "*payment_collections.payments,*transactions";
+
+export function reconcileOutstandingAmount(summary, openCollections, epsilon = DEFAULT_EPSILON) {
+  // Pure: no I/O. summary = {currentOrderTotal, paidTotal, refundedTotal,
+  // transactionTotal}, openCollections = [{id, amount, status}].
+  const pendingDifference = summary.currentOrderTotal - summary.paidTotal - summary.refundedTotal;
+
+  const candidates = openCollections.filter((c) => OPEN_STATUSES.has(c.status));
+  const openTotal = candidates.reduce((sum, c) => sum + c.amount, 0);
+
+  if (pendingDifference <= epsilon) {
+    return { action: "none", correctAmount: Math.max(pendingDifference, 0), staleCollectionIds: [] };
+  }
+
+  const overSized = openTotal - pendingDifference > epsilon;
+  const priorCapture = summary.paidTotal > 0;
+
+  if (!(overSized && priorCapture)) {
+    return { action: "none", correctAmount: Math.max(pendingDifference, 0), staleCollectionIds: [] };
+  }
+
+  if (candidates.length === 1) {
+    return {
+      action: "recreate",
+      correctAmount: Math.max(pendingDifference, 0),
+      staleCollectionIds: [candidates[0].id],
+    };
+  }
+
+  return {
+    action: "flag",
+    correctAmount: Math.max(pendingDifference, 0),
+    staleCollectionIds: candidates.map((c) => c.id),
+  };
+}
+
+function toDecisionInput(rawOrder) {
+  const summary = rawOrder.summary || {};
+  const collections = rawOrder.payment_collections || [];
+
+  const decisionSummary = {
+    currentOrderTotal: summary.current_order_total || 0,
+    paidTotal: summary.paid_total || 0,
+    refundedTotal: summary.refunded_total || 0,
+    transactionTotal: summary.transaction_total || 0,
+  };
+  const openCollections = collections.map((c) => ({
+    id: c.id,
+    amount: c.amount || 0,
+    status: c.status,
+  }));
+
+  return {
+    id: rawOrder.id,
+    displayId: rawOrder.display_id,
+    currencyCode: rawOrder.currency_code,
+    summary: decisionSummary,
+    openCollections,
+  };
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function listOrdersWithCollections(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}
+
+async function refetchPendingDifference(token, orderId) {
+  const data = await adminGet(token, `/admin/orders/${orderId}`, { fields: "id,*summary" });
+  return data.order.summary.pending_difference || 0;
+}
+
+async function cancelCollection(token, collectionId) {
+  const res = await fetch(
+    `${BACKEND_URL}/admin/payment-collections/${collectionId}/mark-as-canceled`,
+    { method: "POST", headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) throw new Error(`Medusa cancel ${res.status}`);
+  return res.json();
+}
+
+async function createCollection(token, orderId, amount, currencyCode) {
+  const res = await fetch(`${BACKEND_URL}/admin/payment-collections`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ order_id: orderId, amount, currency_code: currencyCode }),
+  });
+  if (!res.ok) throw new Error(`Medusa create-collection ${res.status}`);
+  return res.json();
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const rawOrders = await listOrdersWithCollections(token);
+
+  let flagged = 0;
+  let repaired = 0;
+  for (const rawOrder of rawOrders) {
+    const decisionInput = toDecisionInput(rawOrder);
+    const outcome = reconcileOutstandingAmount(decisionInput.summary, decisionInput.openCollections);
+    if (outcome.action === "none") continue;
+
+    const oldAmount = decisionInput.openCollections
+      .filter((c) => OPEN_STATUSES.has(c.status))
+      .reduce((sum, c) => sum + c.amount, 0);
+    console.warn(
+      `Order ${decisionInput.displayId || decisionInput.id} action=${outcome.action} ` +
+        `old_amount=${oldAmount} reconciled_amount=${outcome.correctAmount} ` +
+        `prior_captured_total=${decisionInput.summary.paidTotal} ` +
+        `stale_collection_ids=${JSON.stringify(outcome.staleCollectionIds)}`
+    );
+    flagged++;
+
+    if (outcome.action === "recreate" && !DRY_RUN) {
+      const freshAmount = await refetchPendingDifference(token, decisionInput.id);
+      await cancelCollection(token, outcome.staleCollectionIds[0]);
+      await createCollection(token, decisionInput.id, freshAmount, decisionInput.currencyCode);
+      repaired++;
+    }
+  }
+
+  console.log(
+    `Done. ${flagged} order(s) flagged, ${repaired} repaired. ` +
+      `${DRY_RUN ? "Dry run, no writes made." : "Repairs applied where unambiguous."}`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The part worth testing is <code>reconcile_outstanding_amount</code>, since it decides which orders get flagged versus repaired. It is pure, plain numbers and arrays in, a decision object out, so the tests need no network and no Medusa instance.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_reconcile_collection.py</div>
+      <pre><code class="language-python">from reconcile_new_collection import reconcile_outstanding_amount
+
+
+def summary(**over):
+    base = {"currentOrderTotal": 120.0, "paidTotal": 100.0, "refundedTotal": 0.0, "transactionTotal": 100.0}
+    base.update(over)
+    return base
+
+
+def test_none_when_nothing_owed():
+    result = reconcile_outstanding_amount(summary(currentOrderTotal=100.0), [])
+    assert result["action"] == "none"
+
+
+def test_none_when_open_collection_matches_pending_difference():
+    # pending_difference = 120 - 100 - 0 = 20, open collection is 20: correct.
+    collections = [{"id": "paycol_1", "amount": 20.0, "status": "not_paid"}]
+    result = reconcile_outstanding_amount(summary(), collections)
+    assert result["action"] == "none"
+
+
+def test_recreate_when_single_open_collection_sized_off_full_total():
+    # pending_difference = 20, but the open collection was created for the full new total 120.
+    collections = [{"id": "paycol_1", "amount": 120.0, "status": "not_paid"}]
+    result = reconcile_outstanding_amount(summary(), collections)
+    assert result["action"] == "recreate"
+    assert result["correctAmount"] == 20.0
+    assert result["staleCollectionIds"] == ["paycol_1"]
+
+
+def test_flag_when_multiple_open_collections_are_ambiguous():
+    collections = [
+        {"id": "paycol_1", "amount": 70.0, "status": "not_paid"},
+        {"id": "paycol_2", "amount": 60.0, "status": "awaiting"},
+    ]
+    result = reconcile_outstanding_amount(summary(), collections)
+    assert result["action"] == "flag"
+    assert set(result["staleCollectionIds"]) == {"paycol_1", "paycol_2"}
+
+
+def test_none_when_no_prior_capture_even_if_over_sized_looking():
+    # A fresh order, nothing paid yet: current total and pending difference are the same,
+    # so a collection at the full total is correct, not a bug.
+    collections = [{"id": "paycol_1", "amount": 120.0, "status": "not_paid"}]
+    result = reconcile_outstanding_amount(
+        summary(currentOrderTotal=120.0, paidTotal=0.0), collections
+    )
+    assert result["action"] == "none"
+
+
+def test_canceled_collections_are_ignored_in_the_open_total():
+    collections = [
+        {"id": "paycol_1", "amount": 120.0, "status": "canceled"},
+        {"id": "paycol_2", "amount": 20.0, "status": "not_paid"},
+    ]
+    result = reconcile_outstanding_amount(summary(), collections)
+    assert result["action"] == "none"
+
+
+def test_rounding_epsilon_does_not_false_positive():
+    collections = [{"id": "paycol_1", "amount": 20.004, "status": "not_paid"}]
+    result = reconcile_outstanding_amount(summary(), collections)
+    assert result["action"] == "none"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { reconcileOutstandingAmount } from "./reconcile-new-collection.js";
+
+const summary = (over = {}) => ({
+  currentOrderTotal: 120.0,
+  paidTotal: 100.0,
+  refundedTotal: 0.0,
+  transactionTotal: 100.0,
+  ...over,
+});
+
+test("none when nothing owed", () => {
+  const result = reconcileOutstandingAmount(summary({ currentOrderTotal: 100.0 }), []);
+  assert.equal(result.action, "none");
+});
+
+test("none when open collection matches pending difference", () => {
+  const collections = [{ id: "paycol_1", amount: 20.0, status: "not_paid" }];
+  const result = reconcileOutstandingAmount(summary(), collections);
+  assert.equal(result.action, "none");
+});
+
+test("recreate when single open collection sized off full total", () => {
+  const collections = [{ id: "paycol_1", amount: 120.0, status: "not_paid" }];
+  const result = reconcileOutstandingAmount(summary(), collections);
+  assert.equal(result.action, "recreate");
+  assert.equal(result.correctAmount, 20.0);
+  assert.deepEqual(result.staleCollectionIds, ["paycol_1"]);
+});
+
+test("flag when multiple open collections are ambiguous", () => {
+  const collections = [
+    { id: "paycol_1", amount: 70.0, status: "not_paid" },
+    { id: "paycol_2", amount: 60.0, status: "awaiting" },
+  ];
+  const result = reconcileOutstandingAmount(summary(), collections);
+  assert.equal(result.action, "flag");
+  assert.deepEqual(new Set(result.staleCollectionIds), new Set(["paycol_1", "paycol_2"]));
+});
+
+test("none when no prior capture even if over-sized looking", () => {
+  const collections = [{ id: "paycol_1", amount: 120.0, status: "not_paid" }];
+  const result = reconcileOutstandingAmount(
+    summary({ currentOrderTotal: 120.0, paidTotal: 0.0 }),
+    collections
+  );
+  assert.equal(result.action, "none");
+});
+
+test("canceled collections are ignored in the open total", () => {
+  const collections = [
+    { id: "paycol_1", amount: 120.0, status: "canceled" },
+    { id: "paycol_2", amount: 20.0, status: "not_paid" },
+  ];
+  const result = reconcileOutstandingAmount(summary(), collections);
+  assert.equal(result.action, "none");
+});
+
+test("rounding epsilon does not false positive", () => {
+  const collections = [{ id: "paycol_1", amount: 20.004, status: "not_paid" }];
+  const result = reconcileOutstandingAmount(summary(), collections);
+  assert.equal(result.action, "none");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Order edit</span>
+      <h4>The support agent who added a rush shipping fee</h4>
+      <p>A customer had already paid in full for their order. Support added a rush shipping fee through an order edit to get it out the door faster, and Medusa opened a new payment collection to cover the increase. The collection showed the entire new total, not the small shipping fee difference, and a different agent nearly asked the customer to pay for the whole order again.</p>
+      <p>Running the reconciliation script against the store's orders flagged it right away: one open collection sized at the full new total, a prior capture already on file, and a <code>pending_difference</code> that was only the shipping fee. The team fixed the one collection by hand before anyone charged the customer twice, and later turned on the guarded auto-repair for the same pattern going forward.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Wholesale</span>
+      <h4>The B2B account with a renegotiated line item</h4>
+      <p>A wholesale buyer had already paid a deposit against a large order. A pricing correction on one line item raised the order total, and the new payment collection Medusa created showed the buyer owing the full corrected total again, not just the gap between the deposit and the new price. Finance flagged it as a serious error and paused the account.</p>
+      <p>The detection script confirmed it in minutes: prior capture equal to the deposit, one open collection sized off the full new total, and <code>pending_difference</code> matching only the renegotiated gap. Finance reconciled the one order manually, and the operator turned the guarded repair on for the rest of that account's backlog once they trusted the flagged list.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this against orders that have both a recent edit and a payment, and every over-sized collection surfaces with the exact old amount, the correctly reconciled amount, and how much was already captured, before anyone gets billed twice or scared by a number that was never really owed. The default stays flag-only. The guarded repair only ever touches the one clean, unambiguous case, and it always re-reads the order's real outstanding balance immediately before writing.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Medusa create a new payment collection for the full order total instead of what is still owed?</summary>
+      <p>When an order edit raises the price and Medusa needs a new payment collection to cover the difference, createOrderPaymentCollectionWorkflow builds the collection's amount from the order's current total rather than from order.summary.pending_difference, which already accounts for what was paid and refunded. The workflow does not query the order's existing payment_collections and transactions to net out prior captures, so on a partially paid order the new collection is sized for the whole new total instead of only the outstanding balance.</p>
+    </details>
+    <details>
+      <summary>How do I detect an order affected by this payment collection bug?</summary>
+      <p>Fetch the order with GET /admin/orders and fields=id,display_id,status,*summary,*payment_collections,*payment_collections.payments,*transactions. Sum the amount of any payment_collections with status not_paid or awaiting into new_collection_total, and compare it against summary.pending_difference. If new_collection_total is greater than pending_difference by more than a cent, and the order already has a payment_collection with status completed or a transaction with reference capture, that combination is the signature of this bug: a prior capture exists and the new open collection was sized off the current total instead of what remains unpaid.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-fix the payment collection once I find a mismatch?</summary>
+      <p>Not by default. Canceling and recreating a live payment collection can orphan an in-flight customer payment session, so the script only flags by default. Under an explicit DRY_RUN=false operator flag, and only when exactly one open collection exists, it cancels the stale one with mark-as-canceled, re-fetches summary.pending_difference fresh to avoid racing further edits, and creates a corrected collection scoped to that amount. Orders with pending_difference at or below zero or with more than one open collection are always left for a human to review.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #11591: Payment Collections Don't Account for Previously Paid Amounts When Creating New Collections. <a href="https://github.com/medusajs/medusa/issues/11591" rel="noopener">github.com/medusajs/medusa/issues/11591</a></li>
+      <li>medusajs/medusa GitHub issue #10686: Incorrect Outstanding amount and Total Pending amounts. <a href="https://github.com/medusajs/medusa/issues/10686" rel="noopener">github.com/medusajs/medusa/issues/10686</a></li>
+      <li>medusajs/medusa GitHub issue #13068: Order Edit after captured payment, incorrect difference. <a href="https://github.com/medusajs/medusa/issues/13068" rel="noopener">github.com/medusajs/medusa/issues/13068</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Retrieve Order Totals Using Query, order.summary and pending_difference. <a href="https://docs.medusajs.com/resources/commerce-modules/order/order-totals" rel="noopener">docs.medusajs.com/resources/commerce-modules/order/order-totals</a></li>
+      <li>Medusa Commerce Modules: Payment Collection. <a href="https://docs.medusajs.com/resources/commerce-modules/payment/payment-collection" rel="noopener">docs.medusajs.com/resources/commerce-modules/payment/payment-collection</a></li>
+      <li>Medusa V2 Admin API Reference. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop a customer from being billed twice?</h3>
+    <p>If this saved you from a duplicate charge or a scary looking balance that was never real, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

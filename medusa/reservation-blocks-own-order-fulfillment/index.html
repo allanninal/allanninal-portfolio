@@ -1,0 +1,1041 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Reservation That Blocks Fulfillment of Its Own Order in Medusa</title>
+<meta name="description" content="An order's own reservation eats all the stock, so the same order that legitimately holds it gets told there is zero available and fulfillment is blocked. Learn why Medusa v2 does this and build a Python or Node.js script that finds and safely clears only the orphaned reservations causing it.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/reservation-blocks-own-order-fulfillment/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Reservation That Blocks Fulfillment of Its Own Order in Medusa">
+<meta property="og:description" content="Why Medusa v2 can block fulfillment of an order whose own reservation ate the last unit of stock, and a safe Python or Node.js script that clears only the orphaned reservations causing the deadlock.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/reservation-blocks-own-order-fulfillment/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/reservation-blocks-own-order-fulfillment/#article","headline":"Fix a Reservation That Blocks Fulfillment of Its Own Order in Medusa","description":"Why Medusa v2 can block fulfillment of an order whose own reservation consumed the last unit of stock, and a safe Python or Node.js script that finds and clears only the orphaned reservations causing the deadlock with the Admin API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/reservation-blocks-own-order-fulfillment/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory & Reservations","keywords":"Medusa reservation, available quantity, reserved_quantity, stocked_quantity, fulfillment blocked, orphaned reservation, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Existing reservation blocks fulfillment of its own order","item":"https://www.allanninal.dev/medusa/reservation-blocks-own-order-fulfillment/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Medusa say an order has zero available stock when it clearly has a reservation?","acceptedAnswer":{"@type":"Answer","text":"Medusa computes available quantity as stocked_quantity minus reserved_quantity for an inventory item at a location. It does not subtract out the reservation belonging to the very order you are trying to fulfill. So once reserved_quantity reaches stocked_quantity on the last unit sold, the admin fulfillment check sees zero available and blocks the order even though its own reservation is the legitimate reason the stock is at zero."}},{"@type":"Question","name":"Is it safe to delete a reservation to unblock fulfillment?","acceptedAnswer":{"@type":"Answer","text":"Only when the reservation is confirmed orphaned: its order was canceled or archived, its order was already fulfilled or shipped so the reservation should have been deleted already, or the order or line item no longer exists. A reservation still tied to an open, unfulfilled order must never be deleted, since that stock is legitimately spoken for."}},{"@type":"Question","name":"What happens when you delete a stuck reservation in Medusa?","acceptedAnswer":{"@type":"Answer","text":"Deleting a reservation through DELETE /admin/reservations/{id} triggers Medusa's inventory workflow to decrement reserved_quantity at the associated location level. That raises stocked_quantity minus reserved_quantity, the available quantity, back above zero, which is what the fulfillment check reads before allowing a fulfillment."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Inventory &amp; Reservations</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory &amp; Reservations</p>
+    <h1>Existing reservation blocks fulfillment of its own order</h1>
+    <p class="lead">A customer buys the last unit of a variant. The order is real, paid, and sitting there waiting to ship. But when staff try to fulfill it, Medusa says there is no available stock, so the fulfillment button is a dead end. The stock is not actually missing. It is held by the order's own reservation, and Medusa's availability check never carves that reservation back out before deciding whether to let the fulfillment through. Here is why that deadlock happens and a small script that finds only the orphaned reservations causing it and clears them safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2 computes an inventory level's available quantity strictly as <code>stocked_quantity</code> minus <code>reserved_quantity</code> for an <code>(inventory_item_id, location_id)</code> pair, and both the admin fulfillment UI and the underlying create-fulfillment checks gate on that number being greater than zero. They do not subtract out the reservation belonging to the very line item or order being fulfilled. So once <code>reserved_quantity</code> reaches <code>stocked_quantity</code>, on the last unit or units sold, the same order that legitimately holds the reservation is told there is zero available and fulfillment is blocked. This gets worse when reservations become orphaned, left behind after an order is canceled or archived, or after a known fulfillment bug fails to delete them, since those stale rows permanently occupy the stock and cause the same deadlock for other, still open orders sharing that inventory item and location. Run a script that scans reservations, resolves each one's order, and deletes only the confirmed orphans. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Availability in Medusa v2 is a subtraction. Every inventory level has a <code>stocked_quantity</code>, the number of units physically on hand at a location, and a <code>reserved_quantity</code>, the number spoken for by orders and carts that have not shipped yet. Available quantity is <code>stocked_quantity</code> minus <code>reserved_quantity</code>, and nothing more nuanced than that.</p>
+  <p>That subtraction has no concept of whose reservation is whose. When the admin fulfillment UI, or the workflow step underneath it, checks whether an item can be fulfilled, it looks at the location's available quantity. It never asks "does this particular order's own reservation account for the shortfall." So when the last unit of a variant sells, <code>reserved_quantity</code> climbs to equal <code>stocked_quantity</code>, available quantity hits zero, and the very order that placed that reservation gets told there is nothing to fulfill it with.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An order reserves the last unit of stock, reserved quantity equals stocked quantity, available quantity becomes zero, and the fulfillment check blocks the very order that holds the reservation.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="170" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Order reserves</text>
+      <text x="95" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">the last unit in stock</text>
+      <line x1="95" y1="86" x2="95" y2="112" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="114" width="230" height="72" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="125" y="140" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">reserved_quantity</text>
+      <text x="125" y="157" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">equals stocked_quantity</text>
+      <text x="125" y="174" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">available quantity is zero</text>
+      <line x1="240" y1="150" x2="282" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="261" y="112" text-anchor="middle" font-family="sans-serif" font-size="21" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="261" y="200" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">check ignores whose reservation</text>
+      <rect x="285" y="118" width="185" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="378" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Fulfillment check</text>
+      <text x="378" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">sees available &lt;= 0</text>
+      <line x1="470" y1="150" x2="512" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="515" y="112" width="150" height="76" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="590" y="140" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Fulfillment blocked</text>
+      <text x="590" y="157" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">on its own order</text>
+      <line x1="665" y1="150" x2="672" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="675" y="112" width="70" height="76" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="710" y="140" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Order</text>
+      <text x="710" y="157" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">cannot</text>
+      <text x="710" y="174" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">ship</text>
+    </svg>
+    <figcaption>The order's own reservation is the reason available quantity hit zero, but the fulfillment check does not know that, so it blocks the order anyway.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The subtraction itself is correct behavior on a healthy store: it is what stops you from overselling. The deadlock shows up because of how it interacts with a few common situations:</p>
+  <ul>
+    <li>An order legitimately sells the last unit or units of a variant at a location. Its own reservation is exactly what pushes <code>reserved_quantity</code> up to <code>stocked_quantity</code>, and nothing in the fulfillment path subtracts that reservation back out before checking availability.</li>
+    <li>An order is canceled or archived, but its reservation is not deleted along with it. GitHub issue #6500 and issue #9821 both describe fulfillment becoming impossible once reservations exhaust available inventory, which matches this exact shape.</li>
+    <li>A fulfillment bug sometimes fails to delete the reservation it should have cleaned up. GitHub issue #11266 documents order fulfillment not deleting inventory item reservations in some cases, which leaves the row behind to desync with reality.</li>
+    <li>Once an orphaned reservation exists, it permanently occupies part of the stock buffer. It silently blocks fulfillment for any other, still open order that shares the same inventory item and location, not just the order it was originally tied to.</li>
+  </ul>
+  <p>The common thread is that Medusa's admin UI and create-fulfillment checks read a single aggregate number, available quantity at a location, and never ask which reservation is whose. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A reservation is only safe to delete once you know it is not backing a real, still open order. That means resolving every reservation's <code>line_item_id</code> against its actual order and checking that order's status and fulfillment status. If the order was canceled or archived, or if it is already fulfilled or shipped and the reservation should have been cleaned up but was not, the reservation is an orphan. Anything tied to an open, unfulfilled order must be left alone, even if its inventory level shows <code>reserved_quantity</code> equal to <code>stocked_quantity</code>, because that is exactly what a legitimate last-unit sale looks like. In that case the fix is not to delete anything, it is to flag the order for a human to review.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch live checkouts and we never bump stock or force a fulfillment on someone's behalf. The job lists reservations, resolves each one's order, runs a pure decision function to classify it, and only deletes the ones confirmed as orphans. Anything still tied to an open order gets reported for manual review, not auto-fixed.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists reservations, resolves each one's order, classifies it with a pure function as keep, manual keep, or one of three orphan reasons, then either deletes the orphan when dry run is off or reports the order for manual review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List reservations</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">id, line_item_id, quantity</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Resolve each order</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">status, fulfillment_status</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pure decision fn</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">classifyReservation</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Confirmed</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">orphan?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, dry run off</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">no, keep</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="610" y="185" width="140" height="55" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="680" y="205" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Kept, or flagged</text>
+      <text x="680" y="222" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">for manual review</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">DELETE reservation</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">reserved_quantity drops</text>
+    </svg>
+    <figcaption>Only a confirmed orphan is ever deleted. A reservation still tied to an open order, even one stuck at reserved equal to stocked, is flagged for a human, never auto-fixed.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. Keep the backend URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List reservations and expand each one's order</h3>
+      <p>Ask for every reservation with <code>id</code>, <code>quantity</code>, <code>line_item_id</code>, <code>inventory_item_id</code>, <code>location_id</code>, and <code>created_at</code>, paginating with <code>limit</code> and <code>offset</code>. For any reservation with a <code>line_item_id</code>, expand <code>*line_item.order</code> so you get the order's <code>status</code> and <code>fulfillment_status</code> in the same call. A reservation with no <code>line_item_id</code> is a manual or custom reservation and is skipped entirely.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_reservations(token):
+    reservations = []
+    offset = 0
+    limit = 200
+    while True:
+        data = admin_get(token, "/admin/reservations", {
+            "fields": "id,quantity,line_item_id,inventory_item_id,location_id,created_at,*line_item.order",
+            "limit": limit,
+            "offset": offset,
+        })
+        reservations.extend(data["reservations"])
+        offset += limit
+        if offset &gt;= data["count"]:
+            return reservations</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL;
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function listReservations(token) {
+  const reservations = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const data = await adminGet(token, "/admin/reservations", {
+      fields: "id,quantity,line_item_id,inventory_item_id,location_id,created_at,*line_item.order",
+      limit,
+      offset,
+    });
+    reservations.push(...data.reservations);
+    offset += limit;
+    if (offset &gt;= data.count) return reservations;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the classification in its own function that takes the reservation, the resolved order info, and the inventory level rows for that location, and returns a plain answer. It never touches the network, so it is trivial to unit test with fixture data. A reservation with no <code>line_item_id</code> is always <code>manual_keep</code>. One whose order or line item cannot be resolved at all is <code>orphan_missing_order</code>. One whose order is <code>canceled</code> or <code>archived</code> is <code>orphan_canceled_order</code>. One whose order is already <code>fulfilled</code>, <code>shipped</code>, or <code>delivered</code>, meaning fulfillment should have deleted this reservation already, is <code>orphan_already_fulfilled</code>. Everything else, a reservation legitimately backing an open, unfulfilled order, is <code>keep</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">ORPHAN_ORDER_STATUSES = {"canceled", "archived"}
+ALREADY_FULFILLED_STATUSES = {"fulfilled", "shipped", "delivered"}
+
+def classify_reservation(reservation, order_info, levels):
+    """Pure decision function. No I/O.
+
+    reservation: {"id": str, "line_item_id": str | None, "quantity": int, "location_id": str}
+    order_info: {"exists": bool, "status": str | None, "fulfillment_status": str | None} | None
+    levels: [{"location_id": str, "stocked_quantity": int, "reserved_quantity": int}, ...]
+
+    Returns "keep" | "orphan_canceled_order" | "orphan_missing_order"
+          | "orphan_already_fulfilled" | "manual_keep".
+    """
+    if not reservation.get("line_item_id"):
+        return "manual_keep"
+
+    if order_info is None or not order_info.get("exists"):
+        return "orphan_missing_order"
+
+    if order_info.get("status") in ORPHAN_ORDER_STATUSES:
+        return "orphan_canceled_order"
+
+    if order_info.get("fulfillment_status") in ALREADY_FULFILLED_STATUSES:
+        return "orphan_already_fulfilled"
+
+    return "keep"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const ORPHAN_ORDER_STATUSES = new Set(["canceled", "archived"]);
+const ALREADY_FULFILLED_STATUSES = new Set(["fulfilled", "shipped", "delivered"]);
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, line_item_id: string | null, quantity: number, location_id: string }} reservation
+ * @param {{ exists: boolean, status?: string, fulfillment_status?: string } | null} orderInfo
+ * @param {{ location_id: string, stocked_quantity: number, reserved_quantity: number }[]} levels
+ * @returns {"keep" | "orphan_canceled_order" | "orphan_missing_order" | "orphan_already_fulfilled" | "manual_keep"}
+ */
+export function classifyReservation(reservation, orderInfo, levels) {
+  if (!reservation.line_item_id) return "manual_keep";
+
+  if (!orderInfo || !orderInfo.exists) return "orphan_missing_order";
+
+  if (ORPHAN_ORDER_STATUSES.has(orderInfo.status)) return "orphan_canceled_order";
+
+  if (ALREADY_FULFILLED_STATUSES.has(orderInfo.fulfillment_status)) return "orphan_already_fulfilled";
+
+  return "keep";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Confirm the stuck signature before repair</h3>
+      <p>Before deleting anything, cross-check the flagged reservation's <code>inventory_item_id</code> against <code>GET /admin/inventory-items/{id}/location-levels</code> to confirm <code>reserved_quantity</code> equals <code>stocked_quantity</code> at that <code>location_id</code>. That is the "stuck" signature the issue describes: the orphan is silently consuming the entire stock buffer and blocking fulfillment of legitimate, still open orders sharing that inventory item and location.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def get_location_levels(token, inventory_item_id):
+    data = admin_get(token, f"/admin/inventory-items/{inventory_item_id}/location-levels")
+    return data.get("inventory_levels") or []
+
+def is_stuck_level(levels, location_id):
+    for level in levels:
+        if level["location_id"] == location_id:
+            return level["reserved_quantity"] == level["stocked_quantity"]
+    return False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function getLocationLevels(token, inventoryItemId) {
+  const data = await adminGet(token, `/admin/inventory-items/${inventoryItemId}/location-levels`);
+  return data.inventory_levels || [];
+}
+
+function isStuckLevel(levels, locationId) {
+  const level = levels.find((l) =&gt; l.location_id === locationId);
+  return level ? level.reserved_quantity === level.stocked_quantity : false;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Delete only the confirmed orphans, dry run guarded</h3>
+      <p>When a reservation is classified as <code>orphan_canceled_order</code>, <code>orphan_missing_order</code>, or <code>orphan_already_fulfilled</code>, call <code>DELETE /admin/reservations/{id}</code>. That triggers Medusa's inventory workflow to decrement <code>reserved_quantity</code> at the associated location level, freeing capacity so available quantity rises above zero again. A reservation classified as <code>keep</code> or <code>manual_keep</code> is never touched. If one of those still shows <code>reserved_quantity</code> equal to <code>stocked_quantity</code>, report the order for manual review instead of writing anything, since bumping stock or force-creating a fulfillment on someone's behalf is a financial decision, not a safe automated write.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">ORPHAN_OUTCOMES = {"orphan_canceled_order", "orphan_missing_order", "orphan_already_fulfilled"}
+
+def admin_delete(token, path):
+    r = requests.delete(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def delete_reservation(token, reservation_id):
+    return admin_delete(token, f"/admin/reservations/{reservation_id}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">const ORPHAN_OUTCOMES = new Set(["orphan_canceled_order", "orphan_missing_order", "orphan_already_fulfilled"]);
+
+async function adminDelete(token, path) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on DELETE ${path}`);
+  return res.json();
+}
+
+async function deleteReservation(token, reservationId) {
+  return adminDelete(token, `/admin/reservations/${reservationId}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only logs the <code>{id, inventory_item_id, location_id, quantity, reason}</code> tuples it would delete, along with the pre and post <code>reserved_quantity</code> that would result. Read the output, agree with it, then switch it off to let it write. Keep or manual_keep reservations that still show a stuck level get printed as a manual review list, never auto-fixed.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never delete a reservation classified as <code>keep</code> or <code>manual_keep</code>. If one of those still shows <code>reserved_quantity</code> equal to <code>stocked_quantity</code>, that is a real order waiting on stock, and the fix is a human decision, either expedite restock or contact the customer, not a script bumping numbers.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever deletes a reservation confirmed as an orphan, never one still backing an open order.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/reservation-blocks-own-order-fulfillment" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">clear_blocking_reservations.py</div>
+      <pre><code class="language-python">"""Clear Medusa reservations that block fulfillment of their own order.
+
+Medusa v2 computes an inventory level's available quantity as stocked_quantity
+minus reserved_quantity, and the admin fulfillment checks gate on that number
+being above zero. They never subtract out the reservation belonging to the
+order being fulfilled, so once reserved_quantity reaches stocked_quantity on
+the last unit sold, the very order that holds the reservation is told there is
+zero available. This is worse when reservations are orphaned: left behind
+after an order is canceled or archived, or after a fulfillment bug fails to
+delete them. This scans reservations, resolves each one's order, and deletes
+only the ones confirmed orphaned. Anything tied to an open order is left
+alone and, if stuck, reported for manual review.
+Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("clear_blocking_reservations")
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ORPHAN_ORDER_STATUSES = {"canceled", "archived"}
+ALREADY_FULFILLED_STATUSES = {"fulfilled", "shipped", "delivered"}
+ORPHAN_OUTCOMES = {"orphan_canceled_order", "orphan_missing_order", "orphan_already_fulfilled"}
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_delete(token, path):
+    r = requests.delete(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def classify_reservation(reservation, order_info, levels):
+    """Pure decision function. No I/O.
+
+    reservation: {"id": str, "line_item_id": str | None, "quantity": int, "location_id": str}
+    order_info: {"exists": bool, "status": str | None, "fulfillment_status": str | None} | None
+    levels: [{"location_id": str, "stocked_quantity": int, "reserved_quantity": int}, ...]
+
+    Returns "keep" | "orphan_canceled_order" | "orphan_missing_order"
+          | "orphan_already_fulfilled" | "manual_keep".
+    """
+    if not reservation.get("line_item_id"):
+        return "manual_keep"
+
+    if order_info is None or not order_info.get("exists"):
+        return "orphan_missing_order"
+
+    if order_info.get("status") in ORPHAN_ORDER_STATUSES:
+        return "orphan_canceled_order"
+
+    if order_info.get("fulfillment_status") in ALREADY_FULFILLED_STATUSES:
+        return "orphan_already_fulfilled"
+
+    return "keep"
+
+
+def list_reservations(token):
+    reservations = []
+    offset = 0
+    limit = 200
+    while True:
+        data = admin_get(token, "/admin/reservations", {
+            "fields": "id,quantity,line_item_id,inventory_item_id,location_id,created_at,*line_item.order",
+            "limit": limit,
+            "offset": offset,
+        })
+        reservations.extend(data["reservations"])
+        offset += limit
+        if offset &gt;= data["count"]:
+            return reservations
+
+
+def resolve_order_info(reservation):
+    """Turns the expanded *line_item.order payload into order_info, or None if missing."""
+    line_item = reservation.get("line_item")
+    if not line_item:
+        return None
+    order = line_item.get("order")
+    if not order:
+        return None
+    return {
+        "exists": True,
+        "status": order.get("status"),
+        "fulfillment_status": order.get("fulfillment_status"),
+    }
+
+
+def get_location_levels(token, inventory_item_id):
+    data = admin_get(token, f"/admin/inventory-items/{inventory_item_id}/location-levels")
+    return data.get("inventory_levels") or []
+
+
+def find_level(levels, location_id):
+    for level in levels:
+        if level["location_id"] == location_id:
+            return level
+    return None
+
+
+def run():
+    token = get_admin_token()
+    reservations = list_reservations(token)
+
+    cleared = 0
+    flagged_for_review = 0
+    for reservation in reservations:
+        if not reservation.get("line_item_id"):
+            continue  # manual_keep, never touched
+
+        order_info = resolve_order_info(reservation)
+        levels = get_location_levels(token, reservation["inventory_item_id"])
+        outcome = classify_reservation(reservation, order_info, levels)
+
+        if outcome == "keep":
+            level = find_level(levels, reservation["location_id"])
+            if level and level["reserved_quantity"] == level["stocked_quantity"]:
+                order_id = (reservation.get("line_item") or {}).get("order", {}).get("id")
+                log.warning(
+                    "Order %s: reservation %s keeps reserved_quantity == stocked_quantity "
+                    "at location %s. Flagging for manual review, not touching stock or fulfillment.",
+                    order_id, reservation["id"], reservation["location_id"],
+                )
+                flagged_for_review += 1
+            continue
+
+        if outcome not in ORPHAN_OUTCOMES:
+            continue
+
+        level = find_level(levels, reservation["location_id"])
+        before_reserved = level["reserved_quantity"] if level else None
+        stocked = level["stocked_quantity"] if level else None
+        after_reserved = (before_reserved - reservation["quantity"]) if before_reserved is not None else None
+
+        log.warning(
+            "Reservation %s classified as %s. inventory_item_id=%s location_id=%s quantity=%s "
+            "reserved_quantity %s -&gt; %s (stocked_quantity=%s). %s",
+            reservation["id"], outcome, reservation["inventory_item_id"], reservation["location_id"],
+            reservation["quantity"], before_reserved, after_reserved, stocked,
+            "Would delete" if DRY_RUN else "Deleting",
+        )
+
+        if not DRY_RUN:
+            admin_delete(token, f"/admin/reservations/{reservation['id']}")
+
+        cleared += 1
+
+    log.info(
+        "Done. %d orphaned reservation(s) %s. %d order(s) flagged for manual review.",
+        cleared, "to clear" if DRY_RUN else "cleared", flagged_for_review,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">clear-blocking-reservations.js</div>
+      <pre><code class="language-javascript">/**
+ * Clear Medusa reservations that block fulfillment of their own order.
+ *
+ * Medusa v2 computes an inventory level's available quantity as stocked_quantity
+ * minus reserved_quantity, and the admin fulfillment checks gate on that number
+ * being above zero. They never subtract out the reservation belonging to the
+ * order being fulfilled, so once reserved_quantity reaches stocked_quantity on
+ * the last unit sold, the very order that holds the reservation is told there is
+ * zero available. This is worse when reservations are orphaned: left behind
+ * after an order is canceled or archived, or after a fulfillment bug fails to
+ * delete them. This scans reservations, resolves each one's order, and deletes
+ * only the ones confirmed orphaned. Anything tied to an open order is left
+ * alone and, if stuck, reported for manual review.
+ * Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/reservation-blocks-own-order-fulfillment/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const ORPHAN_ORDER_STATUSES = new Set(["canceled", "archived"]);
+const ALREADY_FULFILLED_STATUSES = new Set(["fulfilled", "shipped", "delivered"]);
+const ORPHAN_OUTCOMES = new Set(["orphan_canceled_order", "orphan_missing_order", "orphan_already_fulfilled"]);
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, line_item_id: string | null, quantity: number, location_id: string }} reservation
+ * @param {{ exists: boolean, status?: string, fulfillment_status?: string } | null} orderInfo
+ * @param {{ location_id: string, stocked_quantity: number, reserved_quantity: number }[]} levels
+ * @returns {"keep" | "orphan_canceled_order" | "orphan_missing_order" | "orphan_already_fulfilled" | "manual_keep"}
+ */
+export function classifyReservation(reservation, orderInfo, levels) {
+  if (!reservation.line_item_id) return "manual_keep";
+
+  if (!orderInfo || !orderInfo.exists) return "orphan_missing_order";
+
+  if (ORPHAN_ORDER_STATUSES.has(orderInfo.status)) return "orphan_canceled_order";
+
+  if (ALREADY_FULFILLED_STATUSES.has(orderInfo.fulfillment_status)) return "orphan_already_fulfilled";
+
+  return "keep";
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function adminDelete(token, path) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on DELETE ${path}`);
+  return res.json();
+}
+
+async function listReservations(token) {
+  const reservations = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const data = await adminGet(token, "/admin/reservations", {
+      fields: "id,quantity,line_item_id,inventory_item_id,location_id,created_at,*line_item.order",
+      limit,
+      offset,
+    });
+    reservations.push(...data.reservations);
+    offset += limit;
+    if (offset &gt;= data.count) return reservations;
+  }
+}
+
+function resolveOrderInfo(reservation) {
+  const lineItem = reservation.line_item;
+  if (!lineItem) return null;
+  const order = lineItem.order;
+  if (!order) return null;
+  return {
+    exists: true,
+    status: order.status,
+    fulfillment_status: order.fulfillment_status,
+  };
+}
+
+async function getLocationLevels(token, inventoryItemId) {
+  const data = await adminGet(token, `/admin/inventory-items/${inventoryItemId}/location-levels`);
+  return data.inventory_levels || [];
+}
+
+function findLevel(levels, locationId) {
+  return levels.find((l) =&gt; l.location_id === locationId) || null;
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const reservations = await listReservations(token);
+
+  let cleared = 0;
+  let flaggedForReview = 0;
+  for (const reservation of reservations) {
+    if (!reservation.line_item_id) continue; // manual_keep, never touched
+
+    const orderInfo = resolveOrderInfo(reservation);
+    const levels = await getLocationLevels(token, reservation.inventory_item_id);
+    const outcome = classifyReservation(reservation, orderInfo, levels);
+
+    if (outcome === "keep") {
+      const level = findLevel(levels, reservation.location_id);
+      if (level &amp;&amp; level.reserved_quantity === level.stocked_quantity) {
+        const orderId = reservation.line_item?.order?.id;
+        console.warn(
+          `Order ${orderId}: reservation ${reservation.id} keeps reserved_quantity == stocked_quantity ` +
+          `at location ${reservation.location_id}. Flagging for manual review, not touching stock or fulfillment.`
+        );
+        flaggedForReview++;
+      }
+      continue;
+    }
+
+    if (!ORPHAN_OUTCOMES.has(outcome)) continue;
+
+    const level = findLevel(levels, reservation.location_id);
+    const beforeReserved = level ? level.reserved_quantity : undefined;
+    const stocked = level ? level.stocked_quantity : undefined;
+    const afterReserved = beforeReserved !== undefined ? beforeReserved - reservation.quantity : undefined;
+
+    console.warn(
+      `Reservation ${reservation.id} classified as ${outcome}. inventory_item_id=${reservation.inventory_item_id} ` +
+      `location_id=${reservation.location_id} quantity=${reservation.quantity} ` +
+      `reserved_quantity ${beforeReserved} -&gt; ${afterReserved} (stocked_quantity=${stocked}). ` +
+      `${DRY_RUN ? "Would delete" : "Deleting"}`
+    );
+
+    if (!DRY_RUN) {
+      await adminDelete(token, `/admin/reservations/${reservation.id}`);
+    }
+
+    cleared++;
+  }
+
+  console.log(
+    `Done. ${cleared} orphaned reservation(s) ${DRY_RUN ? "to clear" : "cleared"}. ` +
+    `${flaggedForReview} order(s) flagged for manual review.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>classify_reservation</code> is the part most worth testing, because it decides which reservations are safe to delete. It is pure, so the test needs no network and no Medusa backend. It just feeds in plain data structures and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_reservation_blocks_fulfillment.py</div>
+      <pre><code class="language-python">from clear_blocking_reservations import classify_reservation
+
+LEVELS = [{"location_id": "sloc_1", "stocked_quantity": 1, "reserved_quantity": 1}]
+
+
+def reservation(**over):
+    base = {"id": "res_1", "line_item_id": "item_1", "quantity": 1, "location_id": "sloc_1"}
+    base.update(over)
+    return base
+
+
+def test_manual_keep_when_no_line_item_id():
+    r = reservation(line_item_id=None)
+    assert classify_reservation(r, None, LEVELS) == "manual_keep"
+
+
+def test_orphan_missing_order_when_order_info_is_none():
+    r = reservation()
+    assert classify_reservation(r, None, LEVELS) == "orphan_missing_order"
+
+
+def test_orphan_missing_order_when_order_does_not_exist():
+    r = reservation()
+    order_info = {"exists": False}
+    assert classify_reservation(r, order_info, LEVELS) == "orphan_missing_order"
+
+
+def test_orphan_canceled_order():
+    r = reservation()
+    order_info = {"exists": True, "status": "canceled", "fulfillment_status": "not_fulfilled"}
+    assert classify_reservation(r, order_info, LEVELS) == "orphan_canceled_order"
+
+
+def test_orphan_archived_order():
+    r = reservation()
+    order_info = {"exists": True, "status": "archived", "fulfillment_status": "not_fulfilled"}
+    assert classify_reservation(r, order_info, LEVELS) == "orphan_canceled_order"
+
+
+def test_orphan_already_fulfilled():
+    r = reservation()
+    order_info = {"exists": True, "status": "completed", "fulfillment_status": "fulfilled"}
+    assert classify_reservation(r, order_info, LEVELS) == "orphan_already_fulfilled"
+
+
+def test_orphan_already_shipped():
+    r = reservation()
+    order_info = {"exists": True, "status": "completed", "fulfillment_status": "shipped"}
+    assert classify_reservation(r, order_info, LEVELS) == "orphan_already_fulfilled"
+
+
+def test_keep_when_order_is_open_and_unfulfilled():
+    r = reservation()
+    order_info = {"exists": True, "status": "pending", "fulfillment_status": "not_fulfilled"}
+    assert classify_reservation(r, order_info, LEVELS) == "keep"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reservation-blocks-fulfillment.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyReservation } from "./clear-blocking-reservations.js";
+
+const LEVELS = [{ location_id: "sloc_1", stocked_quantity: 1, reserved_quantity: 1 }];
+
+const reservation = (over = {}) =&gt; ({
+  id: "res_1",
+  line_item_id: "item_1",
+  quantity: 1,
+  location_id: "sloc_1",
+  ...over,
+});
+
+test("manual_keep when no line_item_id", () =&gt; {
+  const r = reservation({ line_item_id: null });
+  assert.equal(classifyReservation(r, null, LEVELS), "manual_keep");
+});
+
+test("orphan_missing_order when order info is null", () =&gt; {
+  const r = reservation();
+  assert.equal(classifyReservation(r, null, LEVELS), "orphan_missing_order");
+});
+
+test("orphan_missing_order when order does not exist", () =&gt; {
+  const r = reservation();
+  assert.equal(classifyReservation(r, { exists: false }, LEVELS), "orphan_missing_order");
+});
+
+test("orphan_canceled_order", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "canceled", fulfillment_status: "not_fulfilled" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "orphan_canceled_order");
+});
+
+test("orphan_archived_order", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "archived", fulfillment_status: "not_fulfilled" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "orphan_canceled_order");
+});
+
+test("orphan_already_fulfilled", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "completed", fulfillment_status: "fulfilled" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "orphan_already_fulfilled");
+});
+
+test("orphan_already_shipped", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "completed", fulfillment_status: "shipped" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "orphan_already_fulfilled");
+});
+
+test("orphan_already_delivered", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "completed", fulfillment_status: "delivered" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "orphan_already_fulfilled");
+});
+
+test("keep when order is open and unfulfilled", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "pending", fulfillment_status: "not_fulfilled" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "keep");
+});
+
+test("keep when order is completed but not yet fulfilled", () =&gt; {
+  const r = reservation();
+  const orderInfo = { exists: true, status: "completed", fulfillment_status: "not_fulfilled" };
+  assert.equal(classifyReservation(r, orderInfo, LEVELS), "keep");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Last unit sold</span>
+      <h4>A single order deadlocked on its own stock</h4>
+      <p>A small apparel brand sold the very last unit of a limited colorway. The order was paid, the warehouse had the item in hand, but the fulfillment button in the admin was greyed out with zero available stock showing. Staff assumed the inventory count was wrong and spent an hour trying to correct <code>stocked_quantity</code> before realizing the number was accurate, it was the check that was the problem.</p>
+      <p>Running the classifier in dry run showed that reservation as <code>keep</code>, correctly tied to an open, unfulfilled order, with <code>reserved_quantity</code> equal to <code>stocked_quantity</code> at that location. The script flagged it for manual review instead of deleting anything. The team understood the deadlock was expected for a legitimate last-unit sale and fulfilled the order directly through the workflow that bypasses the availability gate, rather than touching stock numbers.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Orphaned after cancellation</span>
+      <h4>A cancelled order kept blocking a different customer's fulfillment</h4>
+      <p>An order for the last two units of a SKU was canceled during a support call, but its reservation was never cleaned up. Weeks later, a different customer ordered the same SKU after a restock, and that new order's fulfillment was blocked because the old, canceled order's reservation was still eating the stock at that location.</p>
+      <p>The scan resolved the stale reservation's line item back to the canceled order and classified it <code>orphan_canceled_order</code>. Deleting it dropped <code>reserved_quantity</code> back down, and the new customer's order fulfilled normally on the very next check, with no changes to <code>stocked_quantity</code> or any fulfillment created on anyone's behalf.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a deadlock caused by a genuinely orphaned reservation clears itself before anyone notices, and available quantity goes back to reflecting stock a real order can still claim. A legitimate last-unit sale that shows the same reserved-equals-stocked signature is never touched automatically. It is surfaced to a human, because deciding to bump stock or push a fulfillment through by hand is a financial call the script should never make for you.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Medusa say an order has zero available stock when it clearly has a reservation?</summary>
+      <p>Medusa computes available quantity as stocked_quantity minus reserved_quantity for an inventory item at a location. It does not subtract out the reservation belonging to the very order you are trying to fulfill. So once reserved_quantity reaches stocked_quantity on the last unit sold, the admin fulfillment check sees zero available and blocks the order even though its own reservation is the legitimate reason the stock is at zero.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete a reservation to unblock fulfillment?</summary>
+      <p>Only when the reservation is confirmed orphaned: its order was canceled or archived, its order was already fulfilled or shipped so the reservation should have been deleted already, or the order or line item no longer exists. A reservation still tied to an open, unfulfilled order must never be deleted, since that stock is legitimately spoken for.</p>
+    </details>
+    <details>
+      <summary>What happens when you delete a stuck reservation in Medusa?</summary>
+      <p>Deleting a reservation through DELETE /admin/reservations/{id} triggers Medusa's inventory workflow to decrement reserved_quantity at the associated location level. That raises stocked_quantity minus reserved_quantity, the available quantity, back above zero, which is what the fulfillment check reads before allowing a fulfillment.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Unable to Fulfill Orders When Reservations Exhaust Available Inventory. Medusa GitHub Issue #6500. <a href="https://github.com/medusajs/medusa/issues/6500" rel="noopener">github.com/medusajs/medusa/issues/6500</a></li>
+      <li>Fulfilment no longer possible when all items have been reserved. Medusa GitHub Issue #9821. <a href="https://github.com/medusajs/medusa/issues/9821" rel="noopener">github.com/medusajs/medusa/issues/9821</a></li>
+      <li>Order fulfillment is not deleting inventory item reservations sometimes. Medusa GitHub Issue #11266. <a href="https://github.com/medusajs/medusa/issues/11266" rel="noopener">github.com/medusajs/medusa/issues/11266</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Inventory Module Concepts, stocked_quantity and reserved_quantity. <a href="https://docs.medusajs.com/resources/commerce-modules/inventory/concepts" rel="noopener">docs.medusajs.com/resources/commerce-modules/inventory/concepts</a></li>
+      <li>Medusa Admin User Guide: Manage Reservations. <a href="https://docs.medusajs.com/user-guide/inventory/reservations" rel="noopener">docs.medusajs.com/user-guide/inventory/reservations</a></li>
+      <li>Medusa V2 Admin API Reference: Reservations and Inventory Items. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa storefront access, pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this unblock your fulfillment?</h3>
+    <p>If this saved you from a phantom out of stock item or a support ticket about an order that would not ship, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

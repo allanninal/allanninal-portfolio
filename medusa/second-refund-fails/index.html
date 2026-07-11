@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Only One Refund Per Order Ever Succeeding in Medusa</title>
+<meta name="description" content="The first refund on a Medusa v2 order works, but every refund after that fails with Order does not have an outstanding balance to refund, even though the payment still has money left to give back. Learn why the validate-refund-step checks the wrong number and build a Python or Node.js script that finds the shortfall safely.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/second-refund-fails/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Only One Refund Per Order Ever Succeeding in Medusa">
+<meta property="og:description" content="Why validate-refund-step rejects every refund after the first on a Medusa v2 order, and a safe Python or Node.js script that finds the true shortfall on each payment.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/second-refund-fails/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/second-refund-fails/#article","headline":"Fix Only One Refund Per Order Ever Succeeding in Medusa","description":"Why validate-refund-step in Medusa v2's refund-payment workflow checks the order's cached balance instead of the payment's own captures and refunds, so a second refund on the same order or payment is rejected even when money is still owed, and a safe Python or Node.js script that finds the true shortfall.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/second-refund-fails/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments and refunds","keywords":"Medusa second refund fails, Order does not have an outstanding balance to refund, validate-refund-step, refundPaymentsWorkflow, pending_difference, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Only one refund per order or payment ever succeeds","item":"https://www.allanninal.dev/medusa/second-refund-fails/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my second refund on a Medusa order fail?","acceptedAnswer":{"@type":"Answer","text":"The refund-payment workflow's validate-refund-step historically checked the order's cached summary.pending_difference instead of re-summing that specific payment's captures minus its existing refunds. The first refund correctly zeroes or flips the sign of the order-level balance, so every refund attempt after that throws Order does not have an outstanding balance to refund, even though the payment itself may still have money left to give back."}},{"@type":"Question","name":"Is it safe to fire the missing refund automatically?","acceptedAnswer":{"@type":"Answer","text":"Not blindly. A refund is a real settlement with a payment provider, so the script only computes and logs the shortfall by default under DRY_RUN. It calls POST /admin/payments/{payment_id}/refund for real only when DRY_RUN is false and a human has approved the flagged list, and only after confirming the store is running a Medusa version that includes the PR 11832 fix, since an unpatched store rejects the corrective refund with the same validation error."}},{"@type":"Question","name":"How do I detect an order that silently blocked a second refund?","acceptedAnswer":{"@type":"Answer","text":"For each payment, sum captures[].raw_amount and refunds[].raw_amount yourself, independent of order.summary. If capturedTotal minus refundedTotal is greater than zero, the payment still has refundable headroom. If at the same time the order's own pending_difference already reads zero or negative, that mismatch is the signature of a silently rejected second refund, because the order-level check will reject a legitimate refund that the payment itself can still afford."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Payments &amp; Refunds</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Payments &amp; Refunds</p>
+    <h1>Only one refund per order or payment ever succeeds</h1>
+    <p class="lead">A customer needs two partial refunds on the same order. The first one works fine. The second one, on the same order, sometimes even on the same payment, comes back with "Order does not have an outstanding balance to refund." The payment provider still shows money that could be returned. The customer is still owed it. But Medusa refuses to let anyone touch that payment again. Here is why the refund workflow checks the wrong number, and a small script that finds every order this happened to and tells you exactly how much is still owed.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2's refund workflow historically validated a refund request against the order's cached <code>summary.pending_difference</code>, the order-level outstanding balance, instead of re-summing that specific payment's actual captures minus its existing refunds. The first refund on an order correctly zeroes out or flips the sign of that order-level balance, so <code>validate-refund-step</code> in the refund-payment workflow throws on every refund attempt after that, even though the payment itself still has capturable or refundable amount left. Run a script that, for each payment, independently sums <code>captures[].raw_amount</code> and <code>refunds[].raw_amount</code>, computes the true shortfall, and flags every order where that shortfall is real but the order's own balance already reads zero. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>An order in Medusa v2 carries a cached number, <code>summary.pending_difference</code>, that is meant to answer one question: how much money is still owed back and forth on this order. The admin trusts that number to decide whether the Refund button should even work. So does the refund-payment workflow itself, through a step called <code>validate-refund-step</code>.</p>
+  <p>That would be fine if the number tracked reality perfectly. It does not always. The order-level balance is computed once, at the order's scope, not per payment. When you issue the first refund, Medusa correctly updates that order-level number, often all the way to zero, because from the order's point of view the outstanding difference has been settled. But a payment can have multiple captures, and a payment can be refunded more than once, in pieces, over time. The order's single cached number cannot represent "this specific payment still has forty dollars of headroom" once the order-level math has already called the account even.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. The first refund on an order succeeds and zeroes the order's cached pending difference. A second refund attempt on the same payment is then rejected by validate-refund-step because it checks the stale order-level balance instead of the payment's own captures minus refunds, even though the payment still has refundable amount left.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="170" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">First refund</text>
+      <text x="95" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">succeeds normally</text>
+      <line x1="180" y1="53" x2="222" y2="53" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="225" y="20" width="200" height="66" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="325" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Order balance zeroed</text>
+      <text x="325" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">summary.pending_difference = 0</text>
+      <line x1="325" y1="86" x2="325" y2="118" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="215" y="120" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="325" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Payment still has headroom</text>
+      <text x="325" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">captures &#8211; refunds &gt; 0</text>
+      <line x1="435" y1="150" x2="477" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="456" y="130" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="480" y="120" width="270" height="80" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="615" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">validate-refund-step rejects</text>
+      <text x="615" y="164" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">checks stale order balance,</text>
+      <text x="615" y="180" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">not the payment's own ledger</text>
+      <line x1="325" y1="180" x2="325" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="325" y="220" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f" font-weight="700">"Order does not have an outstanding balance to refund"</text>
+    </svg>
+    <figcaption>The order's cached balance says zero. The payment's own captures and refunds say otherwise. validate-refund-step trusts the wrong one, so the second refund is rejected.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is not one isolated glitch. It is a scope mismatch between what the order thinks it owes and what a single payment can actually still give back. A few things make it worse in practice:</p>
+  <ul>
+    <li>The refund-payment workflow's <code>validate-refund-step</code> reads <code>order.summary.pending_difference</code>, a single order-wide figure, rather than recomputing <code>this payment's captures minus this payment's refunds</code>, which is the number that actually determines whether a refund can happen.</li>
+    <li>A related bug, tracked as issue #11766, means <code>captured_amount</code> on the payment or payment collection is not always updated correctly after a capture, especially with custom or two-step payment providers such as Stripe's Cash App or Amazon Pay flows. That leaves the order's outstanding-amount bookkeeping permanently out of step with the true capture and refund ledger, independent of the refund-ordering problem above.</li>
+    <li>Because the order-level balance is a cached snapshot, once it reads zero or negative, it stays that way for every future refund attempt against that order, not just the second one. A third or fourth refund fails exactly the same way as the second.</li>
+    <li>This exact class of failure is documented as reproducible in medusajs/medusa issues #10842, #10392, #10491, and #11766. PR #11832 partially addresses it by recomputing the refundable amount from the payment's own captures and refunds instead of the order-level balance, but stores on older releases do not have that fix.</li>
+  </ul>
+  <p>None of this means the payment provider lost track of the money. Stripe, or whichever gateway is in use, still knows exactly what was captured and what has been refunded. The gap is entirely inside Medusa's own bookkeeping, between the order's cached summary and the payment's real ledger. See the citations at the end for the exact issues, the PR, and the API references.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Do not trust <code>order.summary.pending_difference</code> to tell you whether a payment can still be refunded. Trust the payment's own <code>captures[].raw_amount</code> and <code>refunds[].raw_amount</code>, summed independently. The order-level number is exactly the thing that is wrong here, so building a detector on top of it would just repeat the same mistake the workflow makes. And because firing a corrective refund is real money moving through a payment provider, the safe pattern is compute and flag first, never auto-fire, and only submit the live refund once a human has approved it on a store confirmed to be running the patched version.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not patch Medusa's workflow code. The job pulls every order with its payment collections, payments, captures, and refunds expanded, runs a pure function per payment that sums captures and refunds independently of the order summary, and flags any payment where a real shortfall exists alongside a stale order-level balance. Under a dry run flag it only logs the computed delta. Only with the flag off, and only after a human has reviewed the list, does it call the same refund route the admin button uses.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists orders with captures and refunds expanded, sums each payment's own captures minus refunds with a pure function, and flags the payment as silently blocked when a real shortfall exists but the order's pending difference already reads zero. Under dry run it only logs the shortfall. With dry run off and human approval it calls the refund route.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List orders</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">payments, captures, refunds</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Sum per payment</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">captures minus refunds</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pure decision fn</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">computeRefundShortfall</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Silently</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">blocked?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, dry run off + approved</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="592" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">no, or dry run on</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="605" y="185" width="150" height="55" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="680" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Logged only</text>
+      <text x="680" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">no write happens</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">POST refund route</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">real money moves</text>
+    </svg>
+    <figcaption>The pure function never touches the network. Only a human-approved run with dry run off ever calls the live refund endpoint, and only for a payment confirmed to have real headroom.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. Keep the backend URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List orders with captures and refunds expanded</h3>
+      <p>Ask for orders with <code>summary</code> and every payment's <code>captures</code> and <code>refunds</code> expanded. This is the one call that puts both sides of the discrepancy in front of you: the order's own cached balance, and the payment's real ledger. Paginate with <code>limit</code> and <code>offset</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_orders_with_ledger(token):
+    orders = []
+    offset = 0
+    limit = 100
+    fields = (
+        "id,display_id,summary,*payment_collections,"
+        "*payment_collections.payments,*payment_collections.payments.captures,"
+        "*payment_collections.payments.refunds"
+    )
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": fields,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset &gt;= data["count"]:
+            return orders</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+const ORDER_FIELDS =
+  "id,display_id,summary,*payment_collections," +
+  "*payment_collections.payments,*payment_collections.payments.captures," +
+  "*payment_collections.payments.refunds";
+
+async function listOrdersWithLedger(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset &gt;= data.count) return orders;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Cross-check at the payment level</h3>
+      <p>Once you have a candidate payment, confirm the discrepancy directly against that payment rather than the order, since the payment is the object the patched validation step actually evaluates. This also gives you <code>captured_at</code>, useful for telling apart a payment that has not been captured yet from one that genuinely has refundable headroom.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def get_payment_ledger(token, payment_id):
+    return admin_get(token, f"/admin/payments/{payment_id}", {
+        "fields": "id,captured_at,captures.raw_amount,refunds.raw_amount",
+    })["payment"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function getPaymentLedger(token, paymentId) {
+  const data = await adminGet(token, `/admin/payments/${paymentId}`, {
+    fields: "id,captured_at,captures.raw_amount,refunds.raw_amount",
+  });
+  return data.payment;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the math in its own function that takes a payment's captures and refunds plus the order's cached balance, and never touches the network. Sum <code>captures[].raw_amount</code> into a captured total, sum <code>refunds[].raw_amount</code> into a refunded total, and subtract. A payment is flagged as silently blocked only when it still owes a real shortfall and the order's own <code>pending_difference</code> already reads zero or negative, which is exactly the condition that makes the order-level check reject a legitimate refund.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">EPSILON = 0.01
+
+def compute_refund_shortfall(payment, order_pending_difference):
+    """Pure decision function. No I/O.
+
+    payment: {"id": str, "captures": [{"raw_amount": float}], "refunds": [{"raw_amount": float}]}
+    order_pending_difference: float, the order's own cached summary.pending_difference
+
+    Returns {"paymentId", "capturedTotal", "refundedTotal", "shortfall", "isSilentlyBlocked"}.
+    """
+    captured_total = sum(c.get("raw_amount", 0) for c in (payment.get("captures") or []))
+    refunded_total = sum(r.get("raw_amount", 0) for r in (payment.get("refunds") or []))
+    shortfall = captured_total - refunded_total
+    is_silently_blocked = shortfall &gt; EPSILON and order_pending_difference &lt;= EPSILON
+
+    return {
+        "paymentId": payment.get("id"),
+        "capturedTotal": captured_total,
+        "refundedTotal": refunded_total,
+        "shortfall": shortfall,
+        "isSilentlyBlocked": is_silently_blocked,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const EPSILON = 0.01;
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, captures: Array&lt;{ raw_amount: number }&gt;, refunds: Array&lt;{ raw_amount: number }&gt; }} payment
+ * @param {number} orderPendingDifference the order's own cached summary.pending_difference
+ * @returns {{ paymentId: string, capturedTotal: number, refundedTotal: number,
+ *             shortfall: number, isSilentlyBlocked: boolean }}
+ */
+export function computeRefundShortfall(payment, orderPendingDifference) {
+  const capturedTotal = (payment.captures || []).reduce((sum, c) =&gt; sum + (c.raw_amount || 0), 0);
+  const refundedTotal = (payment.refunds || []).reduce((sum, r) =&gt; sum + (r.raw_amount || 0), 0);
+  const shortfall = capturedTotal - refundedTotal;
+  const isSilentlyBlocked = shortfall &gt; EPSILON &amp;&amp; orderPendingDifference &lt;= EPSILON;
+
+  return {
+    paymentId: payment.id,
+    capturedTotal,
+    refundedTotal,
+    shortfall,
+    isSilentlyBlocked,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Fire the make-up refund only when it is safe</h3>
+      <p>Only call the live refund route when the store is confirmed patched, <code>DRY_RUN</code> is false, and a human has approved the flagged list. The amount is always the shortfall already computed from the payment's own ledger, never a guess. On an unpatched store, do not call this at all, since the same validation error will reject the corrective refund too. Report the order and payment for manual processing in the payment provider's own dashboard instead.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">def admin_post(token, path, json_body):
+    r = requests.post(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        json=json_body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def fire_makeup_refund(token, payment_id, shortfall):
+    return admin_post(token, f"/admin/payments/{payment_id}/refund", {"amount": shortfall})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">async function adminPost(token, path, jsonBody) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(jsonBody),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on POST ${path}`);
+  return res.json();
+}
+
+async function fireMakeupRefund(token, paymentId, shortfall) {
+  return adminPost(token, `/admin/payments/${paymentId}/refund`, { amount: shortfall });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On every run, leave <code>DRY_RUN</code> on so the script only logs the <code>{order_id, payment_id, shortfall}</code> tuples it finds. Read the output, confirm the store version, get a human to approve the list, then switch <code>DRY_RUN</code> off to let it write. Run it on a schedule, for example once a day, since a silently blocked refund does not resolve itself.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This is real money moving through a payment provider, so never auto-fire the corrective refund. Confirm the store is on a Medusa release that includes PR #11832 before flipping <code>DRY_RUN</code> off, since an unpatched store rejects the corrective refund with the same validation error it rejected the original one with. On an unpatched store, report the order id, payment id, and shortfall for manual processing directly in the payment provider's dashboard instead.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever computes the shortfall from each payment's own ledger, never from the order's cached balance.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/second-refund-fails" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">refund_shortfall.py</div>
+      <pre><code class="language-python">"""Find Medusa orders where a second refund silently failed.
+
+Medusa v2's refund-payment workflow historically validates a refund request
+against the order's cached summary.pending_difference instead of re-summing
+that specific payment's actual captures minus its existing refunds. The first
+refund on an order correctly zeroes or flips the sign of the order-level
+balance, so validate-refund-step rejects every refund attempt after that with
+"Order does not have an outstanding balance to refund", even though the
+payment itself may still have capturable or refundable amount left. This
+lists orders with captures and refunds expanded, computes the true shortfall
+per payment independent of the order summary, and flags every payment that is
+silently blocked. It never fires a refund unless DRY_RUN is false and a human
+has approved the list, since this is real money moving through a provider.
+Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("refund_shortfall")
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+EPSILON = 0.01
+
+ORDER_FIELDS = (
+    "id,display_id,summary,*payment_collections,"
+    "*payment_collections.payments,*payment_collections.payments.captures,"
+    "*payment_collections.payments.refunds"
+)
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_post(token, path, json_body):
+    r = requests.post(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        json=json_body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def compute_refund_shortfall(payment, order_pending_difference):
+    """Pure decision function. No I/O.
+
+    payment: {"id": str, "captures": [{"raw_amount": float}], "refunds": [{"raw_amount": float}]}
+    order_pending_difference: float, the order's own cached summary.pending_difference
+
+    Returns {"paymentId", "capturedTotal", "refundedTotal", "shortfall", "isSilentlyBlocked"}.
+    """
+    captured_total = sum(c.get("raw_amount", 0) for c in (payment.get("captures") or []))
+    refunded_total = sum(r.get("raw_amount", 0) for r in (payment.get("refunds") or []))
+    shortfall = captured_total - refunded_total
+    is_silently_blocked = shortfall &gt; EPSILON and order_pending_difference &lt;= EPSILON
+
+    return {
+        "paymentId": payment.get("id"),
+        "capturedTotal": captured_total,
+        "refundedTotal": refunded_total,
+        "shortfall": shortfall,
+        "isSilentlyBlocked": is_silently_blocked,
+    }
+
+
+def list_orders_with_ledger(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset &gt;= data["count"]:
+            return orders
+
+
+def payments_of(order):
+    return [
+        payment
+        for collection in (order.get("payment_collections") or [])
+        for payment in (collection.get("payments") or [])
+    ]
+
+
+def fire_makeup_refund(token, payment_id, shortfall):
+    return admin_post(token, f"/admin/payments/{payment_id}/refund", {"amount": shortfall})
+
+
+def run():
+    token = get_admin_token()
+    orders = list_orders_with_ledger(token)
+
+    flagged = 0
+    for order in orders:
+        pending_difference = (order.get("summary") or {}).get("pending_difference", 0)
+        for payment in payments_of(order):
+            outcome = compute_refund_shortfall(payment, pending_difference)
+            if not outcome["isSilentlyBlocked"]:
+                continue
+
+            log.warning(
+                "Order %s payment %s silently blocked: captured=%s refunded=%s shortfall=%s. %s",
+                order.get("display_id") or order["id"], outcome["paymentId"],
+                outcome["capturedTotal"], outcome["refundedTotal"], outcome["shortfall"],
+                "would refund" if DRY_RUN else "refunding",
+            )
+
+            if not DRY_RUN:
+                fire_makeup_refund(token, outcome["paymentId"], outcome["shortfall"])
+
+            flagged += 1
+
+    log.info(
+        "Done. %d payment(s) %s.",
+        flagged, "flagged, none refunded (dry run)" if DRY_RUN else "refunded",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">refund-shortfall.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Medusa orders where a second refund silently failed.
+ *
+ * Medusa v2's refund-payment workflow historically validates a refund request
+ * against the order's cached summary.pending_difference instead of re-summing
+ * that specific payment's actual captures minus its existing refunds. The
+ * first refund on an order correctly zeroes or flips the sign of the
+ * order-level balance, so validate-refund-step rejects every refund attempt
+ * after that with "Order does not have an outstanding balance to refund",
+ * even though the payment itself may still have capturable or refundable
+ * amount left. This lists orders with captures and refunds expanded,
+ * computes the true shortfall per payment independent of the order summary,
+ * and flags every payment that is silently blocked. It never fires a refund
+ * unless DRY_RUN is false and a human has approved the list, since this is
+ * real money moving through a provider.
+ * Run on a schedule. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/second-refund-fails/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const EPSILON = 0.01;
+
+const ORDER_FIELDS =
+  "id,display_id,summary,*payment_collections," +
+  "*payment_collections.payments,*payment_collections.payments.captures," +
+  "*payment_collections.payments.refunds";
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, captures: Array&lt;{ raw_amount: number }&gt;, refunds: Array&lt;{ raw_amount: number }&gt; }} payment
+ * @param {number} orderPendingDifference the order's own cached summary.pending_difference
+ * @returns {{ paymentId: string, capturedTotal: number, refundedTotal: number,
+ *             shortfall: number, isSilentlyBlocked: boolean }}
+ */
+export function computeRefundShortfall(payment, orderPendingDifference) {
+  const capturedTotal = (payment.captures || []).reduce((sum, c) =&gt; sum + (c.raw_amount || 0), 0);
+  const refundedTotal = (payment.refunds || []).reduce((sum, r) =&gt; sum + (r.raw_amount || 0), 0);
+  const shortfall = capturedTotal - refundedTotal;
+  const isSilentlyBlocked = shortfall &gt; EPSILON &amp;&amp; orderPendingDifference &lt;= EPSILON;
+
+  return {
+    paymentId: payment.id,
+    capturedTotal,
+    refundedTotal,
+    shortfall,
+    isSilentlyBlocked,
+  };
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function adminPost(token, path, jsonBody) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(jsonBody),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on POST ${path}`);
+  return res.json();
+}
+
+async function listOrdersWithLedger(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset &gt;= data.count) return orders;
+  }
+}
+
+function paymentsOf(order) {
+  return (order.payment_collections || []).flatMap((collection) =&gt; collection.payments || []);
+}
+
+async function fireMakeupRefund(token, paymentId, shortfall) {
+  return adminPost(token, `/admin/payments/${paymentId}/refund`, { amount: shortfall });
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const orders = await listOrdersWithLedger(token);
+
+  let flagged = 0;
+  for (const order of orders) {
+    const pendingDifference = order.summary ? order.summary.pending_difference || 0 : 0;
+    for (const payment of paymentsOf(order)) {
+      const outcome = computeRefundShortfall(payment, pendingDifference);
+      if (!outcome.isSilentlyBlocked) continue;
+
+      console.warn(
+        `Order ${order.display_id || order.id} payment ${outcome.paymentId} silently blocked: captured=${outcome.capturedTotal} refunded=${outcome.refundedTotal} shortfall=${outcome.shortfall}. ${DRY_RUN ? "would refund" : "refunding"}`
+      );
+
+      if (!DRY_RUN) {
+        await fireMakeupRefund(token, outcome.paymentId, outcome.shortfall);
+      }
+
+      flagged++;
+    }
+  }
+
+  console.log(
+    `Done. ${flagged} payment(s) ${DRY_RUN ? "flagged, none refunded (dry run)" : "refunded"}.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>compute_refund_shortfall</code> is the part most worth testing, because it decides which payments actually have real money still owed versus which orders merely look wrong. It is pure, so the test needs no network and no Medusa backend. It just feeds in plain fixture payments and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_second_refund_shortfall.py</div>
+      <pre><code class="language-python">from refund_shortfall import compute_refund_shortfall
+
+
+def payment(captures=None, refunds=None):
+    return {
+        "id": "pay_1",
+        "captures": captures if captures is not None else [{"raw_amount": 100.0}],
+        "refunds": refunds if refunds is not None else [],
+    }
+
+
+def test_silently_blocked_when_payment_has_headroom_but_order_reads_zero():
+    p = payment(refunds=[{"raw_amount": 40.0}])
+    result = compute_refund_shortfall(p, 0)
+    assert result["capturedTotal"] == 100.0
+    assert result["refundedTotal"] == 40.0
+    assert result["shortfall"] == 60.0
+    assert result["isSilentlyBlocked"] is True
+
+
+def test_not_blocked_when_order_still_shows_a_balance():
+    p = payment(refunds=[{"raw_amount": 40.0}])
+    result = compute_refund_shortfall(p, 60.0)
+    assert result["isSilentlyBlocked"] is False
+
+
+def test_not_blocked_when_fully_refunded():
+    p = payment(refunds=[{"raw_amount": 100.0}])
+    result = compute_refund_shortfall(p, 0)
+    assert result["shortfall"] == 0.0
+    assert result["isSilentlyBlocked"] is False
+
+
+def test_sums_multiple_captures_and_refunds():
+    p = payment(
+        captures=[{"raw_amount": 50.0}, {"raw_amount": 50.0}],
+        refunds=[{"raw_amount": 20.0}, {"raw_amount": 20.0}],
+    )
+    result = compute_refund_shortfall(p, 0)
+    assert result["capturedTotal"] == 100.0
+    assert result["refundedTotal"] == 40.0
+    assert result["shortfall"] == 60.0
+    assert result["isSilentlyBlocked"] is True
+
+
+def test_negative_order_pending_difference_still_counts_as_blocked():
+    p = payment(refunds=[{"raw_amount": 40.0}])
+    result = compute_refund_shortfall(p, -5.0)
+    assert result["isSilentlyBlocked"] is True
+
+
+def test_within_epsilon_shortfall_is_not_blocked():
+    p = payment(captures=[{"raw_amount": 100.0}], refunds=[{"raw_amount": 99.995}])
+    result = compute_refund_shortfall(p, 0)
+    assert result["isSilentlyBlocked"] is False
+
+
+def test_no_captures_means_zero_shortfall():
+    p = payment(captures=[], refunds=[])
+    result = compute_refund_shortfall(p, 0)
+    assert result["capturedTotal"] == 0.0
+    assert result["shortfall"] == 0.0
+    assert result["isSilentlyBlocked"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">refund-shortfall.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { computeRefundShortfall } from "./refund-shortfall.js";
+
+const payment = (over = {}) =&gt; ({
+  id: "pay_1",
+  captures: [{ raw_amount: 100.0 }],
+  refunds: [],
+  ...over,
+});
+
+test("silently blocked when payment has headroom but order reads zero", () =&gt; {
+  const p = payment({ refunds: [{ raw_amount: 40.0 }] });
+  const result = computeRefundShortfall(p, 0);
+  assert.equal(result.capturedTotal, 100.0);
+  assert.equal(result.refundedTotal, 40.0);
+  assert.equal(result.shortfall, 60.0);
+  assert.equal(result.isSilentlyBlocked, true);
+});
+
+test("not blocked when order still shows a balance", () =&gt; {
+  const p = payment({ refunds: [{ raw_amount: 40.0 }] });
+  const result = computeRefundShortfall(p, 60.0);
+  assert.equal(result.isSilentlyBlocked, false);
+});
+
+test("not blocked when fully refunded", () =&gt; {
+  const p = payment({ refunds: [{ raw_amount: 100.0 }] });
+  const result = computeRefundShortfall(p, 0);
+  assert.equal(result.shortfall, 0.0);
+  assert.equal(result.isSilentlyBlocked, false);
+});
+
+test("sums multiple captures and refunds", () =&gt; {
+  const p = payment({
+    captures: [{ raw_amount: 50.0 }, { raw_amount: 50.0 }],
+    refunds: [{ raw_amount: 20.0 }, { raw_amount: 20.0 }],
+  });
+  const result = computeRefundShortfall(p, 0);
+  assert.equal(result.capturedTotal, 100.0);
+  assert.equal(result.refundedTotal, 40.0);
+  assert.equal(result.shortfall, 60.0);
+  assert.equal(result.isSilentlyBlocked, true);
+});
+
+test("negative order pending difference still counts as blocked", () =&gt; {
+  const p = payment({ refunds: [{ raw_amount: 40.0 }] });
+  const result = computeRefundShortfall(p, -5.0);
+  assert.equal(result.isSilentlyBlocked, true);
+});
+
+test("within epsilon shortfall is not blocked", () =&gt; {
+  const p = payment({ captures: [{ raw_amount: 100.0 }], refunds: [{ raw_amount: 99.995 }] });
+  const result = computeRefundShortfall(p, 0);
+  assert.equal(result.isSilentlyBlocked, false);
+});
+
+test("no captures means zero shortfall", () =&gt; {
+  const p = payment({ captures: [], refunds: [] });
+  const result = computeRefundShortfall(p, 0);
+  assert.equal(result.capturedTotal, 0.0);
+  assert.equal(result.shortfall, 0.0);
+  assert.equal(result.isSilentlyBlocked, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Split refund</span>
+      <h4>The order that needed two partial refunds</h4>
+      <p>A customer bought two items on one order and returned them a week apart. Support refunded the first item fine. When the second item came back, the same Refund button on the same order threw "Order does not have an outstanding balance to refund," even though the payment had captured both items and only one refund had gone out. Support assumed the return was somehow already processed and closed the ticket, leaving the customer genuinely still owed money.</p>
+      <p>Running the shortfall script against the store's orders surfaced the payment immediately: captured total matched both items, refunded total matched only the first, and the order's own balance already read zero. The team confirmed the store was on a patched Medusa release, reviewed the flagged list, and fired the make-up refund for the exact shortfall.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Custom provider</span>
+      <h4>The two-step capture that broke the ledger twice over</h4>
+      <p>A store using a custom payment provider with a two-step capture flow, similar to Stripe's Cash App or Amazon Pay integrations, hit both bugs at once. The provider's <code>captured_amount</code> was not always updated correctly after capture, so the order's outstanding-amount bookkeeping was already unreliable before any refund happened. Once a first refund did land, every later refund attempt on those orders failed the same way.</p>
+      <p>Because the store had not yet upgraded past the release with the PR #11832 fix, the team did not fire any corrective refunds through Medusa. Instead they ran the script in report-only mode, exported the flagged order ids, payment ids, and shortfalls, and processed those refunds directly in the payment provider's dashboard until the platform upgrade shipped.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no payment quietly keeps money it should have given back just because the order's cached balance already reads zero. Every shortfall is computed from the payment's own captures and refunds, reviewed by a human, and only ever resolved by a live refund on a store confirmed to be patched. On an unpatched store, the same list becomes the manual to-do sheet for the payment provider dashboard instead of a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my second refund on a Medusa order fail?</summary>
+      <p>The refund-payment workflow's validate-refund-step historically checked the order's cached summary.pending_difference instead of re-summing that specific payment's captures minus its existing refunds. The first refund correctly zeroes or flips the sign of the order-level balance, so every refund attempt after that throws Order does not have an outstanding balance to refund, even though the payment itself may still have money left to give back.</p>
+    </details>
+    <details>
+      <summary>Is it safe to fire the missing refund automatically?</summary>
+      <p>Not blindly. A refund is a real settlement with a payment provider, so the script only computes and logs the shortfall by default under DRY_RUN. It calls POST /admin/payments/{payment_id}/refund for real only when DRY_RUN is false and a human has approved the flagged list, and only after confirming the store is running a Medusa version that includes the PR 11832 fix, since an unpatched store rejects the corrective refund with the same validation error.</p>
+    </details>
+    <details>
+      <summary>How do I detect an order that silently blocked a second refund?</summary>
+      <p>For each payment, sum captures[].raw_amount and refunds[].raw_amount yourself, independent of order.summary. If capturedTotal minus refundedTotal is greater than zero, the payment still has refundable headroom. If at the same time the order's own pending_difference already reads zero or negative, that mismatch is the signature of a silently rejected second refund, because the order-level check will reject a legitimate refund that the payment itself can still afford.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa Issue #10842: Cannot refund multiple times from a single order. <a href="https://github.com/medusajs/medusa/issues/10842" rel="noopener">github.com/medusajs/medusa/issues/10842</a></li>
+      <li>medusajs/medusa Issue #10491: Unable to Refund Captured Payments in Orders with $0 Outstanding Amount. <a href="https://github.com/medusajs/medusa/issues/10491" rel="noopener">github.com/medusajs/medusa/issues/10491</a></li>
+      <li>medusajs/medusa Issue #11766: outstanding amount is incorrect after a payment has been captured from a custom payment provider. <a href="https://github.com/medusajs/medusa/issues/11766" rel="noopener">github.com/medusajs/medusa/issues/11766</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Payment Module Reference: the <code>refundPayment</code> function. <a href="https://docs.medusajs.com/resources/references/payment/refundPayment" rel="noopener">docs.medusajs.com/resources/references/payment/refundPayment</a></li>
+      <li>Medusa Core Workflows Reference: <code>refundPaymentsWorkflow</code>. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/refundPaymentsWorkflow" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/refundPaymentsWorkflow</a></li>
+      <li>Medusa Admin User Guide: Manage Order Payments in Medusa Admin. <a href="https://docs.medusajs.com/user-guide/orders/payments" rel="noopener">docs.medusajs.com/user-guide/orders/payments</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa orders, payments, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this find your missing refund?</h3>
+    <p>If this saved you a support escalation or a customer who was owed money and never got it, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

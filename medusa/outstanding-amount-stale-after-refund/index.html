@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Outstanding Amount Does Not Update After the First Refund in Medusa</title>
+<meta name="description" content="A Medusa v2 order's outstanding_amount stops moving after the first refund, even though later refunds go through at the payment provider. Learn why the cached order summary stalls and build a Python or Node.js script that flags the divergence for a human to reconcile.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Outstanding Amount Does Not Update After the First Refund in Medusa">
+<meta property="og:description" content="Why a Medusa v2 order's outstanding_amount stalls after the first refund while the payment provider keeps processing more, and a Python or Node.js script that flags the divergence for manual reconciliation.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/#article","headline":"Fix Outstanding Amount Does Not Update After the First Refund in Medusa","description":"In Medusa v2, an order's outstanding_amount is derived from order_transaction rows on the totals module. The first refund on an order inserts a row and updates the summary correctly, but a second refundPaymentsWorkflow run on the same order does not insert a new row, so outstanding_amount stops moving while the payment provider keeps refunding. A Python or Node.js script detects the divergence and flags it for manual reconciliation.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments & Refunds","keywords":"Medusa outstanding_amount stale, order summary not recomputed, order_transaction, refundPaymentsWorkflow, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Outstanding amount does not update after the first refund","item":"https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does outstanding_amount stop changing after the first refund in Medusa?","acceptedAnswer":{"@type":"Answer","text":"outstanding_amount is not a stored number you can decrement. It is a derived field on the order's summary, computed by the totals module from rows in order_transaction. The first refund on an order correctly inserts a new transaction row and the summary recomputes from it. Reporters tracing this bug found that a second refundPaymentsWorkflow run on the same order or payment does not insert another transaction row, so the summary is never recomputed again, and outstanding_amount stays frozen at whatever it was after refund number one, even though the payment provider keeps processing more refunds underneath it."}},{"@type":"Question","name":"How do I detect that an order has this stale outstanding_amount bug?","acceptedAnswer":{"@type":"Answer","text":"Pull each order with GET /admin/orders?fields=id,display_id,*summary,*payment_collections,*payment_collections.payments,*payment_collections.payments.refunds using the admin JWT. For each order, recompute the true outstanding amount as order.total minus the sum of captured amounts plus the sum of every refund actually recorded against the payments. Compare that to summary.outstanding_amount. If the order has more than one refund event and the two numbers disagree by more than a cent, that mismatch is the signature of the stale-after-first-refund bug. Cross-check the provider-confirmed total with GET /admin/payments/:id if you want a second source."}},{"@type":"Question","name":"Can I just PATCH the order to fix outstanding_amount once I find a mismatch?","acceptedAnswer":{"@type":"Answer","text":"No. outstanding_amount is not a directly writable field on the order, it is owned by the order module's summary computation from order_transaction rows, so there is no safe PATCH for it. Calling POST /admin/orders/:id/refund again to try to force a recalculation would trigger the exact repeat-refund failure mode this bug creates, refunding real money a second time against a total that was already stale. The safe repair is to flag the order with the computed true outstanding value and let a human reconcile it through the Medusa admin dashboard's Order, Payment, Refund panel, or by re-running the order's transaction sync."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Payments &amp; Refunds</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Payments &amp; Refunds</p>
+    <h1>Outstanding amount does not update after the first refund</h1>
+    <p class="lead">A customer gets a partial refund, and the order's outstanding amount drops exactly the way it should. A second refund goes out through the same payment provider, Stripe shows the money leaving your account, but the order's outstanding amount in the Medusa admin does not move at all. It just sits there reporting the balance from after refund number one, as if nothing happened since. Here is why the order's summary stops recomputing after the first refund, and a script that finds every order where the reported number and the real one have drifted apart.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Flag only, never auto-write</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p><code>outstanding_amount</code> is not a number Medusa decrements when a refund happens. It is a derived field on the order's <code>summary</code>, computed by the totals module from rows in <code>order_transaction</code>, which record paid and refunded amounts over time. The first refund on an order correctly inserts a new <code>order_transaction</code> row and the summary recomputes from it. As tracked in <a href="https://github.com/medusajs/medusa/issues/11481" rel="noopener">medusajs/medusa issue #11481</a>, a second run of <code>refundPaymentsWorkflow</code> against the same order or payment does not insert another transaction row, so the summary never recomputes again, and <code>outstanding_amount</code> freezes at whatever it reported after the first refund, even while the payment provider keeps processing more. There is no safe way to PATCH this field directly. Pull every order with its <code>summary</code>, <code>payment_collections</code>, and <code>refunds</code> expanded, recompute the true outstanding amount from the provider-confirmed capture and refund totals, and flag any order where that diverges from what the API reports. A human reconciles it from there. Full code and tests below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every order in Medusa v2 carries a <code>summary</code>, an <code>OrderSummary</code> object with fields like <code>paid_total</code>, <code>refunded_total</code>, and <code>outstanding_amount</code>. None of those are columns that get edited in place. They are computed on the fly by the totals module, which walks the order's <code>order_transaction</code> rows, the ledger of every payment and refund event tied to that order, and adds them up.</p>
+  <p>That means <code>outstanding_amount</code> is only ever as fresh as the last time something wrote a new row into <code>order_transaction</code> and triggered the summary to recompute. The first time you refund an order, <code>refundPaymentsWorkflow</code> does exactly that: it writes the transaction row, and the summary picks it up correctly. The trouble starts on the second refund against the same order or the same payment. Reporters tracing this in the Medusa repository found that the workflow does not insert a new transaction row that time, so nothing tells the summary computation there is anything new to add up. The order's cached <code>outstanding_amount</code> stays exactly where it was after refund one, permanently, no matter how many more refunds actually go through at the payment provider.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. Refund one on an order inserts a new order_transaction row and the summary recomputes correctly. Refund two on the same order does not insert a new row, so the summary is never recomputed, and outstanding_amount stays frozen while the payment provider has actually processed more refunds.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="14" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="38" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Refund #1 runs</text>
+      <text x="102" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">refundPaymentsWorkflow</text>
+      <line x1="102" y1="74" x2="102" y2="100" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="102" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="125" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">order_transaction row</text>
+      <text x="102" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">inserted, correctly</text>
+      <line x1="198" y1="132" x2="240" y2="132" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="243" y="102" width="185" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="335" y="125" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">summary recomputes</text>
+      <text x="335" y="142" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4c9a2a">outstanding_amount correct</text>
+      <rect x="10" y="180" width="185" height="52" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="102" y="203" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Refund #2 runs</text>
+      <text x="102" y="220" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">same order or payment</text>
+      <line x1="198" y1="206" x2="240" y2="206" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="219" y="192" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="243" y="180" width="185" height="52" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="335" y="200" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">no new row inserted</text>
+      <text x="335" y="217" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">summary never recomputes</text>
+      <line x1="450" y1="206" x2="492" y2="206" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="495" y="180" width="245" height="52" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="617" y="200" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">outstanding_amount frozen</text>
+      <text x="617" y="217" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">provider actually refunded more</text>
+    </svg>
+    <figcaption>The first refund updates the ledger and the summary together, correctly. The second refund on the same order updates the ledger at the provider but never adds a new order_transaction row, so the summary is stuck reporting stale numbers.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This comes from how order totals are derived rather than stored, combined with a gap in how repeat refunds write to the ledger:</p>
+  <ul>
+    <li><code>outstanding_amount</code> lives on <code>OrderSummary</code>, which the order module's totals computation builds by aggregating <code>order_transaction</code> rows, not by decrementing a stored field each time a refund happens.</li>
+    <li>The first <code>refundPaymentsWorkflow</code> run against an order does insert a new <code>order_transaction</code> row, and the summary recomputes from the updated set of rows exactly as expected.</li>
+    <li>As reported in <a href="https://github.com/medusajs/medusa/issues/11481" rel="noopener">medusajs/medusa issue #11481</a>, subsequent runs of that same workflow on the same order or payment do not insert another row, so nothing tells the totals module there is new data, and the summary is never recomputed or persisted again from the updated payment totals.</li>
+    <li>The underlying payment provider, Stripe or otherwise, has no knowledge of this gap. It processes the second and any later refund exactly as instructed, so the money genuinely leaves your account while Medusa's own record of it stalls.</li>
+    <li>Related reports, <a href="https://github.com/medusajs/medusa/issues/10842" rel="noopener">issue #10842</a> on being unable to refund multiple times from a single order, and <a href="https://github.com/medusajs/medusa/issues/10491" rel="noopener">issue #10491</a> on refund actions failing once <code>outstanding_amount</code> reads zero, both point at the same underlying cause: the admin dashboard and API are working from a cached number that stopped updating.</li>
+  </ul>
+  <p>This is a common source of confusion because nothing errors. The refund call to the payment provider succeeds, the order looks unchanged in the dashboard, and the natural read is that the refund did not go through, when the truth is that it went through fine and the order's own bookkeeping just never noticed. That gap is also what lets staff or automated flows re-run a refund against an "outstanding" balance that was never real to begin with. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no field to PATCH here. <code>outstanding_amount</code> is owned entirely by the order module's summary computation over <code>order_transaction</code>, and forcing a write against it risks double-counting a refund that is only partially reflected. The only safe move is to compute the true outstanding amount yourself from the payment provider's own confirmed totals, compare it against what the API reports, and flag the gap for a human. Never call <code>POST /admin/orders/:id/refund</code> again from a script to try to fix it, that is exactly the repeat-refund failure mode this bug creates.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never try to write a corrected number back onto the order. We pull every order with its summary, payment collections, payments, and refunds expanded, recompute what the outstanding amount should truly be from the captures and refunds Medusa itself already recorded against each payment, and flag any order where that diverges from the cached summary by more than a rounding epsilon.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the solution. The script lists orders with summary, payments, and refunds expanded, computes the true outstanding amount from captures and refunds, compares it to the reported summary, and if they diverge and there is more than one refund it flags the order for manual reconciliation, otherwise it moves on.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List orders</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">summary, payments, refunds</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="102" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Compute true</text>
+      <text x="102" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">outstanding from ledger</text>
+      <line x1="198" y1="138" x2="240" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="333,106 420,138 333,170 246,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="333" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Diverges from</text>
+      <text x="333" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">reported summary?</text>
+      <text x="345" y="196" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes, flag</text>
+      <line x1="333" y1="170" x2="333" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="255" y="185" width="160" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="335" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Report for review</text>
+      <text x="335" y="224" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">no write to the order</text>
+      <text x="450" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, matches</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="465" y="108" width="270" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="600" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Move on</text>
+      <text x="600" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">summary is trustworthy here</text>
+    </svg>
+    <figcaption>The script only ever reads and compares. Every affected order gets a computed true outstanding value and a list of the refunds behind it, left for a human to reconcile through the admin dashboard.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend with an admin account that can read orders and payments. Exchange the email and password for a JWT once and reuse it. <code>DRY_RUN</code> defaults to true, but this script never writes to an order regardless, since there is no safe field to write.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # this script only ever reports, it never writes</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // this script only ever reports, it never writes</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>POST /auth/user/emailpass</code>, then send it as <code>Authorization: Bearer &lt;token&gt;</code> on every following call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List orders with summary, payments, and refunds expanded</h3>
+      <p>Ask for <code>summary</code>, <code>payment_collections</code>, the payments on each collection, and the refunds on each payment. This one call gives us both the cached number Medusa reports and the raw ledger of captures and refunds we need to recompute the true value ourselves. Page through with <code>offset</code> and <code>limit</code> so the job covers the whole store.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_FIELDS = (
+    "id,display_id,*summary,*payment_collections,"
+    "*payment_collections.payments,*payment_collections.payments.refunds"
+)
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_orders_with_refunds(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_FIELDS =
+  "id,display_id,*summary,*payment_collections," +
+  "*payment_collections.payments,*payment_collections.payments.refunds";
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function listOrdersWithRefunds(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the whole decision in a function with no network calls. It takes the order's total, the captures, the refunds, and the reported <code>outstanding_amount</code>, and recomputes what the outstanding amount should truly be: the order total, minus everything captured, plus everything refunded. It only flags an order when there has been more than one refund event and the two numbers disagree by more than a cent, since a single refund is exactly the case Medusa handles correctly.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">EPSILON = 0.01
+
+def detect_stale_outstanding(order):
+    captures = order.get("captures") or []
+    refunds = order.get("refunds") or []
+
+    true_outstanding = (
+        order["total"]
+        - sum(c["amount"] for c in captures)
+        + sum(r["amount"] for r in refunds)
+    )
+    refund_count = len(refunds)
+    delta = order["reportedOutstanding"] - true_outstanding
+    affected = refund_count > 1 and abs(delta) > EPSILON
+
+    return {
+        "affected": affected,
+        "trueOutstanding": true_outstanding,
+        "reportedOutstanding": order["reportedOutstanding"],
+        "delta": delta,
+        "refundCount": refund_count,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const EPSILON = 0.01;
+
+export function detectStaleOutstanding(order) {
+  const captures = order.captures || [];
+  const refunds = order.refunds || [];
+
+  const trueOutstanding =
+    order.total -
+    captures.reduce((sum, c) => sum + c.amount, 0) +
+    refunds.reduce((sum, r) => sum + r.amount, 0);
+  const refundCount = refunds.length;
+  const delta = order.reportedOutstanding - trueOutstanding;
+  const affected = refundCount > 1 && Math.abs(delta) > EPSILON;
+
+  return {
+    affected,
+    trueOutstanding,
+    reportedOutstanding: order.reportedOutstanding,
+    delta,
+    refundCount,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Shape the raw order into what the decision function needs</h3>
+      <p>The Admin API response nests captures and refunds under payment collections and payments. Flatten that into the plain <code>total</code>, <code>captures</code>, <code>refunds</code>, and <code>reportedOutstanding</code> shape the pure function expects, then run the decision on it. Nothing here calls the network, it only reshapes data already in hand.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">shape.py</div>
+      <pre><code class="language-python">def to_decision_input(raw_order):
+    payments = [
+        payment
+        for collection in (raw_order.get("payment_collections") or [])
+        for payment in (collection.get("payments") or [])
+    ]
+    captures = [{"amount": p.get("amount", 0)} for p in payments if p.get("captured_at")]
+    refunds = [
+        {"id": r.get("id"), "amount": r.get("amount", 0), "created_at": r.get("created_at")}
+        for p in payments
+        for r in (p.get("refunds") or [])
+    ]
+    summary = raw_order.get("summary") or {}
+
+    return {
+        "id": raw_order.get("id"),
+        "displayId": raw_order.get("display_id"),
+        "total": summary.get("raw_current_order_total", raw_order.get("total", 0)),
+        "captures": captures,
+        "refunds": refunds,
+        "reportedOutstanding": summary.get("outstanding_amount", 0),
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">shape.js</div>
+      <pre><code class="language-javascript">function toDecisionInput(rawOrder) {
+  const payments = (rawOrder.payment_collections || []).flatMap(
+    (collection) => collection.payments || []
+  );
+  const captures = payments
+    .filter((p) => p.captured_at)
+    .map((p) => ({ amount: p.amount || 0 }));
+  const refunds = payments.flatMap((p) =>
+    (p.refunds || []).map((r) => ({ id: r.id, amount: r.amount || 0, created_at: r.created_at }))
+  );
+  const summary = rawOrder.summary || {};
+
+  return {
+    id: rawOrder.id,
+    displayId: rawOrder.display_id,
+    total: summary.raw_current_order_total ?? rawOrder.total ?? 0,
+    captures,
+    refunds,
+    reportedOutstanding: summary.outstanding_amount || 0,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together and report, never repair</h3>
+      <p>The loop lists orders, shapes each one, runs the decision, and logs one finding per affected order with the computed true outstanding value against the reported one, plus the refund ids and amounts behind it. There is nothing for <code>DRY_RUN=false</code> to write, since calling the refund endpoint again from here would trigger exactly the failure mode being diagnosed. Point a human at the flagged orders and let them reconcile through the admin dashboard's Order, Payment, Refund panel.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Do not call <code>POST /admin/orders/:id/refund</code> again from this script under any <code>DRY_RUN=false</code> path to try to fix a flagged order. That is the exact repeat-refund failure mode this bug produces. The only supported repair is a human reconciling the order through the Medusa admin dashboard, or re-running the order's transaction sync.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists every order with its summary and refund history, recomputes the true outstanding amount with a pure decision function, and logs one finding per affected order. It never writes anything back to Medusa.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/outstanding-amount-stale-after-refund" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_stale_outstanding.py</div>
+      <pre><code class="language-python">"""Flag Medusa v2 orders whose outstanding_amount stopped updating after the
+first refund. outstanding_amount is a derived field on the order's summary,
+computed by the totals module from order_transaction rows, not a value that
+gets decremented directly. The first refund on an order inserts a new
+transaction row and the summary recomputes correctly, but a second
+refundPaymentsWorkflow run on the same order or payment does not insert
+another row (see medusajs/medusa#11481), so the summary is never recomputed
+again and outstanding_amount freezes while the payment provider keeps
+processing more refunds. There is no safe PATCH for this field, so this
+script only flags the divergence for a human to reconcile. It never calls
+the refund endpoint again. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_stale_outstanding")
+
+BACKEND_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+ADMIN_EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+ADMIN_PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+EPSILON = 0.01
+
+ORDER_FIELDS = (
+    "id,display_id,*summary,*payment_collections,"
+    "*payment_collections.payments,*payment_collections.payments.refunds"
+)
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def detect_stale_outstanding(order):
+    """Pure decision function. No I/O.
+
+    order: {
+      "total": float,
+      "captures": [{"amount": float}],
+      "refunds": [{"id": str, "amount": float, "created_at": str}],
+      "reportedOutstanding": float,
+    }
+
+    Returns {"affected", "trueOutstanding", "reportedOutstanding", "delta",
+             "refundCount"}.
+    """
+    captures = order.get("captures") or []
+    refunds = order.get("refunds") or []
+
+    true_outstanding = (
+        order["total"]
+        - sum(c["amount"] for c in captures)
+        + sum(r["amount"] for r in refunds)
+    )
+    refund_count = len(refunds)
+    delta = order["reportedOutstanding"] - true_outstanding
+    affected = refund_count > 1 and abs(delta) > EPSILON
+
+    return {
+        "affected": affected,
+        "trueOutstanding": true_outstanding,
+        "reportedOutstanding": order["reportedOutstanding"],
+        "delta": delta,
+        "refundCount": refund_count,
+    }
+
+
+def to_decision_input(raw_order):
+    payments = [
+        payment
+        for collection in (raw_order.get("payment_collections") or [])
+        for payment in (collection.get("payments") or [])
+    ]
+    captures = [{"amount": p.get("amount", 0)} for p in payments if p.get("captured_at")]
+    refunds = [
+        {"id": r.get("id"), "amount": r.get("amount", 0), "created_at": r.get("created_at")}
+        for p in payments
+        for r in (p.get("refunds") or [])
+    ]
+    summary = raw_order.get("summary") or {}
+
+    return {
+        "id": raw_order.get("id"),
+        "displayId": raw_order.get("display_id"),
+        "total": summary.get("raw_current_order_total", raw_order.get("total", 0)),
+        "captures": captures,
+        "refunds": refunds,
+        "reportedOutstanding": summary.get("outstanding_amount", 0),
+    }
+
+
+def list_orders_with_refunds(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders
+
+
+def run():
+    token = get_admin_token()
+    raw_orders = list_orders_with_refunds(token)
+
+    flagged = 0
+    for raw_order in raw_orders:
+        decision_input = to_decision_input(raw_order)
+        outcome = detect_stale_outstanding(decision_input)
+        if not outcome["affected"]:
+            continue
+
+        flagged += 1
+        log.warning(
+            "Order %s stale outstanding_amount: reported=%s true=%s delta=%s "
+            "refund_count=%d refunds=%s. %s",
+            decision_input["displayId"] or decision_input["id"],
+            outcome["reportedOutstanding"], outcome["trueOutstanding"], outcome["delta"],
+            outcome["refundCount"],
+            [(r["id"], r["amount"], r["created_at"]) for r in decision_input["refunds"]],
+            "would flag for review" if DRY_RUN else "flagging for review",
+        )
+
+    log.info(
+        "Done. %d order(s) with a stale outstanding_amount flagged for manual reconciliation. "
+        "No orders were written to.",
+        flagged,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-stale-outstanding.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Medusa v2 orders whose outstanding_amount stopped updating after the
+ * first refund. outstanding_amount is a derived field on the order's summary,
+ * computed by the totals module from order_transaction rows, not a value that
+ * gets decremented directly. The first refund on an order inserts a new
+ * transaction row and the summary recomputes correctly, but a second
+ * refundPaymentsWorkflow run on the same order or payment does not insert
+ * another row (see medusajs/medusa#11481), so the summary is never recomputed
+ * again and outstanding_amount freezes while the payment provider keeps
+ * processing more refunds. There is no safe PATCH for this field, so this
+ * script only flags the divergence for a human to reconcile. It never calls
+ * the refund endpoint again. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/outstanding-amount-stale-after-refund/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const EPSILON = 0.01;
+
+const ORDER_FIELDS =
+  "id,display_id,*summary,*payment_collections," +
+  "*payment_collections.payments,*payment_collections.payments.refunds";
+
+export function detectStaleOutstanding(order) {
+  // Pure: no I/O. order = { total, captures: [{amount}],
+  // refunds: [{id, amount, created_at}], reportedOutstanding }
+  const captures = order.captures || [];
+  const refunds = order.refunds || [];
+
+  const trueOutstanding =
+    order.total -
+    captures.reduce((sum, c) => sum + c.amount, 0) +
+    refunds.reduce((sum, r) => sum + r.amount, 0);
+  const refundCount = refunds.length;
+  const delta = order.reportedOutstanding - trueOutstanding;
+  const affected = refundCount > 1 && Math.abs(delta) > EPSILON;
+
+  return {
+    affected,
+    trueOutstanding,
+    reportedOutstanding: order.reportedOutstanding,
+    delta,
+    refundCount,
+  };
+}
+
+function toDecisionInput(rawOrder) {
+  const payments = (rawOrder.payment_collections || []).flatMap(
+    (collection) => collection.payments || []
+  );
+  const captures = payments
+    .filter((p) => p.captured_at)
+    .map((p) => ({ amount: p.amount || 0 }));
+  const refunds = payments.flatMap((p) =>
+    (p.refunds || []).map((r) => ({ id: r.id, amount: r.amount || 0, created_at: r.created_at }))
+  );
+  const summary = rawOrder.summary || {};
+
+  return {
+    id: rawOrder.id,
+    displayId: rawOrder.display_id,
+    total: summary.raw_current_order_total ?? rawOrder.total ?? 0,
+    captures,
+    refunds,
+    reportedOutstanding: summary.outstanding_amount || 0,
+  };
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function listOrdersWithRefunds(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const rawOrders = await listOrdersWithRefunds(token);
+
+  let flagged = 0;
+  for (const rawOrder of rawOrders) {
+    const decisionInput = toDecisionInput(rawOrder);
+    const outcome = detectStaleOutstanding(decisionInput);
+    if (!outcome.affected) continue;
+
+    flagged++;
+    console.warn(
+      `Order ${decisionInput.displayId || decisionInput.id} stale outstanding_amount: ` +
+        `reported=${outcome.reportedOutstanding} true=${outcome.trueOutstanding} ` +
+        `delta=${outcome.delta} refund_count=${outcome.refundCount} ` +
+        `refunds=${JSON.stringify(decisionInput.refunds)}. ` +
+        `${DRY_RUN ? "would flag for review" : "flagging for review"}`
+    );
+  }
+
+  console.log(
+    `Done. ${flagged} order(s) with a stale outstanding_amount flagged for manual reconciliation. ` +
+      `No orders were written to.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The part worth testing is <code>detect_stale_outstanding</code>, since it decides which orders get flagged. It is pure, plain numbers and arrays in, a decision object out, so the tests need no network and no Medusa instance.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_outstanding_detection.py</div>
+      <pre><code class="language-python">from detect_stale_outstanding import detect_stale_outstanding
+
+
+def order(**over):
+    base = {
+        "total": 100.0,
+        "captures": [{"amount": 100.0}],
+        "refunds": [{"id": "ref_1", "amount": 20.0, "created_at": "2026-07-01T00:00:00Z"}],
+        "reportedOutstanding": 0.0,
+    }
+    base.update(over)
+    return base
+
+
+def test_not_affected_with_a_single_refund_in_sync():
+    # One refund, summary correctly reflects it: not the bug.
+    result = detect_stale_outstanding(order())
+    assert result["affected"] is False
+    assert result["refundCount"] == 1
+
+
+def test_affected_when_second_refund_never_moved_the_summary():
+    refunds = [
+        {"id": "ref_1", "amount": 20.0, "created_at": "2026-07-01T00:00:00Z"},
+        {"id": "ref_2", "amount": 20.0, "created_at": "2026-07-05T00:00:00Z"},
+    ]
+    # summary still reports the balance from after refund #1 only
+    result = detect_stale_outstanding(order(refunds=refunds, reportedOutstanding=0.0))
+    assert result["affected"] is True
+    assert result["trueOutstanding"] == 20.0
+    assert result["delta"] == -20.0
+    assert result["refundCount"] == 2
+
+
+def test_not_affected_when_multiple_refunds_but_summary_matches():
+    refunds = [
+        {"id": "ref_1", "amount": 20.0, "created_at": "2026-07-01T00:00:00Z"},
+        {"id": "ref_2", "amount": 20.0, "created_at": "2026-07-05T00:00:00Z"},
+    ]
+    # true outstanding = 100 - 100 + 40 = 40, and summary agrees
+    result = detect_stale_outstanding(order(refunds=refunds, reportedOutstanding=40.0))
+    assert result["affected"] is False
+
+
+def test_rounding_epsilon_does_not_false_positive():
+    refunds = [
+        {"id": "ref_1", "amount": 20.0, "created_at": "2026-07-01T00:00:00Z"},
+        {"id": "ref_2", "amount": 20.0, "created_at": "2026-07-05T00:00:00Z"},
+    ]
+    result = detect_stale_outstanding(order(refunds=refunds, reportedOutstanding=40.005))
+    assert result["affected"] is False
+
+
+def test_true_outstanding_computed_from_captures_and_refunds():
+    result = detect_stale_outstanding(order(total=150.0, captures=[{"amount": 100.0}], refunds=[]))
+    assert result["trueOutstanding"] == 50.0
+    assert result["refundCount"] == 0
+    assert result["affected"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">outstanding.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectStaleOutstanding } from "./detect-stale-outstanding.js";
+
+const order = (over = {}) => ({
+  total: 100.0,
+  captures: [{ amount: 100.0 }],
+  refunds: [{ id: "ref_1", amount: 20.0, created_at: "2026-07-01T00:00:00Z" }],
+  reportedOutstanding: 0.0,
+  ...over,
+});
+
+test("not affected with a single refund in sync", () => {
+  const result = detectStaleOutstanding(order());
+  assert.equal(result.affected, false);
+  assert.equal(result.refundCount, 1);
+});
+
+test("affected when second refund never moved the summary", () => {
+  const refunds = [
+    { id: "ref_1", amount: 20.0, created_at: "2026-07-01T00:00:00Z" },
+    { id: "ref_2", amount: 20.0, created_at: "2026-07-05T00:00:00Z" },
+  ];
+  const result = detectStaleOutstanding(order({ refunds, reportedOutstanding: 0.0 }));
+  assert.equal(result.affected, true);
+  assert.equal(result.trueOutstanding, 20.0);
+  assert.equal(result.delta, -20.0);
+  assert.equal(result.refundCount, 2);
+});
+
+test("not affected when multiple refunds but summary matches", () => {
+  const refunds = [
+    { id: "ref_1", amount: 20.0, created_at: "2026-07-01T00:00:00Z" },
+    { id: "ref_2", amount: 20.0, created_at: "2026-07-05T00:00:00Z" },
+  ];
+  const result = detectStaleOutstanding(order({ refunds, reportedOutstanding: 40.0 }));
+  assert.equal(result.affected, false);
+});
+
+test("rounding epsilon does not false positive", () => {
+  const refunds = [
+    { id: "ref_1", amount: 20.0, created_at: "2026-07-01T00:00:00Z" },
+    { id: "ref_2", amount: 20.0, created_at: "2026-07-05T00:00:00Z" },
+  ];
+  const result = detectStaleOutstanding(order({ refunds, reportedOutstanding: 40.005 }));
+  assert.equal(result.affected, false);
+});
+
+test("true outstanding computed from captures and refunds", () => {
+  const result = detectStaleOutstanding(order({ total: 150.0, captures: [{ amount: 100.0 }], refunds: [] }));
+  assert.equal(result.trueOutstanding, 50.0);
+  assert.equal(result.refundCount, 0);
+  assert.equal(result.affected, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Repeat refund</span>
+      <h4>The support team that refunded the same order twice</h4>
+      <p>A customer disputed a damaged item, and support issued a partial refund. Two weeks later the same customer complained about a shipping fee, and a different agent looked at the order, saw an outstanding amount, and issued a second refund against it through Stripe. Stripe processed both refunds without complaint, but the Medusa dashboard kept reporting the balance from right after the first one.</p>
+      <p>Running the detection script against the store's orders flagged this one immediately, refund count of two, reported outstanding at zero, true outstanding negative, meaning more had gone out than the order admitted to. The team caught it before a third agent could see that same stale zero and think there was nothing left to refund, or worse, think there was still money owed.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Reconciliation</span>
+      <h4>The monthly close that would not tie out</h4>
+      <p>A finance team reconciling Stripe payouts against Medusa order totals kept finding a handful of orders each month where the refunded amount in Stripe was larger than what Medusa's order summary showed. Nobody could explain the gap, and each month it meant manually opening a dozen orders and comparing timestamps by hand.</p>
+      <p>Running the script against the full order list surfaced exactly which orders had drifted and by how much, with the refund ids and dates already lined up. What used to be an afternoon of manual comparison became a five minute review of a short flagged list, and the team learned to expect it specifically on orders that had been refunded more than once.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this on a schedule and you catch every order where the reported outstanding amount has drifted from what actually happened at the payment provider, before a second refund gets issued against a number that was never real. The script never writes to an order, it only computes the truth from the same ledger Medusa already recorded and hands a human the exact delta and the refunds behind it, so reconciliation through the admin dashboard is a lookup instead of a guess.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does outstanding_amount stop changing after the first refund in Medusa?</summary>
+      <p>outstanding_amount is not a stored number you can decrement. It is a derived field on the order's summary, computed by the totals module from rows in order_transaction. The first refund on an order correctly inserts a new transaction row and the summary recomputes from it. Reporters tracing this bug found that a second refundPaymentsWorkflow run on the same order or payment does not insert another transaction row, so the summary is never recomputed again, and outstanding_amount stays frozen at whatever it was after refund number one, even though the payment provider keeps processing more refunds underneath it.</p>
+    </details>
+    <details>
+      <summary>How do I detect that an order has this stale outstanding_amount bug?</summary>
+      <p>Pull each order with GET /admin/orders?fields=id,display_id,*summary,*payment_collections,*payment_collections.payments,*payment_collections.payments.refunds using the admin JWT. For each order, recompute the true outstanding amount as order.total minus the sum of captured amounts plus the sum of every refund actually recorded against the payments. Compare that to summary.outstanding_amount. If the order has more than one refund event and the two numbers disagree by more than a cent, that mismatch is the signature of the stale-after-first-refund bug. Cross-check the provider-confirmed total with GET /admin/payments/:id if you want a second source.</p>
+    </details>
+    <details>
+      <summary>Can I just PATCH the order to fix outstanding_amount once I find a mismatch?</summary>
+      <p>No. outstanding_amount is not a directly writable field on the order, it is owned by the order module's summary computation from order_transaction rows, so there is no safe PATCH for it. Calling POST /admin/orders/:id/refund again to try to force a recalculation would trigger the exact repeat-refund failure mode this bug creates, refunding real money a second time against a total that was already stale. The safe repair is to flag the order with the computed true outstanding value and let a human reconcile it through the Medusa admin dashboard's Order, Payment, Refund panel, or by re-running the order's transaction sync.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #11481: Outstanding amount doesn't change on multiple refunds. <a href="https://github.com/medusajs/medusa/issues/11481" rel="noopener">github.com/medusajs/medusa/issues/11481</a></li>
+      <li>medusajs/medusa GitHub issue #10842: Cannot refund multiple times from a single order. <a href="https://github.com/medusajs/medusa/issues/10842" rel="noopener">github.com/medusajs/medusa/issues/10842</a></li>
+      <li>medusajs/medusa GitHub issue #10491: Unable to Refund Captured Payments in Orders with $0 Outstanding Amount. <a href="https://github.com/medusajs/medusa/issues/10491" rel="noopener">github.com/medusajs/medusa/issues/10491</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Order Concepts, OrderSummary and totals. <a href="https://docs.medusajs.com/resources/commerce-modules/order/concepts" rel="noopener">docs.medusajs.com/resources/commerce-modules/order/concepts</a></li>
+      <li>Medusa Admin User Guide: Manage Order Payments in Medusa Admin. <a href="https://docs.medusajs.com/user-guide/orders/payments" rel="noopener">docs.medusajs.com/user-guide/orders/payments</a></li>
+      <li>Medusa Core Workflows Reference: refundPaymentsWorkflow. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/refundPaymentsWorkflow" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/refundPaymentsWorkflow</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a stale balance before a bad refund?</h3>
+    <p>If this saved you from a repeat refund or a confusing reconciliation, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

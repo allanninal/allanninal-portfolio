@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Failed Invite Accept That Leaves an Orphaned Auth Identity in Medusa</title>
+<meta name="description" content="A Medusa v2 invite accept fails after the AuthIdentity was already created, so the invitee is stuck with Identity with email already exists on retry. Learn why the workflow leaves it behind and build a Python or Node.js script that finds and repairs the orphan safely.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/orphaned-auth-identity-blocks-reinvite/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Failed Invite Accept That Leaves an Orphaned Auth Identity in Medusa">
+<meta property="og:description" content="Why a failed acceptInviteWorkflow leaves a stale AuthIdentity behind in Medusa v2, and a Python or Node.js script that finds and repairs the orphan without breaking a real login.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/orphaned-auth-identity-blocks-reinvite/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/orphaned-auth-identity-blocks-reinvite/#article","headline":"Fix a Failed Invite Accept That Leaves an Orphaned Auth Identity in Medusa","description":"In Medusa v2, POST /auth/user/{provider}/register creates an AuthIdentity before POST /admin/invites/accept ever runs. If acceptInviteWorkflow fails after that point, the invite is compensated back to pending but the AuthIdentity has no compensation step and is left behind, blocking every retry with Identity with email already exists. A Python or Node.js script detects and repairs the orphan safely.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/orphaned-auth-identity-blocks-reinvite/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Customer & Auth","keywords":"Medusa AuthIdentity orphaned, acceptInviteWorkflow, Identity with email already exists, POST /admin/invites/accept, deleteAuthIdentities, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Failed invite acceptance leaves an orphaned auth identity","item":"https://www.allanninal.dev/medusa/orphaned-auth-identity-blocks-reinvite/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does re-accepting a Medusa invite fail with Identity with email already exists?","acceptedAnswer":{"@type":"Answer","text":"Accepting an invite is two calls. The client first calls POST /auth/user/{provider}/register, which creates an AuthIdentity row for that email right away. Only then does it call POST /admin/invites/accept, which runs acceptInviteWorkflow and creates the user. If that second call fails, for example on a duplicate email or a role conflict, the workflow compensates the invite back to pending, but it has no compensation step for the AuthIdentity created in the earlier, separate register call. That row is left behind, so the next register attempt for the same email hits an identity that already exists."}},{"@type":"Question","name":"How do I find an orphaned AuthIdentity from a failed invite accept?","acceptedAnswer":{"@type":"Answer","text":"There is no admin REST route that lists AuthIdentity rows, so run a server-side script with container.resolve. List pending invites with userModuleService.listInvites({accepted: false}), then for each invite email call authModuleService.listAuthIdentities with the provider_identities relation and filter for an entity_id that matches the invite email. If a matching AuthIdentity exists and userModuleService.listUsers({email}) returns nothing for that email, the identity is orphaned."}},{"@type":"Question","name":"Is it safe to delete the orphaned AuthIdentity?","acceptedAnswer":{"@type":"Answer","text":"Yes, but only when the invite is still pending and no User row exists with that email. In that case authModuleService.deleteAuthIdentities removes only the stale identity and leaves the invite untouched, so the invitee can register and accept again cleanly. Never delete an AuthIdentity when a matching User already exists, since that would break a working login. If the invite has already expired, resend it instead of, or in addition to, deleting the identity."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Customer &amp; Auth</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Customer &amp; Auth</p>
+    <h1>Failed invite acceptance leaves an orphaned auth identity</h1>
+    <p class="lead">An invitee opens the link, sets a password, clicks accept, and something goes wrong on the last step: a duplicate email, a role conflict, a database hiccup. Medusa rolls the invite back to pending like nothing happened. But the invitee tries again and gets a flat 401, identity with that email already exists. Nothing about the invite looks different. The account that was half created during the first attempt is still sitting there, and it is now the only thing standing between the invitee and a working login. Here is why Medusa leaves that row behind and a script that finds and repairs it without touching anyone's real account.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API + Auth Module</span>
+      <span class="chip">Guarded delete, dry run by default</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, accepting an invite is two separate calls. The client first calls <code>POST /auth/user/{provider}/register</code>, which creates an <code>AuthIdentity</code> row for that email immediately and returns a registration JWT. Only after that does the client call <code>POST /admin/invites/accept</code>, which runs <code>acceptInviteWorkflow</code>: it validates the token, runs <code>createUsersWorkflow</code> as a step, and only then runs <code>setAuthAppMetadataStep</code>, <code>deleteInvitesStep</code>, and <code>emitEventStep</code> in parallel to link the identity to the new user. If user creation or that parallel step throws, Medusa's workflow engine compensates the invite back to pending, but the <code>AuthIdentity</code> was created in the earlier, separate register call, outside this workflow's transaction boundary, with no compensation step of its own. It is never rolled back or deleted, so a retry hits an identity that already exists. Detection has to run server-side with <code>container.resolve(Modules.AUTH)</code>, since there is no public admin route that lists <code>AuthIdentity</code> rows. Full code and tests below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Medusa splits invite acceptance into two calls on purpose, because the client needs a JWT from the auth provider before it can call the admin endpoint that actually creates the user. The first call, <code>POST /auth/user/{provider}/register</code>, is where the <code>AuthIdentity</code> row gets created. It happens fast, and it happens outside anything that later fails or rolls back.</p>
+  <p>The second call, <code>POST /admin/invites/accept</code>, carries that same <code>auth_identity_id</code> as input into <code>acceptInviteWorkflow</code>. That workflow does the real work: check the invite token is valid, run <code>createUsersWorkflow</code> to make the actual <code>User</code> row, then link the two together and mark the invite accepted. If anything in that second half throws, for example the email collides with an existing user, a role does not exist, or the database has a bad moment, Medusa's workflow engine steps in and compensates. The invite goes back to pending, exactly as documented. But the compensation only knows about steps inside this workflow. The <code>AuthIdentity</code> was never created by a step in <code>acceptInviteWorkflow</code>, it was created a call earlier, by a completely different route. There is nothing to compensate, so nothing happens to it. It just stays.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the problem. The client first calls register which creates an AuthIdentity outside any workflow. Then it calls admin invites accept which runs acceptInviteWorkflow. If that workflow fails, it compensates the invite back to pending, but the AuthIdentity from the earlier call has no compensation step and is left behind as an orphan.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="18" width="205" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="112" y="41" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">POST /auth/user/{provider}</text>
+      <text x="112" y="58" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">/register creates AuthIdentity</text>
+      <line x1="112" y1="78" x2="112" y2="104" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="106" width="205" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="112" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">AuthIdentity row exists</text>
+      <text x="112" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">au_..., outside any workflow</text>
+      <line x1="218" y1="136" x2="260" y2="136" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="263" y="106" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="373" y="129" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">POST /admin/invites/accept</text>
+      <text x="373" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">acceptInviteWorkflow runs</text>
+      <line x1="373" y1="166" x2="373" y2="190" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="425" y="182" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="263" y="192" width="220" height="46" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="373" y="212" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">createUsersWorkflow throws</text>
+      <text x="373" y="228" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">invite compensated to pending</text>
+      <line x1="486" y1="136" x2="528" y2="136" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="531" y="106" width="215" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="638" y="129" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">AuthIdentity orphaned</text>
+      <text x="638" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">no compensation step for it</text>
+    </svg>
+    <figcaption>The register call and the workflow that can fail sit on different sides of the transaction boundary. Compensation rolls the invite back but has nothing to say about the AuthIdentity it never created.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This comes down to where the transaction boundary sits, not a missing check inside any single step:</p>
+  <ul>
+    <li><code>POST /auth/user/{provider}/register</code> creates the <code>AuthIdentity</code> and returns a registration JWT before <code>acceptInviteWorkflow</code> is ever invoked, so that row exists independent of whatever happens next.</li>
+    <li><code>acceptInviteWorkflow</code> takes the resulting <code>auth_identity_id</code> as plain input. It validates the invite token, runs <code>createUsersWorkflow</code> as a step, and only afterward runs <code>setAuthAppMetadataStep</code>, <code>deleteInvitesStep</code>, and <code>emitEventStep</code> in parallel to finish linking the identity to the new user.</li>
+    <li>If <code>createUsersWorkflow</code> or the parallelized steps throw, for example a duplicate email, a role that does not exist, or a database error, Medusa's workflow engine compensates every step that has a compensation function, which puts the invite back to pending.</li>
+    <li>The <code>AuthIdentity</code> was created outside this workflow, so it has no compensation function registered anywhere in <code>acceptInviteWorkflow</code>. Nothing about the rollback touches it, and it survives as a row keyed to that email.</li>
+    <li>This is tracked directly in <a href="https://github.com/medusajs/medusa/issues/9884" rel="noopener">medusajs/medusa issue #9884</a>, where a failed invitation acceptance leaves the auth identity behind after the invite itself expires, and in <a href="https://github.com/medusajs/medusa/issues/13256" rel="noopener">issue #13256</a>, where copying and reusing an invite link produces the exact "identity with email already exists" error on the retry.</li>
+  </ul>
+  <p>This is a common source of confusion because the invite looks completely normal afterward. It shows up in the admin as pending, same as any invite waiting to be accepted, with its token still valid if it has not expired. Nothing on the invite record hints that an earlier attempt already left a live <code>AuthIdentity</code> behind. The invitee just keeps hitting the same wall no matter how many times they retry, because retrying calls register again, and register always finds the row from the first attempt. See the citations at the end for the exact issues and reference docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>AuthIdentity</code> is an internal Auth Module data model with no public admin listing route, so you cannot just query for orphans. But you can cross-reference three things you already have access to: pending invites from <code>userModuleService.listInvites({accepted: false})</code>, matching identities from <code>authModuleService.listAuthIdentities</code> filtered by <code>provider_identities.entity_id</code>, and a check that <code>userModuleService.listUsers({email})</code> comes back empty for that same email. When all three line up, the identity is provably orphaned, and it is safe to remove with <code>deleteAuthIdentities</code>. When a real user already exists on that email, stop and flag it instead, because deleting there would break a working login.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch the accept flow itself. We run a separate reconciliation job that lists pending invites, checks each one for a matching orphaned identity, and only removes the identity when there is no linked user, leaving the invite itself untouched so the invitee can simply try again.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. The script lists pending invites, then for each one checks for a matching AuthIdentity and whether a User already exists for that email. If a user exists it flags the case as ambiguous. If the invite is expired it resends the invite. Otherwise it deletes the orphaned AuthIdentity so the invitee can register again.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">List pending</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">invites</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="230" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="125" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Find matching AuthIdentity</text>
+      <text x="125" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">by entity_id === email</text>
+      <line x1="240" y1="138" x2="282" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="378,106 465,138 378,170 291,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="378" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2a1730">User already</text>
+      <text x="378" y="143" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2a1730">exists for email?</text>
+      <text x="378" y="196" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes, ambiguous</text>
+      <line x1="378" y1="170" x2="378" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="300" y="205" width="160" height="46" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="225" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Flag, do not touch</text>
+      <text x="380" y="240" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b5a70">a working login exists</text>
+      <text x="480" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no</text>
+      <line x1="465" y1="138" x2="507" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="600,106 687,138 600,170 513,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="600" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2a1730">Invite already</text>
+      <text x="600" y="143" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2a1730">expired?</text>
+      <text x="700" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no</text>
+      <line x1="687" y1="138" x2="729" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="600" y="200" width="170" height="52" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="685" y="221" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">resend_invite</text>
+      <text x="685" y="237" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b5a70">also fresh token</text>
+      <line x1="600" y1="170" x2="600" y2="197" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="605" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <rect x="672" y="106" width="78" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="711" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">delete</text>
+      <text x="711" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Auth</text>
+      <text x="711" y="158" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#4c9a2a">Identity</text>
+    </svg>
+    <figcaption>The invite is never touched unless it has already expired. Only a confirmed, userless AuthIdentity gets deleted, clearing the way for the invitee to register again.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session, and know this runs server-side</h3>
+      <p>The Admin API gives you invites, but not <code>AuthIdentity</code> rows, that model is internal to the Auth Module and has no public listing route. So this script authenticates against the Admin API to read invites, and assumes it also has access to a Medusa server context (a custom script or subscriber) where <code>container.resolve(Modules.AUTH)</code> and <code>container.resolve(Modules.USER)</code> are available for the identity and user lookups. Default to <code>DRY_RUN=true</code> so nothing is deleted until you have reviewed the list.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, only reports the orphans it finds</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, only reports the orphans it finds</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>POST /auth/user/emailpass</code>, then send it as <code>Authorization: Bearer &lt;token&gt;</code> on every following call. This token is only used to read invites and, if needed, to trigger a resend.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+async function getToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List pending invites, then the auth identities and users to cross-check</h3>
+      <p>Ask for invites with <code>accepted:false</code>, then feed each invite email into the identity and user lookups. In a real deployment the identity and user lookups run through <code>container.resolve(Modules.AUTH)</code> and <code>container.resolve(Modules.USER)</code> inside a Medusa script or subscriber, not through a public REST route, since none exists for <code>AuthIdentity</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def list_pending_invites(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/invites",
+        params={"fields": "id,email,accepted,expires_at,token"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    invites = r.json()["invites"]
+    return [i for i in invites if i.get("accepted") is False]
+
+
+# Server-side only, run inside a Medusa script or subscriber:
+#
+# const authModuleService = container.resolve(Modules.AUTH)
+# const userModuleService = container.resolve(Modules.USER)
+#
+# const authIdentities = await authModuleService.listAuthIdentities(
+#   {},
+#   { relations: ["provider_identities"] }
+# )
+# const users = await userModuleService.listUsers({ email: invite.email })</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function listPendingInvites(token) {
+  const res = await fetch(`${BASE_URL}/admin/invites?fields=id,email,accepted,expires_at,token`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa invites ${res.status}`);
+  const body = await res.json();
+  return body.invites.filter((i) =&gt; i.accepted === false);
+}
+
+// Server-side only, run inside a Medusa script or subscriber:
+//
+// const authModuleService = container.resolve(Modules.AUTH)
+// const userModuleService = container.resolve(Modules.USER)
+//
+// const authIdentities = await authModuleService.listAuthIdentities(
+//   {},
+//   { relations: ["provider_identities"] }
+// )
+// const users = await userModuleService.listUsers({ email: invite.email })</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision separate from every I/O call. It takes the pending invites, the auth identities (already shaped down to id, entityId, and providerId), the users, and a fixed clock, and returns a plain decision per orphan candidate. Only a pending invite with a matching identity and no linked user gets a delete decision. A matching identity next to an existing user is flagged instead of touched. An orphan tied to an expired invite gets a resend decision alongside the delete.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_orphaned_auth_identities(invites, auth_identities, users, now):
+    user_emails = {u["email"].strip().lower() for u in users if u.get("email")}
+    decisions = []
+
+    for invite in invites:
+        if invite.get("accepted") is not False:
+            continue
+        email = invite["email"].strip().lower()
+
+        match = next(
+            (ai for ai in auth_identities if ai.get("entityId", "").strip().lower() == email),
+            None,
+        )
+        if match is None:
+            continue
+
+        if email in user_emails:
+            decisions.append({
+                "inviteId": invite["id"], "email": invite["email"],
+                "authIdentityId": match["id"], "action": "flag_ambiguous",
+            })
+            continue
+
+        expires_at = invite.get("expires_at")
+        if expires_at is not None and expires_at &lt; now:
+            decisions.append({
+                "inviteId": invite["id"], "email": invite["email"],
+                "authIdentityId": match["id"], "action": "resend_invite",
+            })
+        else:
+            decisions.append({
+                "inviteId": invite["id"], "email": invite["email"],
+                "authIdentityId": match["id"], "action": "delete_auth_identity",
+            })
+
+    return decisions</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findOrphanedAuthIdentities(invites, authIdentities, users, now) {
+  const userEmails = new Set(
+    users.filter((u) =&gt; u.email).map((u) =&gt; u.email.trim().toLowerCase())
+  );
+  const decisions = [];
+
+  for (const invite of invites) {
+    if (invite.accepted !== false) continue;
+    const email = invite.email.trim().toLowerCase();
+
+    const match = authIdentities.find(
+      (ai) =&gt; (ai.entityId || "").trim().toLowerCase() === email
+    );
+    if (!match) continue;
+
+    if (userEmails.has(email)) {
+      decisions.push({ inviteId: invite.id, email: invite.email, authIdentityId: match.id, action: "flag_ambiguous" });
+      continue;
+    }
+
+    const expiresAt = invite.expires_at ? new Date(invite.expires_at) : null;
+    if (expiresAt !== null &amp;&amp; expiresAt &lt; now) {
+      decisions.push({ inviteId: invite.id, email: invite.email, authIdentityId: match.id, action: "resend_invite" });
+    } else {
+      decisions.push({ inviteId: invite.id, email: invite.email, authIdentityId: match.id, action: "delete_auth_identity" });
+    }
+  }
+
+  return decisions;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Apply only what the decision says, never more</h3>
+      <p>For a <code>delete_auth_identity</code> decision, call <code>authModuleService.deleteAuthIdentities([authIdentity.id])</code> and leave the invite completely alone, still pending, token intact if it has not expired, so the invitee can register and accept again. For <code>resend_invite</code>, call <code>POST /admin/invites/{id}/resend</code> to reissue a fresh token, in addition to the delete when the identity is also orphaned. For <code>flag_ambiguous</code>, only log it. Never call delete on that path.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def resend_invite(token, invite_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/invites/{invite_id}/resend",
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+# Server-side only, run inside a Medusa script or subscriber:
+#
+# await authModuleService.deleteAuthIdentities([authIdentity.id])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function resendInvite(token, inviteId) {
+  const res = await fetch(`${BASE_URL}/admin/invites/${inviteId}/resend`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa resend ${res.status}`);
+}
+
+// Server-side only, run inside a Medusa script or subscriber:
+//
+// await authModuleService.deleteAuthIdentities([authIdentity.id])</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop lists pending invites, resolves each one against auth identities and users, runs them all through the pure decision function, then applies each decision only when <code>DRY_RUN</code> is off. Read the dry run output first. Anything marked <code>flag_ambiguous</code> needs a human to look at it, not a script to guess.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never delete an <code>AuthIdentity</code> when a matching <code>User</code> already exists for that email. That row is a working login, and the resemblance to an orphan is exactly what makes this dangerous to automate blindly. Only <code>delete_auth_identity</code> decisions should ever call <code>deleteAuthIdentities</code>, and only after you have confirmed there is no linked user.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists pending invites, and runs the pure decision function against auth identity and user data you supply (from your Medusa server context), gated by <code>DRY_RUN</code>. The direct <code>authModuleService</code> and <code>userModuleService</code> calls are commented inline because they only run inside a Medusa server process, not over the Admin REST API.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/orphaned-auth-identity-blocks-reinvite" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair_orphaned_identity.py</div>
+      <pre><code class="language-python">"""Find and repair an AuthIdentity orphaned by a failed Medusa v2 invite accept.
+
+POST /auth/user/{provider}/register creates the AuthIdentity before
+POST /admin/invites/accept ever runs acceptInviteWorkflow. If that workflow
+fails, Medusa compensates the invite back to pending, but the AuthIdentity has
+no compensation step of its own and is left behind, blocking every retry with
+"Identity with email already exists". This lists pending invites over the
+Admin API, cross-checks them against auth identities and users you supply
+(read server-side with container.resolve(Modules.AUTH) and Modules.USER), and
+only ever deletes an identity when no user is linked to that email. DRY_RUN=true
+only reports what it would do. Safe to run again and again.
+"""
+import os
+import logging
+import datetime
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("repair_orphaned_identity")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def list_pending_invites(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(
+        f"{BASE_URL}/admin/invites",
+        params={"fields": "id,email,accepted,expires_at,token"},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    invites = r.json()["invites"]
+    return [i for i in invites if i.get("accepted") is False]
+
+
+def resend_invite(token, invite_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/invites/{invite_id}/resend",
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+def find_orphaned_auth_identities(invites, auth_identities, users, now):
+    """Pure: no I/O. invites/authIdentities/users are plain lists, now is a datetime."""
+    user_emails = {u["email"].strip().lower() for u in users if u.get("email")}
+    decisions = []
+
+    for invite in invites:
+        if invite.get("accepted") is not False:
+            continue
+        email = invite["email"].strip().lower()
+
+        match = next(
+            (ai for ai in auth_identities if ai.get("entityId", "").strip().lower() == email),
+            None,
+        )
+        if match is None:
+            continue
+
+        if email in user_emails:
+            decisions.append({
+                "inviteId": invite["id"], "email": invite["email"],
+                "authIdentityId": match["id"], "action": "flag_ambiguous",
+            })
+            continue
+
+        expires_at = invite.get("expires_at")
+        if expires_at is not None and expires_at &lt; now:
+            decisions.append({
+                "inviteId": invite["id"], "email": invite["email"],
+                "authIdentityId": match["id"], "action": "resend_invite",
+            })
+        else:
+            decisions.append({
+                "inviteId": invite["id"], "email": invite["email"],
+                "authIdentityId": match["id"], "action": "delete_auth_identity",
+            })
+
+    return decisions
+
+
+def run():
+    token = get_token()
+    invites = list_pending_invites(token)
+
+    # In a real deployment these two calls happen server-side, inside a Medusa
+    # script or subscriber, using container.resolve(Modules.AUTH) and
+    # container.resolve(Modules.USER). There is no public admin route for
+    # AuthIdentity, so this is left as an injection point:
+    #
+    #   auth_identities = await authModuleService.listAuthIdentities(
+    #       {}, {"relations": ["provider_identities"]}
+    #   )
+    #   users = await userModuleService.listUsers({})
+    auth_identities = []
+    users = []
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    decisions = find_orphaned_auth_identities(invites, auth_identities, users, now)
+
+    for decision in decisions:
+        if decision["action"] == "flag_ambiguous":
+            log.warning(
+                "Flagged: %s has both a pending invite and a user. Not touching AuthIdentity %s.",
+                decision["email"], decision["authIdentityId"],
+            )
+            continue
+
+        if decision["action"] == "resend_invite":
+            log.warning(
+                "Invite for %s expired with an orphaned identity. %s",
+                decision["email"], "would resend and delete identity" if DRY_RUN else "resending and deleting identity",
+            )
+            if not DRY_RUN:
+                resend_invite(token, decision["inviteId"])
+                # await authModuleService.deleteAuthIdentities([decision["authIdentityId"]])
+            continue
+
+        log.info(
+            "Orphaned AuthIdentity for %s. %s",
+            decision["email"], "would delete" if DRY_RUN else "deleting",
+        )
+        if not DRY_RUN:
+            pass
+            # await authModuleService.deleteAuthIdentities([decision["authIdentityId"]])
+
+    log.info("Done. %d decision(s) evaluated.", len(decisions))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair-orphaned-identity.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and repair an AuthIdentity orphaned by a failed Medusa v2 invite accept.
+ *
+ * POST /auth/user/{provider}/register creates the AuthIdentity before
+ * POST /admin/invites/accept ever runs acceptInviteWorkflow. If that workflow
+ * fails, Medusa compensates the invite back to pending, but the AuthIdentity has
+ * no compensation step of its own and is left behind, blocking every retry with
+ * "Identity with email already exists". This lists pending invites over the
+ * Admin API, cross-checks them against auth identities and users you supply
+ * (read server-side with container.resolve(Modules.AUTH) and Modules.USER), and
+ * only ever deletes an identity when no user is linked to that email. DRY_RUN=true
+ * only reports what it would do. Safe to run again and again.
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function findOrphanedAuthIdentities(invites, authIdentities, users, now) {
+  // Pure: no I/O. invites/authIdentities/users are plain arrays, now is a Date.
+  const userEmails = new Set(
+    users.filter((u) =&gt; u.email).map((u) =&gt; u.email.trim().toLowerCase())
+  );
+  const decisions = [];
+
+  for (const invite of invites) {
+    if (invite.accepted !== false) continue;
+    const email = invite.email.trim().toLowerCase();
+
+    const match = authIdentities.find(
+      (ai) =&gt; (ai.entityId || "").trim().toLowerCase() === email
+    );
+    if (!match) continue;
+
+    if (userEmails.has(email)) {
+      decisions.push({ inviteId: invite.id, email: invite.email, authIdentityId: match.id, action: "flag_ambiguous" });
+      continue;
+    }
+
+    const expiresAt = invite.expires_at ? new Date(invite.expires_at) : null;
+    if (expiresAt !== null &amp;&amp; expiresAt &lt; now) {
+      decisions.push({ inviteId: invite.id, email: invite.email, authIdentityId: match.id, action: "resend_invite" });
+    } else {
+      decisions.push({ inviteId: invite.id, email: invite.email, authIdentityId: match.id, action: "delete_auth_identity" });
+    }
+  }
+
+  return decisions;
+}
+
+async function getToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function listPendingInvites(token) {
+  const res = await fetch(`${BASE_URL}/admin/invites?fields=id,email,accepted,expires_at,token`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa invites ${res.status}`);
+  const body = await res.json();
+  return body.invites.filter((i) =&gt; i.accepted === false);
+}
+
+async function resendInvite(token, inviteId) {
+  const res = await fetch(`${BASE_URL}/admin/invites/${inviteId}/resend`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa resend ${res.status}`);
+}
+
+export async function run() {
+  const token = await getToken();
+  const invites = await listPendingInvites(token);
+
+  // In a real deployment these two calls happen server-side, inside a Medusa
+  // script or subscriber, using container.resolve(Modules.AUTH) and
+  // container.resolve(Modules.USER). There is no public admin route for
+  // AuthIdentity, so this is left as an injection point:
+  //
+  //   const authModuleService = container.resolve(Modules.AUTH)
+  //   const userModuleService = container.resolve(Modules.USER)
+  //   const authIdentities = await authModuleService.listAuthIdentities(
+  //     {}, { relations: ["provider_identities"] }
+  //   )
+  //   const users = await userModuleService.listUsers({})
+  const authIdentities = [];
+  const users = [];
+
+  const decisions = findOrphanedAuthIdentities(invites, authIdentities, users, new Date());
+
+  for (const decision of decisions) {
+    if (decision.action === "flag_ambiguous") {
+      console.warn(
+        `Flagged: ${decision.email} has both a pending invite and a user. Not touching AuthIdentity ${decision.authIdentityId}.`
+      );
+      continue;
+    }
+
+    if (decision.action === "resend_invite") {
+      console.warn(
+        `Invite for ${decision.email} expired with an orphaned identity. ${DRY_RUN ? "would resend and delete identity" : "resending and deleting identity"}`
+      );
+      if (!DRY_RUN) {
+        await resendInvite(token, decision.inviteId);
+        // await authModuleService.deleteAuthIdentities([decision.authIdentityId])
+      }
+      continue;
+    }
+
+    console.log(`Orphaned AuthIdentity for ${decision.email}. ${DRY_RUN ? "would delete" : "deleting"}`);
+    if (!DRY_RUN) {
+      // await authModuleService.deleteAuthIdentities([decision.authIdentityId])
+    }
+  }
+
+  console.log(`Done. ${decisions.length} decision(s) evaluated.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is <code>findOrphanedAuthIdentities</code>, since it decides which email gets deleted, flagged, or resent. It is pure, no network and no Medusa instance, just plain arrays and a fixed clock in, and a decision array out, so the tests feed in fixture invites, identities, and users and check the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_orphaned_identity.py</div>
+      <pre><code class="language-python">from datetime import datetime, timezone
+from repair_orphaned_identity import find_orphaned_auth_identities
+
+NOW = datetime(2026, 7, 10, tzinfo=timezone.utc)
+
+
+def invite(**over):
+    base = {"id": "invite_01", "email": "jane@example.com", "accepted": False,
+            "expires_at": datetime(2026, 7, 20, tzinfo=timezone.utc)}
+    base.update(over)
+    return base
+
+
+def identity(**over):
+    base = {"id": "au_01", "entityId": "jane@example.com", "providerId": "emailpass"}
+    base.update(over)
+    return base
+
+
+def test_no_decision_when_no_matching_identity():
+    result = find_orphaned_auth_identities([invite()], [], [], NOW)
+    assert result == []
+
+
+def test_delete_when_pending_orphaned_and_not_expired():
+    result = find_orphaned_auth_identities([invite()], [identity()], [], NOW)
+    assert result == [{"inviteId": "invite_01", "email": "jane@example.com",
+                        "authIdentityId": "au_01", "action": "delete_auth_identity"}]
+
+
+def test_flag_ambiguous_when_user_already_exists():
+    users = [{"id": "user_01", "email": "jane@example.com"}]
+    result = find_orphaned_auth_identities([invite()], [identity()], users, NOW)
+    assert result == [{"inviteId": "invite_01", "email": "jane@example.com",
+                        "authIdentityId": "au_01", "action": "flag_ambiguous"}]
+
+
+def test_resend_invite_when_expired():
+    expired = invite(expires_at=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    result = find_orphaned_auth_identities([expired], [identity()], [], NOW)
+    assert result == [{"inviteId": "invite_01", "email": "jane@example.com",
+                        "authIdentityId": "au_01", "action": "resend_invite"}]
+
+
+def test_skip_when_invite_already_accepted():
+    accepted = invite(accepted=True)
+    result = find_orphaned_auth_identities([accepted], [identity()], [], NOW)
+    assert result == []
+
+
+def test_user_check_wins_over_expired_invite():
+    expired = invite(expires_at=datetime(2026, 7, 1, tzinfo=timezone.utc))
+    users = [{"id": "user_01", "email": "jane@example.com"}]
+    result = find_orphaned_auth_identities([expired], [identity()], users, NOW)
+    assert result[0]["action"] == "flag_ambiguous"
+
+
+def test_case_and_whitespace_are_normalized():
+    messy_invite = invite(email="  Jane@Example.com  ")
+    result = find_orphaned_auth_identities([messy_invite], [identity()], [], NOW)
+    assert result[0]["action"] == "delete_auth_identity"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">orphan.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findOrphanedAuthIdentities } from "./repair-orphaned-identity.js";
+
+const NOW = new Date("2026-07-10T00:00:00Z");
+
+const invite = (over = {}) =&gt; ({
+  id: "invite_01",
+  email: "jane@example.com",
+  accepted: false,
+  expires_at: "2026-07-20T00:00:00Z",
+  ...over,
+});
+
+const identity = (over = {}) =&gt; ({
+  id: "au_01",
+  entityId: "jane@example.com",
+  providerId: "emailpass",
+  ...over,
+});
+
+test("no decision when no matching identity", () =&gt; {
+  const result = findOrphanedAuthIdentities([invite()], [], [], NOW);
+  assert.deepEqual(result, []);
+});
+
+test("delete when pending, orphaned, and not expired", () =&gt; {
+  const result = findOrphanedAuthIdentities([invite()], [identity()], [], NOW);
+  assert.deepEqual(result, [
+    { inviteId: "invite_01", email: "jane@example.com", authIdentityId: "au_01", action: "delete_auth_identity" },
+  ]);
+});
+
+test("flag ambiguous when user already exists", () =&gt; {
+  const users = [{ id: "user_01", email: "jane@example.com" }];
+  const result = findOrphanedAuthIdentities([invite()], [identity()], users, NOW);
+  assert.deepEqual(result, [
+    { inviteId: "invite_01", email: "jane@example.com", authIdentityId: "au_01", action: "flag_ambiguous" },
+  ]);
+});
+
+test("resend invite when expired", () =&gt; {
+  const expired = invite({ expires_at: "2026-07-01T00:00:00Z" });
+  const result = findOrphanedAuthIdentities([expired], [identity()], [], NOW);
+  assert.deepEqual(result, [
+    { inviteId: "invite_01", email: "jane@example.com", authIdentityId: "au_01", action: "resend_invite" },
+  ]);
+});
+
+test("skip when invite already accepted", () =&gt; {
+  const accepted = invite({ accepted: true });
+  const result = findOrphanedAuthIdentities([accepted], [identity()], [], NOW);
+  assert.deepEqual(result, []);
+});
+
+test("user check wins over expired invite", () =&gt; {
+  const expired = invite({ expires_at: "2026-07-01T00:00:00Z" });
+  const users = [{ id: "user_01", email: "jane@example.com" }];
+  const result = findOrphanedAuthIdentities([expired], [identity()], users, NOW);
+  assert.equal(result[0].action, "flag_ambiguous");
+});
+
+test("case and whitespace are normalized", () =&gt; {
+  const messyInvite = invite({ email: "  Jane@Example.com  " });
+  const result = findOrphanedAuthIdentities([messyInvite], [identity()], [], NOW);
+  assert.equal(result[0].action, "delete_auth_identity");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Duplicate email retry</span>
+      <h4>The teammate who was invited twice by mistake</h4>
+      <p>A team lead invited a new hire, then a second manager invited the same person again a day later without checking, thinking the first invite had gone stale. The new hire clicked the second link, registered, and hit a role conflict during accept because two invites for the same email collided inside <code>createUsersWorkflow</code>. The invite bounced back to pending, and the new hire's retry failed instantly with identity already exists.</p>
+      <p>Running the reconciler found exactly one pending invite for that email with a matching, userless <code>AuthIdentity</code>, a clean <code>delete_auth_identity</code> case. Deleting it left the still-pending invite untouched, and the new hire registered and accepted on the very next attempt, no second invite required.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Expired token</span>
+      <h4>The contractor whose invite sat too long</h4>
+      <p>A contractor was invited, started the accept flow, hit a transient database error on the last step, and then got busy and did not retry for two weeks. By the time they came back, the invite's <code>expires_at</code> had passed, and the orphaned <code>AuthIdentity</code> from that first attempt was still sitting there blocking a fresh register.</p>
+      <p>The reconciler's decision for that row was <code>resend_invite</code>, since the invite itself was expired on top of the orphan. The script reissued a fresh token with <code>POST /admin/invites/{id}/resend</code> and cleared the stale identity in the same pass, and the contractor accepted cleanly with the new link.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this reconciler on a schedule against your pending invites, and a failed accept stops being a dead end. The invite itself is never touched unless it has expired, and an identity is only ever deleted when there is provably no user attached to it. Anything ambiguous, a pending invite next to an existing user on the same email, gets reported for a human to look at instead of guessed at. Keep that boundary, and the script stays exactly as safe as it looks: a cleanup step, never a login-breaking one.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does re-accepting a Medusa invite fail with Identity with email already exists?</summary>
+      <p>Accepting an invite is two calls. The client first calls POST /auth/user/{provider}/register, which creates an AuthIdentity row for that email right away. Only then does it call POST /admin/invites/accept, which runs acceptInviteWorkflow and creates the user. If that second call fails, for example on a duplicate email or a role conflict, the workflow compensates the invite back to pending, but it has no compensation step for the AuthIdentity created in the earlier, separate register call. That row is left behind, so the next register attempt for the same email hits an identity that already exists.</p>
+    </details>
+    <details>
+      <summary>How do I find an orphaned AuthIdentity from a failed invite accept?</summary>
+      <p>There is no admin REST route that lists AuthIdentity rows, so run a server-side script with container.resolve. List pending invites with userModuleService.listInvites({accepted: false}), then for each invite email call authModuleService.listAuthIdentities with the provider_identities relation and filter for an entity_id that matches the invite email. If a matching AuthIdentity exists and userModuleService.listUsers({email}) returns nothing for that email, the identity is orphaned.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete the orphaned AuthIdentity?</summary>
+      <p>Yes, but only when the invite is still pending and no User row exists with that email. In that case authModuleService.deleteAuthIdentities removes only the stale identity and leaves the invite untouched, so the invitee can register and accept again cleanly. Never delete an AuthIdentity when a matching User already exists, since that would break a working login. If the invite has already expired, resend it instead of, or in addition to, deleting the identity.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #9884: If invitation acceptance fails, the invitation expires and the auth identity is created. <a href="https://github.com/medusajs/medusa/issues/9884" rel="noopener">github.com/medusajs/medusa/issues/9884</a></li>
+      <li>medusajs/medusa core-flows source: the accept-invite.ts workflow, showing createUsersWorkflow followed by the parallelized setAuthAppMetadataStep, deleteInvitesStep, and emitEventStep. <a href="https://github.com/medusajs/medusa/blob/develop/packages/core/core-flows/src/invite/workflows/accept-invite.ts" rel="noopener">github.com/medusajs/medusa/blob/develop/packages/core/core-flows/src/invite/workflows/accept-invite.ts</a></li>
+      <li>medusajs/medusa GitHub issue #13256: Copy invite link gives error, Identity with email already exists. <a href="https://github.com/medusajs/medusa/issues/13256" rel="noopener">github.com/medusajs/medusa/issues/13256</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: AuthIdentity, Auth Module data model reference. <a href="https://docs.medusajs.com/resources/references/auth/models/AuthIdentity" rel="noopener">docs.medusajs.com/resources/references/auth/models/AuthIdentity</a></li>
+      <li>Medusa Documentation: Invite, User Module data model reference. <a href="https://docs.medusajs.com/resources/references/user/models/Invite" rel="noopener">docs.medusajs.com/resources/references/user/models/Invite</a></li>
+      <li>Medusa Documentation: How to Use Authentication Routes. <a href="https://docs.medusajs.com/resources/commerce-modules/auth/authentication-route" rel="noopener">docs.medusajs.com/resources/commerce-modules/auth/authentication-route</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this unblock a stuck invitee?</h3>
+    <p>If this saved you from a confusing 401 that made no sense on a second attempt, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>
