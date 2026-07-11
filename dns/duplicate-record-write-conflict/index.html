@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Duplicate DNS Record Write Rejected by the Provider API</title>
+<meta name="description" content="A script keeps POSTing a new DNS record without checking what is already there, and Cloudflare rejects it with error 81057 or 81053. Learn why, and build a list-then-upsert reconciler in Python or Node.js.">
+<link rel="canonical" href="https://www.allanninal.dev/dns/duplicate-record-write-conflict/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Duplicate DNS Record Write Rejected by the Provider API">
+<meta property="og:description" content="Why a blind POST to the Cloudflare DNS API fails with error 81057 or 81053, and a list-then-upsert reconciler in Python or Node.js that fixes it for good.">
+<meta property="og:url" content="https://www.allanninal.dev/dns/duplicate-record-write-conflict/">
+<meta property="og:image" content="https://www.allanninal.dev/dns/assets/img/duplicate-record-write-conflict/feature.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/dns/assets/dns.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/dns/duplicate-record-write-conflict/#article","headline":"Fix a Duplicate DNS Record Write Rejected by the Provider API","description":"Why a blind POST to the Cloudflare DNS API fails with error 81057 or 81053, and a list-then-upsert reconciler in Python or Node.js that fixes it for good.","datePublished":"2026-07-11","dateModified":"2026-07-11","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/dns/duplicate-record-write-conflict/","image":"https://www.allanninal.dev/dns/assets/img/duplicate-record-write-conflict/feature.jpg","articleSection":"Provider API / Reconciliation","keywords":"DNS record already exists, Cloudflare error 81057, Cloudflare error 81053, DNS upsert, Cloudflare DNS API, list then update","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/dns/"},{"@type":"ListItem","position":2,"name":"Duplicate record write rejected by provider API","item":"https://www.allanninal.dev/dns/duplicate-record-write-conflict/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Cloudflare reject my DNS record with error 81057?","acceptedAnswer":{"@type":"Answer","text":"Error 81057, \"The record already exists,\" means a record of the same type already sits at that exact name. Your script or tool sent a create (POST) call without first checking whether the record was already there, so Cloudflare refused to make a duplicate."}},{"@type":"Question","name":"What is the difference between error 81057 and error 81053?","acceptedAnswer":{"@type":"Answer","text":"81057 is a same-type clash, for example you tried to create a second A record at a name that already has one with the exact same content or an existing record of that type. 81053 is a cross-type clash, most often trying to add a CNAME at a name that already has an A, AAAA, or other record, or the reverse. DNS forbids a CNAME from sharing a name with any other record type, so 81053 always needs one of the two records deleted."}},{"@type":"Question","name":"How do I stop this from happening again?","acceptedAnswer":{"@type":"Answer","text":"Change the automation so it never blindly creates. Before every write, list what already exists at that exact name and type. If nothing is there, create it. If a record is already there and matches what you want, do nothing. If it is there but different, update it in place with a PATCH instead of creating a new one."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/dns/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / dns</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/dns/">Field notes</a> / Provider API / Reconciliation</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Provider API / Reconciliation</p>
+    <h1>Duplicate record write rejected by provider API</h1>
+    <p class="lead">A script tries to add a DNS record, and the provider API says no: the record already exists. This is not a bug in the API. It is a script that never checked what was already in the zone before it tried to write. Here is why Cloudflare rejects the call, and a small reconciler that lists first, then only creates or updates what actually needs to change.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Cloudflare DNS API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <figure class="feature-img">
+    <img src="/dns/assets/img/duplicate-record-write-conflict/feature.jpg" alt="A close up of a network with wires connected to it" width="1200" height="630" loading="eager" decoding="async">
+    <figcaption>Photo by <a href="https://unsplash.com/@albertstoynov?utm_source=allanninal_dev&utm_medium=referral" rel="noopener nofollow" target="_blank">Albert Stoynov</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+  </figure>
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>A script or automation sent a create call to add a DNS record without first checking whether one already existed at that exact name and type. Cloudflare's API rejects the write with error 81057, "The record already exists," for a same-type clash, or error 81053, "An A, AAAA, or CNAME record with that host already exists," when a CNAME conflicts with any other record type at the same name. The fix is to change the automation from always creating to listing first, then creating only when nothing is there, or updating in place when something already is. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>DNS is simple about one thing: a script that wants to add a record has to check first whether that record is already there. Most automation does not. It reads a desired state, a name and a type and a value, and just fires a create call every time it runs. The first run works. The second run, or the run after someone else already made the record by hand, hits a wall.</p>
+  <p>Cloudflare will not silently accept a second copy of the same record, and it will not let a CNAME sit next to any other record type at the same name. So the create call comes back as a failure, the automation stops or logs an error, and whoever is watching the pipeline has to go find out why "adding a DNS record" broke.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A script blindly POSTs a new DNS record without checking what already exists, and the Cloudflare API rejects the write with error 81057 or 81053.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#565175"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="78" width="170" height="60" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="95" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e1b3a">Script runs</text>
+      <text x="95" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#565175">desired: A app.example.com</text>
+      <line x1="183" y1="108" x2="225" y2="108" stroke="#565175" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="228" y="78" width="170" height="60" rx="10" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="313" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e1b3a">POST create</text>
+      <text x="313" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#565175">no check first</text>
+      <line x1="401" y1="108" x2="443" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="422" y="66" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="422" y="135" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">record already</text>
+      <text x="422" y="150" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">exists in zone</text>
+      <rect x="446" y="78" width="170" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="531" y="104" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">HTTP 400</text>
+      <text x="531" y="122" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#565175">success: false</text>
+      <line x1="619" y1="108" x2="661" y2="108" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="619" y="20" width="131" height="46" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="684" y="47" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">code 81057</text>
+      <rect x="619" y="150" width="131" height="46" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="684" y="177" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">code 81053</text>
+      <line x1="664" y1="66" x2="664" y2="96" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <line x1="664" y1="150" x2="664" y2="120" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>The script never asked what was already in the zone. Cloudflare refuses the duplicate create and hands back an error code instead of a new record.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>Automation is written as "always POST" instead of "check, then decide," so the second run of the same job fails where the first run succeeded.</li>
+    <li>Someone added the record by hand in the dashboard, and the script has no idea that happened, so it tries to create it again.</li>
+    <li>A migration or bulk import script runs twice, maybe because a job retried after a timeout, and the second attempt collides with the first.</li>
+    <li>A CNAME is being added at a name that already has an A, AAAA, or other record, which DNS itself does not allow no matter which provider you use, per RFC 1034.</li>
+  </ul>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Cloudflare's API is not being difficult. It is enforcing a rule that DNS has always had: one name cannot hold two conflicting answers of the same kind, and a CNAME cannot share a name with anything else at all. The fix is not to retry the same create call, it is to stop treating every write as a create. List what is there first, then create only when it is missing, or update in place when it is already there but wrong.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>Replace the blind create with a small reconciliation step. Before writing anything, ask the API what already exists at that exact name and type. If nothing comes back, it is safe to create. If one record comes back and it already matches what you want, there is nothing to do. If one record comes back but the content, TTL, or proxied flag is different, update that record in place with a PATCH instead of creating a second one. If the conflict is a CNAME blocking an A or AAAA record (or the reverse), decide which one should own that name and delete the other first.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the solution. The script lists existing records at the name and type first, then creates when none exist, updates in place when one exists and differs, or does nothing when it already matches.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4f46e5"></path></marker></defs>
+      <rect x="10" y="85" width="150" height="60" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="85" y="111" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">List records</text>
+      <text x="85" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">at name.exact + type</text>
+      <line x1="160" y1="115" x2="197" y2="115" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="200,85 280,115 200,145 120,115" fill="#eef2ff" stroke="#c7c5f0"></polygon>
+      <text x="200" y="111" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">Any record</text>
+      <text x="200" y="126" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">found?</text>
+      <text x="215" y="70" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no</text>
+      <line x1="200" y1="85" x2="200" y2="45" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="125" y="10" width="150" height="46" rx="8" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="200" y="30" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#4c9a2a">Create (POST)</text>
+      <text x="200" y="46" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#565175">nothing to clash with</text>
+      <text x="300" y="105" font-family="sans-serif" font-size="10.5" fill="#565175" font-weight="700">yes, one exists</text>
+      <line x1="280" y1="115" x2="317" y2="115" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="320,85 400,115 320,145 240,115" fill="#eef2ff" stroke="#c7c5f0"></polygon>
+      <text x="320" y="111" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">Matches</text>
+      <text x="320" y="126" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">desired?</text>
+      <text x="330" y="70" font-family="sans-serif" font-size="10.5" fill="#565175" font-weight="700">yes</text>
+      <line x1="320" y1="85" x2="320" y2="45" stroke="#565175" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="245" y="10" width="150" height="46" rx="8" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="320" y="30" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#565175">No-op, skip</text>
+      <text x="320" y="46" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#565175">already correct</text>
+      <text x="440" y="105" font-family="sans-serif" font-size="10.5" fill="#4f46e5" font-weight="700">no, differs</text>
+      <line x1="400" y1="115" x2="437" y2="115" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="440" y="85" width="160" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="520" y="111" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#4c9a2a">Update (PATCH)</text>
+      <text x="520" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">only the changed fields</text>
+      <line x1="600" y1="115" x2="637" y2="115" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="640" y="85" width="110" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="695" y="111" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Zone now</text>
+      <text x="695" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">matches</text>
+    </svg>
+    <figcaption>Listing before writing turns every run into a safe no-op, a safe create, or a targeted update, and never a duplicate.</figcaption>
+  </figure>
+
+  <h2>How to fix it</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Check what is already at that exact name and type</h3>
+      <p>Before writing anything, ask Cloudflare what already exists at the exact name and type you are about to write. A non-empty result means a blind create will fail. This one call is the entire fix for the root cause: it turns a guess into a fact.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">list-before-write.sh</div>
+      <pre><code class="language-bash">curl -s "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&amp;name.exact=app.example.com" \
+  -H "Authorization: Bearer $CF_TOKEN" \
+  | jq '.result[] | {id, name, type, content}'
+
+# a non-empty result array means the record already exists
+# and a blind POST will fail</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Reproduce the actual failure</h3>
+      <p>See the error for yourself. POST the same record twice: the first call succeeds, the second returns HTTP 400 with the exact error code that names the conflict.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">reproduce-81057.sh</div>
+      <pre><code class="language-bash">curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+  -H "Authorization: Bearer $CF_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"type":"A","name":"app.example.com","content":"203.0.113.10","ttl":300}'
+
+# second call with the same body returns:
+# HTTP 400, "success": false
+# errors[0].code = 81057  (same-type duplicate)
+# or 81053  (CNAME/A-type clash) if a CNAME is already at that name</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Cross-check what actually resolves</h3>
+      <p>Confirm which record is really answering for that name before you decide what to delete or keep. If a CNAME comes back where you expected an A record, that CNAME is what is blocking the write.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">check-what-resolves.sh</div>
+      <pre><code class="language-bash">dig +short A app.example.com
+dig +short CNAME app.example.com
+
+# against a public resolver too, in case of caching differences
+dig +short A app.example.com @1.1.1.1
+dig +short CNAME app.example.com @1.1.1.1</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Change the write from "always create" to "list, then upsert"</h3>
+      <p>List first. If the array is empty, POST the new record. If a record already exists, take its <code>id</code> and PATCH just the changed fields instead of POSTing a duplicate. If the conflict is a CNAME blocking an A or AAAA record (or the reverse), decide which record should own the name, delete the other one, then create the intended record.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">DNS record</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">records-before-and-after</div>
+      <pre><code class="language-text"># BEFORE: the script always sends this, even on the second run
+POST /zones/{zone_id}/dns_records
+{"type":"A","name":"app.example.com","content":"203.0.113.10","ttl":300,"proxied":false}
+# -> HTTP 400, code 81057, "The record already exists"
+
+# AFTER: list first
+GET /zones/{zone_id}/dns_records?type=A&amp;name.exact=app.example.com
+# -> one result, id "abc123", content "203.0.113.10" (already correct)
+# decision: noop, nothing to send
+
+# AFTER: content changed, so PATCH the existing record instead of creating one
+PATCH /zones/{zone_id}/dns_records/abc123
+{"content":"203.0.113.20"}
+
+# AFTER: CNAME blocking an A record at the same name, pick a winner
+DELETE /zones/{zone_id}/dns_records/{cname_record_id}
+POST /zones/{zone_id}/dns_records
+{"type":"A","name":"app.example.com","content":"203.0.113.10","ttl":300,"proxied":false}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Apply the change through the Cloudflare API</h3>
+      <p>With the decision made, send only the call that matches it: POST to create, PATCH to update in place, or DELETE followed by POST to resolve a CNAME versus A/AAAA clash.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">cloudflare-upsert.sh</div>
+      <pre><code class="language-bash"># create, only when the list call returned zero results
+curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records" \
+  -H "Authorization: Bearer $CF_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"type":"A","name":"app.example.com","content":"203.0.113.10","ttl":300,"proxied":false}'
+
+# update in place, only when the list call returned one existing record
+curl -s -X PATCH "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records/$RECORD_ID" \
+  -H "Authorization: Bearer $CF_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"content":"203.0.113.20"}'</code></pre>
+    </div>
+  </div>
+
+  <h2>How to check it worked</h2>
+  <p>Re-run the same create call: it should now succeed with no 81057 or 81053 error, because the script lists first, finds the existing record, and PATCHes it instead of POSTing a duplicate.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">verify.sh</div>
+      <pre><code class="language-bash"># confirm exactly one record exists at that name/type, not zero and not a duplicate
+curl -s "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/dns_records?type=A&amp;name.exact=app.example.com" \
+  -H "Authorization: Bearer $CF_TOKEN" | jq '.result | length'
+# good answer: 1
+
+# confirm externally that exactly one IP resolves, with no stale duplicate
+dig +short A app.example.com @1.1.1.1
+# good answer: one IP, the intended one, nothing else</code></pre>
+    </div>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete reconciler in one file for each language. It reads the desired record from the environment, lists what already exists at that name and type through the Cloudflare API, decides whether to create, update, or do nothing with a pure function, and only writes when you turn dry run off.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/dns-fixes/tree/main/duplicate-record-write-conflict" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the dns-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">duplicate_record_write_conflict.py</div>
+      <pre><code class="language-python">"""List DNS records before writing, then create or update instead of
+blindly POSTing a duplicate. Repairs the write through Cloudflare.
+
+Safe by default. Set DRY_RUN=false to let it write.
+
+Env vars:
+  DNS_DOMAIN               the name to check, e.g. "app.example.com"
+  DNS_RECORD_TYPE          record type to check, default "A"
+  DNS_RECORD_CONTENT       desired content, e.g. an IP for an A record
+  DNS_RECORD_TTL           desired TTL, default 300
+  DNS_RECORD_PROXIED       "true" or "false", default "false"
+  CLOUDFLARE_API_TOKEN     Cloudflare API token (only needed for repair)
+  CLOUDFLARE_ZONE_ID       Cloudflare zone id (only needed for repair)
+  DRY_RUN                  default "true"; set to "false" to actually write
+"""
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("duplicate_record_write_conflict")
+
+DNS_DOMAIN = os.environ.get("DNS_DOMAIN", "app.example.com")
+DNS_RECORD_TYPE = os.environ.get("DNS_RECORD_TYPE", "A")
+DNS_RECORD_CONTENT = os.environ.get("DNS_RECORD_CONTENT", "203.0.113.10")
+DNS_RECORD_TTL = int(os.environ.get("DNS_RECORD_TTL", "300"))
+DNS_RECORD_PROXIED = os.environ.get("DNS_RECORD_PROXIED", "false").lower() == "true"
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ZONE_ID = os.environ.get("CLOUDFLARE_ZONE_ID", "")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+CF_API = "https://api.cloudflare.com/client/v4"
+
+
+def plan_dns_write(existing_records, desired):
+    """Pure decision function. No I/O.
+
+    existing_records: list of {id, name, type, content, ttl, proxied}
+                       already at (desired['name'], desired['type'])
+    desired: {name, type, content, ttl, proxied}
+
+    Returns one of:
+      {"action": "create", "body": desired}
+      {"action": "noop", "id": <id>}
+      {"action": "update", "id": <id>, "body": {changed fields only}}
+    """
+    if not existing_records:
+        return {"action": "create", "body": desired}
+
+    current = existing_records[0]
+    diff = {}
+    for field in ("content", "ttl", "proxied"):
+        if field in desired and current.get(field) != desired[field]:
+            diff[field] = desired[field]
+
+    if not diff:
+        return {"action": "noop", "id": current["id"]}
+
+    return {"action": "update", "id": current["id"], "body": diff}
+
+
+def resolve_via_dns(domain, record_type):
+    """Look up what a public resolver actually returns right now, using
+    dnspython. Informational only, used before deciding what to touch.
+    """
+    import dns.resolver
+
+    try:
+        answer = dns.resolver.resolve(domain, record_type)
+        return [str(rdata) for rdata in answer]
+    except dns.resolver.NXDOMAIN:
+        return []
+    except dns.resolver.NoAnswer:
+        return []
+
+
+def list_existing_records(name, record_type):
+    """List DNS records at the exact name and type through the Cloudflare API."""
+    import requests
+
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+    params = {"type": record_type, "name.exact": name}
+    r = requests.get(
+        f"{CF_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records",
+        headers=headers, params=params, timeout=30,
+    )
+    r.raise_for_status()
+    return [
+        {
+            "id": rec["id"],
+            "name": rec["name"],
+            "type": rec["type"],
+            "content": rec["content"],
+            "ttl": rec.get("ttl", 1),
+            "proxied": rec.get("proxied", False),
+        }
+        for rec in r.json()["result"]
+    ]
+
+
+def create_record(body):
+    import requests
+
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+    if DRY_RUN:
+        log.info("[dry run] would create record %s", body)
+        return
+    r = requests.post(
+        f"{CF_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records",
+        headers=headers, json=body, timeout=30,
+    )
+    r.raise_for_status()
+    log.info("Created record %s", body)
+
+
+def update_record(record_id, body):
+    import requests
+
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}
+    if DRY_RUN:
+        log.info("[dry run] would update record %s with %s", record_id, body)
+        return
+    r = requests.patch(
+        f"{CF_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records/{record_id}",
+        headers=headers, json=body, timeout=30,
+    )
+    r.raise_for_status()
+    log.info("Updated record %s with %s", record_id, body)
+
+
+def run():
+    if not (CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID):
+        log.warning("No Cloudflare credentials set. Nothing to reconcile for %s.", DNS_DOMAIN)
+        return
+
+    desired = {
+        "name": DNS_DOMAIN,
+        "type": DNS_RECORD_TYPE,
+        "content": DNS_RECORD_CONTENT,
+        "ttl": DNS_RECORD_TTL,
+        "proxied": DNS_RECORD_PROXIED,
+    }
+
+    existing = list_existing_records(DNS_DOMAIN, DNS_RECORD_TYPE)
+    plan = plan_dns_write(existing, desired)
+
+    if plan["action"] == "noop":
+        log.info("%s already matches the desired state. Nothing to do.", DNS_DOMAIN)
+        return
+
+    if plan["action"] == "create":
+        log.info("%s has no existing %s record. Creating.", DNS_DOMAIN, DNS_RECORD_TYPE)
+        create_record(plan["body"])
+        return
+
+    log.info("%s exists but differs. Updating in place instead of duplicating.", DNS_DOMAIN)
+    update_record(plan["id"], plan["body"])
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">duplicate-record-write-conflict.js</div>
+      <pre><code class="language-javascript">/**
+ * List DNS records before writing, then create or update instead of
+ * blindly POSTing a duplicate. Repairs the write through Cloudflare.
+ *
+ * Safe by default. Set DRY_RUN=false to let it write.
+ *
+ * Env vars:
+ *   DNS_DOMAIN               the name to check, e.g. "app.example.com"
+ *   DNS_RECORD_TYPE          record type to check, default "A"
+ *   DNS_RECORD_CONTENT       desired content, e.g. an IP for an A record
+ *   DNS_RECORD_TTL           desired TTL, default 300
+ *   DNS_RECORD_PROXIED       "true" or "false", default "false"
+ *   CLOUDFLARE_API_TOKEN     Cloudflare API token (only needed for repair)
+ *   CLOUDFLARE_ZONE_ID       Cloudflare zone id (only needed for repair)
+ *   DRY_RUN                  default "true"; set to "false" to actually write
+ */
+import { pathToFileURL } from "node:url";
+
+const DNS_DOMAIN = process.env.DNS_DOMAIN || "app.example.com";
+const DNS_RECORD_TYPE = process.env.DNS_RECORD_TYPE || "A";
+const DNS_RECORD_CONTENT = process.env.DNS_RECORD_CONTENT || "203.0.113.10";
+const DNS_RECORD_TTL = Number(process.env.DNS_RECORD_TTL || 300);
+const DNS_RECORD_PROXIED = (process.env.DNS_RECORD_PROXIED || "false").toLowerCase() === "true";
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN || "";
+const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID || "";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const CF_API = "https://api.cloudflare.com/client/v4";
+
+export function planDnsWrite(existingRecords, desired) {
+  // Pure decision function. No I/O.
+  // existingRecords: array of { id, name, type, content, ttl, proxied }
+  //                  already at (desired.name, desired.type)
+  // desired: { name, type, content, ttl, proxied }
+  //
+  // Returns one of:
+  //   { action: "create", body: desired }
+  //   { action: "noop", id }
+  //   { action: "update", id, body: { changed fields only } }
+  if (!existingRecords.length) {
+    return { action: "create", body: desired };
+  }
+
+  const current = existingRecords[0];
+  const diff = {};
+  for (const field of ["content", "ttl", "proxied"]) {
+    if (field in desired && current[field] !== desired[field]) {
+      diff[field] = desired[field];
+    }
+  }
+
+  if (Object.keys(diff).length === 0) {
+    return { action: "noop", id: current.id };
+  }
+
+  return { action: "update", id: current.id, body: diff };
+}
+
+async function resolveViaDns(domain, recordType) {
+  // Look up what a public resolver actually returns right now, using the
+  // built-in dns module. Informational only, used before deciding what to
+  // touch.
+  const dns = await import("node:dns");
+  const { promises: dnsPromises } = dns;
+  try {
+    if (recordType === "CNAME") return await dnsPromises.resolveCname(domain);
+    return await dnsPromises.resolve4(domain);
+  } catch (err) {
+    if (err.code === "ENODATA" || err.code === "ENOTFOUND") return [];
+    throw err;
+  }
+}
+
+async function listExistingRecords(name, recordType) {
+  const headers = { Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}` };
+  const params = new URLSearchParams({ type: recordType, "name.exact": name });
+  const res = await fetch(
+    `${CF_API}/zones/${CLOUDFLARE_ZONE_ID}/dns_records?${params.toString()}`,
+    { headers },
+  );
+  if (!res.ok) throw new Error(`Cloudflare list returned ${res.status}`);
+  const body = await res.json();
+  return body.result.map((rec) => ({
+    id: rec.id,
+    name: rec.name,
+    type: rec.type,
+    content: rec.content,
+    ttl: rec.ttl ?? 1,
+    proxied: rec.proxied ?? false,
+  }));
+}
+
+async function createRecord(body) {
+  const headers = {
+    Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+  if (DRY_RUN) {
+    console.log(`[dry run] would create record ${JSON.stringify(body)}`);
+    return;
+  }
+  const res = await fetch(`${CF_API}/zones/${CLOUDFLARE_ZONE_ID}/dns_records`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Cloudflare create returned ${res.status}`);
+  console.log(`Created record ${JSON.stringify(body)}`);
+}
+
+async function updateRecord(recordId, body) {
+  const headers = {
+    Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+    "Content-Type": "application/json",
+  };
+  if (DRY_RUN) {
+    console.log(`[dry run] would update record ${recordId} with ${JSON.stringify(body)}`);
+    return;
+  }
+  const res = await fetch(`${CF_API}/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${recordId}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`Cloudflare update returned ${res.status}`);
+  console.log(`Updated record ${recordId} with ${JSON.stringify(body)}`);
+}
+
+async function run() {
+  if (!(CLOUDFLARE_API_TOKEN &amp;&amp; CLOUDFLARE_ZONE_ID)) {
+    console.warn(`No Cloudflare credentials set. Nothing to reconcile for ${DNS_DOMAIN}.`);
+    return;
+  }
+
+  const desired = {
+    name: DNS_DOMAIN,
+    type: DNS_RECORD_TYPE,
+    content: DNS_RECORD_CONTENT,
+    ttl: DNS_RECORD_TTL,
+    proxied: DNS_RECORD_PROXIED,
+  };
+
+  const existing = await listExistingRecords(DNS_DOMAIN, DNS_RECORD_TYPE);
+  const plan = planDnsWrite(existing, desired);
+
+  if (plan.action === "noop") {
+    console.log(`${DNS_DOMAIN} already matches the desired state. Nothing to do.`);
+    return;
+  }
+
+  if (plan.action === "create") {
+    console.log(`${DNS_DOMAIN} has no existing ${DNS_RECORD_TYPE} record. Creating.`);
+    await createRecord(plan.body);
+    return;
+  }
+
+  console.log(`${DNS_DOMAIN} exists but differs. Updating in place instead of duplicating.`);
+  await updateRecord(plan.id, plan.body);
+}
+
+if (process.argv[1] &amp;&amp; import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The upsert decision is the part most worth testing, because it decides whether the script sends a create, an update, or nothing at all. Because <code>plan_dns_write</code> is pure, the test needs no network and no Cloudflare account. It just feeds in plain record lists and checks the plan.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_write_conflict.py</div>
+      <pre><code class="language-python">from duplicate_record_write_conflict import plan_dns_write
+
+
+def desired(**over):
+    base = {"name": "app.example.com", "type": "A", "content": "203.0.113.10",
+            "ttl": 300, "proxied": False}
+    base.update(over)
+    return base
+
+
+def existing(**over):
+    base = {"id": "rec_1", "name": "app.example.com", "type": "A",
+            "content": "203.0.113.10", "ttl": 300, "proxied": False}
+    base.update(over)
+    return base
+
+
+def test_creates_when_nothing_exists():
+    plan = plan_dns_write([], desired())
+    assert plan["action"] == "create"
+    assert plan["body"] == desired()
+
+
+def test_noop_when_existing_matches_desired():
+    plan = plan_dns_write([existing()], desired())
+    assert plan == {"action": "noop", "id": "rec_1"}
+
+
+def test_update_when_content_differs():
+    plan = plan_dns_write([existing(content="203.0.113.99")], desired())
+    assert plan["action"] == "update"
+    assert plan["id"] == "rec_1"
+    assert plan["body"] == {"content": "203.0.113.10"}
+
+
+def test_update_only_sends_changed_fields():
+    plan = plan_dns_write([existing(ttl=60)], desired())
+    assert plan["body"] == {"ttl": 300}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">duplicate-record-write-conflict.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { planDnsWrite } from "./duplicate-record-write-conflict.js";
+
+const desired = (over = {}) => ({
+  name: "app.example.com", type: "A", content: "203.0.113.10",
+  ttl: 300, proxied: false, ...over,
+});
+
+const existing = (over = {}) => ({
+  id: "rec_1", name: "app.example.com", type: "A",
+  content: "203.0.113.10", ttl: 300, proxied: false, ...over,
+});
+
+test("creates when nothing exists", () => {
+  const plan = planDnsWrite([], desired());
+  assert.equal(plan.action, "create");
+  assert.deepEqual(plan.body, desired());
+});
+
+test("noop when existing matches desired", () => {
+  const plan = planDnsWrite([existing()], desired());
+  assert.deepEqual(plan, { action: "noop", id: "rec_1" });
+});
+
+test("update when content differs", () => {
+  const plan = planDnsWrite([existing({ content: "203.0.113.99" })], desired());
+  assert.equal(plan.action, "update");
+  assert.equal(plan.id, "rec_1");
+  assert.deepEqual(plan.body, { content: "203.0.113.10" });
+});
+
+test("update only sends changed fields", () => {
+  const plan = planDnsWrite([existing({ ttl: 60 })], desired());
+  assert.deepEqual(plan.body, { ttl: 300 });
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Retry storm</span>
+      <h4>The deploy job that fought itself</h4>
+      <p>A deploy pipeline added a DNS record for every new preview environment by calling a create endpoint directly. When a deploy took longer than the pipeline's timeout, the job retried, sending the exact same create call a second time. Every retried deploy failed with error 81057, even though the record from the first attempt was correct and already live.</p>
+      <p>Switching the step to list first, then create only when nothing existed, made retries harmless. The second attempt now saw the record from the first attempt, matched it, and returned a clean no-op instead of an error.</p>
+    </div>
+    <div class="case">
+      <span class="tag">CNAME clash</span>
+      <h4>The onboarding flow that could not add its own record</h4>
+      <p>A SaaS product asked customers to add a CNAME for a custom domain, but some customers already had an A record at that name from a previous provider. The onboarding script's create call failed every time with error 81053, and the error message on screen just said "something went wrong," which generated support tickets.</p>
+      <p>The fix listed the existing records at that name first. When a conflicting A record was found, the flow showed the customer exactly which record to remove, and only after confirming it was gone did the script create the CNAME. The confusing failure became a clear, one-step instruction.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After the fix, the automation can run any number of times without ever hitting error 81057 or 81053 again. Every run either creates a record that was missing, updates one that had drifted, or does nothing because the zone already matches what is wanted. Re-running the same job twice in a row is now a safe, boring no-op instead of a failure.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Cloudflare reject my DNS record with error 81057?</summary>
+      <p>Error 81057, "The record already exists," means a record of the same type already sits at that exact name. Your script or tool sent a create (POST) call without first checking whether the record was already there, so Cloudflare refused to make a duplicate.</p>
+    </details>
+    <details>
+      <summary>What is the difference between error 81057 and error 81053?</summary>
+      <p>81057 is a same-type clash, for example you tried to create a second A record at a name that already has one with the exact same content or an existing record of that type. 81053 is a cross-type clash, most often trying to add a CNAME at a name that already has an A, AAAA, or other record, or the reverse. DNS forbids a CNAME from sharing a name with any other record type, so 81053 always needs one of the two records deleted.</p>
+    </details>
+    <details>
+      <summary>How do I stop this from happening again?</summary>
+      <p>Change the automation so it never blindly creates. Before every write, list what already exists at that exact name and type. If nothing is there, create it. If a record is already there and matches what you want, do nothing. If it is there but different, update it in place with a PATCH instead of creating a new one.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/dns/">All DNS and Domains field notes</a>
+    <a href="/woocommerce/paid-orders-stuck-on-pending/">WooCommerce orders stuck on Pending after a successful Stripe payment</a>
+    <a href="/woocommerce/order-marked-paid-no-charge/">WooCommerce order marked paid with no matching charge</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Cloudflare DNS docs: cannot add DNS records with the same name. <a href="https://developers.cloudflare.com/dns/manage-dns-records/troubleshooting/records-with-same-name/" rel="noopener">developers.cloudflare.com/dns</a></li>
+      <li>Cloudflare Community: cannot add A record, record already exists (code 81057). <a href="https://community.cloudflare.com/t/cannot-add-a-record-record-already-exists-code-81057/501271" rel="noopener">community.cloudflare.com</a></li>
+      <li>Cloudflare Community: an A, AAAA, or CNAME record with that host already exists (code 81053). <a href="https://community.cloudflare.com/t/unable-to-add-cname-due-to-error-received-an-a-aaaa-or-cname-record-with-that-host-already-exists-code-81053/343031" rel="noopener">community.cloudflare.com</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Cloudflare API: DNS Records, List method. <a href="https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/list/" rel="noopener">developers.cloudflare.com/api</a></li>
+      <li>Cloudflare API: DNS Records, Update (Overwrite) method. <a href="https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/edit/" rel="noopener">developers.cloudflare.com/api</a></li>
+      <li>Cloudflare DNS docs: how to create DNS records. <a href="https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records/" rel="noopener">developers.cloudflare.com/dns</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a DNS, domain, or certificate problem you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this fix your zone?</h3>
+    <p>If this saved you a failed deploy or a confusing support ticket, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/dns/">Back to all DNS and Domains field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on DNS and Domains.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/dns/assets/dns.js" defer></script>
+</body>
+</html>

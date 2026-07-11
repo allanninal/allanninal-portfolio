@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix CNAME to A Record Type Change Conflict on the Same Name</title>
+<meta name="description" content="Swapping a CNAME for an A record fails with a same-name conflict because DNS forbids both existing at once. Learn why the delete-then-create race happens and how to fix it with one atomic update.">
+<link rel="canonical" href="https://www.allanninal.dev/dns/cname-to-a-type-change-conflict/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix CNAME to A Record Type Change Conflict on the Same Name">
+<meta property="og:description" content="Why swapping a CNAME for an A record fails with a same-name conflict, and how to fix it with one atomic update instead of a delete-then-create race.">
+<meta property="og:url" content="https://www.allanninal.dev/dns/cname-to-a-type-change-conflict/">
+<meta property="og:image" content="https://www.allanninal.dev/dns/assets/img/cname-to-a-type-change-conflict/feature.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/dns/assets/dns.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/dns/cname-to-a-type-change-conflict/#article","headline":"Fix CNAME to A Record Type Change Conflict on the Same Name","description":"Why swapping a CNAME for an A record fails with a same-name conflict, and how to fix it with one atomic update instead of a delete-then-create race.","datePublished":"2026-07-11","dateModified":"2026-07-11","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/dns/cname-to-a-type-change-conflict/","image":"https://www.allanninal.dev/dns/assets/img/cname-to-a-type-change-conflict/feature.jpg","articleSection":"Core Records","keywords":"CNAME to A record change, DNS same name conflict, Cloudflare 81057, Cloudflare 81054, Terraform DNS race, Cloudflare DNS API","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/dns/"},{"@type":"ListItem","position":2,"name":"CNAME to A record type change fails on an existing name","item":"https://www.allanninal.dev/dns/cname-to-a-type-change-conflict/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does changing a CNAME to an A record fail with a conflict?","acceptedAnswer":{"@type":"Answer","text":"DNS will not let a CNAME and any other record type sit at the same name at once. If your tool sends the create for the new A record before the delete of the old CNAME has finished, the DNS host still sees the CNAME and rejects the new record as a same-name conflict."}},{"@type":"Question","name":"How do I know if this is what is happening to me?","acceptedAnswer":{"@type":"Answer","text":"Run dig +short CNAME on the name. If it still returns a target after your tool reported success, the old record was never fully removed before the new one was attempted. The API error usually names the existing record type directly, such as Cloudflare's 81057 or 81054 codes."}},{"@type":"Question","name":"What is the actual fix?","acceptedAnswer":{"@type":"Answer","text":"Stop sending a delete and a create as two separate calls. Either wait for the delete to return success before sending the create, or better, send one PUT to the existing record's ID that overwrites its type and value. That way both records never exist at the same name at the same time."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/dns/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / dns</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/dns/">Field notes</a> / Core Records</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Core Records</p>
+    <h1>CNAME to A record type change fails on existing RRSet</h1>
+    <p class="lead">You changed a hostname from a CNAME to a plain A record, your deploy tool said it worked, and the DNS host still rejects it or still serves the old alias. This happens because DNS will never let a CNAME and an A record share the same name, even for a single moment. Here is why the swap fails and a script that fixes it without the race.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Cloudflare DNS API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <figure class="feature-img">
+    <img src="/dns/assets/img/cname-to-a-type-change-conflict/feature.jpg" alt="A bunch of wires that are connected to a server" width="1200" height="630" loading="eager" decoding="async">
+    <figcaption>Photo by <a href="https://unsplash.com/@lightsabercollection?utm_source=allanninal_dev&utm_medium=referral" rel="noopener nofollow" target="_blank">Lightsaber Collection</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+  </figure>
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>DNS forbids a CNAME from sharing a name with any other record type. When a script deletes the old CNAME and creates the new A record as two separate calls, the create can race ahead of the delete and get rejected because the CNAME is still there. Fix it by turning the change into one atomic update on the existing record's ID, so the CNAME and the A record are never both present at once.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A hostname can only mean one thing in DNS. Either it is an alias that points somewhere else with a CNAME, or it is a real address with an A record. It cannot be both, not even for a second. This rule comes straight from RFC 1035 and is repeated as a common error to avoid in RFC 1912.</p>
+  <p>Most deploy tools change a record type by removing the old one and adding the new one as two separate API calls. If those two calls are not strictly ordered, or if the second one is sent before the first one is confirmed, the DNS host still sees the old CNAME sitting there when the new A record arrives. It rejects the new record with a same-name conflict, and your change fails halfway through.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A delete call for the CNAME and a create call for the A record are sent close together. The create arrives while the CNAME still exists, so the DNS host rejects it with a same-name conflict.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#565175"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="180" height="58" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="100" y="45" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e1b3a">Deploy tool</text>
+      <text x="100" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">wants CNAME to A</text>
+
+      <line x1="100" y1="78" x2="100" y2="108" stroke="#565175" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="110" width="180" height="58" rx="10" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="100" y="135" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">DELETE CNAME</text>
+      <text x="100" y="153" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">app.example.com</text>
+
+      <line x1="100" y1="78" x2="380" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="290" y="110" width="180" height="58" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="135" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">POST A record</text>
+      <text x="380" y="153" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">sent too soon</text>
+
+      <text x="235" y="95" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="235" y="188" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">CNAME still live when A arrives</text>
+
+      <line x1="470" y1="139" x2="512" y2="139" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="515" y="110" width="230" height="58" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="630" y="132" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">400 same-name conflict</text>
+      <text x="630" y="150" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">CNAME already exists with that host</text>
+    </svg>
+    <figcaption>The delete and the create are sent as two separate calls. If the create arrives before the delete is confirmed, the DNS host still sees the CNAME and rejects the A record.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>DNS forbids a CNAME from coexisting with any other record type at the same name, per RFC 1035 section 3.6.2 and RFC 1912 section 2.4.</li>
+    <li>Reconciliation tools such as Terraform and external-dns typically model a type change as a plan with two separate actions, a delete and a create, rather than one update.</li>
+    <li>If the create request races ahead of the delete finishing, or the two calls are sent out of order, the DNS host still holds the old CNAME when it receives the new A record.</li>
+    <li>The API then rejects the create with a same-name conflict, because the zone still has a CNAME at that exact hostname.</li>
+    <li>The Terraform Cloudflare provider has an open issue describing this exact case, where the new resource is created before the old one is destroyed and Cloudflare returns "A CNAME already exists with that host."</li>
+  </ul>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The failure is not about the record values being wrong. It is about timing. Two independent calls, a delete and a create, leave a window where the old record and the new record could both exist, and DNS refuses to allow that window. Collapsing the change into one call on the same record ID removes the window entirely.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>Instead of asking "did the delete finish yet," change the question to "what is live right now, and does it match what I want." A script reads the current record at the name, compares it to the desired record, and if the only thing at that name is a CNAME where an A record belongs, it overwrites that same record in place with one call. No delete, no create, no race.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the solution. A script reads the live record, compares it to the desired record, finds one conflicting CNAME, and sends a single PUT that overwrites the record in place to become an A record.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4f46e5"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="58" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="95" y="45" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">Read live record</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">GET dns_records?name=</text>
+
+      <line x1="180" y1="49" x2="222" y2="49" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="225" y="20" width="170" height="58" rx="10" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="310" y="45" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">Compare to desired</text>
+      <text x="310" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">type A, given IP</text>
+
+      <line x1="395" y1="49" x2="437" y2="49" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="530,20 615,49 530,78 445,49" fill="#eef2ff" stroke="#c7c5f0"></polygon>
+      <text x="530" y="45" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">One CNAME</text>
+      <text x="530" y="60" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">conflict?</text>
+
+      <text x="625" y="40" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="615" y1="49" x2="655" y2="49" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+
+      <text x="545" y="105" font-family="sans-serif" font-size="10.5" fill="#8983a8" font-weight="700">no match, no conflict: noop or create</text>
+      <line x1="530" y1="78" x2="530" y2="112" stroke="#8983a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+
+      <rect x="592" y="90" width="150" height="58" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="667" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">PUT same record id</text>
+      <text x="667" y="130" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#565175">type becomes A, one call</text>
+      <path d="M655,49 C685,49 667,60 667,87" fill="none" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></path>
+
+      <line x1="667" y1="148" x2="667" y2="178" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="577" y="180" width="180" height="40" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="667" y="205" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">One record, no window</text>
+    </svg>
+    <figcaption>The script reads the live state first, finds the single conflicting CNAME, then sends one PUT to that record's own ID. The CNAME and the A record never coexist, even briefly.</figcaption>
+  </figure>
+
+  <h2>How to fix it</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Confirm what is actually live</h3>
+      <p>Before touching anything, check both record types at the name. If the CNAME still returns a target when you expected an A record with an IP, the old record was never removed.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">check-live.sh</div>
+      <pre><code class="language-bash">dig +short CNAME app.example.com
+dig +short A app.example.com</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Ask the authoritative nameserver directly</h3>
+      <p>Your resolver may still be caching the old answer. Query the zone's own nameserver to see the true current state, with no caching in the way.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">check-authoritative.sh</div>
+      <pre><code class="language-bash">dig @ns1.example.com app.example.com CNAME +noall +answer
+dig @ns1.example.com app.example.com A +noall +answer</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Reproduce the API rejection</h3>
+      <p>Sending the create while the CNAME is still present returns a 400 with a code that names the conflict directly. Cloudflare uses 81057 or 81053 for "Record already exists," and 81054 for "A CNAME already exists with that host" on the reverse swap.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">reproduce-conflict.sh</div>
+      <pre><code class="language-bash">curl -s -X POST "https://api.cloudflare.com/client/v4/zones/&lt;ZONE_ID&gt;/dns_records" \
+  -H "Authorization: Bearer &lt;TOKEN&gt;" \
+  -H "Content-Type: application/json" \
+  --data '{"type":"A","name":"app.example.com","content":"203.0.113.10","ttl":300}'</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Do not delete then create. Overwrite in place</h3>
+      <p>The safe fix is one PUT call to the existing record's own ID. It reuses the record instead of removing one and adding another, so there is never a moment where both a CNAME and an A record exist at the name.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">DNS record</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">overwrite-in-place.sh</div>
+      <pre><code class="language-bash">curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/&lt;ZONE_ID&gt;/dns_records/&lt;existing_record_id&gt;" \
+  -H "Authorization: Bearer &lt;TOKEN&gt;" \
+  -H "Content-Type: application/json" \
+  --data '{"type":"A","name":"app.example.com","content":"203.0.113.10","ttl":300}'</code></pre>
+    </div>
+  </div>
+
+  <p>If your tool truly must delete and create as two calls, the fallback is to sequence them strictly: call <code>DELETE /zones/{zone_id}/dns_records/{cname_record_id}</code> and wait for a 200, then only after that succeeds call <code>POST /zones/{zone_id}/dns_records</code> with the new A record. The single PUT above is preferred because it removes the race instead of just managing it.</p>
+
+  <h2>How to check it worked</h2>
+  <p>Run the same checks from step 1 again. The CNAME should be gone, and only the A record should answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">verify.sh</div>
+      <pre><code class="language-bash">dig +short CNAME app.example.com
+# expect: empty output, nothing returned
+
+dig +short A app.example.com
+# expect: 203.0.113.10
+
+dig @ns1.example.com app.example.com A +noall +answer
+# expect: one A record, no CNAME alongside it</code></pre>
+    </div>
+  </div>
+
+  <p>A good result is exactly one record type at that name, every resolver agreeing on the IP, and the same POST or PUT call from step 3 now returning HTTP 200 with <code>"success":true</code> and a <code>type</code> field of <code>"A"</code>.</p>
+
+  <h2>The full code</h2>
+  <p>Here is a complete script for each language. It reads the live records at a name from Cloudflare, decides whether the change is a noop, a plain create, or an overwrite of a conflicting record, and only writes when told to. The decision is a pure function with no network calls, so it is easy to test on its own.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/dns-fixes/tree/main/cname-to-a-type-change-conflict" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the dns-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">fix_cname_to_a.py</div>
+      <pre><code class="language-python">"""Detect a CNAME left behind at a name where an A record is wanted, and
+repair it with one atomic Cloudflare PUT instead of a delete-then-create race.
+Safe to run again and again.
+"""
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("fix_cname_to_a")
+
+
+def plan_rrset_change(live_records, desired):
+    """Pure decision. No I/O. live_records: list of dicts with id, type,
+    content for the name. desired: dict with name, type, content, ttl.
+    Returns one of:
+      {"action": "noop"}
+      {"action": "overwrite", "record_id": <id>}
+      {"action": "create"}
+    """
+    for rec in live_records:
+        if rec["type"] == desired["type"] and rec["content"] == desired["content"]:
+            return {"action": "noop"}
+
+    conflicting = [r for r in live_records if r["type"] != desired["type"]]
+    if len(conflicting) == 1:
+        return {"action": "overwrite", "record_id": conflicting[0]["id"]}
+
+    if not live_records:
+        return {"action": "create"}
+
+    return {"action": "noop"}
+
+
+def run():
+    # Imported lazily so this module can be unit tested with no network
+    # and no DNS libraries installed.
+    import dns.resolver
+    import requests
+
+    domain = os.environ["DNS_DOMAIN"]
+    api_token = os.environ["CLOUDFLARE_API_TOKEN"]
+    zone_id = os.environ["CLOUDFLARE_ZONE_ID"]
+    desired_ip = os.environ["DESIRED_A_RECORD_IP"]
+    ttl = int(os.environ.get("DESIRED_TTL", "300"))
+    dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+    headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
+    base = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
+
+    try:
+        answers = dns.resolver.resolve(domain, "CNAME")
+        log.info("Resolver still sees a CNAME for %s: %s", domain, answers[0].target)
+    except Exception:
+        log.info("Resolver shows no CNAME for %s", domain)
+
+    resp = requests.get(base, headers=headers, params={"name": domain}, timeout=30)
+    resp.raise_for_status()
+    live_records = [
+        {"id": r["id"], "type": r["type"], "content": r["content"]}
+        for r in resp.json()["result"]
+    ]
+
+    desired = {"name": domain, "type": "A", "content": desired_ip, "ttl": ttl}
+    plan = plan_rrset_change(live_records, desired)
+    log.info("Plan for %s: %s", domain, plan)
+
+    if plan["action"] == "noop":
+        log.info("Nothing to do. %s already matches.", domain)
+        return
+
+    if dry_run:
+        log.info("Dry run is on. Would apply: %s", plan)
+        return
+
+    if plan["action"] == "overwrite":
+        record_id = plan["record_id"]
+        r = requests.put(
+            f"{base}/{record_id}",
+            headers=headers,
+            json={"type": "A", "name": domain, "content": desired_ip, "ttl": ttl},
+            timeout=30,
+        )
+        r.raise_for_status()
+        log.info("Overwrote record %s in place. Now type A, content %s.", record_id, desired_ip)
+    elif plan["action"] == "create":
+        r = requests.post(
+            base,
+            headers=headers,
+            json={"type": "A", "name": domain, "content": desired_ip, "ttl": ttl},
+            timeout=30,
+        )
+        r.raise_for_status()
+        log.info("Created new A record for %s pointing to %s.", domain, desired_ip)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">fix-cname-to-a.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect a CNAME left behind at a name where an A record is wanted, and
+ * repair it with one atomic Cloudflare PUT instead of a delete-then-create
+ * race. Safe to run again and again.
+ */
+import { pathToFileURL } from "node:url";
+
+export function planRrsetChange(liveRecords, desired) {
+  for (const rec of liveRecords) {
+    if (rec.type === desired.type &amp;&amp; rec.content === desired.content) {
+      return { action: "noop" };
+    }
+  }
+
+  const conflicting = liveRecords.filter((r) => r.type !== desired.type);
+  if (conflicting.length === 1) {
+    return { action: "overwrite", recordId: conflicting[0].id };
+  }
+
+  if (liveRecords.length === 0) {
+    return { action: "create" };
+  }
+
+  return { action: "noop" };
+}
+
+export async function run() {
+  // Imported lazily so this module can be unit tested with no network
+  // and no DNS libraries installed.
+  const dns = await import("node:dns/promises");
+
+  const domain = process.env.DNS_DOMAIN;
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+  const zoneId = process.env.CLOUDFLARE_ZONE_ID;
+  const desiredIp = process.env.DESIRED_A_RECORD_IP;
+  const ttl = Number(process.env.DESIRED_TTL || 300);
+  const dryRun = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+  const headers = { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" };
+  const base = `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`;
+
+  try {
+    const answers = await dns.resolveCname(domain);
+    console.log(`Resolver still sees a CNAME for ${domain}: ${answers[0]}`);
+  } catch {
+    console.log(`Resolver shows no CNAME for ${domain}`);
+  }
+
+  const listRes = await fetch(`${base}?name=${encodeURIComponent(domain)}`, { headers });
+  if (!listRes.ok) throw new Error(`Cloudflare list returned ${listRes.status}`);
+  const listBody = await listRes.json();
+  const liveRecords = listBody.result.map((r) => ({ id: r.id, type: r.type, content: r.content }));
+
+  const desired = { name: domain, type: "A", content: desiredIp, ttl };
+  const plan = planRrsetChange(liveRecords, desired);
+  console.log(`Plan for ${domain}:`, plan);
+
+  if (plan.action === "noop") {
+    console.log(`Nothing to do. ${domain} already matches.`);
+    return;
+  }
+
+  if (dryRun) {
+    console.log(`Dry run is on. Would apply:`, plan);
+    return;
+  }
+
+  if (plan.action === "overwrite") {
+    const putRes = await fetch(`${base}/${plan.recordId}`, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ type: "A", name: domain, content: desiredIp, ttl }),
+    });
+    if (!putRes.ok) throw new Error(`Cloudflare update returned ${putRes.status}`);
+    console.log(`Overwrote record ${plan.recordId} in place. Now type A, content ${desiredIp}.`);
+  } else if (plan.action === "create") {
+    const postRes = await fetch(base, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ type: "A", name: domain, content: desiredIp, ttl }),
+    });
+    if (!postRes.ok) throw new Error(`Cloudflare create returned ${postRes.status}`);
+    console.log(`Created new A record for ${domain} pointing to ${desiredIp}.`);
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part worth testing on its own, since it decides whether a live DNS record gets overwritten. It takes plain lists and dicts, makes no network call, and is fast to run.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_plan_rrset.py</div>
+      <pre><code class="language-python">from fix_cname_to_a import plan_rrset_change
+
+
+def desired(**over):
+    base = {"name": "app.example.com", "type": "A", "content": "203.0.113.10", "ttl": 300}
+    base.update(over)
+    return base
+
+
+def test_noop_when_already_matching():
+    live = [{"id": "rec_1", "type": "A", "content": "203.0.113.10"}]
+    assert plan_rrset_change(live, desired()) == {"action": "noop"}
+
+
+def test_overwrite_when_one_conflicting_cname():
+    live = [{"id": "rec_9", "type": "CNAME", "content": "old-target.example.net"}]
+    assert plan_rrset_change(live, desired()) == {"action": "overwrite", "record_id": "rec_9"}
+
+
+def test_create_when_nothing_exists():
+    assert plan_rrset_change([], desired()) == {"action": "create"}
+
+
+def test_noop_when_multiple_conflicting_records():
+    live = [
+        {"id": "rec_1", "type": "TXT", "content": "v=spf1 -all"},
+        {"id": "rec_2", "type": "MX", "content": "mail.example.com"},
+    ]
+    assert plan_rrset_change(live, desired())["action"] == "noop"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">plan-rrset.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { planRrsetChange } from "./fix-cname-to-a.js";
+
+const desired = (over = {}) => ({
+  name: "app.example.com",
+  type: "A",
+  content: "203.0.113.10",
+  ttl: 300,
+  ...over,
+});
+
+test("noop when already matching", () => {
+  const live = [{ id: "rec_1", type: "A", content: "203.0.113.10" }];
+  assert.deepEqual(planRrsetChange(live, desired()), { action: "noop" });
+});
+
+test("overwrite when one conflicting cname", () => {
+  const live = [{ id: "rec_9", type: "CNAME", content: "old-target.example.net" }];
+  assert.deepEqual(planRrsetChange(live, desired()), { action: "overwrite", recordId: "rec_9" });
+});
+
+test("create when nothing exists", () => {
+  assert.deepEqual(planRrsetChange([], desired()), { action: "create" });
+});
+
+test("noop when multiple conflicting records", () => {
+  const live = [
+    { id: "rec_1", type: "TXT", content: "v=spf1 -all" },
+    { id: "rec_2", type: "MX", content: "mail.example.com" },
+  ];
+  assert.equal(planRrsetChange(live, desired()).action, "noop");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Terraform</span>
+      <h4>The apply that half finished every time</h4>
+      <p>A team moved a staging subdomain off a CDN CNAME to a direct A record. Terraform's plan showed one resource destroyed and one created. On every apply, the create failed with Cloudflare's "A CNAME already exists with that host" error, because the provider sent the create before the destroy had fully propagated on Cloudflare's side.</p>
+      <p>They stopped modeling the change as destroy plus create and instead pointed both the old and new resource blocks at the same record ID so Terraform issued a single update. The next apply succeeded on the first try.</p>
+    </div>
+    <div class="case">
+      <span class="tag">external-dns</span>
+      <h4>The Kubernetes ingress that kept flapping</h4>
+      <p>A cluster's external-dns controller was reconciling an ingress from a CNAME to an A record on every sync loop, since the change never fully committed and the controller saw a diff again next cycle. Each attempt logged the same 81057 conflict.</p>
+      <p>Switching the annotation so the controller updated the existing record instead of tearing it down first ended the loop. The dig checks afterward showed one clean A record with no leftover CNAME.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After the fix, there is exactly one record at the name, the deploy tool's own conflict-detection call returns success on the same request that used to fail, and dig from both a normal resolver and the authoritative nameserver agree on the answer. No delete-then-create race left to fail on the next deploy.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does changing a CNAME to an A record fail with a conflict?</summary>
+      <p>DNS will not let a CNAME and any other record type sit at the same name at once. If your tool sends the create for the new A record before the delete of the old CNAME has finished, the DNS host still sees the CNAME and rejects the new record as a same-name conflict.</p>
+    </details>
+    <details>
+      <summary>How do I know if this is what is happening to me?</summary>
+      <p>Run dig +short CNAME on the name. If it still returns a target after your tool reported success, the old record was never fully removed before the new one was attempted. The API error usually names the existing record type directly, such as Cloudflare's 81057 or 81054 codes.</p>
+    </details>
+    <details>
+      <summary>What is the actual fix?</summary>
+      <p>Stop sending a delete and a create as two separate calls. Either wait for the delete to return success before sending the create, or better, send one PUT to the existing record's ID that overwrites its type and value. That way both records never exist at the same name at the same time.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/dns/">All DNS and Domains field notes</a>
+    <a href="/woocommerce/paid-orders-stuck-on-pending/">Orders stuck on Pending after a successful Stripe payment</a>
+    <a href="/woocommerce/order-marked-paid-no-charge/">Order marked paid with no matching charge</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>RFC 1035 section 3.6.2, the rule that a CNAME cannot coexist with other record types at the same name. <a href="https://www.ietf.org/rfc/rfc1035.txt" rel="noopener">ietf.org/rfc/rfc1035.txt</a></li>
+      <li>RFC 1912, Common DNS Operational and Configuration Errors, section 2.4. <a href="https://www.ietf.org/rfc/rfc1912.txt" rel="noopener">ietf.org/rfc/rfc1912.txt</a></li>
+      <li>Cloudflare docs on the "Cannot add DNS records with the same name" error. <a href="https://developers.cloudflare.com/dns/manage-dns-records/troubleshooting/records-with-same-name/" rel="noopener">developers.cloudflare.com/dns</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>cloudflare/terraform-provider-cloudflare issue #750, the create-before-destroy race producing error 81054. <a href="https://github.com/cloudflare/terraform-provider-cloudflare/issues/750" rel="noopener">github.com/cloudflare/terraform-provider-cloudflare/issues/750</a></li>
+      <li>Cloudflare API reference for updating (overwriting) a DNS record with PUT. <a href="https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/update/" rel="noopener">developers.cloudflare.com/api</a></li>
+      <li>Cloudflare API reference for editing a DNS record with PATCH. <a href="https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/edit/" rel="noopener">developers.cloudflare.com/api</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a DNS cutover, a Terraform reconciliation race, or a zone that will not converge the way you expect, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this fix your DNS conflict?</h3>
+    <p>If this saved you a broken deploy or a confusing on-call page, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/dns/">Back to all DNS and Domains field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on DNS and Domains.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/dns/assets/dns.js" defer></script>
+</body>
+</html>

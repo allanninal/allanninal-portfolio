@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DKIM Public Key Stale After Rotation</title>
+<meta name="description" content="Mail signs fine with the new DKIM private key, but the public key in DNS was never updated, so every message fails as dkim=fail. Learn how to check it and fix it safely.">
+<link rel="canonical" href="https://www.allanninal.dev/dns/dkim-key-stale-after-rotation/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="DKIM Public Key Stale After Rotation">
+<meta property="og:description" content="Why a DKIM key rotation breaks mail with dkim=fail instead of a missing record, and how to publish the matching public key and roll it out safely.">
+<meta property="og:url" content="https://www.allanninal.dev/dns/dkim-key-stale-after-rotation/">
+<meta property="og:image" content="https://www.allanninal.dev/dns/assets/img/dkim-key-stale-after-rotation/feature.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/dns/assets/dns.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/dns/dkim-key-stale-after-rotation/#article","headline":"DKIM Public Key Stale After Rotation","description":"Why a DKIM key rotation breaks mail with dkim=fail instead of a missing record, and how to publish the matching public key and roll it out safely.","datePublished":"2026-07-11","dateModified":"2026-07-11","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/dns/dkim-key-stale-after-rotation/","image":"https://www.allanninal.dev/dns/assets/img/dkim-key-stale-after-rotation/feature.jpg","articleSection":"Email Authentication","keywords":"DKIM key rotation, DKIM public key mismatch, dkim=fail, selector._domainkey TXT record, DKIM key rollover, dig DKIM selector, Cloudflare DNS API","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/dns/"},{"@type":"ListItem","position":2,"name":"DKIM public key stale after rotation","item":"https://www.allanninal.dev/dns/dkim-key-stale-after-rotation/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does DKIM fail right after we rotated our signing key?","acceptedAnswer":{"@type":"Answer","text":"Your mail server or ESP started signing with a new private key, but the matching public key was never published to the TXT record at the selector DNS uses. Receivers still see the old public key, it does not match the new signature, and every message comes back as dkim=fail, a key mismatch rather than a missing record."}},{"@type":"Question","name":"How is this different from a missing DKIM selector record?","acceptedAnswer":{"@type":"Answer","text":"A missing selector record returns NXDOMAIN or no answer, so verifiers report none or permfail because there is nothing to check against. A stale key after rotation still returns a normal, non-empty TXT record, it just holds the old public key. Verifiers get a real answer and compare it, so the result is dkim=fail, a mismatch, not a missing record."}},{"@type":"Question","name":"Is it safe to overwrite the old selector's TXT record right away?","acceptedAnswer":{"@type":"Answer","text":"Not immediately. Mail that was queued or is still in transit may have been signed with the old key, so keep the old selector resolving unchanged for 24 to 48 hours after the new one goes live. Publish the new key under a new selector name, switch signing to it, then retire the old selector once you confirm nothing is using it."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/dns/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / dns</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/dns/">Field notes</a> / Email Authentication</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Email Authentication</p>
+    <h1>DKIM public key stale after rotation</h1>
+    <p class="lead">You rotated your DKIM signing key. Nothing else changed. But now every outgoing message comes back dkim=fail instead of dkim=pass. The DNS record is not missing, it resolves fine, it just still holds the old public key that no longer matches what your mail server is signing with. Here is why that happens and how to roll a key over without breaking mail in the middle.</p>
+    <div class="meta">
+      <span class="chip">dig and openssl</span>
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Fixable through the DNS API</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <figure class="feature-img">
+    <img src="/dns/assets/img/dkim-key-stale-after-rotation/feature.jpg" alt="The word email in tiles" width="1200" height="630" loading="eager" decoding="async">
+    <figcaption>Photo by <a href="https://unsplash.com/@padrinan?utm_source=allanninal_dev&utm_medium=referral" rel="noopener nofollow" target="_blank">Miguel Angel Padrinan Alba</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+  </figure>
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Your mail platform started signing with a new DKIM private key, but the matching public key was never published to the TXT record at the selector named in the DKIM-Signature header. Receivers still fetch the old public key from DNS, it does not match the new signature, so every message fails as dkim=fail, a key mismatch, not a missing record. Publish the new key under a new selector, switch signing to it, keep the old selector alive for a day or two, then retire it. Full check script and code below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>DKIM works by pairs. A private key stays secret on the mail server and signs every outgoing message. A public key sits in DNS so anyone receiving the mail can check the signature against it. Both halves have to match, always.</p>
+  <p>When someone rotates the private key on the mail platform, that is only half the job. The new private key needs a new public key in DNS before it starts signing anything. If the platform starts signing with the new key while DNS still answers with the old public key, every single message fails verification. The DNS record is not broken. It resolves. It is just the wrong key for what is being signed now.</p>
+  <p>This usually happens in one of two ways: someone swaps the private key on the mail server as one change and forgets DNS is a second change, or someone rotates selectors out of order, retiring the old one before the new one is live and checked.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. The mail server signs with a new private key, but DNS still answers with the old public key, so the receiver's comparison fails and the message is marked dkim=fail.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8b8398"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="30" width="180" height="66" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="100" y="58" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e1b3a">Mail server</text>
+      <text x="100" y="76" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#565175">signs with new private key</text>
+      <rect x="10" y="130" width="180" height="66" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="100" y="158" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#1e1b3a">DNS TXT record</text>
+      <text x="100" y="176" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#565175">still holds old public key</text>
+      <line x1="193" y1="63" x2="300" y2="140" stroke="#8b8398" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="193" y1="163" x2="300" y2="150" stroke="#8b8398" stroke-width="2" marker-end="url(#ah)"></line>
+      <polygon points="360,110 445,140 360,170 275,140" fill="#eef2ff" stroke="#c7c5f0"></polygon>
+      <text x="360" y="136" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">Keys</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#1e1b3a">match?</text>
+      <line x1="448" y1="140" x2="500" y2="140" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="474" y="120" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="474" y="168" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">no, mismatch</text>
+      <rect x="503" y="107" width="140" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="573" y="135" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">dkim=fail</text>
+      <text x="573" y="153" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#565175">signature mismatch</text>
+      <rect x="668" y="107" width="82" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="709" y="135" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Mail at</text>
+      <text x="709" y="153" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">risk</text>
+      <line x1="646" y1="140" x2="665" y2="140" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>DNS answers with a real, non-empty public key. It is just the old one, so it never matches a signature made with the new private key.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>RFC 6376 defines DKIM as this exact pairing: a selector in the signature names the DNS location of the public key, and verification only works when that public key matches the private key that made the signature. A few common ways teams break that pairing during rotation:</p>
+  <ul>
+    <li>The mail platform or ESP was reconfigured to use a new private key, but the operator assumed DNS would "just update," when DNS is a completely separate system that has to be edited by hand or by API.</li>
+    <li>The team rotated in the wrong order: they retired or overwrote the old selector's record before confirming the new selector's record was live, so there was no valid public key published anywhere for a window of time.</li>
+    <li>The new key was published to DNS, but under the wrong selector name, so the selector the mail server actually signs with (the s= tag) still points at the stale record.</li>
+    <li>A staging or test key rotation accidentally got promoted to the production mail path before its DNS record went out, or went out to only one DNS host in a split setup.</li>
+  </ul>
+  <p>M3AAWG's key rotation guidance calls this out directly: key rotation is a DNS change and a mail platform change that must happen in the right order, with an overlap window, not a single flip of a switch.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A missing DKIM record and a stale DKIM record look similar to an angry inbox admin, but they are opposite failures. Missing means DNS has nothing to compare against, so the result is none or permfail. Stale means DNS has a perfectly valid answer, it is just the wrong key, so the result is dkim=fail with a real signature mismatch. Fixing a stale key means publishing the correct value, not just publishing something.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>The safe pattern is to never edit a selector's record in place while mail is actively signing with it. Instead, treat rotation as adding a brand new selector, moving signing over to it, and only then retiring the old one once nothing depends on it anymore.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Publish the new key under a new selector, switch the mail platform to sign with it, keep the old selector resolving during an overlap window, then verify and retire the old selector.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4f46e5"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#eef2ff" stroke="#c7c5f0"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">Publish new key</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">at new selector name</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="110" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">Verify new record</text>
+      <text x="110" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">matches deployed key</text>
+      <line x1="210" y1="138" x2="252" y2="138" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="255" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="347" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1e1b3a">Switch signing</text>
+      <text x="347" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">to the new selector</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="485" y="108" width="175" height="60" rx="10" fill="#fff" stroke="#c7c5f0"></rect>
+      <text x="572" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#1e1b3a">Keep old selector</text>
+      <text x="572" y="144" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">resolving 24 to 48h</text>
+      <text x="572" y="160" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565175">for queued mail</text>
+      <line x1="572" y1="168" x2="572" y2="205" stroke="#4f46e5" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="480" y="207" width="185" height="40" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="572" y="232" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Retire old selector</text>
+    </svg>
+    <figcaption>New selector goes live and gets checked before the mail server ever signs with it. The old selector is retired only after the overlap window, once nothing needs it.</figcaption>
+  </figure>
+
+  <h2>How to fix it</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Find the selector that is actually signing mail</h3>
+      <p>Open a DKIM-Signature header from a real message your mail server just sent. The s= tag is the selector, and d= is the signing domain. That selector name is what the receiver looks up in DNS, not whatever name you think should be active.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">DKIM-Signature header</span>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">from a sent message</div>
+      <pre><code>DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+    d=example.com; s=sel2; t=1752123456;
+    h=from:to:subject:date; bh=...; b=...</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Query the live public key in DNS</h3>
+      <p>Ask DNS directly for the TXT record at that selector. A healthy record is non-empty and starts with v=DKIM1 followed by a long p= value, the base64 public key.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">check the DNS record</div>
+      <pre><code>dig +short TXT sel2._domainkey.example.com
+
+"v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC4v..."</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Compare it against the key actually deployed on the mail server</h3>
+      <p>Derive the public key from the private key file that the mail server is signing with right now, and compare the base64 output against the p= value from dig. If they differ, DNS is stale, not missing, and this is the exact mismatch causing dkim=fail.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">derive the public key from the deployed private key</div>
+      <pre><code>openssl rsa -in dkim_private.pem -pubout -outform DER 2&gt;/dev/null | openssl base64 -A
+
+# Compare this output, character for character, against the p= value
+# returned by dig above. Any difference means DNS is stale.</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Publish the new key under a new selector, never overwrite the old one live</h3>
+      <p>Add a brand new TXT record at the new selector name with the correct public key. Do not touch the old selector's record yet, in-transit mail signed with the old key still needs it to resolve.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">DNS record</span>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">new selector TXT record</div>
+      <pre><code>Type:  TXT
+Host:  sel2._domainkey.example.com
+Value: "v=DKIM1; k=rsa; p=&lt;base64-of-new-public-key&gt;"
+TTL:   3600</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Switch the mail platform to sign with the new selector</h3>
+      <p>Only after step 4 resolves correctly, point the mail server or ESP at the new selector so its s= tag becomes sel2. Keep sel1._domainkey.example.com resolving unchanged for at least 24 to 48 hours so queued and in-transit mail signed with sel1 still verifies.</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Retire the old selector once it is confirmed unused</h3>
+      <p>After the overlap window, once you have confirmed nothing is still signing with sel1, delete its TXT record, or set its p= tag to empty to formally revoke it. An empty p= means revoked on purpose. It is different from staleness and different from a missing record.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">DNS record</span>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">revoke the old selector</div>
+      <pre><code>Type:  TXT
+Host:  sel1._domainkey.example.com
+Value: "v=DKIM1; p="</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Same selector, in place rotation</div>
+    <p>If your setup requires keeping the same selector name and rotating the key value in place, update the existing TXT record's p= tag to the new key's base64 value at the exact moment the mail server begins signing with the new private key. Never let the old p= linger once the new private key is live, and never flip DNS before the new private key is actually deployed either. Either order creates a window where nothing matches.</p>
+  </div>
+
+  <h2>How to check it worked</h2>
+  <p>Confirm the fix from both the DNS side and the mail side, and rule out propagation lag before you call anything broken.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <span class="code-tab" aria-selected="true">Terminal</span>
+    </div>
+    <div class="code-pane" data-active="true">
+      <div class="code-filename">verify across resolvers and against Authentication-Results</div>
+      <pre><code># 1. The new selector resolves with the new key everywhere, not just at your authoritative NS
+dig @1.1.1.1 +short TXT sel2._domainkey.example.com
+dig @8.8.8.8 +short TXT sel2._domainkey.example.com
+
+# 2. Confirm the base64 in DNS matches the deployed private key, byte for byte
+openssl rsa -in new_private.pem -pubout -outform DER | openssl base64 -A
+
+# 3. Send a fresh test email through the production mail path, then check
+#    the Authentication-Results header on the receiving side. A good result:
+Authentication-Results: mx.example.net;
+    dkim=pass header.d=example.com header.s=sel2
+
+# A bad result still shows dkim=fail (signature mismatch) even though the
+# TXT record resolves fine, which means the DNS value and the signing key
+# still do not match.</code></pre>
+    </div>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Below is a small script that resolves the live selector's TXT record, pulls out the p= value, and diffs it against the public key derived from the currently deployed private key. On a mismatch, it can publish the correct record to a new selector, or update an existing one, through the Cloudflare DNS API. It stays in dry run until you turn writes on.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/dns-fixes/tree/main/dkim-key-stale-after-rotation" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the dns-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">dkim_key_rotation_check.py</div>
+      <pre><code class="language-python">"""Detect a DKIM public key that is stale after a private key rotation and
+repair it via Cloudflare. Safe to run on a schedule. Stays in dry run
+until DRY_RUN=false.
+"""
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dkim_key_rotation_check")
+
+MISSING = "missing"
+
+
+def dkim_key_mismatch(published_txt: str, deployed_pubkey_b64: str):
+    """Pure decision function. No network, no I/O.
+
+    Parses the p= tag out of a published DKIM TXT record value, handling
+    the quoted/concatenated chunk style DNS providers sometimes return per
+    RFC 6376, and compares it against the base64 public key actually
+    derived from the deployed private key.
+
+    Returns True if the keys differ (stale), False if they match (ok),
+    or the MISSING sentinel string if there is no DKIM record at all so
+    callers can branch on mismatch vs missing vs revoked.
+    """
+    if not published_txt:
+        return MISSING
+
+    # Join quoted/concatenated TXT chunks into one string, RFC 6376 style.
+    joined = "".join(part.strip().strip('"') for part in published_txt.split('" "'))
+    joined = joined.strip().strip('"')
+
+    p_value = None
+    for tag in joined.split(";"):
+        tag = tag.strip()
+        if tag.startswith("p="):
+            p_value = tag[2:].strip()
+            break
+
+    if p_value is None:
+        return MISSING
+    if p_value == "":
+        # Empty p= means the key was deliberately revoked, not stale.
+        return False
+
+    return p_value != deployed_pubkey_b64.strip()
+
+
+def run():
+    # Imported lazily so the pure function above can be tested with no
+    # network or crypto libraries installed at all.
+    import subprocess
+    import dns.resolver
+    import requests
+
+    domain = os.environ["DNS_DOMAIN"]
+    selector = os.environ["DKIM_SELECTOR"]
+    private_key_path = os.environ["DKIM_PRIVATE_KEY_PATH"]
+    ttl = int(os.environ.get("RECORD_TTL", "3600"))
+    dry_run = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+    zone_id = os.environ["CLOUDFLARE_ZONE_ID"]
+    api_token = os.environ["CLOUDFLARE_API_TOKEN"]
+
+    name = f"{selector}._domainkey.{domain}"
+
+    try:
+        answer = dns.resolver.resolve(name, "TXT")
+        published_txt = "".join(
+            chunk.decode() if isinstance(chunk, bytes) else chunk
+            for rdata in answer for chunk in rdata.strings
+        )
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+        published_txt = ""
+
+    deployed_pubkey_b64 = subprocess.run(
+        ["openssl", "rsa", "-in", private_key_path, "-pubout", "-outform", "DER"],
+        capture_output=True, check=True,
+    ).stdout
+    deployed_pubkey_b64 = subprocess.run(
+        ["openssl", "base64", "-A"], input=deployed_pubkey_b64,
+        capture_output=True, check=True,
+    ).stdout.decode().strip()
+
+    result = dkim_key_mismatch(published_txt, deployed_pubkey_b64)
+
+    if result == MISSING:
+        log.warning("No DKIM record found at %s. This is a missing record, not staleness.", name)
+        return
+    if result is False:
+        log.info("DKIM key at %s matches the deployed private key. Nothing to do.", name)
+        return
+
+    log.warning("DKIM key at %s is stale: DNS still serves the old public key.", name)
+    correct_value = f"v=DKIM1; k=rsa; p={deployed_pubkey_b64}"
+
+    log.info("%s update TXT record for %s.", "Would" if dry_run else "Will", name)
+    if dry_run:
+        return
+
+    lookup = requests.get(
+        f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
+        headers={"Authorization": f"Bearer {api_token}"},
+        params={"type": "TXT", "name": name},
+        timeout=30,
+    )
+    lookup.raise_for_status()
+    existing = lookup.json().get("result", [])
+
+    payload = {"type": "TXT", "name": name, "content": correct_value, "ttl": ttl}
+    if existing:
+        record_id = existing[0]["id"]
+        resp = requests.put(
+            f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}",
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json=payload, timeout=30,
+        )
+    else:
+        resp = requests.post(
+            f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"},
+            json=payload, timeout=30,
+        )
+    resp.raise_for_status()
+    log.info("Published the correct DKIM public key at %s", name)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">dkim-key-rotation-check.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect a DKIM public key that is stale after a private key rotation and
+ * repair it via Cloudflare. Safe to run on a schedule. Stays in dry run
+ * until DRY_RUN=false.
+ */
+import { pathToFileURL } from "node:url";
+
+export const MISSING = "missing";
+
+export function dkimKeyMismatch(publishedTxt, deployedPubkeyB64) {
+  // Pure decision function. No network, no I/O.
+  //
+  // Parses the p= tag out of a published DKIM TXT record value, handling
+  // the quoted/concatenated chunk style DNS providers sometimes return per
+  // RFC 6376, and compares it against the base64 public key actually
+  // derived from the deployed private key.
+  //
+  // Returns true if the keys differ (stale), false if they match (ok),
+  // or the MISSING sentinel string if there is no DKIM record at all so
+  // callers can branch on mismatch vs missing vs revoked.
+  if (!publishedTxt) return MISSING;
+
+  const joined = publishedTxt
+    .split('" "').map((part) =&gt; part.trim().replace(/^"|"$/g, "")).join("")
+    .trim().replace(/^"|"$/g, "");
+
+  let pValue = null;
+  for (const rawTag of joined.split(";")) {
+    const tag = rawTag.trim();
+    if (tag.startsWith("p=")) {
+      pValue = tag.slice(2).trim();
+      break;
+    }
+  }
+
+  if (pValue === null) return MISSING;
+  if (pValue === "") return false; // Empty p= means deliberately revoked, not stale.
+
+  return pValue !== deployedPubkeyB64.trim();
+}
+
+export async function run() {
+  // Imported lazily so the pure function above can be tested with no
+  // network, DNS, or crypto modules touched at all.
+  const dns = await import("node:dns");
+  const { execFileSync } = await import("node:child_process");
+
+  const domain = process.env.DNS_DOMAIN;
+  const selector = process.env.DKIM_SELECTOR;
+  const privateKeyPath = process.env.DKIM_PRIVATE_KEY_PATH;
+  const ttl = Number(process.env.RECORD_TTL || 3600);
+  const dryRun = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+  const zoneId = process.env.CLOUDFLARE_ZONE_ID;
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+
+  const name = `${selector}._domainkey.${domain}`;
+
+  let publishedTxt = "";
+  try {
+    const records = await dns.promises.resolveTxt(name);
+    publishedTxt = records.map((chunks) =&gt; chunks.join("")).join("");
+  } catch (err) {
+    if (err.code !== "ENOTFOUND" && err.code !== "ENODATA") throw err;
+  }
+
+  const derDer = execFileSync("openssl", ["rsa", "-in", privateKeyPath, "-pubout", "-outform", "DER"]);
+  const deployedPubkeyB64 = execFileSync("openssl", ["base64", "-A"], { input: derDer }).toString().trim();
+
+  const result = dkimKeyMismatch(publishedTxt, deployedPubkeyB64);
+
+  if (result === MISSING) {
+    console.warn(`No DKIM record found at ${name}. This is a missing record, not staleness.`);
+    return;
+  }
+  if (result === false) {
+    console.log(`DKIM key at ${name} matches the deployed private key. Nothing to do.`);
+    return;
+  }
+
+  console.warn(`DKIM key at ${name} is stale: DNS still serves the old public key.`);
+  const correctValue = `v=DKIM1; k=rsa; p=${deployedPubkeyB64}`;
+
+  console.log(`${dryRun ? "Would" : "Will"} update TXT record for ${name}.`);
+  if (dryRun) return;
+
+  const lookupRes = await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records?type=TXT&name=${encodeURIComponent(name)}`,
+    { headers: { Authorization: `Bearer ${apiToken}` } },
+  );
+  if (!lookupRes.ok) throw new Error(`Cloudflare lookup returned ${lookupRes.status}`);
+  const lookupBody = await lookupRes.json();
+  const existing = lookupBody.result || [];
+
+  const payload = { type: "TXT", name, content: correctValue, ttl };
+  const url = existing.length
+    ? `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records/${existing[0].id}`
+    : `https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`;
+  const method = existing.length ? "PUT" : "POST";
+
+  const res = await fetch(url, {
+    method,
+    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Cloudflare API returned ${res.status}`);
+  console.log(`Published the correct DKIM public key at ${name}`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part worth testing on its own, because it decides whether a real production DNS record gets rewritten. It takes plain strings in and returns a plain result, no DNS lookups and no Cloudflare account needed.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_dkim_rotation.py</div>
+      <pre><code class="language-python">from dkim_key_rotation_check import dkim_key_mismatch, MISSING
+
+
+def test_missing_when_no_record():
+    assert dkim_key_mismatch("", "AAA123") == MISSING
+
+
+def test_missing_when_no_p_tag_at_all():
+    assert dkim_key_mismatch("v=DKIM1; k=rsa", "AAA123") == MISSING
+
+
+def test_revoked_when_p_is_empty():
+    assert dkim_key_mismatch("v=DKIM1; p=", "AAA123") is False
+
+
+def test_mismatch_when_keys_differ():
+    published = 'v=DKIM1; k=rsa; p=OLDKEY000'
+    assert dkim_key_mismatch(published, "NEWKEY111") is True
+
+
+def test_ok_when_keys_match():
+    published = "v=DKIM1; k=rsa; p=SAMEKEY42"
+    assert dkim_key_mismatch(published, "SAMEKEY42") is False
+
+
+def test_handles_concatenated_quoted_chunks():
+    published = '"v=DKIM1; k=rsa; " "p=SPLITKEY99"'
+    assert dkim_key_mismatch(published, "SPLITKEY99") is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">dkim-key-rotation-check.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { dkimKeyMismatch, MISSING } from "./dkim-key-rotation-check.js";
+
+test("missing when no record", () =&gt; {
+  assert.equal(dkimKeyMismatch("", "AAA123"), MISSING);
+});
+
+test("missing when no p tag at all", () =&gt; {
+  assert.equal(dkimKeyMismatch("v=DKIM1; k=rsa", "AAA123"), MISSING);
+});
+
+test("revoked when p is empty", () =&gt; {
+  assert.equal(dkimKeyMismatch("v=DKIM1; p=", "AAA123"), false);
+});
+
+test("mismatch when keys differ", () =&gt; {
+  const published = "v=DKIM1; k=rsa; p=OLDKEY000";
+  assert.equal(dkimKeyMismatch(published, "NEWKEY111"), true);
+});
+
+test("ok when keys match", () =&gt; {
+  const published = "v=DKIM1; k=rsa; p=SAMEKEY42";
+  assert.equal(dkimKeyMismatch(published, "SAMEKEY42"), false);
+});
+
+test("handles concatenated quoted chunks", () =&gt; {
+  const published = '"v=DKIM1; k=rsa; " "p=SPLITKEY99"';
+  assert.equal(dkimKeyMismatch(published, "SPLITKEY99"), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">ESP migration</span>
+      <h4>The provider that rotated on its own schedule</h4>
+      <p>A team moved outbound mail to a new ESP. The ESP rotated its DKIM signing key automatically during onboarding and told the team to "add the DNS record," but the record they were given did not match the selector the ESP actually ended up signing with after a later config change.</p>
+      <p>Pulling the s= tag from a real sent message and diffing it against the deployed key found the mismatch in minutes. Publishing the correct key under the right selector fixed dkim=fail without a single support ticket to the ESP.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Security rotation</span>
+      <h4>The scheduled rotation that skipped the overlap window</h4>
+      <p>A security policy required rotating the DKIM private key every ninety days. The runbook updated the mail server first, then queued a ticket to update DNS "by end of day." Mail sent in that gap failed at every receiver that checked DKIM strictly.</p>
+      <p>Moving to a new selector for every rotation, verified in DNS before the switch, removed the gap entirely. The old selector now stays alive for two full days after every rotation before it is revoked.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this, a key rotation is boring: a new selector goes into DNS, gets checked against the deployed private key, then and only then does the mail server start signing with it, and the old selector sticks around for a day or two before it is revoked. dkim=pass never has a gap.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does DKIM fail right after we rotated our signing key?</summary>
+      <p>Your mail server or ESP started signing with a new private key, but the matching public key was never published to the TXT record at the selector DNS uses. Receivers still see the old public key, it does not match the new signature, and every message comes back as dkim=fail, a key mismatch rather than a missing record.</p>
+    </details>
+    <details>
+      <summary>How is this different from a missing DKIM selector record?</summary>
+      <p>A missing selector record returns NXDOMAIN or no answer, so verifiers report none or permfail because there is nothing to check against. A stale key after rotation still returns a normal, non-empty TXT record, it just holds the old public key. Verifiers get a real answer and compare it, so the result is dkim=fail, a mismatch, not a missing record.</p>
+    </details>
+    <details>
+      <summary>Is it safe to overwrite the old selector's TXT record right away?</summary>
+      <p>Not immediately. Mail that was queued or is still in transit may have been signed with the old key, so keep the old selector resolving unchanged for 24 to 48 hours after the new one goes live. Publish the new key under a new selector, switch signing to it, then retire the old selector once you confirm nothing is using it.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/dns/">All DNS and domains field notes</a>
+    <a href="/woocommerce/paid-orders-stuck-on-pending/">WooCommerce orders stuck on Pending after a successful Stripe payment</a>
+    <a href="/woocommerce/order-marked-paid-no-charge/">WooCommerce order marked paid with no matching charge</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>RFC 6376: DomainKeys Identified Mail (DKIM) Signatures. <a href="https://datatracker.ietf.org/doc/html/rfc6376" rel="noopener">datatracker.ietf.org/doc/html/rfc6376</a></li>
+      <li>RFC 8301: Cryptographic Algorithm and Key Usage Update to DKIM. <a href="https://datatracker.ietf.org/doc/html/rfc8301" rel="noopener">datatracker.ietf.org/doc/html/rfc8301</a></li>
+      <li>M3AAWG DKIM Key Rotation Best Common Practices. <a href="https://www.m3aawg.org/DKIMKeyRotation" rel="noopener">m3aawg.org/DKIMKeyRotation</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>DKIM key rotation: a safe, zero-downtime playbook. <a href="https://willitinbox.com/blog/dkim-key-rotation" rel="noopener">willitinbox.com/blog/dkim-key-rotation</a></li>
+      <li>Verify DKIM with dig and online tools. <a href="https://support.dnsimple.com/articles/verify-dkim/" rel="noopener">support.dnsimple.com/articles/verify-dkim</a></li>
+      <li>Cloudflare DNS records API documentation. <a href="https://developers.cloudflare.com/api/operations/dns-records-for-a-zone-list-dns-records" rel="noopener">developers.cloudflare.com/api</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a DNS or email authentication problem that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this fix your DKIM failures?</h3>
+    <p>If this saved you a rotation gone wrong or a pile of bounced mail, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/dns/">Back to all DNS and domains field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on DNS and domains.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/dns/assets/dns.js" defer></script>
+</body>
+</html>
