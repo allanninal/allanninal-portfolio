@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix PrestaShop Reserved Stock Quantity Drift From Pending Orders</title>
+<meta name="description" content="PrestaShop's stock_available.reserved_quantity is a running counter, not a live query, so cancelled and refunded orders can leave it stuck above zero forever. Learn why the drift happens and build a Python or Node.js reconciler that finds and repairs it.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/reserved-quantity-drift/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix PrestaShop Reserved Stock Quantity Drift From Pending Orders">
+<meta property="og:description" content="Why reserved_quantity stops matching real open orders, and a safe Python or Node.js reconciler that detects and repairs the drift through PrestaShop's own order_histories hook.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/reserved-quantity-drift/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/reserved-quantity-drift/#article","headline":"Fix PrestaShop Reserved Stock Quantity Drift From Pending Orders","description":"Why reserved_quantity stops matching real open orders, and a safe Python or Node.js reconciler that detects and repairs the drift through PrestaShop's own order_histories hook.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/reserved-quantity-drift/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Stock & Inventory","keywords":"PrestaShop reserved_quantity, stock_available drift, order_histories, StockManager, PrestaShop Webservice API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Reserved stock quantity drifts from actual pending orders","item":"https://www.allanninal.dev/prestashop/reserved-quantity-drift/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does PrestaShop's reserved_quantity stop matching my real pending orders?","acceptedAnswer":{"@type":"Answer","text":"reserved_quantity is a running counter that PrestaShop updates as a side effect of order_histories inserts, not a live query against currently open orders. When an order is cancelled or refunded outside the normal order state flow, such as a bulk edit, a direct database write, or a webservice call that skips order_histories, the decrement step is skipped and the counter never returns to zero."}},{"@type":"Question","name":"Can I just fix reserved_quantity by editing the stock_available row directly?","acceptedAnswer":{"@type":"Answer","text":"No. PrestaShop's own Stock FAQ says not to modify reserved_quantity or physical_quantity by hand, since they are core managed derived values, and the public webservice does not offer a supported write path for reserved_quantity. Hand editing the row will desync it from physical_quantity and available for sale quantity again the next time an order state changes."}},{"@type":"Question","name":"How do I actually repair the drift once I find it?","acceptedAnswer":{"@type":"Answer","text":"Insert a corrective order_histories row that re-applies the order's own current terminal state, for example re-posting Canceled or Refunded. That re-triggers PrestaShop's native StockManager recalculation hook, which is the only supported mechanism that keeps physical_quantity, reserved_quantity, and available for sale quantity internally consistent."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Stock &amp; Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Stock &amp; Inventory</p>
+    <h1>Reserved stock quantity drifts from actual pending orders</h1>
+    <p class="lead">A product still shows units held in <code>reserved_quantity</code> long after the order that reserved them was cancelled or refunded. Nobody edited stock by hand, but the count never lets go. Here is why PrestaShop's reserved quantity is a counter, not a live answer, and a small script that finds every drifted row and repairs it the way PrestaShop's own core would.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>PrestaShop keeps <code>stock_available.reserved_quantity</code> as a running sum that is only touched as a side effect of <code>order_histories</code> inserts, so it can only move when a state change goes through the normal flow. Run a script that pulls the logable order states, recomputes expected reserved quantity from real open orders, and diffs it against the API's reported <code>reserved_quantity</code> per product and combination. Where they disagree, repair it by reinserting an <code>order_histories</code> row for the order's own current state, which re-triggers PrestaShop's native stock recalculation. Never write <code>reserved_quantity</code> directly. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When a customer checks out, PrestaShop needs to hold stock so two people cannot buy the last unit at the same time. It does that by bumping <code>reserved_quantity</code> on the product's <code>stock_available</code> row the moment the order reaches a state flagged <code>logable</code>, meaning it counts as a real pending sale.</p>
+  <p>The trouble is what happens next. That number is not recalculated from scratch by asking "which orders are currently open." It is only ever incremented or decremented as a side effect of <code>order_histories</code> rows being inserted, through <code>StockManager</code> and <code>StockAvailable</code> hooks tied to the normal <code>validateOrder</code> and <code>changeIdOrderState</code> flow. If an order is cancelled or refunded any other way, a bulk edit in the backoffice, a direct database write, a custom module, or a webservice call that changes the order state without going through <code>order_histories</code>, the decrement step is skipped or applied twice. The counter drifts, and it has no way to self correct.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An order is cancelled outside the normal order state flow, so the reserved_quantity decrement never runs, leaving the stock_available row permanently holding stale reserved units.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="165" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="92" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Order placed</text>
+      <text x="92" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">reserved_quantity +1</text>
+      <line x1="178" y1="105" x2="220" y2="105" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="223" y="70" width="175" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="310" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Cancelled outside</text>
+      <text x="310" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">bulk edit, direct DB, module</text>
+      <line x1="398" y1="105" x2="450" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="424" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="424" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">order_histories skipped</text>
+      <rect x="453" y="70" width="165" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="535" y="94" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Decrement never runs</text>
+      <text x="535" y="112" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">no hook was triggered</text>
+      <line x1="631" y1="105" x2="650" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="653" y="70" width="97" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="701" y="98" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Stuck</text>
+      <text x="701" y="116" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">above zero</text>
+      <text x="380" y="180" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">reserved_quantity is a counter, not a live query, so it never self corrects</text>
+    </svg>
+    <figcaption>The reservation goes up when an order is placed and comes down only through a normal state change. Skip that step and the number is stuck.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>PrestaShop's stock model was built to move fast at checkout, not to re-derive the truth on every read. That tradeoff shows up in a few recurring ways stores end up with a permanently wrong <code>reserved_quantity</code>:</p>
+  <ul>
+    <li>An order is cancelled or refunded through a bulk backoffice action or a custom SQL update instead of the normal order state change screen, so no <code>order_histories</code> row is ever inserted.</li>
+    <li>A custom module or a webservice call changes the order's <code>current_state</code> field directly instead of posting a new <code>order_histories</code> entry, which is the only path that fires the <code>StockManager</code> hooks.</li>
+    <li>An order state is applied twice in quick succession, for example by a retrying integration, which can double apply the reservation change in the other direction.</li>
+    <li>A product's stock row is edited manually while it still has open orders against it, leaving <code>reserved_quantity</code> out of step with what those orders actually need.</li>
+  </ul>
+  <p>This is a well documented, recurring defect rather than a one-off misconfiguration. PrestaShop's own core issue tracker has multiple confirmed reports of incorrect <code>reserved_quantity</code> values and stock corruption tied to order state changes, spanning several major versions. See the citations at the end for the exact reports.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>reserved_quantity</code> is not something you can trust as a live number, and it is not something you should hand edit either. PrestaShop's own devdocs say not to write it or <code>physical_quantity</code> directly, since they are core managed derived values, and the webservice does not expose a supported write path for <code>reserved_quantity</code> at all. The only way to correct it safely is to make PrestaShop recompute it itself, by re-triggering the same hook a normal state change would fire.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch the stock row directly. Instead the script recomputes what <code>reserved_quantity</code> should be from the orders that are actually still open, compares that to what the API reports, and for every row that disagrees, reinserts an <code>order_histories</code> entry for that order's own current state. That forces PrestaShop's native <code>StockManager</code> hook to run again and settle the number on its own.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. The script pulls logable order states, sums open order lines per product, diffs that against the API's reserved_quantity, and when they disagree in live mode reposts an order_histories row for the order's current state to trigger PrestaShop's own stock recalculation.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Pull order_states</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">find logable ids</text>
+      <line x1="97" y1="80" x2="97" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Sum open order lines</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">qty minus refunded qty</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="365" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Diff vs API stock</text>
+      <text x="365" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">stock_availables rows</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 677,138 590,170 503,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Drift</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">found?</text>
+      <text x="680" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="677" y1="138" x2="705" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#6b4f5b" font-weight="700">no, skip</text>
+      <line x1="590" y1="170" x2="590" y2="215" stroke="#6b4f5b" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="65" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Repost order_histories</text>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">re-apply current state</text>
+      <text x="684" y="236" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#6b4f5b">StockManager recalculates</text>
+      <path d="M705,138 C725,138 684,150 684,180" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only repairs rows where the computed reserved quantity really disagrees with what the API reports, and it repairs them through PrestaShop's own hook, never by hand editing the row.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a webservice key with the right permissions</h3>
+      <p>In the backoffice, go to Advanced Parameters, Webservice, and create a key with read access to <code>order_states</code>, <code>orders</code>, <code>order_details</code>, and <code>stock_availables</code>, plus write access to <code>order_histories</code>. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Find which order states actually reserve stock</h3>
+      <p>Not every order state counts as a pending sale. PrestaShop flags each <code>order_state</code> row with a <code>logable</code> field, and only those states hold a reservation. Pull the full list once and keep the ids where <code>logable</code> is true.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def logable_state_ids():
+    data = api_get("order_states", {"display": "full"})
+    states = data.get("order_states") or []
+    return {int(s["id"]) for s in states if str(s.get("logable")) in ("1", "true", "True")}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function logableStateIds() {
+  const data = await apiGet("order_states", { display: "full" });
+  const states = data.order_states || [];
+  return new Set(states.filter((s) => String(s.logable) === "1" || s.logable === true).map((s) => Number(s.id)));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull open orders and their lines</h3>
+      <p>List orders whose <code>current_state</code> is one of the logable ids, then read each order's lines to get <code>product_quantity</code> and <code>product_quantity_refunded</code> per product and combination. This is the real, current picture of what should be reserved.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def open_orders(logable_ids):
+    data = api_get("orders", {"display": "full", "limit": "0,1000"})
+    orders = data.get("orders") or []
+    return [o for o in orders if int(o.get("current_state", 0)) in logable_ids]
+
+def order_lines(id_order):
+    data = api_get("order_details", {"display": "full", "filter[id_order]": id_order})
+    return data.get("order_details") or []
+
+def open_order_lines(logable_ids):
+    lines = []
+    for order in open_orders(logable_ids):
+        id_state = int(order["current_state"])
+        for line in order_lines(order["id"]):
+            lines.append({
+                "id_product": int(line["product_id"]),
+                "id_product_attribute": int(line.get("product_attribute_id") or 0),
+                "product_quantity": int(line.get("product_quantity") or 0),
+                "product_quantity_refunded": int(line.get("product_quantity_refunded") or 0),
+                "id_order_state": id_state,
+            })
+    return lines</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function openOrders(logableIds) {
+  const data = await apiGet("orders", { display: "full", limit: "0,1000" });
+  const orders = data.orders || [];
+  return orders.filter((o) => logableIds.has(Number(o.current_state)));
+}
+
+async function orderLines(idOrder) {
+  const data = await apiGet("order_details", { display: "full", "filter[id_order]": idOrder });
+  return data.order_details || [];
+}
+
+async function openOrderLines(logableIds) {
+  const lines = [];
+  for (const order of await openOrders(logableIds)) {
+    const idState = Number(order.current_state);
+    for (const line of await orderLines(order.id)) {
+      lines.push({
+        id_product: Number(line.product_id),
+        id_product_attribute: Number(line.product_attribute_id || 0),
+        product_quantity: Number(line.product_quantity || 0),
+        product_quantity_refunded: Number(line.product_quantity_refunded || 0),
+        id_order_state: idState,
+      });
+    }
+  }
+  return lines;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the actual comparison in its own function that takes plain lists in and returns plain data out. It filters lines to the logable states, sums quantity minus refunded quantity per product and combination clipped at zero, joins that against the stock rows the API reports, and returns only the rows that actually disagree, with the signed drift. Nothing here talks to the network, so it is simple to test with hand built fixtures.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def compute_reserved_drift(open_order_lines, logable_state_ids, stock_rows):
+    expected = {}
+    for line in open_order_lines:
+        if line["id_order_state"] not in logable_state_ids:
+            continue
+        key = (line["id_product"], line["id_product_attribute"])
+        remaining = line["product_quantity"] - line["product_quantity_refunded"]
+        if remaining < 0:
+            remaining = 0
+        expected[key] = expected.get(key, 0) + remaining
+
+    actual_by_key = {
+        (row["id_product"], row["id_product_attribute"]): row["reserved_quantity"]
+        for row in stock_rows
+    }
+
+    keys = set(expected) | set(actual_by_key)
+    results = []
+    for key in keys:
+        expected_reserved = expected.get(key, 0)
+        actual_reserved = actual_by_key.get(key, 0)
+        if expected_reserved != actual_reserved:
+            id_product, id_product_attribute = key
+            results.append({
+                "id_product": id_product,
+                "id_product_attribute": id_product_attribute,
+                "expected_reserved": expected_reserved,
+                "actual_reserved": actual_reserved,
+                "drift": actual_reserved - expected_reserved,
+            })
+    return results</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function computeReservedDrift(openOrderLines, logableStateIds, stockRows) {
+  const expected = new Map();
+  for (const line of openOrderLines) {
+    if (!logableStateIds.has(line.id_order_state)) continue;
+    const key = `${line.id_product}:${line.id_product_attribute}`;
+    let remaining = line.product_quantity - line.product_quantity_refunded;
+    if (remaining < 0) remaining = 0;
+    expected.set(key, (expected.get(key) || 0) + remaining);
+  }
+
+  const actualByKey = new Map();
+  for (const row of stockRows) {
+    actualByKey.set(`${row.id_product}:${row.id_product_attribute}`, row.reserved_quantity);
+  }
+
+  const keys = new Set([...expected.keys(), ...actualByKey.keys()]);
+  const results = [];
+  for (const key of keys) {
+    const [idProduct, idProductAttribute] = key.split(":").map(Number);
+    const expectedReserved = expected.get(key) || 0;
+    const actualReserved = actualByKey.get(key) || 0;
+    if (expectedReserved !== actualReserved) {
+      results.push({
+        id_product: idProduct,
+        id_product_attribute: idProductAttribute,
+        expected_reserved: expectedReserved,
+        actual_reserved: actualReserved,
+        drift: actualReserved - expectedReserved,
+      });
+    }
+  }
+  return results;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair through order_histories, never through the stock row</h3>
+      <p>For a drifted row, do not write <code>reserved_quantity</code> or <code>physical_quantity</code> directly. PrestaShop's Stock FAQ says these are core managed derived values and the webservice does not offer a supported write path for <code>reserved_quantity</code>. Instead, post a fresh <code>order_histories</code> row that re-applies the order's own current, terminal state. That reruns the same <code>StockManager</code> hook a normal state change would trigger, and PrestaShop recalculates the stock row on its own.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def resync_order_state(id_order, id_order_state):
+    body = {
+        "order_history": {
+            "id_order": id_order,
+            "id_order_state": id_order_state,
+        }
+    }
+    r = requests.post(
+        f"{BASE_URL}/api/order_histories",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function resyncOrderState(idOrder, idOrderState) {
+  const url = new URL(`${BASE_URL}/api/order_histories`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ order_history: { id_order: idOrder, id_order_state: idOrderState } }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop pulls the logable states, the open order lines, and the current stock rows, computes the drift, and logs every drifted product and combination with the old value versus the computed value. Leave <code>DRY_RUN</code> on for the first few runs so it only reports. Once you trust the list, switch it off so it resyncs each drifted order's state and lets PrestaShop settle the number itself.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. This script never writes to <code>stock_available</code> directly, it only reposts an order's own existing current state to <code>order_histories</code>, which is the same mechanism PrestaShop's own order state screen uses.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only repairs rows where the computed reservation actually disagrees with what the API reports.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/reserved-quantity-drift" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reserved_quantity_drift.py</div>
+      <pre><code class="language-python">"""Find and repair PrestaShop reserved_quantity drift from real pending orders.
+
+stock_available.reserved_quantity is a running counter PrestaShop updates as a side
+effect of order_histories inserts, not a live query. When an order state changes
+outside the normal flow, the decrement can be skipped and the counter never comes
+back down. This recomputes the expected reserved quantity from real open orders,
+diffs it against the API, and repairs drift by reposting the order's own current
+state to order_histories, which re-triggers PrestaShop's native stock recalculation.
+Never writes reserved_quantity or physical_quantity directly. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reserved_quantity_drift")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def api_get(path, params):
+    params = dict(params)
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def logable_state_ids():
+    data = api_get("order_states", {"display": "full"})
+    states = data.get("order_states") or []
+    return {int(s["id"]) for s in states if str(s.get("logable")) in ("1", "true", "True")}
+
+
+def open_orders(logable_ids):
+    data = api_get("orders", {"display": "full", "limit": "0,1000"})
+    orders = data.get("orders") or []
+    return [o for o in orders if int(o.get("current_state", 0)) in logable_ids]
+
+
+def order_lines(id_order):
+    data = api_get("order_details", {"display": "full", "filter[id_order]": id_order})
+    return data.get("order_details") or []
+
+
+def open_order_lines(logable_ids):
+    lines = []
+    for order in open_orders(logable_ids):
+        id_state = int(order["current_state"])
+        for line in order_lines(order["id"]):
+            lines.append({
+                "id_product": int(line["product_id"]),
+                "id_product_attribute": int(line.get("product_attribute_id") or 0),
+                "product_quantity": int(line.get("product_quantity") or 0),
+                "product_quantity_refunded": int(line.get("product_quantity_refunded") or 0),
+                "id_order_state": id_state,
+            })
+    return lines
+
+
+def stock_rows():
+    data = api_get("stock_availables", {"display": "full", "limit": "0,1000"})
+    rows = data.get("stock_availables") or []
+    return [
+        {
+            "id_product": int(r["id_product"]),
+            "id_product_attribute": int(r.get("id_product_attribute") or 0),
+            "reserved_quantity": int(r.get("reserved_quantity") or 0),
+        }
+        for r in rows
+    ]
+
+
+def order_current_state(id_order):
+    data = api_get(f"orders/{id_order}", {"display": "full"})
+    return int(data["order"]["current_state"])
+
+
+def compute_reserved_drift(open_order_lines, logable_ids, stock_rows_list):
+    expected = {}
+    for line in open_order_lines:
+        if line["id_order_state"] not in logable_ids:
+            continue
+        key = (line["id_product"], line["id_product_attribute"])
+        remaining = line["product_quantity"] - line["product_quantity_refunded"]
+        if remaining < 0:
+            remaining = 0
+        expected[key] = expected.get(key, 0) + remaining
+
+    actual_by_key = {
+        (row["id_product"], row["id_product_attribute"]): row["reserved_quantity"]
+        for row in stock_rows_list
+    }
+
+    keys = set(expected) | set(actual_by_key)
+    results = []
+    for key in keys:
+        expected_reserved = expected.get(key, 0)
+        actual_reserved = actual_by_key.get(key, 0)
+        if expected_reserved != actual_reserved:
+            id_product, id_product_attribute = key
+            results.append({
+                "id_product": id_product,
+                "id_product_attribute": id_product_attribute,
+                "expected_reserved": expected_reserved,
+                "actual_reserved": actual_reserved,
+                "drift": actual_reserved - expected_reserved,
+            })
+    return results
+
+
+def resync_order_state(id_order, id_order_state):
+    body = {"order_history": {"id_order": id_order, "id_order_state": id_order_state}}
+    r = requests.post(
+        f"{BASE_URL}/api/order_histories",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def orders_touching_product(open_orders_list, id_product, id_product_attribute):
+    matches = []
+    for order in open_orders_list:
+        for line in order_lines(order["id"]):
+            if int(line["product_id"]) == id_product and int(line.get("product_attribute_id") or 0) == id_product_attribute:
+                matches.append(order)
+                break
+    return matches
+
+
+def run():
+    ids = logable_state_ids()
+    orders = open_orders(ids)
+    lines = []
+    for order in orders:
+        id_state = int(order["current_state"])
+        for line in order_lines(order["id"]):
+            lines.append({
+                "id_product": int(line["product_id"]),
+                "id_product_attribute": int(line.get("product_attribute_id") or 0),
+                "product_quantity": int(line.get("product_quantity") or 0),
+                "product_quantity_refunded": int(line.get("product_quantity_refunded") or 0),
+                "id_order_state": id_state,
+            })
+    rows = stock_rows()
+    drifted = compute_reserved_drift(lines, ids, rows)
+
+    for item in drifted:
+        log.warning(
+            "Product %s attribute %s drift: expected=%s actual=%s (%s)",
+            item["id_product"], item["id_product_attribute"],
+            item["expected_reserved"], item["actual_reserved"],
+            "would resync" if DRY_RUN else "resyncing",
+        )
+        if not DRY_RUN:
+            touching = orders_touching_product(orders, item["id_product"], item["id_product_attribute"])
+            for order in touching:
+                resync_order_state(order["id"], int(order["current_state"]))
+
+    log.info("Done. %d drifted product/attribute row(s) %s.", len(drifted), "to resync" if DRY_RUN else "resynced")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reserved-quantity-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and repair PrestaShop reserved_quantity drift from real pending orders.
+ *
+ * stock_available.reserved_quantity is a running counter PrestaShop updates as a side
+ * effect of order_histories inserts, not a live query. When an order state changes
+ * outside the normal flow, the decrement can be skipped and the counter never comes
+ * back down. This recomputes the expected reserved quantity from real open orders,
+ * diffs it against the API, and repairs drift by reposting the order's own current
+ * state to order_histories, which re-triggers PrestaShop's native stock recalculation.
+ * Never writes reserved_quantity or physical_quantity directly. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/reserved-quantity-drift/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://example.test").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "dummy_key";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params) {
+  const url = new URL(`${BASE_URL}/api/${path}`);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, { headers: { Authorization: authHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function logableStateIds() {
+  const data = await apiGet("order_states", { display: "full" });
+  const states = data.order_states || [];
+  return new Set(states.filter((s) => String(s.logable) === "1" || s.logable === true).map((s) => Number(s.id)));
+}
+
+async function openOrders(logableIds) {
+  const data = await apiGet("orders", { display: "full", limit: "0,1000" });
+  const orders = data.orders || [];
+  return orders.filter((o) => logableIds.has(Number(o.current_state)));
+}
+
+async function orderLines(idOrder) {
+  const data = await apiGet("order_details", { display: "full", "filter[id_order]": idOrder });
+  return data.order_details || [];
+}
+
+async function stockRows() {
+  const data = await apiGet("stock_availables", { display: "full", limit: "0,1000" });
+  const rows = data.stock_availables || [];
+  return rows.map((r) => ({
+    id_product: Number(r.id_product),
+    id_product_attribute: Number(r.id_product_attribute || 0),
+    reserved_quantity: Number(r.reserved_quantity || 0),
+  }));
+}
+
+export function computeReservedDrift(openOrderLines, logableStateIds, stockRowsList) {
+  const expected = new Map();
+  for (const line of openOrderLines) {
+    if (!logableStateIds.has(line.id_order_state)) continue;
+    const key = `${line.id_product}:${line.id_product_attribute}`;
+    let remaining = line.product_quantity - line.product_quantity_refunded;
+    if (remaining < 0) remaining = 0;
+    expected.set(key, (expected.get(key) || 0) + remaining);
+  }
+
+  const actualByKey = new Map();
+  for (const row of stockRowsList) {
+    actualByKey.set(`${row.id_product}:${row.id_product_attribute}`, row.reserved_quantity);
+  }
+
+  const keys = new Set([...expected.keys(), ...actualByKey.keys()]);
+  const results = [];
+  for (const key of keys) {
+    const [idProduct, idProductAttribute] = key.split(":").map(Number);
+    const expectedReserved = expected.get(key) || 0;
+    const actualReserved = actualByKey.get(key) || 0;
+    if (expectedReserved !== actualReserved) {
+      results.push({
+        id_product: idProduct,
+        id_product_attribute: idProductAttribute,
+        expected_reserved: expectedReserved,
+        actual_reserved: actualReserved,
+        drift: actualReserved - expectedReserved,
+      });
+    }
+  }
+  return results;
+}
+
+async function resyncOrderState(idOrder, idOrderState) {
+  const url = new URL(`${BASE_URL}/api/order_histories`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ order_history: { id_order: idOrder, id_order_state: idOrderState } }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function ordersTouchingProduct(openOrdersList, idProduct, idProductAttribute) {
+  const matches = [];
+  for (const order of openOrdersList) {
+    const lines = await orderLines(order.id);
+    if (lines.some((l) => Number(l.product_id) === idProduct && Number(l.product_attribute_id || 0) === idProductAttribute)) {
+      matches.push(order);
+    }
+  }
+  return matches;
+}
+
+export async function run() {
+  const ids = await logableStateIds();
+  const orders = await openOrders(ids);
+  const lines = [];
+  for (const order of orders) {
+    const idState = Number(order.current_state);
+    for (const line of await orderLines(order.id)) {
+      lines.push({
+        id_product: Number(line.product_id),
+        id_product_attribute: Number(line.product_attribute_id || 0),
+        product_quantity: Number(line.product_quantity || 0),
+        product_quantity_refunded: Number(line.product_quantity_refunded || 0),
+        id_order_state: idState,
+      });
+    }
+  }
+  const rows = await stockRows();
+  const drifted = computeReservedDrift(lines, ids, rows);
+
+  for (const item of drifted) {
+    console.warn(
+      `Product ${item.id_product} attribute ${item.id_product_attribute} drift: expected=${item.expected_reserved} actual=${item.actual_reserved} (${DRY_RUN ? "would resync" : "resyncing"})`
+    );
+    if (!DRY_RUN) {
+      const touching = await ordersTouchingProduct(orders, item.id_product, item.id_product_attribute);
+      for (const order of touching) {
+        await resyncOrderState(order.id, Number(order.current_state));
+      }
+    }
+  }
+
+  console.log(`Done. ${drifted.length} drifted product/attribute row(s) ${DRY_RUN ? "to resync" : "resynced"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which products get a corrective order state resync. Because <code>compute_reserved_drift</code> is pure, the test needs no PrestaShop instance and no network. It just feeds in plain lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_reserved_drift.py</div>
+      <pre><code class="language-python">from reserved_quantity_drift import compute_reserved_drift
+
+LOGABLE = {2}  # only order state id 2 counts as a pending reservation
+
+
+def line(**over):
+    base = {
+        "id_product": 10,
+        "id_product_attribute": 0,
+        "product_quantity": 2,
+        "product_quantity_refunded": 0,
+        "id_order_state": 2,
+    }
+    base.update(over)
+    return base
+
+
+def stock_row(**over):
+    base = {"id_product": 10, "id_product_attribute": 0, "reserved_quantity": 2}
+    base.update(over)
+    return base
+
+
+def test_no_drift_when_expected_matches_actual():
+    assert compute_reserved_drift([line()], LOGABLE, [stock_row()]) == []
+
+
+def test_drift_when_reserved_quantity_stuck_after_cancellation():
+    # no open orders at all, but the stock row still holds reserved units
+    result = compute_reserved_drift([], LOGABLE, [stock_row(reserved_quantity=3)])
+    assert result == [{
+        "id_product": 10,
+        "id_product_attribute": 0,
+        "expected_reserved": 0,
+        "actual_reserved": 3,
+        "drift": 3,
+    }]
+
+
+def test_zero_orders_and_zero_stock_produces_no_drift():
+    assert compute_reserved_drift([], LOGABLE, []) == []
+
+
+def test_refunded_partial_line_reduces_expected_reserved():
+    l = line(product_quantity=5, product_quantity_refunded=3)  # 2 remaining
+    assert compute_reserved_drift([l], LOGABLE, [stock_row(reserved_quantity=2)]) == []
+    assert compute_reserved_drift([l], LOGABLE, [stock_row(reserved_quantity=5)]) == [{
+        "id_product": 10,
+        "id_product_attribute": 0,
+        "expected_reserved": 2,
+        "actual_reserved": 5,
+        "drift": 3,
+    }]
+
+
+def test_non_logable_state_is_excluded_from_expected():
+    l = line(id_order_state=99)  # not in LOGABLE
+    result = compute_reserved_drift([l], LOGABLE, [stock_row(reserved_quantity=2)])
+    assert result == [{
+        "id_product": 10,
+        "id_product_attribute": 0,
+        "expected_reserved": 0,
+        "actual_reserved": 2,
+        "drift": 2,
+    }]
+
+
+def test_multiple_attributes_per_product_are_tracked_separately():
+    lines = [
+        line(id_product_attribute=1, product_quantity=1),
+        line(id_product_attribute=2, product_quantity=4),
+    ]
+    rows = [
+        stock_row(id_product_attribute=1, reserved_quantity=1),
+        stock_row(id_product_attribute=2, reserved_quantity=9),
+    ]
+    result = compute_reserved_drift(lines, LOGABLE, rows)
+    assert result == [{
+        "id_product": 10,
+        "id_product_attribute": 2,
+        "expected_reserved": 4,
+        "actual_reserved": 9,
+        "drift": 5,
+    }]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reserved-quantity-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { computeReservedDrift } from "./reserved-quantity-drift.js";
+
+const LOGABLE = new Set([2]);
+
+const line = (over = {}) => ({
+  id_product: 10,
+  id_product_attribute: 0,
+  product_quantity: 2,
+  product_quantity_refunded: 0,
+  id_order_state: 2,
+  ...over,
+});
+
+const stockRow = (over = {}) => ({ id_product: 10, id_product_attribute: 0, reserved_quantity: 2, ...over });
+
+test("no drift when expected matches actual", () => {
+  assert.deepEqual(computeReservedDrift([line()], LOGABLE, [stockRow()]), []);
+});
+
+test("drift when reserved_quantity stuck after cancellation", () => {
+  const result = computeReservedDrift([], LOGABLE, [stockRow({ reserved_quantity: 3 })]);
+  assert.deepEqual(result, [{
+    id_product: 10,
+    id_product_attribute: 0,
+    expected_reserved: 0,
+    actual_reserved: 3,
+    drift: 3,
+  }]);
+});
+
+test("zero orders and zero stock produces no drift", () => {
+  assert.deepEqual(computeReservedDrift([], LOGABLE, []), []);
+});
+
+test("refunded partial line reduces expected reserved", () => {
+  const l = line({ product_quantity: 5, product_quantity_refunded: 3 });
+  assert.deepEqual(computeReservedDrift([l], LOGABLE, [stockRow({ reserved_quantity: 2 })]), []);
+  assert.deepEqual(computeReservedDrift([l], LOGABLE, [stockRow({ reserved_quantity: 5 })]), [{
+    id_product: 10,
+    id_product_attribute: 0,
+    expected_reserved: 2,
+    actual_reserved: 5,
+    drift: 3,
+  }]);
+});
+
+test("non-logable state is excluded from expected", () => {
+  const l = line({ id_order_state: 99 });
+  const result = computeReservedDrift([l], LOGABLE, [stockRow({ reserved_quantity: 2 })]);
+  assert.deepEqual(result, [{
+    id_product: 10,
+    id_product_attribute: 0,
+    expected_reserved: 0,
+    actual_reserved: 2,
+    drift: 2,
+  }]);
+});
+
+test("multiple attributes per product are tracked separately", () => {
+  const lines = [
+    line({ id_product_attribute: 1, product_quantity: 1 }),
+    line({ id_product_attribute: 2, product_quantity: 4 }),
+  ];
+  const rows = [
+    stockRow({ id_product_attribute: 1, reserved_quantity: 1 }),
+    stockRow({ id_product_attribute: 2, reserved_quantity: 9 }),
+  ];
+  const result = computeReservedDrift(lines, LOGABLE, rows);
+  assert.deepEqual(result, [{
+    id_product: 10,
+    id_product_attribute: 2,
+    expected_reserved: 4,
+    actual_reserved: 9,
+    drift: 5,
+  }]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Bulk cancellation</span>
+      <h4>The seasonal cleanup that never let go</h4>
+      <p>A homeware store ran a quarterly cleanup that bulk cancelled hundreds of stale, unpaid orders straight from a saved backoffice filter. Weeks later, popular products kept showing lower available stock than the physical count in the warehouse justified, and nobody could explain why.</p>
+      <p>The reconciler found dozens of products still holding reserved units from orders that had been cancelled months earlier. Once the drifted rows were resynced through <code>order_histories</code>, available stock matched the warehouse count again, and the team now runs the check right after every bulk cancellation.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Custom module</span>
+      <h4>The refund plugin that skipped the hook</h4>
+      <p>A store used a third party refund module that updated the order's state column directly for speed, bypassing the normal order state change screen. Refunds looked correct in the order view, but reserved quantity on the refunded products never came back down.</p>
+      <p>Running the drift check on a schedule caught it within a day of the first refund. The fix did not touch the module. It just reposted each affected order's already-current refunded state to <code>order_histories</code>, which let PrestaShop's own hook do the recalculation the module had skipped.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, <code>reserved_quantity</code> stays honest even when orders get cancelled or refunded through paths that skip the normal flow. Available stock reflects reality, nobody hand edits a core managed column, and every repair goes through the same <code>order_histories</code> mechanism PrestaShop's own order state screen uses, so <code>physical_quantity</code> and available for sale quantity stay internally consistent too.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does PrestaShop's reserved_quantity stop matching my real pending orders?</summary>
+      <p>reserved_quantity is a running counter that PrestaShop updates as a side effect of order_histories inserts, not a live query against currently open orders. When an order is cancelled or refunded outside the normal order state flow, such as a bulk edit, a direct database write, or a webservice call that skips order_histories, the decrement step is skipped and the counter never returns to zero.</p>
+    </details>
+    <details>
+      <summary>Can I just fix reserved_quantity by editing the stock_available row directly?</summary>
+      <p>No. PrestaShop's own Stock FAQ says not to modify reserved_quantity or physical_quantity by hand, since they are core managed derived values, and the public webservice does not offer a supported write path for reserved_quantity. Hand editing the row will desync it from physical_quantity and available for sale quantity again the next time an order state changes.</p>
+    </details>
+    <details>
+      <summary>How do I actually repair the drift once I find it?</summary>
+      <p>Insert a corrective order_histories row that re-applies the order's own current terminal state, for example re-posting Canceled or Refunded. That re-triggers PrestaShop's native StockManager recalculation hook, which is the only supported mechanism that keeps physical_quantity, reserved_quantity, and available for sale quantity internally consistent.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past a shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PS 1.7.6 ASM incorrect "reserved_quantity" values. <a href="https://github.com/PrestaShop/PrestaShop/issues/17490" rel="noopener">github.com/PrestaShop/PrestaShop/issues/17490</a></li>
+      <li>Reserved stock issue. <a href="https://github.com/PrestaShop/PrestaShop/issues/22756" rel="noopener">github.com/PrestaShop/PrestaShop/issues/22756</a></li>
+      <li>Product Physical quantity is wrongly increased when Order status is changed. <a href="https://github.com/PrestaShop/PrestaShop/issues/36024" rel="noopener">github.com/PrestaShop/PrestaShop/issues/36024</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Stock FAQ. <a href="https://devdocs.prestashop-project.org/9/faq/stock/" rel="noopener">devdocs.prestashop-project.org/9/faq/stock/</a></li>
+      <li>PrestaShop Developer Documentation: Stock availables webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/stock_availables/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/stock_availables/</a></li>
+      <li>PrestaShop Developer Documentation: Order histories webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_histories/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_histories/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop stock, orders, order states, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this settle your reserved stock?</h3>
+    <p>If this saved you a pile of confused stock counts or a wrong "in stock" message, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

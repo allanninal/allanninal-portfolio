@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix PrestaShop Stock Quantity Doubled or Changed on Order Status Change</title>
+<meta name="description" content="A PrestaShop order status change fires the stock update twice, or a reverted status increments stock instead of restoring it. Learn why OrderHistory corrupts stock_available.quantity and build a Python or Node.js script that flags and safely repairs it.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix PrestaShop Stock Quantity Doubled or Changed on Order Status Change">
+<meta property="og:description" content="Why a repeated or reverted order status change corrupts stock_available.quantity, and a safe Python or Node.js script that flags and repairs it.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/#article","headline":"Fix PrestaShop Stock Quantity Doubled or Changed on Order Status Change","description":"Why a repeated or reverted order status change corrupts stock_available.quantity in PrestaShop, and a safe Python or Node.js script that flags and repairs it with the webservice API.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Stock and inventory","keywords":"PrestaShop stock quantity doubled, OrderHistory changeIdOrderState, StockAvailable updateQuantity, order_histories webservice, order_states logable, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Product quantity wrongly doubled or changed when order status changes","item":"https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my PrestaShop stock quantity double after an order status change?","acceptedAnswer":{"@type":"Answer","text":"PrestaShop's OrderHistory::changeIdOrderState() applies a signed stock adjustment every time it sees a transition into or out of a logable order state. If the same target state is applied twice, for example a webservice PUT that re-adds the same id_order_state, PrestaShop creates a duplicate order_histories row and re-runs the same stock adjustment a second time, doubling the decrement or increment."}},{"@type":"Question","name":"Why did reverting an order status increase stock instead of restoring it?","acceptedAnswer":{"@type":"Answer","text":"Reverting a status, such as moving Cancelled back to Awaiting payment, is treated as a brand new logable-state transition. PrestaShop only knows the sign of the state pair difference, not the original quantity before the first change, so it increments stock again rather than restoring the value it had before the transition happened."}},{"@type":"Question","name":"Is it safe to auto correct PrestaShop stock quantity after this bug?","acceptedAnswer":{"@type":"Answer","text":"Not by blindly overwriting it. Other orders on the same product may have sold or restocked between the corruption and the moment you detect it, so a naive overwrite can clobber legitimate stock movement. Flag the mismatch, require a human to confirm the expected value, and only then write a compensating change with a dry run guard."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Stock &amp; Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Stock &amp; Inventory</p>
+    <h1>Product quantity wrongly doubled or changed when order status changes</h1>
+    <p class="lead">An order moves from Awaiting payment to Payment accepted, and the stock drops by twice the line quantity. Or a Cancelled order gets reverted, and instead of restoring the stock it had before, PrestaShop adds even more. Nothing about your catalog changed, but the numbers in stock_available no longer match what actually shipped. Here is why PrestaShop's own status engine does this and a small script that finds the affected products and repairs them safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>PrestaShop's <code>OrderHistory::changeIdOrderState()</code> drives every stock change off the transition between the order's old state and the new one, and it calls <code>StockAvailable::updateQuantity()</code> with a signed delta each time. If that transition is applied twice, such as a webservice PUT to <code>order_histories</code> re-adding the same <code>id_order_state</code>, PrestaShop writes a duplicate history row and repeats the same stock adjustment. Reverting a status is treated the same way, as a fresh transition, so it adjusts stock again instead of restoring the original value. Pull the order's status timeline, re-derive what the stock should be by walking that timeline yourself, diff it against the live value, and only apply a confirmed, dry run guarded correction. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every time an order's status changes in PrestaShop, a new row goes into <code>order_histories</code> and the engine compares the state you left against the state you are entering. If that comparison crosses from "not logable" to "logable" (roughly: the order now counts as a real sale), stock goes down by the order line's quantity. If it crosses back the other way, stock goes up. That part works as designed.</p>
+  <p>The trouble is that PrestaShop's engine has no memory of what the stock was before a given transition. It only knows the sign of the difference between the old state's flags and the new state's flags. So if the same target state gets applied a second time, whether through a webservice call that fires the state change twice or an admin action racing with an API call, PrestaShop happily runs the same signed adjustment again. A single Payment accepted transition that should remove 3 units removes 6. A Cancelled order reverted back to Awaiting payment does not restore the pre-cancellation quantity, it just adds the line quantity on top of whatever is already there. This is a documented, reproduced defect in PrestaShop itself, not a store misconfiguration; see the GitHub issues in the citations.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A status change fires the stock update once as expected, but a duplicate order_histories row for the same state fires the same signed adjustment a second time, doubling the stock change.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="180" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="100" y="46" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Status change fires</text>
+      <text x="100" y="63" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">order_histories row #1</text>
+      <line x1="100" y1="80" x2="100" y2="108" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="110" width="180" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="100" y="136" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Stock adjusted</text>
+      <text x="100" y="153" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">expected, correct once</text>
+      <line x1="190" y1="140" x2="240" y2="140" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="243" y="20" width="230" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="358" y="46" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Same target state applied again</text>
+      <text x="358" y="63" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">API race or duplicate PUT</text>
+      <line x1="358" y1="80" x2="358" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="243" y="110" width="230" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="358" y="136" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Duplicate history row</text>
+      <text x="358" y="153" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">no memory of row #1</text>
+      <line x1="473" y1="140" x2="523" y2="140" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="526" y="110" width="220" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="636" y="136" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Same delta applied twice</text>
+      <text x="636" y="153" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">quantity doubled or over-restocked</text>
+    </svg>
+    <figcaption>The engine only knows the sign of the state pair difference, not whether it already applied that exact transition. A repeated or reverted transition adjusts stock again.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>PrestaShop drives stock side effects entirely off comparing <code>order_states</code> flags (<code>logable</code>, <code>shipped</code>, <code>paid</code>) between the order's previous state and its new one, inside <code>OrderHistory::changeIdOrderState()</code>, then calls <code>StockAvailable::updateQuantity()</code> with a signed quantity. A few concrete ways this goes wrong in real stores:</p>
+  <ul>
+    <li>A webservice integration PUTs to <code>order_histories</code> to set a new <code>id_order_state</code>, the request is retried after a timeout, and PrestaShop records the same state change twice, running the stock decrement twice (PrestaShop issue #22011).</li>
+    <li>An admin employee clicks the status dropdown while an automated sync is also pushing the same status, and both fire the change hook (PrestaShop issue #36024).</li>
+    <li>A status is reverted, for example Cancelled back to Awaiting payment, and PrestaShop treats it purely as a new logable-flag transition, incrementing stock again instead of restoring the pre-cancellation quantity.</li>
+    <li>Out of stock handling interacts with a state change on the same request, and the two writes to <code>stock_availables.quantity</code> land in an order that compounds rather than cancels out (PrestaShop issue #27631).</li>
+  </ul>
+  <p>None of this shows up as an error. The order looks fine, the status history looks fine at a glance, and the only symptom is that <code>stock_availables.quantity</code> for one or two products slowly drifts away from what you actually shipped.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The bug is not that PrestaShop calculates the wrong delta. It calculates the right delta for the transition it sees. The bug is that it has no idea whether it already applied that exact transition before. So the fix is not to change PrestaShop's logic, it is to keep our own memory of which state transitions we have already accounted for, replay the order's full history ourselves, and compare our expected total against the live value before touching anything.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not patch PrestaShop's stock engine. We read the order's full status timeline, the order lines, the order state flags, and the current stock, independently recompute what stock should be by walking the same signed deltas PrestaShop would apply, and only report or repair when the live value disagrees with our recomputed expectation.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. Pull order_histories, order_details, and order_states, replay the expected stock delta for each transition, diff against the live stock_availables quantity, and only write a compensating correction after human confirmation with a dry run guard.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="190" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="105" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Pull order_histories</text>
+      <text x="105" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">plus order_details, order_states</text>
+      <line x1="105" y1="80" x2="105" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="105" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Replay each transition</text>
+      <text x="105" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">signed delta, seen states tracked</text>
+      <line x1="200" y1="138" x2="242" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="245" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="340" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Sum expected quantity</text>
+      <text x="340" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">duplicates count as zero</text>
+      <line x1="435" y1="138" x2="477" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="570,106 657,138 570,170 483,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="570" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">Matches live</text>
+      <text x="570" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2b101c">stock?</text>
+      <text x="660" y="128" font-family="sans-serif" font-size="10.5" fill="#8a9a92" font-weight="700">yes, no-op</text>
+      <line x1="657" y1="138" x2="690" y2="138" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="585" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, flag it</text>
+      <line x1="570" y1="170" x2="570" y2="205" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="608" y="185" width="142" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="679" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report the mismatch</text>
+      <text x="679" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">human confirms, then</text>
+      <text x="679" y="239" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">dry run guarded PUT</text>
+    </svg>
+    <figcaption>Nothing writes to stock_availables until a human has confirmed the flagged mismatch, and even then only inside a dry run guard.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a webservice key</h3>
+      <p>In your PrestaShop admin, go to Advanced Parameters, Webservice, and create a key with access to <code>order_histories</code>, <code>order_details</code>, <code>order_states</code>, and <code>stock_availables</code> (read for the first three, read and write for the last). Keep the shop URL and the key in environment variables, never in the file. Authentication is HTTP Basic with the key as the username and a blank password.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://yourstore.example.com"
+export PRESTASHOP_WS_KEY="YOURWEBSERVICEKEY"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://yourstore.example.com"
+export PRESTASHOP_WS_KEY="YOURWEBSERVICEKEY"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the webservice API</h3>
+      <p>Every call goes to <code>{PRESTASHOP_URL}/api/&lt;resource&gt;</code> with Basic auth (key as username, blank password) and <code>?output_format=JSON</code> so PrestaShop returns JSON instead of its default XML. A small helper wraps GET and PUT and raises on a non-2xx response.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def api_put(path, body):
+    r = requests.put(
+        f"{BASE_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        auth=(WS_KEY, ""),
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "";
+
+function authHeader() {
+  const token = Buffer.from(`${WS_KEY}:`).toString("base64");
+  return { Authorization: `Basic ${token}` };
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${BASE_URL}/api/${path}?${qs}`, { headers: authHeader() });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, body) {
+  const res = await fetch(`${BASE_URL}/api/${path}?output_format=JSON`, {
+    method: "PUT",
+    headers: { ...authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the order's status timeline and lines</h3>
+      <p>For a suspect order, fetch its full <code>order_histories</code> timeline sorted by date, its <code>order_details</code> lines for the product quantities, and the <code>order_states</code> flags (<code>logable</code>, <code>shipped</code>) each state carries. Watch for the same <code>id_order_state</code> showing up in two rows within a short window, that is the duplicate-history signature from issue #22011.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def order_history(id_order):
+    data = api_get("order_histories", {"filter[id_order]": id_order, "display": "full"})
+    rows = data.get("order_histories") or []
+    return sorted(rows, key=lambda r: (r.get("date_add") or "", int(r.get("id", 0))))
+
+def order_lines(id_order):
+    data = api_get("order_details", {"filter[id_order]": id_order, "display": "full"})
+    return data.get("order_details") or []
+
+def state_flags(id_order_state):
+    data = api_get(f"order_states/{id_order_state}")
+    s = data["order_state"]
+    return {"id": int(id_order_state), "logable": s.get("logable") == "1", "shipped": s.get("shipped") == "1"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function orderHistory(idOrder) {
+  const data = await apiGet("order_histories", { "filter[id_order]": idOrder, display: "full" });
+  const rows = data.order_histories || [];
+  return rows.sort((a, b) => (a.date_add || "").localeCompare(b.date_add || "") || Number(a.id) - Number(b.id));
+}
+
+async function orderLines(idOrder) {
+  const data = await apiGet("order_details", { "filter[id_order]": idOrder, display: "full" });
+  return data.order_details || [];
+}
+
+async function stateFlags(idOrderState) {
+  const data = await apiGet(`order_states/${idOrderState}`);
+  const s = data.order_state;
+  return { id: Number(idOrderState), logable: s.logable === "1", shipped: s.shipped === "1" };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide the delta for one transition, with one pure function</h3>
+      <p>This is the exact decision PrestaShop's engine should make for a single transition, isolated from any database call so it can be unit tested directly. It takes the flags of the state you left and the state you are entering, the line quantity, the list of state ids already applied for this order, and the candidate state id. A transition into a state already seen contributes nothing, since applying it again would be the duplicate bug. Otherwise the sign follows whether the order is becoming logable or leaving it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def expected_stock_delta(from_state, to_state, line_quantity, applied_state_ids_seen, candidate_state_id):
+    if candidate_state_id in applied_state_ids_seen:
+        return 0
+    if not from_state["logable"] and to_state["logable"]:
+        return -line_quantity
+    if from_state["logable"] and not to_state["logable"]:
+        return line_quantity
+    return 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function expectedStockDelta(fromState, toState, lineQuantity, appliedStateIdsSeen, candidateStateId) {
+  if (appliedStateIdsSeen.includes(candidateStateId)) return 0;
+  if (!fromState.logable &amp;&amp; toState.logable) return lineQuantity === 0 ? 0 : -lineQuantity;
+  if (fromState.logable &amp;&amp; !toState.logable) return lineQuantity;
+  return 0;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Walk the whole timeline and diff against live stock</h3>
+      <p>Starting from a neutral non-logable state, replay every history row through <code>expected_stock_delta</code>, tracking which state ids you have already applied so a duplicate row contributes zero. Sum the deltas per product and combination, then read the live <code>stock_availables</code> quantity and compare. Any mismatch, especially one that is an exact multiple of a line quantity, is a corrupted-stock candidate.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">walk.py</div>
+      <pre><code class="language-python">def stock_available(id_product, id_product_attribute):
+    data = api_get("stock_availables", {
+        "filter[id_product]": id_product,
+        "filter[id_product_attribute]": id_product_attribute or 0,
+        "display": "full",
+    })
+    rows = data.get("stock_availables") or []
+    return rows[0] if rows else None
+
+def replay_expected_delta(history_rows, line_quantity):
+    seen = []
+    total = 0
+    from_state = {"id": 0, "logable": False, "shipped": False}
+    for row in history_rows:
+        to_id = int(row["id_order_state"])
+        to_state = state_flags(to_id)
+        total += expected_stock_delta(from_state, to_state, line_quantity, seen, to_id)
+        seen.append(to_id)
+        from_state = to_state
+    return total</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">walk.js</div>
+      <pre><code class="language-javascript">async function stockAvailable(idProduct, idProductAttribute) {
+  const data = await apiGet("stock_availables", {
+    "filter[id_product]": idProduct,
+    "filter[id_product_attribute]": idProductAttribute || 0,
+    display: "full",
+  });
+  const rows = data.stock_availables || [];
+  return rows[0] || null;
+}
+
+async function replayExpectedDelta(historyRows, lineQuantity) {
+  const seen = [];
+  let total = 0;
+  let fromState = { id: 0, logable: false, shipped: false };
+  for (const row of historyRows) {
+    const toId = Number(row.id_order_state);
+    const toState = await stateFlags(toId);
+    total += expectedStockDelta(fromState, toState, lineQuantity, seen, toId);
+    seen.push(toId);
+    fromState = toState;
+  }
+  return total;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Report first, repair only with a dry run guard</h3>
+      <p>Do not blind-write a corrected quantity. Other orders on the same product may have sold or restocked between the corruption and the moment you detect it, so a naive overwrite can clobber legitimate stock movement. Emit one record per order, product, and combination with the observed quantity, the expected quantity, and the delta, and require a human to confirm before any write happens. When authorized, re-read the resource immediately before writing so the correction is based on the latest quantity, then PUT <code>quantity = observed_quantity - delta</code> and log the before and after values.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Review the flagged mismatches, confirm them by hand, and only then let the script write a compensating <code>stock_availables</code> update. It always re-reads the resource right before writing to base the correction on the latest quantity, since another order may have touched the same stock in between.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, replays each order's status history against the pure decision function, flags any mismatch against live stock, and only writes a compensating change when a human has confirmed it and <code>DRY_RUN</code> is off.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/stock-quantity-corrupted-on-status-change" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_stock.py</div>
+      <pre><code class="language-python">"""Flag and, once confirmed, repair PrestaShop stock corrupted by a duplicate
+or reverted order status change.
+
+OrderHistory::changeIdOrderState() applies a signed stock delta for every state
+transition it sees, with no memory of transitions it already applied. A duplicate
+order_histories row for the same target state, or a reverted status, makes it
+apply the same delta again. This script independently replays an order's status
+timeline with a pure decision function, diffs the expected quantity against the
+live stock_availables value, and reports a record per mismatch. It only writes a
+compensating correction when DRY_RUN is false, and it re-reads stock right before
+writing so the correction is based on the latest quantity.
+
+Guide: https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_stock")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+NEUTRAL_STATE = {"id": 0, "logable": False, "shipped": False}
+
+
+def expected_stock_delta(from_state, to_state, line_quantity, applied_state_ids_seen, candidate_state_id):
+    if candidate_state_id in applied_state_ids_seen:
+        return 0
+    if not from_state["logable"] and to_state["logable"]:
+        return -line_quantity
+    if from_state["logable"] and not to_state["logable"]:
+        return line_quantity
+    return 0
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_put(path, body):
+    r = requests.put(
+        f"{BASE_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        auth=(WS_KEY, ""),
+        json=body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def order_history(id_order):
+    data = api_get("order_histories", {"filter[id_order]": id_order, "display": "full"})
+    rows = data.get("order_histories") or []
+    return sorted(rows, key=lambda r: (r.get("date_add") or "", int(r.get("id", 0))))
+
+
+def order_lines(id_order):
+    data = api_get("order_details", {"filter[id_order]": id_order, "display": "full"})
+    return data.get("order_details") or []
+
+
+def state_flags(id_order_state):
+    data = api_get(f"order_states/{id_order_state}")
+    s = data["order_state"]
+    return {"id": int(id_order_state), "logable": s.get("logable") == "1", "shipped": s.get("shipped") == "1"}
+
+
+def stock_available(id_product, id_product_attribute):
+    data = api_get("stock_availables", {
+        "filter[id_product]": id_product,
+        "filter[id_product_attribute]": id_product_attribute or 0,
+        "display": "full",
+    })
+    rows = data.get("stock_availables") or []
+    return rows[0] if rows else None
+
+
+def replay_expected_delta(history_rows, line_quantity, state_flags_fn=state_flags):
+    seen = []
+    total = 0
+    from_state = dict(NEUTRAL_STATE)
+    for row in history_rows:
+        to_id = int(row["id_order_state"])
+        to_state = state_flags_fn(to_id)
+        total += expected_stock_delta(from_state, to_state, line_quantity, seen, to_id)
+        seen.append(to_id)
+        from_state = to_state
+    return total
+
+
+def reconcile_order(id_order):
+    history_rows = order_history(id_order)
+    findings = []
+    for line in order_lines(id_order):
+        id_product = int(line["id_product"])
+        id_product_attribute = int(line.get("id_product_attribute") or 0)
+        line_quantity = int(line["product_quantity"])
+
+        expected_delta = replay_expected_delta(history_rows, line_quantity)
+        stock = stock_available(id_product, id_product_attribute)
+        if stock is None:
+            continue
+        observed_quantity = int(stock["quantity"])
+        expected_quantity = observed_quantity - expected_delta if expected_delta == 0 else None
+
+        duplicate_ids = duplicate_history_ids(history_rows)
+        if expected_delta == 0 and not duplicate_ids:
+            continue
+
+        findings.append({
+            "id_order": id_order,
+            "id_product": id_product,
+            "id_product_attribute": id_product_attribute,
+            "id_stock_available": int(stock["id"]),
+            "observed_quantity": observed_quantity,
+            "expected_delta": expected_delta,
+            "duplicate_order_histories_ids": duplicate_ids,
+        })
+    return findings
+
+
+def duplicate_history_ids(history_rows):
+    seen_state_at = {}
+    duplicates = []
+    for row in history_rows:
+        state_id = int(row["id_order_state"])
+        row_id = int(row["id"])
+        if state_id in seen_state_at:
+            duplicates.append(row_id)
+        else:
+            seen_state_at[state_id] = row_id
+    return duplicates
+
+
+def apply_correction(finding):
+    """Compensating write. Only called when DRY_RUN is false and a human confirmed."""
+    fresh = stock_available(finding["id_product"], finding["id_product_attribute"])
+    if fresh is None:
+        raise RuntimeError("stock_availables row disappeared before write")
+    before = int(fresh["quantity"])
+    after = before - finding["expected_delta"]
+    fresh["quantity"] = str(after)
+    api_put(f"stock_availables/{finding['id_stock_available']}", {"stock_available": fresh})
+    log.info("Corrected stock_availables %s: %d -> %d", finding["id_stock_available"], before, after)
+
+
+def run(order_ids):
+    all_findings = []
+    for id_order in order_ids:
+        findings = reconcile_order(id_order)
+        for finding in findings:
+            log.warning(
+                "Order %s product %s (attr %s): observed=%d expected_delta=%d duplicates=%s",
+                finding["id_order"], finding["id_product"], finding["id_product_attribute"],
+                finding["observed_quantity"], finding["expected_delta"],
+                finding["duplicate_order_histories_ids"],
+            )
+        all_findings.extend(findings)
+
+    if not DRY_RUN:
+        for finding in all_findings:
+            apply_correction(finding)
+
+    log.info("Done. %d finding(s) %s.", len(all_findings), "to review" if DRY_RUN else "corrected")
+    return all_findings
+
+
+if __name__ == "__main__":
+    ids = [int(x) for x in os.environ.get("ORDER_IDS", "").split(",") if x.strip()]
+    run(ids)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-stock.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag and, once confirmed, repair PrestaShop stock corrupted by a duplicate
+ * or reverted order status change.
+ *
+ * OrderHistory::changeIdOrderState() applies a signed stock delta for every state
+ * transition it sees, with no memory of transitions it already applied. A duplicate
+ * order_histories row for the same target state, or a reverted status, makes it
+ * apply the same delta again. This script independently replays an order's status
+ * timeline with a pure decision function, diffs the expected quantity against the
+ * live stock_availables value, and reports a record per mismatch. It only writes a
+ * compensating correction when DRY_RUN is false, and it re-reads stock right before
+ * writing so the correction is based on the latest quantity.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/stock-quantity-corrupted-on-status-change/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://example-store.test").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "DUMMYKEY";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const NEUTRAL_STATE = { id: 0, logable: false, shipped: false };
+
+export function expectedStockDelta(fromState, toState, lineQuantity, appliedStateIdsSeen, candidateStateId) {
+  if (appliedStateIdsSeen.includes(candidateStateId)) return 0;
+  if (!fromState.logable &amp;&amp; toState.logable) return lineQuantity === 0 ? 0 : -lineQuantity;
+  if (fromState.logable &amp;&amp; !toState.logable) return lineQuantity;
+  return 0;
+}
+
+function authHeader() {
+  const token = Buffer.from(`${WS_KEY}:`).toString("base64");
+  return { Authorization: `Basic ${token}` };
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${BASE_URL}/api/${path}?${qs}`, { headers: authHeader() });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiPut(path, body) {
+  const res = await fetch(`${BASE_URL}/api/${path}?output_format=JSON`, {
+    method: "PUT",
+    headers: { ...authHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function orderHistory(idOrder) {
+  const data = await apiGet("order_histories", { "filter[id_order]": idOrder, display: "full" });
+  const rows = data.order_histories || [];
+  return rows.sort((a, b) => (a.date_add || "").localeCompare(b.date_add || "") || Number(a.id) - Number(b.id));
+}
+
+async function orderLines(idOrder) {
+  const data = await apiGet("order_details", { "filter[id_order]": idOrder, display: "full" });
+  return data.order_details || [];
+}
+
+async function stateFlags(idOrderState) {
+  const data = await apiGet(`order_states/${idOrderState}`);
+  const s = data.order_state;
+  return { id: Number(idOrderState), logable: s.logable === "1", shipped: s.shipped === "1" };
+}
+
+async function stockAvailable(idProduct, idProductAttribute) {
+  const data = await apiGet("stock_availables", {
+    "filter[id_product]": idProduct,
+    "filter[id_product_attribute]": idProductAttribute || 0,
+    display: "full",
+  });
+  const rows = data.stock_availables || [];
+  return rows[0] || null;
+}
+
+export async function replayExpectedDelta(historyRows, lineQuantity, stateFlagsFn = stateFlags) {
+  const seen = [];
+  let total = 0;
+  let fromState = { ...NEUTRAL_STATE };
+  for (const row of historyRows) {
+    const toId = Number(row.id_order_state);
+    const toState = await stateFlagsFn(toId);
+    total += expectedStockDelta(fromState, toState, lineQuantity, seen, toId);
+    seen.push(toId);
+    fromState = toState;
+  }
+  return total;
+}
+
+export function duplicateHistoryIds(historyRows) {
+  const seenStateAt = new Map();
+  const duplicates = [];
+  for (const row of historyRows) {
+    const stateId = Number(row.id_order_state);
+    const rowId = Number(row.id);
+    if (seenStateAt.has(stateId)) {
+      duplicates.push(rowId);
+    } else {
+      seenStateAt.set(stateId, rowId);
+    }
+  }
+  return duplicates;
+}
+
+async function reconcileOrder(idOrder) {
+  const historyRows = await orderHistory(idOrder);
+  const findings = [];
+  for (const line of await orderLines(idOrder)) {
+    const idProduct = Number(line.id_product);
+    const idProductAttribute = Number(line.id_product_attribute || 0);
+    const lineQuantity = Number(line.product_quantity);
+
+    const expectedDelta = await replayExpectedDelta(historyRows, lineQuantity);
+    const stock = await stockAvailable(idProduct, idProductAttribute);
+    if (!stock) continue;
+    const observedQuantity = Number(stock.quantity);
+
+    const duplicateIds = duplicateHistoryIds(historyRows);
+    if (expectedDelta === 0 &amp;&amp; duplicateIds.length === 0) continue;
+
+    findings.push({
+      idOrder,
+      idProduct,
+      idProductAttribute,
+      idStockAvailable: Number(stock.id),
+      observedQuantity,
+      expectedDelta,
+      duplicateOrderHistoriesIds: duplicateIds,
+    });
+  }
+  return findings;
+}
+
+async function applyCorrection(finding) {
+  const fresh = await stockAvailable(finding.idProduct, finding.idProductAttribute);
+  if (!fresh) throw new Error("stock_availables row disappeared before write");
+  const before = Number(fresh.quantity);
+  const after = before - finding.expectedDelta;
+  fresh.quantity = String(after);
+  await apiPut(`stock_availables/${finding.idStockAvailable}`, { stock_available: fresh });
+  console.log(`Corrected stock_availables ${finding.idStockAvailable}: ${before} -> ${after}`);
+}
+
+export async function run(orderIds) {
+  const allFindings = [];
+  for (const idOrder of orderIds) {
+    const findings = await reconcileOrder(idOrder);
+    for (const finding of findings) {
+      console.warn(
+        `Order ${finding.idOrder} product ${finding.idProduct} (attr ${finding.idProductAttribute}): ` +
+        `observed=${finding.observedQuantity} expected_delta=${finding.expectedDelta} ` +
+        `duplicates=${JSON.stringify(finding.duplicateOrderHistoriesIds)}`
+      );
+    }
+    allFindings.push(...findings);
+  }
+
+  if (!DRY_RUN) {
+    for (const finding of allFindings) {
+      await applyCorrection(finding);
+    }
+  }
+
+  console.log(`Done. ${allFindings.length} finding(s) ${DRY_RUN ? "to review" : "corrected"}.`);
+  return allFindings;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const ids = (process.env.ORDER_IDS || "").split(",").map((s) => s.trim()).filter(Boolean).map(Number);
+  run(ids).catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The part worth testing is the pure decision function, since it decides whether a transition should move stock at all. Because <code>expected_stock_delta</code> takes plain values and returns a number, the test needs no network and no PrestaShop store. It just feeds in state flags and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_stock_delta.py</div>
+      <pre><code class="language-python">from reconcile_stock import expected_stock_delta
+
+NOT_LOGABLE = {"id": 1, "logable": False, "shipped": False}
+LOGABLE = {"id": 2, "logable": True, "shipped": False}
+
+
+def test_becoming_logable_decrements_stock():
+    assert expected_stock_delta(NOT_LOGABLE, LOGABLE, 3, [], 2) == -3
+
+
+def test_leaving_logable_restocks():
+    assert expected_stock_delta(LOGABLE, NOT_LOGABLE, 3, [2], 1) == 3
+
+
+def test_non_logable_to_non_logable_is_a_no_op():
+    other_not_logable = {"id": 3, "logable": False, "shipped": False}
+    assert expected_stock_delta(NOT_LOGABLE, other_not_logable, 3, [], 3) == 0
+
+
+def test_duplicate_transition_to_same_state_is_a_no_op():
+    assert expected_stock_delta(NOT_LOGABLE, LOGABLE, 3, [2], 2) == 0
+
+
+def test_logable_to_logable_is_a_no_op():
+    other_logable = {"id": 4, "logable": True, "shipped": True}
+    assert expected_stock_delta(LOGABLE, other_logable, 3, [2], 4) == 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">stock-delta.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { expectedStockDelta } from "./reconcile-stock.js";
+
+const NOT_LOGABLE = { id: 1, logable: false, shipped: false };
+const LOGABLE = { id: 2, logable: true, shipped: false };
+
+test("becoming logable decrements stock", () =&gt; {
+  assert.equal(expectedStockDelta(NOT_LOGABLE, LOGABLE, 3, [], 2), -3);
+});
+
+test("leaving logable restocks", () =&gt; {
+  assert.equal(expectedStockDelta(LOGABLE, NOT_LOGABLE, 3, [2], 1), 3);
+});
+
+test("non logable to non logable is a no-op", () =&gt; {
+  const otherNotLogable = { id: 3, logable: false, shipped: false };
+  assert.equal(expectedStockDelta(NOT_LOGABLE, otherNotLogable, 3, [], 3), 0);
+});
+
+test("duplicate transition to same state is a no-op", () =&gt; {
+  assert.equal(expectedStockDelta(NOT_LOGABLE, LOGABLE, 3, [2], 2), 0);
+});
+
+test("logable to logable is a no-op", () =&gt; {
+  const otherLogable = { id: 4, logable: true, shipped: true };
+  assert.equal(expectedStockDelta(LOGABLE, otherLogable, 3, [2], 4), 0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Webservice retry</span>
+      <h4>The fulfillment integration that doubled every decrement</h4>
+      <p>A store synced order status from a third party fulfillment tool through the webservice, PUTing the same <code>id_order_state</code> to <code>order_histories</code> whenever the tool's own retry logic fired after a slow response. Every retried call created a second history row for a status that was already applied, and stock for the bestselling products quietly dropped twice as fast as real sales.</p>
+      <p>The team ran the reconciler against the last month of orders in dry run, saw the flagged products where the observed quantity was short by an exact multiple of a line quantity, confirmed the duplicate history rows against the fulfillment tool's own logs, then let a guarded write correct the stock without touching orders that had genuinely sold in between.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Cancelled and reopened</span>
+      <h4>The reopened order that kept adding stock back</h4>
+      <p>Customer service routinely cancelled and then reopened orders when a customer changed their mind about an item, moving the status from Awaiting payment to Cancelled and back again. Each reopen was read by PrestaShop as a fresh transition out of a logable-adjacent path, so stock crept upward every time an order bounced back and forth, and the catalog started showing more stock than was physically on the shelf.</p>
+      <p>Walking the order's full history with the pure decision function showed exactly which reopen contributed a real restock and which one was a repeat of a transition already counted. The store used the flagged report to true up the affected SKUs once, then kept the reconciler running weekly to catch the pattern early.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs regularly, a duplicate or reverted status change no longer silently drifts your stock. The reconciler catches the mismatch, shows you exactly which duplicate history rows caused it, and only ever writes a correction after a human has confirmed it and re-reads the resource first so it never clobbers a sale that happened in between. Stock finally means what it says.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my PrestaShop stock quantity double after an order status change?</summary>
+      <p>PrestaShop's <code>OrderHistory::changeIdOrderState()</code> applies a signed stock adjustment every time it sees a transition into or out of a logable order state. If the same target state is applied twice, for example a webservice PUT that re-adds the same <code>id_order_state</code>, PrestaShop creates a duplicate <code>order_histories</code> row and re-runs the same stock adjustment a second time, doubling the decrement or increment.</p>
+    </details>
+    <details>
+      <summary>Why did reverting an order status increase stock instead of restoring it?</summary>
+      <p>Reverting a status, such as moving Cancelled back to Awaiting payment, is treated as a brand new logable-state transition. PrestaShop only knows the sign of the state pair difference, not the original quantity before the first change, so it increments stock again rather than restoring the value it had before the transition happened.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto correct PrestaShop stock quantity after this bug?</summary>
+      <p>Not by blindly overwriting it. Other orders on the same product may have sold or restocked between the corruption and the moment you detect it, so a naive overwrite can clobber legitimate stock movement. Flag the mismatch, require a human to confirm the expected value, and only then write a compensating change with a dry run guard.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop GitHub: Product Physical quantity is wrongly increased when Order status is changed, issue #36024. <a href="https://github.com/PrestaShop/PrestaShop/issues/36024" rel="noopener">github.com/PrestaShop/PrestaShop/issues/36024</a></li>
+      <li>PrestaShop GitHub: when the order status is changed in the webservice, the OrderHistory instance is duplicated, issue #22011. <a href="https://github.com/PrestaShop/PrestaShop/issues/22011" rel="noopener">github.com/PrestaShop/PrestaShop/issues/22011</a></li>
+      <li>PrestaShop GitHub: ps_stock_available updated wrongly on order when products out of stock, issue #27631. <a href="https://github.com/PrestaShop/PrestaShop/issues/27631" rel="noopener">github.com/PrestaShop/PrestaShop/issues/27631</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: the <code>order_histories</code> webservice resource. <a href="https://devdocs.prestashop-project.org/8/webservice/resources/order_histories/" rel="noopener">devdocs.prestashop-project.org/8/webservice/resources/order_histories</a></li>
+      <li>PrestaShop Developer Documentation: the <code>order_states</code> webservice resource. <a href="https://devdocs.prestashop-project.org/8/webservice/resources/order_states/" rel="noopener">devdocs.prestashop-project.org/8/webservice/resources/order_states</a></li>
+      <li>PrestaShop Developer Documentation: Stock FAQ. <a href="https://devdocs.prestashop-project.org/9/faq/stock/" rel="noopener">devdocs.prestashop-project.org/9/faq/stock</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop orders, stock, catalog, or the webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle your stock numbers?</h3>
+    <p>If this saved you a pile of manual recounts or a wrong inventory report, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,884 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refund Created via API Does Not Update the Order's Refunded Quantity</title>
+<meta name="description" content="Creating a credit slip through POST /api/order_slip only inserts rows into order_slip and order_slip_detail. It never runs the back office refund logic that recalculates order_detail.product_quantity_refunded. Learn why it happens and build a Python or Node.js script that finds and repairs the stale quantity.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/api-refund-not-updating-order-line/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Refund Created via API Does Not Update the Order's Refunded Quantity">
+<meta property="og:description" content="Why a credit slip created through POST /api/order_slip leaves order_detail.product_quantity_refunded stale, and a Python or Node.js script that finds and repairs the drift.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/api-refund-not-updating-order-line/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/api-refund-not-updating-order-line/#article","headline":"Refund Created via API Does Not Update the Order's Refunded Quantity","description":"Why a credit slip created through POST /api/order_slip leaves order_detail.product_quantity_refunded stale, and a Python or Node.js script that finds and repairs every order line where the two disagree.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/api-refund-not-updating-order-line/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders & Financials","keywords":"PrestaShop order_slip API, order_slip_detail, product_quantity_refunded, OrderSlip create, PrestaShop webservice, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"PrestaShop field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Refund created via API does not update the order's refunded quantity","item":"https://www.allanninal.dev/prestashop/api-refund-not-updating-order-line/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a credit slip created through the PrestaShop API not update product_quantity_refunded?","acceptedAnswer":{"@type":"Answer","text":"POST /api/order_slip only performs a generic insert into the order_slip and order_slip_detail tables that back the resource's declared field map. It does not run the back office refund logic in OrderSlip::create or AdminOrdersController, which is the code that actually recalculates and writes order_detail.product_quantity_refunded, the refund totals, and the related stock movement. Because the webservice bypasses that code path, the credit slip exists but the order line still reports its old refunded quantity."}},{"@type":"Question","name":"Is it safe to write product_quantity_refunded directly to fix this?","acceptedAnswer":{"@type":"Answer","text":"Only under a guarded, reviewed repair. Writing the field directly skips the same business logic that was already skipped when the credit slip was created, including the stock movement and the order state check, so a blind write can leave other parts of the order still inconsistent. The safe pattern is to compute the expected quantity from the real order_slip_detail rows, log the delta by default, and only write when DRY_RUN is explicitly turned off, flagging any order whose current_state does not already reflect a refund for a human to review instead."}},{"@type":"Question","name":"How do I detect orders where an API-created refund did not update the order line?","acceptedAnswer":{"@type":"Answer","text":"Pull GET order_slip filtered by id_order and sum product_quantity per id_order_detail across all order_slip_detail rows to get the expected refunded quantity. Then pull GET order_details/{id_order_detail} and compare its stored product_quantity_refunded against that expected sum. Any order_detail where the stored value is lower than the expected sum has a stale, unapplied refund quantity."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Orders &amp; Financials</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span></p>
+    <h1>Refund created via API does not update the order's refunded quantity</h1>
+    <p class="lead">A script calls the PrestaShop webservice to issue a refund, gets back a shiny new credit slip, and everyone assumes the order is now correctly marked as partially or fully refunded. Then someone opens the order and the line still shows zero units refunded. Here is why creating a credit slip through the API never touches the order line's own refund counters, and a script that finds every order where the two disagree so it can be repaired safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Creating a credit slip through <code>POST /api/order_slip</code>, with <code>order_slip_detail</code> rows attached, only performs a generic <code>ObjectModel</code> insert into the <code>order_slip</code> and <code>order_slip_detail</code> tables that back that resource's declared field map. It never runs PrestaShop's back office refund logic in <code>OrderSlip::create()</code> or <code>AdminOrdersController</code>, which is the code that actually recalculates and writes <code>order_detail.product_quantity_refunded</code>, the <code>total_refunded_tax_excl</code> and <code>total_refunded_tax_incl</code> totals, and the matching stock movement. So you end up with a fully populated credit slip sitting next to an order line that still reports its pre-refund quantity. Run a Python or Node.js script that sums <code>product_quantity</code> from every <code>order_slip_detail</code> row per <code>id_order_detail</code>, compares that expected total against the stored <code>product_quantity_refunded</code>, and only writes the corrected value when <code>DRY_RUN</code> is explicitly turned off. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In the back office, issuing a refund is not just one database write. When a staff member opens an order and issues a standard or partial refund, PrestaShop's controller code creates the credit slip rows, but it also walks through the order's lines and updates each affected <code>order_detail</code> row's <code>product_quantity_refunded</code>, recalculates the order's refunded totals, and records a stock movement if the item is meant to go back into inventory. All of that happens together, in the same request, because the same controller code path is responsible for all of it.</p>
+  <p>The webservice resource for credit slips does not know about any of that. <code>POST /api/order_slip</code> is a generic REST endpoint over the <code>order_slip</code> object model. Send it an order id and a list of <code>order_slip_detail</code> rows, each with an <code>id_order_detail</code>, a <code>product_quantity</code>, and an <code>amount_tax_excl</code>, and it inserts exactly those rows into <code>order_slip</code> and <code>order_slip_detail</code>. Nothing more. It never calls into <code>OrderSlip::create()</code> or the <code>AdminOrdersController</code> refund flow, so <code>order_detail.product_quantity_refunded</code> is left exactly where it was before the API call. The credit slip is real. The order line does not know about it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A script posts to the order_slip webservice resource, which inserts rows into order_slip and order_slip_detail, but never calls the back office refund controller, so order_detail.product_quantity_refunded stays at its old value even though the credit slip exists.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="165" height="66" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="92" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Script calls API</text>
+      <text x="92" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">POST /api/order_slip</text>
+      <line x1="178" y1="103" x2="220" y2="103" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="223" y="70" width="200" height="66" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="323" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">Generic insert only</text>
+      <text x="323" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b4f5b">order_slip, order_slip_detail</text>
+      <line x1="426" y1="103" x2="460" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="443" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="443" y="130" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#cf4b3f">refund controller never runs</text>
+      <rect x="463" y="70" width="170" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="548" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Order line unchanged</text>
+      <text x="548" y="116" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">product_quantity_refunded stale</text>
+      <line x1="636" y1="103" x2="655" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="658" y="70" width="92" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="704" y="94" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Reports</text>
+      <text x="704" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">look wrong</text>
+    </svg>
+    <figcaption>The credit slip is created, but the webservice never runs the back office code that would update the order line's own refund counters. The two disagree until something repairs order_detail directly.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The PrestaShop webservice resource system is built around each object model's declared field map. A resource like <code>order_slip</code> exposes the columns of the <code>order_slip</code> table, plus its nested <code>order_slip_detail</code> associations, for generic create, read, update, and delete. It has no idea that in the back office, creating a credit slip is supposed to also touch a different table's row. A few common ways stores hit this:</p>
+  <ul>
+    <li>An integration issues refunds entirely through <code>POST /api/order_slip</code> because it is the only refund-shaped endpoint the webservice documents, without realizing the back office button does more than one write.</li>
+    <li>A migration or bulk-refund script creates many credit slips at once through the API to save time, multiplying the number of order lines left with a stale <code>product_quantity_refunded</code>.</li>
+    <li>The credit slip's own PDF and totals look completely normal, because they are generated from the <code>order_slip</code> and <code>order_slip_detail</code> rows that were correctly inserted, so nothing about the credit slip itself hints that the order line is out of sync.</li>
+    <li>Any script or storefront view that later compares "requested refund" against <code>order_detail.product_quantity_refunded</code> sees the old, pre-refund number and either under-reports the refund or lets a second refund through for units that were already credited.</li>
+  </ul>
+  <p>This exact gap between the webservice and the back office refund logic is documented by PrestaShop maintainers and reported independently on the forums, both pointing at the same root cause: the object model behind <code>order_slip</code> was never wired to also run <code>OrderSlip::create()</code>'s side effects. See the citations at the end for the exact reports.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Writing <code>order_detail.product_quantity_refunded</code> directly bypasses the same business logic that was already skipped when the credit slip was created through the API, including the stock movement and the order state check. So the safe pattern is not "recalculate and write the field the moment a mismatch is found." It is "compute the expected quantity from the real <code>order_slip_detail</code> rows, log the delta by default, and only write under an explicit <code>DRY_RUN=false</code> run," with anything where the order's <code>current_state</code> does not already look like a refund left for a human instead of auto-corrected.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch <code>order_detail</code> by default. We add a job that reads every credit slip for a suspected order, sums the refunded quantity that the credit slip rows actually claim per line, compares that sum against what the order line currently reports, and only writes the corrected value when <code>DRY_RUN</code> is off and the order's state looks consistent with a refund having happened.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job lists order_slip_detail rows for an order, sums product_quantity per order line to get the expected refunded quantity, compares it against the stored product_quantity_refunded, and either reports the delta or, only if DRY_RUN is false and the order state looks consistent, writes the corrected quantity to order_details.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">List credit slips</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">order_slip by id_order</text>
+      <line x1="185" y1="50" x2="227" y2="50" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="230" y="20" width="200" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="330" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Sum expected quantity</text>
+      <text x="330" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">per id_order_detail</text>
+      <line x1="330" y1="80" x2="330" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="165" y="108" width="330" height="55" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="330" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">Compare against order_details</text>
+      <text x="330" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">stored product_quantity_refunded</text>
+      <line x1="495" y1="135" x2="537" y2="135" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,103 677,135 590,167 503,135" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="590" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">Delta found?</text>
+      <text x="685" y="125" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes</text>
+      <text x="610" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, move on</text>
+      <line x1="590" y1="167" x2="590" y2="200" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="685" y="107" width="65" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="717" y="128" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#cf4b3f">Report</text>
+      <text x="717" y="145" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">for staff</text>
+      <line x1="677" y1="135" x2="683" y2="135" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="430" y="200" width="240" height="35" rx="8" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="550" y="215" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#4c9a2a">Only if DRY_RUN=false and state consistent:</text>
+      <text x="550" y="228" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#4c9a2a">PUT order_details/{id} writes expected quantity</text>
+    </svg>
+    <figcaption>The job only ever reads and reports by default. A corrective write only happens when DRY_RUN is off, and any order whose state looks inconsistent with a refund is flagged for a human instead.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Enable the webservice and get a key</h3>
+      <p>In the back office, go to Advanced Parameters, Webservice, and create a key with read access to <code>orders</code>, <code>order_details</code>, <code>order_slip</code>, and <code>order_histories</code>, plus write access to <code>order_details</code> if you plan to run confirmed repairs. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, only reports by default</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, only reports by default</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List the credit slips for a suspected order</h3>
+      <p>Call <code>GET /api/order_slip?filter[id_order]={id_order}&amp;display=full&amp;output_format=JSON</code> to get every credit slip for the order, with each one's nested <code>order_slip_detail</code> rows. Each detail row carries the <code>id_order_detail</code> it refunds against and the <code>product_quantity</code> that credit slip claims for that line.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+PRESTASHOP_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+PRESTASHOP_WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+AUTH = (PRESTASHOP_WS_KEY, "")
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{PRESTASHOP_URL}/api/{path}", params=params, auth=AUTH, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def order_slips_for(id_order):
+    data = api_get("order_slip", params={"filter[id_order]": id_order, "display": "full"})
+    return data.get("order_slips") or []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "").replace(/\/+$/, "");
+const PRESTASHOP_WS_KEY = process.env.PRESTASHOP_WS_KEY;
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${PRESTASHOP_WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${PRESTASHOP_URL}/api/${path}`);
+  url.searchParams.set("output_format", "JSON");
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: basicAuthHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function orderSlipsFor(idOrder) {
+  const data = await apiGet("order_slip", { "filter[id_order]": idOrder, display: "full" });
+  return data.order_slips || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Read the order line's stored refunded quantity</h3>
+      <p>For each <code>id_order_detail</code> referenced by the credit slips, call <code>GET /api/order_details/{id_order_detail}?display=full&amp;output_format=JSON</code> to read the current <code>product_quantity_refunded</code> straight from the order line. This is the value the storefront and any report will actually see, whether or not the credit slips agree with it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def order_detail(id_order_detail):
+    data = api_get(f"order_details/{id_order_detail}", params={"display": "full"})
+    return data["order_detail"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function orderDetail(idOrderDetail) {
+  const data = await apiGet(`order_details/${idOrderDetail}`, { display: "full" });
+  return data.order_detail;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the comparison in its own function that takes the stored <code>product_quantity_refunded</code> and the list of <code>product_quantity</code> values from every matching <code>order_slip_detail</code> row, and returns the expected total, the delta, and whether the line needs repair or review. No network calls happen inside it, which is what makes it easy to test with plain integers.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def compute_refund_delta(stored_refunded_qty, order_slip_quantities):
+    expected = sum(order_slip_quantities)
+    delta = expected - stored_refunded_qty
+    return {
+        "expected": expected,
+        "stored": stored_refunded_qty,
+        "delta": delta,
+        "needs_repair": expected &gt; stored_refunded_qty,
+        "needs_review": expected &lt; stored_refunded_qty,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function computeRefundDelta(storedRefundedQty, orderSlipQuantities) {
+  const expected = orderSlipQuantities.reduce((a, b) =&gt; a + b, 0);
+  const delta = expected - storedRefundedQty;
+  return {
+    expected,
+    stored: storedRefundedQty,
+    delta,
+    needs_repair: expected &gt; storedRefundedQty,
+    needs_review: expected &lt; storedRefundedQty,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair only under an explicit dry run guard</h3>
+      <p>When a line needs repair, and only when <code>DRY_RUN=false</code>, pull the full <code>order_detail</code> body, set <code>product_quantity_refunded</code> to the expected value, and send the entire object back with <code>PUT</code>, since PrestaShop's webservice requires the whole resource on a write, not a partial patch. If the order's <code>current_state</code> does not look consistent with a refund, for example no matching entry in <code>order_histories</code> for a refunded or cancelled state, skip the write and flag the order for a human instead, since <code>needs_review</code> cases (delta negative) always go to a human, never to an automatic write.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair.py</div>
+      <pre><code class="language-python">def apply_expected_refund(id_order_detail, expected_qty):
+    full = api_get(f"order_details/{id_order_detail}")["order_detail"]
+    unit_price_tax_excl = float(full.get("unit_price_tax_excl", 0) or 0)
+    unit_price_tax_incl = float(full.get("unit_price_tax_incl", 0) or 0)
+    full["product_quantity_refunded"] = expected_qty
+    if "total_refunded_tax_excl" in full:
+        full["total_refunded_tax_excl"] = f"{expected_qty * unit_price_tax_excl:.6f}"
+    if "total_refunded_tax_incl" in full:
+        full["total_refunded_tax_incl"] = f"{expected_qty * unit_price_tax_incl:.6f}"
+    r = requests.put(
+        f"{PRESTASHOP_URL}/api/order_details/{id_order_detail}",
+        params={"output_format": "JSON"},
+        json={"order_detail": full},
+        auth=AUTH,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair.js</div>
+      <pre><code class="language-javascript">async function applyExpectedRefund(idOrderDetail, expectedQty) {
+  const full = (await apiGet(`order_details/${idOrderDetail}`)).order_detail;
+  const unitPriceTaxExcl = Number(full.unit_price_tax_excl || 0);
+  const unitPriceTaxIncl = Number(full.unit_price_tax_incl || 0);
+  full.product_quantity_refunded = expectedQty;
+  if ("total_refunded_tax_excl" in full) full.total_refunded_tax_excl = (expectedQty * unitPriceTaxExcl).toFixed(6);
+  if ("total_refunded_tax_incl" in full) full.total_refunded_tax_incl = (expectedQty * unitPriceTaxIncl).toFixed(6);
+  const url = new URL(`${PRESTASHOP_URL}/api/order_details/${idOrderDetail}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: basicAuthHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ order_detail: full }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on PUT order_details/${idOrderDetail}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and never writes an order line unless the delta is a genuine repair and the operator has switched off dry run.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/api-refund-not-updating-order-line" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">fix_api_refund_quantity.py</div>
+      <pre><code class="language-python">"""Find and repair PrestaShop order lines whose refunded quantity is stale
+after a credit slip was created through the webservice.
+
+POST /api/order_slip only inserts rows into order_slip and order_slip_detail. It
+never runs the back office refund logic in OrderSlip::create() or
+AdminOrdersController, which is what actually recalculates and writes
+order_detail.product_quantity_refunded, the refund totals, and the related stock
+movement. So a credit slip can exist while the order line still reports its old
+refunded quantity.
+
+This script sums product_quantity from every order_slip_detail row per
+id_order_detail to get the expected refunded quantity, compares it against the
+stored product_quantity_refunded, and only writes the corrected value when
+DRY_RUN is explicitly false. A negative delta (stored higher than expected) is
+always flagged for a human, never auto-corrected.
+
+Run on demand for a suspected order id, or on a schedule across recent orders.
+Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("fix_api_refund_quantity")
+
+PRESTASHOP_URL = os.environ.get("PRESTASHOP_URL", "https://demo.example.com").rstrip("/")
+PRESTASHOP_WS_KEY = os.environ.get("PRESTASHOP_WS_KEY", "WSKEYDUMMY")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+ORDER_IDS = os.environ.get("ORDER_IDS", "1,2,3")
+AUTH = (PRESTASHOP_WS_KEY, "")
+
+
+def compute_refund_delta(stored_refunded_qty, order_slip_quantities):
+    """Pure decision logic, no I/O.
+
+    Sums order_slip_quantities to get the expected refunded quantity, and
+    compares it against stored_refunded_qty. needs_repair means the API-created
+    credit slips claim more refunded units than the order line shows, the
+    exact symptom this script exists to fix. needs_review means the stored
+    value is already higher than the credit slips justify, which is left for
+    a human rather than corrected automatically.
+    """
+    expected = sum(order_slip_quantities)
+    delta = expected - stored_refunded_qty
+    return {
+        "expected": expected,
+        "stored": stored_refunded_qty,
+        "delta": delta,
+        "needs_repair": expected &gt; stored_refunded_qty,
+        "needs_review": expected &lt; stored_refunded_qty,
+    }
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{PRESTASHOP_URL}/api/{path}", params=params, auth=AUTH, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def order_slips_for(id_order):
+    data = api_get("order_slip", params={"filter[id_order]": id_order, "display": "full"})
+    return data.get("order_slips") or []
+
+
+def order_detail(id_order_detail):
+    data = api_get(f"order_details/{id_order_detail}", params={"display": "full"})
+    return data["order_detail"]
+
+
+def order_history_states(id_order):
+    data = api_get("order_histories", params={"filter[id_order]": id_order, "display": "full"})
+    return [h.get("id_order_state") for h in (data.get("order_histories") or [])]
+
+
+def refund_quantities_by_line(order_slips):
+    """Group order_slip_detail rows by id_order_detail and collect their quantities."""
+    by_line = {}
+    for slip in order_slips:
+        details = (slip.get("associations", {}) or {}).get("order_slip_detail") or slip.get("order_slip_detail") or []
+        for row in details:
+            id_order_detail = row["id_order_detail"]
+            by_line.setdefault(id_order_detail, []).append(int(row["product_quantity"]))
+    return by_line
+
+
+def apply_expected_refund(id_order_detail, expected_qty):
+    full = api_get(f"order_details/{id_order_detail}")["order_detail"]
+    unit_price_tax_excl = float(full.get("unit_price_tax_excl", 0) or 0)
+    unit_price_tax_incl = float(full.get("unit_price_tax_incl", 0) or 0)
+    full["product_quantity_refunded"] = expected_qty
+    if "total_refunded_tax_excl" in full:
+        full["total_refunded_tax_excl"] = f"{expected_qty * unit_price_tax_excl:.6f}"
+    if "total_refunded_tax_incl" in full:
+        full["total_refunded_tax_incl"] = f"{expected_qty * unit_price_tax_incl:.6f}"
+    r = requests.put(
+        f"{PRESTASHOP_URL}/api/order_details/{id_order_detail}",
+        params={"output_format": "JSON"},
+        json={"order_detail": full},
+        auth=AUTH,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    checked = 0
+    repaired = 0
+    flagged_for_review = 0
+    for id_order in [s.strip() for s in ORDER_IDS.split(",") if s.strip()]:
+        slips = order_slips_for(id_order)
+        if not slips:
+            continue
+        by_line = refund_quantities_by_line(slips)
+        history_states = order_history_states(id_order)
+        for id_order_detail, quantities in by_line.items():
+            detail = order_detail(id_order_detail)
+            stored = int(detail.get("product_quantity_refunded", 0) or 0)
+            result = compute_refund_delta(stored, quantities)
+            checked += 1
+            if result["delta"] == 0:
+                continue
+            if result["needs_review"]:
+                flagged_for_review += 1
+                log.warning(
+                    "Needs human review. id_order=%s id_order_detail=%s stored=%d expected=%d delta=%d",
+                    id_order, id_order_detail, result["stored"], result["expected"], result["delta"],
+                )
+                continue
+            if not history_states:
+                flagged_for_review += 1
+                log.warning(
+                    "Skipping repair, no order_histories rows found. id_order=%s id_order_detail=%s",
+                    id_order, id_order_detail,
+                )
+                continue
+            log.info(
+                "Refund quantity stale. id_order=%s id_order_detail=%s stored=%d expected=%d %s",
+                id_order, id_order_detail, result["stored"], result["expected"],
+                "would repair" if DRY_RUN else "repairing",
+            )
+            if not DRY_RUN:
+                apply_expected_refund(id_order_detail, result["expected"])
+                verify = order_detail(id_order_detail)
+                log.info(
+                    "Verified. id_order_detail=%s product_quantity_refunded=%s",
+                    id_order_detail, verify.get("product_quantity_refunded"),
+                )
+            repaired += 1
+    log.info(
+        "Done. %d line(s) checked, %d repaired, %d flagged for review. DRY_RUN=%s",
+        checked, repaired, flagged_for_review, DRY_RUN,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">fix-api-refund-quantity.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and repair PrestaShop order lines whose refunded quantity is stale
+ * after a credit slip was created through the webservice.
+ *
+ * POST /api/order_slip only inserts rows into order_slip and order_slip_detail. It
+ * never runs the back office refund logic in OrderSlip::create() or
+ * AdminOrdersController, which is what actually recalculates and writes
+ * order_detail.product_quantity_refunded, the refund totals, and the related stock
+ * movement. So a credit slip can exist while the order line still reports its old
+ * refunded quantity.
+ *
+ * This script sums product_quantity from every order_slip_detail row per
+ * id_order_detail to get the expected refunded quantity, compares it against the
+ * stored product_quantity_refunded, and only writes the corrected value when
+ * DRY_RUN is explicitly false. A negative delta (stored higher than expected) is
+ * always flagged for a human, never auto-corrected.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/api-refund-not-updating-order-line/
+ */
+import { pathToFileURL } from "node:url";
+
+const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "https://demo.example.com").replace(/\/+$/, "");
+const PRESTASHOP_WS_KEY = process.env.PRESTASHOP_WS_KEY || "WSKEYDUMMY";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const ORDER_IDS = process.env.ORDER_IDS || "1,2,3";
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${PRESTASHOP_WS_KEY}:`).toString("base64");
+}
+
+/**
+ * Pure decision logic, no I/O.
+ *
+ * Sums orderSlipQuantities to get the expected refunded quantity, and compares
+ * it against storedRefundedQty. needsRepair means the API-created credit slips
+ * claim more refunded units than the order line shows. needsReview means the
+ * stored value is already higher than the credit slips justify, which is left
+ * for a human rather than corrected automatically.
+ */
+export function computeRefundDelta(storedRefundedQty, orderSlipQuantities) {
+  const expected = orderSlipQuantities.reduce((a, b) =&gt; a + b, 0);
+  const delta = expected - storedRefundedQty;
+  return {
+    expected,
+    stored: storedRefundedQty,
+    delta,
+    needs_repair: expected &gt; storedRefundedQty,
+    needs_review: expected &lt; storedRefundedQty,
+  };
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${PRESTASHOP_URL}/api/${path}`);
+  url.searchParams.set("output_format", "JSON");
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: basicAuthHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function orderSlipsFor(idOrder) {
+  const data = await apiGet("order_slip", { "filter[id_order]": idOrder, display: "full" });
+  return data.order_slips || [];
+}
+
+async function orderDetail(idOrderDetail) {
+  const data = await apiGet(`order_details/${idOrderDetail}`, { display: "full" });
+  return data.order_detail;
+}
+
+async function orderHistoryStates(idOrder) {
+  const data = await apiGet("order_histories", { "filter[id_order]": idOrder, display: "full" });
+  return (data.order_histories || []).map((h) =&gt; h.id_order_state);
+}
+
+function refundQuantitiesByLine(orderSlips) {
+  const byLine = new Map();
+  for (const slip of orderSlips) {
+    const details = (slip.associations &amp;&amp; slip.associations.order_slip_detail) || slip.order_slip_detail || [];
+    for (const row of details) {
+      const idOrderDetail = row.id_order_detail;
+      if (!byLine.has(idOrderDetail)) byLine.set(idOrderDetail, []);
+      byLine.get(idOrderDetail).push(Number(row.product_quantity));
+    }
+  }
+  return byLine;
+}
+
+async function applyExpectedRefund(idOrderDetail, expectedQty) {
+  const full = (await apiGet(`order_details/${idOrderDetail}`)).order_detail;
+  const unitPriceTaxExcl = Number(full.unit_price_tax_excl || 0);
+  const unitPriceTaxIncl = Number(full.unit_price_tax_incl || 0);
+  full.product_quantity_refunded = expectedQty;
+  if ("total_refunded_tax_excl" in full) full.total_refunded_tax_excl = (expectedQty * unitPriceTaxExcl).toFixed(6);
+  if ("total_refunded_tax_incl" in full) full.total_refunded_tax_incl = (expectedQty * unitPriceTaxIncl).toFixed(6);
+  const url = new URL(`${PRESTASHOP_URL}/api/order_details/${idOrderDetail}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: basicAuthHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify({ order_detail: full }),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on PUT order_details/${idOrderDetail}`);
+  return res.json();
+}
+
+export async function run() {
+  let checked = 0;
+  let repaired = 0;
+  let flaggedForReview = 0;
+  const orderIds = ORDER_IDS.split(",").map((s) =&gt; s.trim()).filter(Boolean);
+  for (const idOrder of orderIds) {
+    const slips = await orderSlipsFor(idOrder);
+    if (!slips.length) continue;
+    const byLine = refundQuantitiesByLine(slips);
+    const historyStates = await orderHistoryStates(idOrder);
+    for (const [idOrderDetail, quantities] of byLine.entries()) {
+      const detail = await orderDetail(idOrderDetail);
+      const stored = Number(detail.product_quantity_refunded || 0);
+      const result = computeRefundDelta(stored, quantities);
+      checked++;
+      if (result.delta === 0) continue;
+      if (result.needs_review) {
+        flaggedForReview++;
+        console.warn(
+          `Needs human review. id_order=${idOrder} id_order_detail=${idOrderDetail} ` +
+            `stored=${result.stored} expected=${result.expected} delta=${result.delta}`
+        );
+        continue;
+      }
+      if (!historyStates.length) {
+        flaggedForReview++;
+        console.warn(`Skipping repair, no order_histories rows found. id_order=${idOrder} id_order_detail=${idOrderDetail}`);
+        continue;
+      }
+      console.log(
+        `Refund quantity stale. id_order=${idOrder} id_order_detail=${idOrderDetail} ` +
+          `stored=${result.stored} expected=${result.expected} ${DRY_RUN ? "would repair" : "repairing"}`
+      );
+      if (!DRY_RUN) {
+        await applyExpectedRefund(idOrderDetail, result.expected);
+        const verify = await orderDetail(idOrderDetail);
+        console.log(`Verified. id_order_detail=${idOrderDetail} product_quantity_refunded=${verify.product_quantity_refunded}`);
+      }
+      repaired++;
+    }
+  }
+  console.log(`Done. ${checked} line(s) checked, ${repaired} repaired, ${flaggedForReview} flagged for review. DRY_RUN=${DRY_RUN}`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides which lines get repaired automatically and which get sent to a human. Because we kept <code>compute_refund_delta</code> pure, the test needs no network and no PrestaShop store. It just feeds in plain integers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_refund_delta.py</div>
+      <pre><code class="language-python">from fix_api_refund_quantity import compute_refund_delta
+
+
+def test_matching_quantities_need_nothing():
+    result = compute_refund_delta(2, [2])
+    assert result["expected"] == 2
+    assert result["delta"] == 0
+    assert result["needs_repair"] is False
+    assert result["needs_review"] is False
+
+
+def test_stale_stored_quantity_needs_repair():
+    result = compute_refund_delta(0, [3])
+    assert result["expected"] == 3
+    assert result["delta"] == 3
+    assert result["needs_repair"] is True
+    assert result["needs_review"] is False
+
+
+def test_multiple_credit_slips_sum_together():
+    result = compute_refund_delta(1, [1, 2])
+    assert result["expected"] == 3
+    assert result["delta"] == 2
+    assert result["needs_repair"] is True
+
+
+def test_stored_higher_than_slips_needs_review():
+    result = compute_refund_delta(5, [2])
+    assert result["expected"] == 2
+    assert result["delta"] == -3
+    assert result["needs_repair"] is False
+    assert result["needs_review"] is True
+
+
+def test_no_credit_slips_means_zero_expected():
+    result = compute_refund_delta(0, [])
+    assert result["expected"] == 0
+    assert result["delta"] == 0
+    assert result["needs_repair"] is False
+    assert result["needs_review"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">refund-delta.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { computeRefundDelta } from "./fix-api-refund-quantity.js";
+
+test("matching quantities need nothing", () =&gt; {
+  const result = computeRefundDelta(2, [2]);
+  assert.equal(result.expected, 2);
+  assert.equal(result.delta, 0);
+  assert.equal(result.needs_repair, false);
+  assert.equal(result.needs_review, false);
+});
+
+test("stale stored quantity needs repair", () =&gt; {
+  const result = computeRefundDelta(0, [3]);
+  assert.equal(result.expected, 3);
+  assert.equal(result.delta, 3);
+  assert.equal(result.needs_repair, true);
+  assert.equal(result.needs_review, false);
+});
+
+test("multiple credit slips sum together", () =&gt; {
+  const result = computeRefundDelta(1, [1, 2]);
+  assert.equal(result.expected, 3);
+  assert.equal(result.delta, 2);
+  assert.equal(result.needs_repair, true);
+});
+
+test("stored higher than slips needs review", () =&gt; {
+  const result = computeRefundDelta(5, [2]);
+  assert.equal(result.expected, 2);
+  assert.equal(result.delta, -3);
+  assert.equal(result.needs_repair, false);
+  assert.equal(result.needs_review, true);
+});
+
+test("no credit slips means zero expected", () =&gt; {
+  const result = computeRefundDelta(0, []);
+  assert.equal(result.expected, 0);
+  assert.equal(result.delta, 0);
+  assert.equal(result.needs_repair, false);
+  assert.equal(result.needs_review, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Bulk refund migration</span>
+      <h4>The store that refunded a season's returns through the API</h4>
+      <p>A homeware store ran a return campaign at the end of a season and wrote a script that posted a credit slip through <code>POST /api/order_slip</code> for every approved return, since it was faster than clicking through the back office one order at a time. The credit slips all looked correct, PDFs and all, but the order lines never moved off their original refunded quantity.</p>
+      <p>Weeks later, a customer support agent pulled up one of those orders and saw zero units refunded on a line that clearly had a credit slip attached. Running the diagnostic across the batch of orders from the campaign surfaced every stale line at once, and the guarded repair fixed the ones where the order state already reflected the refund, while flagging a handful with no matching order history for a human to check first.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Marketplace integration</span>
+      <h4>The connector that issued partial refunds for damaged items</h4>
+      <p>A marketplace connector automatically issued a partial refund through the API whenever a buyer reported a damaged item on one line of a multi-item order. The credit slip amounts were always correct, but because the connector only ever called the webservice, <code>order_detail.product_quantity_refunded</code> silently stayed at zero on every line it touched.</p>
+      <p>The store's finance team noticed their refund totals reconciled against the payment processor, but individual order pages never reflected any refund, making it look like nothing had ever been credited back. The script's dry run report gave them an exact list of the affected lines and expected quantities before they turned off <code>DRY_RUN</code> and let it write the correct numbers back.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs against a suspected order or on a schedule, an order's credit slips and its line-level refunded quantity agree with each other. Anything a repair could get wrong, a negative delta or an order whose state does not yet look like a refund, is reported for a human instead of silently corrected. The only field this script ever writes is <code>product_quantity_refunded</code> and its matching totals, and only under an explicit <code>DRY_RUN=false</code> run.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a credit slip created through the PrestaShop API not update product_quantity_refunded?</summary>
+      <p>POST /api/order_slip only performs a generic insert into the order_slip and order_slip_detail tables that back the resource's declared field map. It does not run the back office refund logic in OrderSlip::create or AdminOrdersController, which is the code that actually recalculates and writes order_detail.product_quantity_refunded, the refund totals, and the related stock movement. Because the webservice bypasses that code path, the credit slip exists but the order line still reports its old refunded quantity.</p>
+    </details>
+    <details>
+      <summary>Is it safe to write product_quantity_refunded directly to fix this?</summary>
+      <p>Only under a guarded, reviewed repair. Writing the field directly skips the same business logic that was already skipped when the credit slip was created through the API, including the stock movement and the order state check, so a blind write can leave other parts of the order still inconsistent. The safe pattern is to compute the expected quantity from the real order_slip_detail rows, log the delta by default, and only write when DRY_RUN is explicitly turned off, flagging any order whose current_state does not already reflect a refund for a human to review instead.</p>
+    </details>
+    <details>
+      <summary>How do I detect orders where an API-created refund did not update the order line?</summary>
+      <p>Pull GET order_slip filtered by id_order and sum product_quantity per id_order_detail across all order_slip_detail rows to get the expected refunded quantity. Then pull GET order_details/{id_order_detail} and compare its stored product_quantity_refunded against that expected sum. Any order_detail where the stored value is lower than the expected sum has a stale, unapplied refund quantity.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop/PrestaShop GitHub issue #39391: Inconsistencies in product_quantity and product_quantity_refunded during partial refunds and subsequent manual edits of product quantities. <a href="https://github.com/PrestaShop/PrestaShop/issues/39391" rel="noopener">github.com/PrestaShop/PrestaShop/issues/39391</a></li>
+      <li>PrestaShop Forums: product_quantity_refunded not updated for refunded orders. <a href="https://www.prestashop.com/forums/topic/1031643-product_quantity_refunded-not-updated-for-refunded-orders/" rel="noopener">prestashop.com/forums/topic/1031643-product_quantity_refunded-not-updated-for-refunded-orders</a></li>
+      <li>PrestaShop/PrestaShop GitHub issue #21177: Standard Refund PrestaShop Back Office, quantity and amount refunded does not get updated in the UI. <a href="https://github.com/PrestaShop/PrestaShop/issues/21177" rel="noopener">github.com/PrestaShop/PrestaShop/issues/21177</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Order slip webservice resource. <a href="https://devdocs.prestashop-project.org/8/webservice/resources/order_slip/" rel="noopener">devdocs.prestashop-project.org/8/webservice/resources/order_slip/</a></li>
+      <li>PrestaShop Developer Documentation: Order details webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_details/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_details/</a></li>
+      <li>PrestaShop Developer Documentation: Refunds in the back office order view. <a href="https://devdocs.prestashop-project.org/8/development/page-reference/back-office/order/view-order/refunds/" rel="noopener">devdocs.prestashop-project.org/8/development/page-reference/back-office/order/view-order/refunds/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop orders, refunds, stock, or the webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a stale refund?</h3>
+    <p>If this saved you a wrong revenue report or a customer wondering where their refund went, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order current_state Field Goes Stale After Order History Is Edited</title>
+<meta name="description" content="PrestaShop only keeps orders.current_state in sync with order_history inside Order::setCurrentState(). Learn why deleting or editing a history row leaves current_state pointing at a stale status, and build a Python or Node.js script that detects and repairs the pointer safely.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/order-current-state-stale-after-history-edit/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Order current_state Field Goes Stale After Order History Is Edited">
+<meta property="og:description" content="Why orders.current_state goes stale when an order_history row is deleted or edited directly, and a Python or Node.js script that recomputes and repairs the pointer safely.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/order-current-state-stale-after-history-edit/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/order-current-state-stale-after-history-edit/#article","headline":"Order current_state Field Goes Stale After Order History Is Edited","description":"Why orders.current_state goes stale when an order_history row is deleted or edited directly, and a Python or Node.js script that recomputes and repairs the pointer safely.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/order-current-state-stale-after-history-edit/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders & Order States","keywords":"PrestaShop current_state, order_history, Order::setCurrentState, OrderHistory addWithemail, order_histories webservice, PrestaShop webservice, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"PrestaShop field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Order current_state field goes stale after order history is edited","item":"https://www.allanninal.dev/prestashop/order-current-state-stale-after-history-edit/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does orders.current_state not update when I delete an order_history row?","acceptedAnswer":{"@type":"Answer","text":"PrestaShop only writes orders.current_state as a side effect of Order::setCurrentState() and OrderHistory::addWithemail(), the same call that inserts a new order_history row. If a history row is deleted or edited directly, by a bad module, a cleanup script, or a manual database fix, that write path never runs, so current_state keeps pointing at whatever was last set instead of the state the edited history now shows as most recent."}},{"@type":"Question","name":"Is it safe to automatically repair a stale current_state?","acceptedAnswer":{"@type":"Answer","text":"Yes, as long as the repair only overwrites the current_state pointer and never inserts a new order_history row. Inserting a row would trigger a customer notification email and add another entry to an already edited history. Recomputing current_state from the existing history is a pointer repair, so it is safe to automate once the tie-break logic for picking the most recent row is deterministic."}},{"@type":"Question","name":"How do I find orders where current_state disagrees with order_history?","acceptedAnswer":{"@type":"Answer","text":"Pull every order's id, reference, and current_state with GET orders, then for each order pull its rows with GET order_histories filtered by id_order. Sort those rows by date_add descending, breaking ties by the highest id, and compare the id_order_state of that top row against the order's current_state. Any mismatch, or any order with zero history rows, is a stale or unsupported pointer."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Orders &amp; Order States</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span></p>
+    <h1>Order current_state field goes stale after order history is edited</h1>
+    <p class="lead">An admin removes a wrongly added status line from an order, or a cleanup script deletes some old order_history rows, and the order list keeps showing a status that no longer matches what the history actually says. PrestaShop only ever updates orders.current_state as a side effect of adding a new history row, so editing or deleting a history row directly leaves that column pointing at a status the order no longer supports. Here is why that gap opens up and a script that finds every order where the pointer disagrees with its own history and repairs it safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>PrestaShop keeps two representations of an order's status: the append-only <code>order_history</code> table, one row per transition, and a denormalized <code>current_state</code> column on the <code>orders</code> row, kept purely as a read-optimization. The core only synchronizes the two inside <code>Order::setCurrentState()</code> and <code>OrderHistory::addWithemail()</code>, which insert a history row and then write that same state into <code>current_state</code> in the same call. Delete or edit a history row directly and that write path is bypassed, so <code>current_state</code> silently diverges from what the history now shows as most recent. Run a Python or Node.js script that pulls every order's stored <code>current_state</code> with <code>GET /api/orders</code>, pulls its history with <code>GET /api/order_histories</code>, recomputes the correct state as the most recent row by <code>date_add</code>, and patches only the ones that disagree. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every order in PrestaShop carries a <code>current_state</code> field right on the <code>orders</code> table. It is the fast answer to "what state is this order in," and order lists, filters, and exports all read it directly instead of joining against history every time.</p>
+  <p>Sitting next to it is <code>order_history</code>, an append-only log with one row per transition, each carrying an <code>id_order_state</code> and a <code>date_add</code>. In a healthy order, the newest row in that log always matches <code>current_state</code>. But <code>current_state</code> is not derived from the log on read, it is a cached copy written at the moment a transition happens. If a history row is deleted or edited afterward, by a bad module, a GDPR or cleanup script, a manual database fix, or an admin removing a wrongly-added status line, nothing goes back and recomputes <code>current_state</code>. The column keeps pointing at whatever was last set, and the order list quietly disagrees with the order's own history, exactly the desync reported in PrestaShop GitHub issue #13390.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An admin edits or deletes an order_history row directly. current_state was only ever written at the moment of the original transition, so it is never recomputed, and it keeps pointing at a state the edited history no longer supports.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="200" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="110" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Original transition</text>
+      <text x="110" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">setCurrentState() writes both</text>
+      <line x1="210" y1="50" x2="252" y2="50" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="255" y="20" width="200" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="355" y="43" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">current_state set</text>
+      <text x="355" y="60" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">and history row inserted</text>
+      <line x1="355" y1="80" x2="355" y2="100" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="255" y="103" width="200" height="55" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="355" y="125" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">Time passes</text>
+      <text x="355" y="142" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">order sits, unchanged</text>
+      <line x1="465" y1="130" x2="507" y2="130" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="486" y="112" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="510" y="103" width="240" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="630" y="125" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">history row edited or deleted</text>
+      <text x="630" y="142" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">module, script, or manual fix</text>
+      <rect x="60" y="185" width="640" height="30" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="205" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">current_state is never rewritten, so it stays stale</text>
+    </svg>
+    <figcaption>current_state is only ever set at the moment of the original transition. Editing history afterward does not trigger a recompute, so the column keeps pointing at a state the history no longer supports.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The core only synchronizes the two representations inside one code path. Anything that touches history outside that path leaves <code>current_state</code> behind. Common ways this happens:</p>
+  <ul>
+    <li>A bad or poorly-tested module deletes or rewrites rows in <code>order_history</code> directly, for example during a cleanup or migration routine, without calling back into <code>Order::setCurrentState()</code> afterward.</li>
+    <li>A GDPR or data-retention script prunes old history rows for closed orders, not realizing the most recent surviving row no longer matches the order's stored <code>current_state</code>.</li>
+    <li>An admin manually removes a wrongly-added status line from an order's history in the database, intending to correct a mistake, without also updating the column that reads from a different place.</li>
+    <li>A direct SQL fix during support or migration work edits <code>id_order_state</code> on an existing history row instead of inserting a new one, which is exactly the desync tracked in <a href="https://github.com/PrestaShop/PrestaShop/issues/13390" rel="noopener">GitHub issue #13390</a>.</li>
+  </ul>
+  <p>Any of these leaves the order list, filters, and exports showing a status nobody can explain from the order's own history, since the timeline underneath tells a different story, or in the zero-history case, no story at all. See the citations at the end for the exact issue and forum threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Fixing this is not the same problem as backfilling missing history. Here the history is the trustworthy record, current_state is the stale copy. So the safe repair is a pointer fix only: recompute <code>current_state</code> from the order's existing <code>order_history</code> rows and write that value back to the order. Never insert a new <code>order_history</code> row for this correction, since that would trigger a customer notification email and add yet another entry to a timeline someone already edited. If an order has zero history rows, there is nothing to recompute from, so it gets flagged for review instead of repaired.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch history at all. We add a job that reads every order's stored <code>current_state</code>, pulls its full history, works out what the most recent row actually says, and patches the order only when the two disagree. Everything with no history at all is skipped and reported instead, since there is no safe state to recompute from.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job lists orders and their current_state, pulls each order's history rows, computes the correct current_state from the most recent row, and either patches the order when it disagrees or flags it when history is empty.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">List orders</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">GET orders, current_state</text>
+      <line x1="180" y1="50" x2="222" y2="50" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="225" y="20" width="190" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="320" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Pull its history</text>
+      <text x="320" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">GET order_histories</text>
+      <line x1="320" y1="80" x2="320" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="155" y="108" width="330" height="55" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="320" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">compute_correct_current_state</text>
+      <text x="320" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">newest row by date_add, tie on id</text>
+      <line x1="485" y1="135" x2="527" y2="135" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,103 667,135 580,167 493,135" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="580" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">Disagrees with</text>
+      <text x="580" y="145" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">current_state?</text>
+      <text x="675" y="125" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <text x="600" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, or no history: skip/flag</text>
+      <line x1="580" y1="167" x2="580" y2="200" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">PUT orders/id</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">pointer only, no new history</text>
+      <path d="M667,135 C700,135 684,150 684,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job only ever recomputes and writes the current_state pointer. It never inserts a new order_history row, and orders with zero history rows are flagged for review instead of repaired.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Enable the webservice and get a key</h3>
+      <p>In the back office, go to Advanced Parameters, Webservice, and create a key with read access to <code>orders</code> and <code>order_histories</code>, plus write access to <code>orders</code> if you plan to run repairs. The key is sent as the HTTP Basic username with a blank password. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, only logs by default</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, only logs by default</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List every order and its stored current_state</h3>
+      <p>Call <code>GET /api/orders?display=[id,current_state,reference]&amp;limit=0&amp;output_format=JSON</code> to pull every order's id, reference, and stored pointer in one pass. Auth is HTTP Basic with the webservice key as the username and a blank password.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+PRESTASHOP_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+PRESTASHOP_WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+AUTH = (PRESTASHOP_WS_KEY, "")
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{PRESTASHOP_URL}/api/{path}", params=params, auth=AUTH, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def all_orders():
+    data = api_get("orders", params={"display": "[id,current_state,reference]", "limit": "0"})
+    return data.get("orders") or []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "").replace(/\/+$/, "");
+const PRESTASHOP_WS_KEY = process.env.PRESTASHOP_WS_KEY;
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${PRESTASHOP_WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${PRESTASHOP_URL}/api/${path}`);
+  url.searchParams.set("output_format", "JSON");
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: basicAuthHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function allOrders() {
+  const data = await apiGet("orders", { display: "[id,current_state,reference]", limit: "0" });
+  return data.orders || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull each order's full history</h3>
+      <p>Call <code>GET /api/order_histories?filter[id_order]=[id]&amp;display=[id,id_order_state,date_add]&amp;output_format=JSON</code> for each order id. This resource has no "latest per order" filter, so the rows come back in whatever order the API returns them, and the sorting has to happen client-side.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def order_history_rows(id_order):
+    data = api_get("order_histories", params={
+        "filter[id_order]": id_order,
+        "display": "[id,id_order_state,date_add]",
+    })
+    return data.get("order_histories") or []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function orderHistoryRows(idOrder) {
+  const data = await apiGet("order_histories", {
+    "filter[id_order]": idOrder,
+    display: "[id,id_order_state,date_add]",
+  });
+  return data.order_histories || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the recompute in its own function that takes the order's history rows and returns the correct <code>current_state</code>, nothing else. It picks the row with the lexicographically-largest <code>date_add</code>, breaking ties by the largest <code>id</code> since <code>order_history</code> ids are auto-increment and insert-ordered. If the list is empty, it returns <code>None</code>, which signals "flag this order, do not repair it," since there is no history left to recompute from.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def compute_correct_current_state(history_rows):
+    if not history_rows:
+        return None
+    best = max(
+        history_rows,
+        key=lambda row: (row.get("date_add") or "", int(row["id"])),
+    )
+    return int(best["id_order_state"])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function computeCorrectCurrentState(historyRows) {
+  if (!historyRows || historyRows.length === 0) return null;
+  const best = historyRows.reduce((a, b) => {
+    const aKey = [a.date_add || "", Number(a.id)];
+    const bKey = [b.date_add || "", Number(b.id)];
+    if (bKey[0] !== aKey[0]) return bKey[0] > aKey[0] ? b : a;
+    return bKey[1] > aKey[1] ? b : a;
+  });
+  return Number(best.id_order_state);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Patch only the pointer, never insert history</h3>
+      <p>When the recomputed state disagrees with the stored <code>current_state</code>, fetch the full order body with <code>GET /api/orders/{id}?output_format=JSON</code> first, since a webservice <code>PUT</code> requires the complete resource and a partial payload nulls out every field you omit. Set <code>current_state</code> on that body, then <code>PUT</code> it back to <code>/api/orders/{id}</code>. This never touches <code>order_histories</code>, so it never sends a customer notification email.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair.py</div>
+      <pre><code class="language-python">def patch_current_state(id_order, correct_state):
+    body = api_get(f"orders/{id_order}")
+    body["order"]["current_state"] = str(correct_state)
+    r = requests.put(
+        f"{PRESTASHOP_URL}/api/orders/{id_order}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=AUTH,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair.js</div>
+      <pre><code class="language-javascript">async function patchCurrentState(idOrder, correctState) {
+  const body = await apiGet(`orders/${idOrder}`);
+  body.order.current_state = String(correctState);
+  const url = new URL(`${PRESTASHOP_URL}/api/orders/${idOrder}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: basicAuthHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on PUT orders/${idOrder}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: list every order, pull its history, recompute the correct state, and only patch when the two disagree. <code>DRY_RUN</code> defaults to true, so the script only ever logs <code>{id_order, stale_current_state, correct_current_state}</code> pairs unless you flip it off. Orders with zero history rows are skipped and flagged in the log, since there is no safe state to recompute from. Run it on a schedule that matches how often modules or scripts touch your order history, for example once a day.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never insert a new <code>order_histories</code> row for this correction, since that both sends a customer notification email and adds yet another entry to a timeline someone already edited. If an order comes back with zero history rows, skip the write and report it instead of guessing a state.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, walks every order and its history, logs every stale pointer it finds, respects the dry run flag, and patches only the <code>current_state</code> field, never the history table.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/order-current-state-stale-after-history-edit" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">fix_stale_current_state.py</div>
+      <pre><code class="language-python">"""Detect and repair PrestaShop orders whose current_state has gone stale.
+
+PrestaShop keeps two representations of an order's status: the append-only
+order_history table, one row per transition, and a denormalized current_state
+column on the orders row, kept purely as a read-optimization for order lists,
+filters, and exports. The core only synchronizes these inside
+Order::setCurrentState() and OrderHistory::addWithemail(), which insert a new
+history row and then write that same state into orders.current_state in the
+same call. If a history row is deleted or edited directly, by a bad module, a
+GDPR or cleanup script, a manual database fix, or an admin removing a
+wrongly-added status line, that write path is bypassed, so current_state keeps
+pointing at whatever was last set and silently diverges from what the history
+now shows as most recent. This is the desync reported in PrestaShop GitHub
+issue #13390.
+
+This script logs every stale pointer it finds. It never inserts a new
+order_history row for a correction, since that would trigger a customer
+notification email and further pollute an already-edited history. A confirmed
+repair only overwrites orders.current_state, and only when DRY_RUN is false.
+Orders with zero history rows are skipped and flagged, since there is no safe
+state to recompute from.
+
+Run on a schedule. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("fix_stale_current_state")
+
+PRESTASHOP_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+PRESTASHOP_WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+AUTH = (PRESTASHOP_WS_KEY, "")
+
+
+def compute_correct_current_state(history_rows):
+    """Pure decision function, no I/O.
+
+    history_rows is a list of dicts, each with at least "id", "id_order_state",
+    and "date_add" as an ISO-ish string, in any order. Returns the
+    id_order_state of the row with the lexicographically-max date_add,
+    breaking ties by the largest id (order_history ids are auto-increment and
+    insert-ordered). Returns None when history_rows is empty, which signals
+    "flag this order, do not repair it."
+    """
+    if not history_rows:
+        return None
+    best = max(
+        history_rows,
+        key=lambda row: (row.get("date_add") or "", int(row["id"])),
+    )
+    return int(best["id_order_state"])
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{PRESTASHOP_URL}/api/{path}", params=params, auth=AUTH, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def all_orders():
+    data = api_get("orders", params={"display": "[id,current_state,reference]", "limit": "0"})
+    return data.get("orders") or []
+
+
+def order_history_rows(id_order):
+    data = api_get("order_histories", params={
+        "filter[id_order]": id_order,
+        "display": "[id,id_order_state,date_add]",
+    })
+    return data.get("order_histories") or []
+
+
+def patch_current_state(id_order, correct_state):
+    body = api_get(f"orders/{id_order}")
+    body["order"]["current_state"] = str(correct_state)
+    r = requests.put(
+        f"{PRESTASHOP_URL}/api/orders/{id_order}",
+        params={"output_format": "JSON"},
+        json=body,
+        auth=AUTH,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    flagged = 0
+    repaired = 0
+    for order in all_orders():
+        id_order = order["id"]
+        stale_state = int(order["current_state"])
+        rows = order_history_rows(id_order)
+        correct_state = compute_correct_current_state(rows)
+        if correct_state is None:
+            flagged += 1
+            log.warning("Order id_order=%s reference=%s has zero order_history rows. Skipping, flagged for review.",
+                        id_order, order.get("reference"))
+            continue
+        if correct_state == stale_state:
+            continue
+        flagged += 1
+        log.info(
+            "Order id_order=%s reference=%s stale_current_state=%s correct_current_state=%s. %s",
+            id_order, order.get("reference"), stale_state, correct_state,
+            "would patch" if DRY_RUN else "patching",
+        )
+        if not DRY_RUN:
+            patch_current_state(id_order, correct_state)
+            repaired += 1
+    log.info("Done. %d order(s) flagged, %d %s.", flagged, repaired,
+              "would be patched" if DRY_RUN else "patched")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">fix-stale-current-state.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect and repair PrestaShop orders whose current_state has gone stale.
+ *
+ * PrestaShop keeps two representations of an order's status: the append-only
+ * order_history table, one row per transition, and a denormalized current_state
+ * column on the orders row, kept purely as a read-optimization for order lists,
+ * filters, and exports. The core only synchronizes these inside
+ * Order::setCurrentState() and OrderHistory::addWithemail(), which insert a new
+ * history row and then write that same state into orders.current_state in the
+ * same call. If a history row is deleted or edited directly, by a bad module, a
+ * GDPR or cleanup script, a manual database fix, or an admin removing a
+ * wrongly-added status line, that write path is bypassed, so current_state keeps
+ * pointing at whatever was last set and silently diverges from what the history
+ * now shows as most recent. This is the desync reported in PrestaShop GitHub
+ * issue #13390.
+ *
+ * This script logs every stale pointer it finds. It never inserts a new
+ * order_history row for a correction, since that would trigger a customer
+ * notification email and further pollute an already-edited history. A confirmed
+ * repair only overwrites orders.current_state, and only when DRY_RUN is false.
+ * Orders with zero history rows are skipped and flagged, since there is no safe
+ * state to recompute from.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/order-current-state-stale-after-history-edit/
+ */
+import { pathToFileURL } from "node:url";
+
+const PRESTASHOP_URL = (process.env.PRESTASHOP_URL || "https://demo.example.com").replace(/\/+$/, "");
+const PRESTASHOP_WS_KEY = process.env.PRESTASHOP_WS_KEY || "WSKEYDUMMY";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+function basicAuthHeader() {
+  return "Basic " + Buffer.from(`${PRESTASHOP_WS_KEY}:`).toString("base64");
+}
+
+/**
+ * Pure decision function, no I/O.
+ *
+ * historyRows is an array of objects, each with at least "id", "id_order_state",
+ * and "date_add" as an ISO-ish string, in any order. Returns the id_order_state
+ * of the row with the lexicographically-max date_add, breaking ties by the
+ * largest id (order_history ids are auto-increment and insert-ordered). Returns
+ * null when historyRows is empty, which signals "flag this order, do not
+ * repair it."
+ */
+export function computeCorrectCurrentState(historyRows) {
+  if (!historyRows || historyRows.length === 0) return null;
+  const best = historyRows.reduce((a, b) => {
+    const aKey = [a.date_add || "", Number(a.id)];
+    const bKey = [b.date_add || "", Number(b.id)];
+    if (bKey[0] !== aKey[0]) return bKey[0] > aKey[0] ? b : a;
+    return bKey[1] > aKey[1] ? b : a;
+  });
+  return Number(best.id_order_state);
+}
+
+async function apiGet(path, params = {}) {
+  const url = new URL(`${PRESTASHOP_URL}/api/${path}`);
+  url.searchParams.set("output_format", "JSON");
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: basicAuthHeader() } });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function allOrders() {
+  const data = await apiGet("orders", { display: "[id,current_state,reference]", limit: "0" });
+  return data.orders || [];
+}
+
+async function orderHistoryRows(idOrder) {
+  const data = await apiGet("order_histories", {
+    "filter[id_order]": idOrder,
+    display: "[id,id_order_state,date_add]",
+  });
+  return data.order_histories || [];
+}
+
+async function patchCurrentState(idOrder, correctState) {
+  const body = await apiGet(`orders/${idOrder}`);
+  body.order.current_state = String(correctState);
+  const url = new URL(`${PRESTASHOP_URL}/api/orders/${idOrder}`);
+  url.searchParams.set("output_format", "JSON");
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: { Authorization: basicAuthHeader(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status} on PUT orders/${idOrder}`);
+  return res.json();
+}
+
+export async function run() {
+  let flagged = 0;
+  let repaired = 0;
+  for (const order of await allOrders()) {
+    const idOrder = order.id;
+    const staleState = Number(order.current_state);
+    const rows = await orderHistoryRows(idOrder);
+    const correctState = computeCorrectCurrentState(rows);
+    if (correctState === null) {
+      flagged++;
+      console.warn(
+        `Order id_order=${idOrder} reference=${order.reference} has zero order_history rows. Skipping, flagged for review.`
+      );
+      continue;
+    }
+    if (correctState === staleState) continue;
+    flagged++;
+    console.log(
+      `Order id_order=${idOrder} reference=${order.reference} stale_current_state=${staleState} ` +
+        `correct_current_state=${correctState}. ${DRY_RUN ? "would patch" : "patching"}`
+    );
+    if (!DRY_RUN) {
+      await patchCurrentState(idOrder, correctState);
+      repaired++;
+    }
+  }
+  console.log(`Done. ${flagged} order(s) flagged, ${repaired} ${DRY_RUN ? "would be patched" : "patched"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The recompute function is the part most worth testing, because it decides what state gets written back to a real order. Because we kept <code>compute_correct_current_state</code> pure, the test needs no network and no PrestaShop store. It just feeds in plain lists of dicts and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_order_current_state.py</div>
+      <pre><code class="language-python">from fix_stale_current_state import compute_correct_current_state
+
+
+def row(id, id_order_state, date_add):
+    return {"id": id, "id_order_state": id_order_state, "date_add": date_add}
+
+
+def test_empty_history_returns_none():
+    assert compute_correct_current_state([]) is None
+
+
+def test_single_row_returns_its_state():
+    assert compute_correct_current_state([row(1, 2, "2026-07-01 10:00:00")]) == 2
+
+
+def test_picks_most_recent_by_date_add():
+    rows = [row(1, 1, "2026-07-01 10:00:00"), row(2, 2, "2026-07-05 10:00:00")]
+    assert compute_correct_current_state(rows) == 2
+
+
+def test_out_of_order_input_still_picks_latest():
+    rows = [row(3, 5, "2026-07-09 10:00:00"), row(1, 1, "2026-07-01 10:00:00"), row(2, 2, "2026-07-05 10:00:00")]
+    assert compute_correct_current_state(rows) == 5
+
+
+def test_tie_on_date_add_breaks_by_highest_id():
+    rows = [row(10, 3, "2026-07-05 10:00:00"), row(11, 4, "2026-07-05 10:00:00")]
+    assert compute_correct_current_state(rows) == 4
+
+
+def test_row_with_missing_date_add_sorts_first():
+    rows = [row(1, 9, None), row(2, 2, "2026-07-01 10:00:00")]
+    assert compute_correct_current_state(rows) == 2</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">current-state.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { computeCorrectCurrentState } from "./fix-stale-current-state.js";
+
+const row = (id, id_order_state, date_add) => ({ id, id_order_state, date_add });
+
+test("empty history returns null", () => {
+  assert.equal(computeCorrectCurrentState([]), null);
+});
+
+test("single row returns its state", () => {
+  assert.equal(computeCorrectCurrentState([row(1, 2, "2026-07-01 10:00:00")]), 2);
+});
+
+test("picks most recent by date_add", () => {
+  const rows = [row(1, 1, "2026-07-01 10:00:00"), row(2, 2, "2026-07-05 10:00:00")];
+  assert.equal(computeCorrectCurrentState(rows), 2);
+});
+
+test("out of order input still picks latest", () => {
+  const rows = [row(3, 5, "2026-07-09 10:00:00"), row(1, 1, "2026-07-01 10:00:00"), row(2, 2, "2026-07-05 10:00:00")];
+  assert.equal(computeCorrectCurrentState(rows), 5);
+});
+
+test("tie on date_add breaks by highest id", () => {
+  const rows = [row(10, 3, "2026-07-05 10:00:00"), row(11, 4, "2026-07-05 10:00:00")];
+  assert.equal(computeCorrectCurrentState(rows), 4);
+});
+
+test("row with missing date_add sorts first", () => {
+  const rows = [row(1, 9, null), row(2, 2, "2026-07-01 10:00:00")];
+  assert.equal(computeCorrectCurrentState(rows), 2);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Manual correction</span>
+      <h4>The admin who removed a wrong status line</h4>
+      <p>A support agent added a status to an order by mistake, then went into the database to delete that one history row rather than adding another transition on top of it. The order list kept showing the mistaken status long after the row was gone, and nobody connected the two until a customer asked why their order still said "Payment error" when the payment had gone through days earlier.</p>
+      <p>Running the reconciler across the order book found the mismatch immediately: the history's most recent surviving row said one thing, current_state said another. The team reviewed the dry run log, confirmed it matched what the agent intended, and let the script patch the pointer without touching history again.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Data retention</span>
+      <h4>The GDPR cleanup that pruned old history</h4>
+      <p>A retention job deleted order_history rows older than a cutoff for closed orders, as part of routine GDPR cleanup. For most orders this was harmless, since the surviving rows still ended on the right status. But for a handful of older orders, the row that got pruned happened to be the last one, leaving current_state pointing at a status with no supporting history at all.</p>
+      <p>The script's zero-history check caught every one of those orders and flagged them for review instead of guessing a value, since there was nothing safe to recompute from. Staff cross-checked those against archived invoices and set the state manually, while every other stale pointer in the batch got repaired automatically.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, orders.current_state always matches what the order's own history actually says, whenever that history exists. Nothing gets a phantom notification email, and nothing gets a guessed status. Orders with a gap in their history are handed to a human instead of silently patched, so the order list stops lying and the audit trail stays honest.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does orders.current_state not update when I delete an order_history row?</summary>
+      <p>PrestaShop only writes orders.current_state as a side effect of Order::setCurrentState() and OrderHistory::addWithemail(), the same call that inserts a new order_history row. If a history row is deleted or edited directly, by a bad module, a cleanup script, or a manual database fix, that write path never runs, so current_state keeps pointing at whatever was last set instead of the state the edited history now shows as most recent.</p>
+    </details>
+    <details>
+      <summary>Is it safe to automatically repair a stale current_state?</summary>
+      <p>Yes, as long as the repair only overwrites the current_state pointer and never inserts a new order_history row. Inserting a row would trigger a customer notification email and add another entry to an already edited history. Recomputing current_state from the existing history is a pointer repair, so it is safe to automate once the tie-break logic for picking the most recent row is deterministic.</p>
+    </details>
+    <details>
+      <summary>How do I find orders where current_state disagrees with order_history?</summary>
+      <p>Pull every order's id, reference, and current_state with GET orders, then for each order pull its rows with GET order_histories filtered by id_order. Sort those rows by date_add descending, breaking ties by the highest id, and compare the id_order_state of that top row against the order's current_state. Any mismatch, or any order with zero history rows, is a stale or unsupported pointer.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop GitHub: ps_orders column current_state not updated after ps_orders_history modification. Issue #13390. <a href="https://github.com/PrestaShop/PrestaShop/issues/13390" rel="noopener">github.com/PrestaShop/PrestaShop/issues/13390</a></li>
+      <li>PrestaShop Forums: Query to update order current_state and order_history. <a href="https://www.prestashop.com/forums/topic/1022800-query-to-update-order-current_state-and-order_history/" rel="noopener">prestashop.com/forums/topic/1022800-query-to-update-order-current_state-and-order_history</a></li>
+      <li>PrestaShop GitHub: Order History not updated. Issue #33238. <a href="https://github.com/PrestaShop/PrestaShop/issues/33238" rel="noopener">github.com/PrestaShop/PrestaShop/issues/33238</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: Orders webservice resource, current_state field. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/orders/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/orders/</a></li>
+      <li>PrestaShop Developer Documentation: Order histories webservice resource, id_order_state, id_order, date_add. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_histories/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_histories/</a></li>
+      <li>PrestaShop Developer Documentation: Order states webservice resource. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/order_states/" rel="noopener">devdocs.prestashop-project.org/9/webservice/resources/order_states/</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop orders, order states, stock, or the webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this fix your stale order status?</h3>
+    <p>If this saved you a confusing support ticket or a manual pass over the order book, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>

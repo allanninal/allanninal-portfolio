@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicate Order History Rows Created for a Single Status Change in PrestaShop</title>
+<meta name="description" content="A retried webhook or a webservice PUT can make PrestaShop insert the same order_history row twice and resend the customer email. Learn why Order::setCurrentState() lets this happen and build a Python or Node.js script that detects and safely cleans up duplicate order history rows.">
+<link rel="canonical" href="https://www.allanninal.dev/prestashop/duplicate-order-history-rows/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Duplicate Order History Rows Created for a Single Status Change in PrestaShop">
+<meta property="og:description" content="Why Order::setCurrentState() can insert the same order_history row twice, and a safe Python or Node.js script that finds and cleans up the duplicates.">
+<meta property="og:url" content="https://www.allanninal.dev/prestashop/duplicate-order-history-rows/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/prestashop/assets/prestashop.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/prestashop/duplicate-order-history-rows/#article","headline":"Duplicate order history rows created for a single status change","description":"PrestaShop's Order::setCurrentState() historically ran its full body, insert order_history, send the email, fire the hooks, every time it was called, without checking whether the order already had the requested state. A retried webhook or webservice PUT can insert a second, identical order_history row and resend the customer email. A Python or Node.js script detects and safely cleans up the duplicates.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/prestashop/duplicate-order-history-rows/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders & Order States","keywords":"PrestaShop order_history, setCurrentState, setWsCurrentState, duplicate order history, webservice, order_histories, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/prestashop/"},{"@type":"ListItem","position":2,"name":"Duplicate order history rows created for a single status change","item":"https://www.allanninal.dev/prestashop/duplicate-order-history-rows/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does PrestaShop create two identical order_history rows for one status change?","acceptedAnswer":{"@type":"Answer","text":"Order::setCurrentState() historically ran its full body, insert an order_history row, send the order state's email, and fire the related hooks, every time it was called, without first checking whether the order's current_state already equalled the requested id_order_state. A retried webhook, a payment module firing its IPN handler twice, or a webservice client PUTting the same state runs that body twice, so the same status gets logged, and sometimes emailed, twice."}},{"@type":"Question","name":"Is this fixed in current PrestaShop?","acceptedAnswer":{"@type":"Answer","text":"PrestaShop fixed it for core back office calls in 1.7.7, in PR 20622, which added a guard that compares the current state to the requested state before proceeding. Many merchants still run older 1.6 or early 1.7 stores, and third party modules or webservice integrations that call setCurrentState directly, or POST order_histories without checking the existing state first, can still reintroduce the same pattern."}},{"@type":"Question","name":"Is it safe to delete the duplicate order_history rows?","acceptedAnswer":{"@type":"Answer","text":"Only the later duplicate in each consecutive run, never the first occurrence and never the order's current_state field. order_history rows can be referenced by invoice and credit slip numbering, so the safe default is to report the duplicate ids and only delete them with an explicit DRY_RUN=false flag, keeping the earliest row of every run intact."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/prestashop/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / prestashop</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/prestashop/">Field notes</a> / Orders &amp; Order States</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Orders &amp; Order States</p>
+    <h1>Duplicate order history rows created for a single status change</h1>
+    <p class="lead">You open an order's history and the same status is listed twice in a row, back to back, with two different history ids and two nearly identical timestamps. Sometimes the customer even got the same email twice. Nothing in the store changed the order's real status, it just got recorded more than once. Here is why PrestaShop lets one status change turn into two history rows, how to find every order it has happened to, and a safe way to clean it up without losing the audit trail.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">PrestaShop Webservice API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p><code>Order::setCurrentState()</code>, called directly in the back office or through <code>Order::setWsCurrentState()</code> when the webservice PUTs an order with <code>current_state</code> set, historically ran its full body every time it was invoked: insert into <code>order_history</code>, send the order state's email, fire the related hooks, all without first checking whether the order's <code>current_state</code> already matched the requested <code>id_order_state</code>. A retried webhook, a payment module firing its IPN handler twice, or a webservice client blindly PUTting the same state runs that body twice, so you end up with two identical <code>order_history</code> rows back to back, and possibly a duplicate customer email. PrestaShop fixed this for core back office calls in 1.7.7, but pre-1.7.7 stores and third party modules or webservice clients that call <code>setCurrentState</code> or POST <code>order_histories</code> directly can still reproduce it. Run a small Python or Node.js script that pulls each order's <code>order_histories</code>, sorts them, and flags any consecutive pair with the same <code>id_order_state</code>. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every time an order's status changes in PrestaShop, one function is supposed to run: <code>Order::setCurrentState()</code>. It writes a new row into <code>order_history</code>, it can send the customer an email tied to that order state, and it fires the hooks that other modules listen for, like <code>actionOrderStatusUpdate</code> and <code>actionOrderStatusPostUpdate</code>.</p>
+  <p>For a long time, that function did all of that unconditionally. It never asked "does this order already have this exact status?" before doing the work. So if the same call happened twice, because a webhook retried after a slow response, because a payment module's IPN handler fired more than once for the same transaction, or because a webservice client PUT the same <code>current_state</code> value it had already sent, PrestaShop happily inserted a second, identical <code>order_history</code> row, and could resend the same notification email to the customer. Nothing about the order's real status changed. It just got logged, and sometimes announced, twice.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A payment module fires its IPN handler twice for the same transaction, both calls run setCurrentState in full without checking the existing state, so two identical order_history rows are inserted and the confirmation email can be sent twice.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b4f5b"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="65" width="165" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="92" y="93" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2b101c">IPN fires twice</text>
+      <text x="92" y="111" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">same transaction, retried</text>
+      <line x1="178" y1="100" x2="220" y2="100" stroke="#6b4f5b" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="223" y="65" width="170" height="70" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="308" y="93" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">setCurrentState()</text>
+      <text x="308" y="111" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">no "already this state?" check</text>
+      <line x1="396" y1="100" x2="450" y2="100" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="418" y="60" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="418" y="128" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">runs full body twice</text>
+      <rect x="453" y="65" width="165" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="535" y="90" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Two identical</text>
+      <text x="535" y="107" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">order_history rows</text>
+      <text x="535" y="123" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">back to back</text>
+      <line x1="618" y1="100" x2="642" y2="100" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="645" y="65" width="105" height="70" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="697" y="93" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Email sent</text>
+      <text x="697" y="110" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">twice</text>
+    </svg>
+    <figcaption>Without a guard comparing the requested state to the current one, the same call running twice inserts the same history row twice and can email the customer twice.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is not a one-off glitch, it is a gap in how <code>setCurrentState()</code> was written before it was patched. A few concrete ways stores still hit it:</p>
+  <ul>
+    <li>A retried webhook. A payment gateway's callback times out waiting for a response, retries automatically, and both deliveries reach the store and each triggers the same status transition.</li>
+    <li>A payment module firing its own IPN handler twice for the same transaction, once from the redirect back to the store and once from the gateway's server to server notification, with no idempotency check on the module's side.</li>
+    <li>A webservice client that blindly PUTs an order with <code>current_state</code> set to the value it thinks is correct, on every sync run, whether or not the order already has that state, routed through <code>Order::setWsCurrentState()</code>.</li>
+    <li>A pre-1.7.7 store, or a store on 1.7.7 and later running a third party module that calls <code>setCurrentState()</code> directly or POSTs to <code>order_histories</code> without first checking the order's existing <code>current_state</code>, reintroducing the same no-guard pattern core itself no longer has.</li>
+  </ul>
+  <p>PrestaShop core acknowledged this directly. GitHub issue #22011 describes the OrderHistory instance being duplicated when the order status is changed through the webservice, and issue #20623 tracks calling <code>setCurrentState()</code> with the same <code>id_order_state</code> the order already has. The fix landed in PR #20622, "Do not proceed setCurrentState if order already has the right state," in PrestaShop 1.7.7. See the citations at the end for the exact threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A legitimate order can revisit the same state more than once over its life, for example Awaiting payment, then Payment accepted, then Refunded, then Awaiting payment again. That is normal and should never be flagged. What is not normal is the same <code>id_order_state</code> appearing on two <code>order_history</code> rows back to back, with nothing in between. So the rule is about adjacency, not repetition: sort an order's history rows in the order they were written, and flag only a row whose <code>id_order_state</code> matches the row directly before it. Anything separated by a different state in between is a real business event, not a duplicate.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never touch an order's <code>current_state</code> field, and we never delete the first row of a run, only the repeats. The script pulls each order's full <code>order_histories</code>, sorts them by <code>date_add</code> then <code>id</code>, walks the list looking for consecutive rows with the same <code>id_order_state</code>, and reports every duplicate id it finds. Only with a human's confirmation and <code>DRY_RUN=false</code> does it delete those specific duplicate ids, one at a time, then re-checks that exactly one row remains per run.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists an order's history rows, sorts them by date_add and id, walks the list checking whether each row's state matches the previous row's state. If it matches, the row is flagged as a duplicate and only deleted with dry run off. If it does not match, the row is a normal transition and is kept."   >
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fdeef4" stroke="#efadc7"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2b101c">Reconciler job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b4f5b">runs on demand</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">Read order_histories</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">per id_order</text>
+      <line x1="225" y1="138" x2="262" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="265" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#efadc7"></rect>
+      <text x="357" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2b101c">Sort by date_add, id</text>
+      <text x="357" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b4f5b">walk the list</text>
+      <line x1="450" y1="138" x2="487" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="578,106 662,138 578,170 494,138" fill="#fdeef4" stroke="#efadc7"></polygon>
+      <text x="578" y="133" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">Same state as</text>
+      <text x="578" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#2b101c">previous row?</text>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, keep row</text>
+      <line x1="578" y1="170" x2="578" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="205" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">Flag duplicate id,</text>
+      <text x="684" y="222" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">delete if confirmed</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#cf4b3f" stroke-width="2"></path>
+    </svg>
+    <figcaption>Only a row whose state matches the row directly before it is flagged. Everything else, including a state repeated later after a different state in between, is left untouched.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Enable the Webservice API and get a key</h3>
+      <p>In the PrestaShop admin, go to Advanced Parameters, Webservice, and turn it on. Create a key with access to the <code>orders</code>, <code>order_histories</code>, and <code>order_states</code> resources. Keep the shop URL and the key in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export PRESTASHOP_URL="https://your-shop.example.com"
+export PRESTASHOP_WS_KEY="your webservice key"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Webservice API</h3>
+      <p>Every call goes to <code>{PRESTASHOP_URL}/api/&lt;resource&gt;</code> with the key sent as the HTTP Basic username and a blank password, plus <code>?output_format=JSON</code> since PrestaShop replies in XML by default. A small helper wraps GET, POST, and DELETE and raises on a bad status.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def api_delete(path):
+    r = requests.delete(
+        f"{BASE_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return True</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = (process.env.PRESTASHOP_URL || "").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY;
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${BASE_URL}/api/${path}?${qs}`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiDelete(path) {
+  const res = await fetch(`${BASE_URL}/api/${path}?output_format=JSON`, {
+    method: "DELETE",
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return true;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull one order's full history timeline</h3>
+      <p>Read every <code>order_histories</code> row for a given <code>id_order</code> with <code>display=full</code> so you get <code>id</code>, <code>id_order_state</code>, and <code>date_add</code> back for each row. To scan a whole store, page through <code>orders</code> to enumerate order ids first, then run this per order.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def order_history_rows(id_order):
+    data = api_get("order_histories", {
+        "filter[id_order]": id_order,
+        "display": "full",
+    })
+    rows = data.get("order_histories") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [
+        {"id": int(r["id"]), "id_order_state": int(r["id_order_state"]), "date_add": r["date_add"]}
+        for r in rows
+    ]
+
+def order_ids_to_check():
+    data = api_get("orders", {"display": "full", "limit": "0,200"})
+    orders = data.get("orders") or []
+    if isinstance(orders, dict):
+        orders = [orders]
+    return [int(o["id"]) for o in orders]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function orderHistoryRows(idOrder) {
+  const data = await apiGet("order_histories", {
+    "filter[id_order]": idOrder,
+    display: "full",
+  });
+  let rows = data.order_histories || [];
+  if (!Array.isArray(rows)) rows = [rows];
+  return rows.map((r) => ({
+    id: Number(r.id),
+    id_order_state: Number(r.id_order_state),
+    date_add: r.date_add,
+  }));
+}
+
+async function orderIdsToCheck() {
+  const data = await apiGet("orders", { display: "full", limit: "0,200" });
+  let orders = data.orders || [];
+  if (!Array.isArray(orders)) orders = [orders];
+  return orders.map((o) => Number(o.id));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the history rows for a single order and returns the ids of the duplicate rows. Sort by <code>(date_add, id)</code> ascending, walk the sorted list, and whenever a row's <code>id_order_state</code> equals the previous row's, flag that row's id. The earlier row in each run is always kept. A run longer than two repeats gets every repeat after the first flagged, because the tracker resets to the current row's state after every comparison.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_duplicate_history_ids(history_rows):
+    if not history_rows:
+        return []
+    ordered = sorted(history_rows, key=lambda r: (r["date_add"], r["id"]))
+    duplicate_ids = []
+    previous_state = None
+    for row in ordered:
+        if previous_state is not None and row["id_order_state"] == previous_state:
+            duplicate_ids.append(row["id"])
+        previous_state = row["id_order_state"]
+    return duplicate_ids</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findDuplicateHistoryIds(historyRows) {
+  if (!historyRows || historyRows.length === 0) return [];
+  const ordered = [...historyRows].sort((a, b) => {
+    if (a.date_add < b.date_add) return -1;
+    if (a.date_add > b.date_add) return 1;
+    return a.id - b.id;
+  });
+  const duplicateIds = [];
+  let previousState = null;
+  for (const row of ordered) {
+    if (previousState !== null && row.id_order_state === previousState) {
+      duplicateIds.push(row.id);
+    }
+    previousState = row.id_order_state;
+  }
+  return duplicateIds;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Delete only the flagged duplicates, never the first row</h3>
+      <p>When a duplicate id is confirmed, delete it with <code>DELETE {PRESTASHOP_URL}/api/order_histories/[id]</code>. Never delete the first occurrence in a run, and never touch the order's own <code>current_state</code> field, since that pointer is already correct, it is only the history log that has an extra row. After deleting, re-fetch <code>order_histories</code> for that order to confirm exactly one row remains per consecutive run.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def delete_duplicate_history(id_order_history):
+    return api_delete(f"order_histories/{id_order_history}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function deleteDuplicateHistory(idOrderHistory) {
+  return apiDelete(`order_histories/${idOrderHistory}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop pulls every order id, reads that order's history, runs it through the pure decision function, and logs every duplicate id it finds. On the first runs, leave <code>DRY_RUN</code> on so the script only reports the duplicate ids and their <code>id_order</code> and <code>id_order_state</code>. Only with <code>DRY_RUN=false</code> does it delete the flagged ids, one at a time, then re-checks the order's history to confirm the cleanup worked.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. <code>order_history</code> rows can be referenced by invoice and credit slip numbering, so hard-deleting is opt in, never the default. The script never deletes the first row of a run and never edits <code>current_state</code>. As a companion fix, if you maintain a custom module or run a pre-1.7.7 store, add the same guard PrestaShop core added in 1.7.7: compare <code>(int) $this-&gt;current_state</code> to <code>(int) $id_order_state</code> before inserting a new history row or sending an email.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and the only write it ever performs is deleting the specific duplicate <code>order_history</code> ids the pure function flagged, keeping the first row of every run.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/prestashop-fixes/tree/main/duplicate-order-history-rows" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the prestashop-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">duplicate_history_cleanup.py</div>
+      <pre><code class="language-python">"""Flag and clean up duplicate PrestaShop order_history rows for a single status change.
+
+Order::setCurrentState() historically ran its full body, insert order_history,
+send the email, fire the hooks, every time it was called, without checking whether
+the order already had the requested state. A retried webhook, a duplicated IPN call,
+or a webservice client blindly re-sending current_state can insert the same
+order_history row twice. This script reports duplicate ids by default. Only with
+DRY_RUN=false does it delete the flagged duplicate ids, never the first row of a
+run and never the order's current_state field. Safe to run again and again.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("duplicate_history_cleanup")
+
+BASE_URL = os.environ["PRESTASHOP_URL"].rstrip("/")
+WS_KEY = os.environ["PRESTASHOP_WS_KEY"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def api_get(path, params=None):
+    params = dict(params or {})
+    params["output_format"] = "JSON"
+    r = requests.get(f"{BASE_URL}/api/{path}", params=params, auth=(WS_KEY, ""), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_delete(path):
+    r = requests.delete(
+        f"{BASE_URL}/api/{path}",
+        params={"output_format": "JSON"},
+        auth=(WS_KEY, ""),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return True
+
+
+def find_duplicate_history_ids(history_rows):
+    if not history_rows:
+        return []
+    ordered = sorted(history_rows, key=lambda r: (r["date_add"], r["id"]))
+    duplicate_ids = []
+    previous_state = None
+    for row in ordered:
+        if previous_state is not None and row["id_order_state"] == previous_state:
+            duplicate_ids.append(row["id"])
+        previous_state = row["id_order_state"]
+    return duplicate_ids
+
+
+def order_history_rows(id_order):
+    data = api_get("order_histories", {
+        "filter[id_order]": id_order,
+        "display": "full",
+    })
+    rows = data.get("order_histories") or []
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [
+        {"id": int(r["id"]), "id_order_state": int(r["id_order_state"]), "date_add": r["date_add"]}
+        for r in rows
+    ]
+
+
+def order_ids_to_check():
+    data = api_get("orders", {"display": "full", "limit": "0,200"})
+    orders = data.get("orders") or []
+    if isinstance(orders, dict):
+        orders = [orders]
+    return [int(o["id"]) for o in orders]
+
+
+def delete_duplicate_history(id_order_history):
+    return api_delete(f"order_histories/{id_order_history}")
+
+
+def run():
+    flagged = 0
+    for id_order in order_ids_to_check():
+        rows = order_history_rows(id_order)
+        duplicate_ids = find_duplicate_history_ids(rows)
+        if not duplicate_ids:
+            continue
+        flagged += len(duplicate_ids)
+        log.warning("Order %s has duplicate order_history ids: %s", id_order, duplicate_ids)
+        if DRY_RUN:
+            log.info("DRY RUN: would delete order_histories %s for order %s", duplicate_ids, id_order)
+        else:
+            for id_order_history in duplicate_ids:
+                delete_duplicate_history(id_order_history)
+            remaining = order_history_rows(id_order)
+            remaining_states = [r["id_order_state"] for r in remaining]
+            log.info("Order %s cleaned up. Remaining history states: %s", id_order, remaining_states)
+    log.info("Done. %d duplicate order_history row(s) %s.", flagged, "to delete" if DRY_RUN else "deleted")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">duplicate-history-cleanup.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag and clean up duplicate PrestaShop order_history rows for a single status change.
+ *
+ * Order::setCurrentState() historically ran its full body, insert order_history,
+ * send the email, fire the hooks, every time it was called, without checking whether
+ * the order already had the requested state. A retried webhook, a duplicated IPN call,
+ * or a webservice client blindly re-sending current_state can insert the same
+ * order_history row twice. This script reports duplicate ids by default. Only with
+ * DRY_RUN=false does it delete the flagged duplicate ids, never the first row of a
+ * run and never the order's current_state field. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/prestashop/duplicate-order-history-rows/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = (process.env.PRESTASHOP_URL || "https://demo.example.com").replace(/\/$/, "");
+const WS_KEY = process.env.PRESTASHOP_WS_KEY || "WSKEYDUMMY";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function findDuplicateHistoryIds(historyRows) {
+  if (!historyRows || historyRows.length === 0) return [];
+  const ordered = [...historyRows].sort((a, b) => {
+    if (a.date_add < b.date_add) return -1;
+    if (a.date_add > b.date_add) return 1;
+    return a.id - b.id;
+  });
+  const duplicateIds = [];
+  let previousState = null;
+  for (const row of ordered) {
+    if (previousState !== null && row.id_order_state === previousState) {
+      duplicateIds.push(row.id);
+    }
+    previousState = row.id_order_state;
+  }
+  return duplicateIds;
+}
+
+function authHeader() {
+  return "Basic " + Buffer.from(`${WS_KEY}:`).toString("base64");
+}
+
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams({ ...params, output_format: "JSON" });
+  const res = await fetch(`${BASE_URL}/api/${path}?${qs}`, {
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return res.json();
+}
+
+async function apiDelete(path) {
+  const res = await fetch(`${BASE_URL}/api/${path}?output_format=JSON`, {
+    method: "DELETE",
+    headers: { Authorization: authHeader() },
+  });
+  if (!res.ok) throw new Error(`PrestaShop ${res.status}`);
+  return true;
+}
+
+async function orderHistoryRows(idOrder) {
+  const data = await apiGet("order_histories", {
+    "filter[id_order]": idOrder,
+    display: "full",
+  });
+  let rows = data.order_histories || [];
+  if (!Array.isArray(rows)) rows = [rows];
+  return rows.map((r) => ({
+    id: Number(r.id),
+    id_order_state: Number(r.id_order_state),
+    date_add: r.date_add,
+  }));
+}
+
+async function orderIdsToCheck() {
+  const data = await apiGet("orders", { display: "full", limit: "0,200" });
+  let orders = data.orders || [];
+  if (!Array.isArray(orders)) orders = [orders];
+  return orders.map((o) => Number(o.id));
+}
+
+async function deleteDuplicateHistory(idOrderHistory) {
+  return apiDelete(`order_histories/${idOrderHistory}`);
+}
+
+export async function run() {
+  let flagged = 0;
+  const orderIds = await orderIdsToCheck();
+  for (const idOrder of orderIds) {
+    const rows = await orderHistoryRows(idOrder);
+    const duplicateIds = findDuplicateHistoryIds(rows);
+    if (duplicateIds.length === 0) continue;
+    flagged += duplicateIds.length;
+    console.warn(`Order ${idOrder} has duplicate order_history ids:`, duplicateIds);
+    if (DRY_RUN) {
+      console.log(`DRY RUN: would delete order_histories ${duplicateIds} for order ${idOrder}`);
+    } else {
+      for (const idOrderHistory of duplicateIds) {
+        await deleteDuplicateHistory(idOrderHistory);
+      }
+      const remaining = await orderHistoryRows(idOrder);
+      console.log(`Order ${idOrder} cleaned up. Remaining history states:`, remaining.map((r) => r.id_order_state));
+    }
+  }
+  console.log(`Done. ${flagged} duplicate order_history row(s) ${DRY_RUN ? "to delete" : "deleted"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which rows get deleted. Because <code>find_duplicate_history_ids</code> is pure, the test needs no network and no PrestaShop store. It just feeds in plain lists of history rows and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_duplicate_order_history.py</div>
+      <pre><code class="language-python">from duplicate_history_cleanup import find_duplicate_history_ids
+
+
+def row(id, id_order_state, date_add):
+    return {"id": id, "id_order_state": id_order_state, "date_add": date_add}
+
+
+def test_no_rows_no_duplicates():
+    assert find_duplicate_history_ids([]) == []
+
+
+def test_no_duplicates_when_all_states_differ():
+    rows = [row(1, 1, "2026-07-10 10:00:00"), row(2, 2, "2026-07-10 10:05:00")]
+    assert find_duplicate_history_ids(rows) == []
+
+
+def test_consecutive_same_state_flagged():
+    rows = [row(1, 2, "2026-07-10 10:00:00"), row(2, 2, "2026-07-10 10:00:05")]
+    assert find_duplicate_history_ids(rows) == [2]
+
+
+def test_first_occurrence_never_flagged():
+    rows = [row(1, 2, "2026-07-10 10:00:00"), row(2, 2, "2026-07-10 10:00:05")]
+    duplicate_ids = find_duplicate_history_ids(rows)
+    assert 1 not in duplicate_ids
+
+
+def test_revisiting_same_state_later_is_not_flagged():
+    # Awaiting payment -> Payment accepted -> Refunded -> Awaiting payment again.
+    rows = [
+        row(1, 1, "2026-07-10 09:00:00"),
+        row(2, 2, "2026-07-10 09:05:00"),
+        row(3, 3, "2026-07-10 09:10:00"),
+        row(4, 1, "2026-07-10 09:15:00"),
+    ]
+    assert find_duplicate_history_ids(rows) == []
+
+
+def test_run_longer_than_two_flags_all_but_first():
+    rows = [
+        row(1, 2, "2026-07-10 10:00:00"),
+        row(2, 2, "2026-07-10 10:00:01"),
+        row(3, 2, "2026-07-10 10:00:02"),
+    ]
+    assert find_duplicate_history_ids(rows) == [2, 3]
+
+
+def test_unsorted_input_is_sorted_before_comparing():
+    rows = [
+        row(2, 2, "2026-07-10 10:00:05"),
+        row(1, 2, "2026-07-10 10:00:00"),
+    ]
+    assert find_duplicate_history_ids(rows) == [2]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">duplicate-order-history.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findDuplicateHistoryIds } from "./duplicate-history-cleanup.js";
+
+const row = (id, id_order_state, date_add) =&gt; ({ id, id_order_state, date_add });
+
+test("no rows means no duplicates", () =&gt; {
+  assert.deepEqual(findDuplicateHistoryIds([]), []);
+});
+
+test("no duplicates when all states differ", () =&gt; {
+  const rows = [row(1, 1, "2026-07-10 10:00:00"), row(2, 2, "2026-07-10 10:05:00")];
+  assert.deepEqual(findDuplicateHistoryIds(rows), []);
+});
+
+test("consecutive same state is flagged", () =&gt; {
+  const rows = [row(1, 2, "2026-07-10 10:00:00"), row(2, 2, "2026-07-10 10:00:05")];
+  assert.deepEqual(findDuplicateHistoryIds(rows), [2]);
+});
+
+test("first occurrence is never flagged", () =&gt; {
+  const rows = [row(1, 2, "2026-07-10 10:00:00"), row(2, 2, "2026-07-10 10:00:05")];
+  const duplicateIds = findDuplicateHistoryIds(rows);
+  assert.equal(duplicateIds.includes(1), false);
+});
+
+test("revisiting the same state later is not flagged", () =&gt; {
+  const rows = [
+    row(1, 1, "2026-07-10 09:00:00"),
+    row(2, 2, "2026-07-10 09:05:00"),
+    row(3, 3, "2026-07-10 09:10:00"),
+    row(4, 1, "2026-07-10 09:15:00"),
+  ];
+  assert.deepEqual(findDuplicateHistoryIds(rows), []);
+});
+
+test("a run longer than two flags all but the first", () =&gt; {
+  const rows = [
+    row(1, 2, "2026-07-10 10:00:00"),
+    row(2, 2, "2026-07-10 10:00:01"),
+    row(3, 2, "2026-07-10 10:00:02"),
+  ];
+  assert.deepEqual(findDuplicateHistoryIds(rows), [2, 3]);
+});
+
+test("unsorted input is sorted before comparing", () =&gt; {
+  const rows = [
+    row(2, 2, "2026-07-10 10:00:05"),
+    row(1, 2, "2026-07-10 10:00:00"),
+  ];
+  assert.deepEqual(findDuplicateHistoryIds(rows), [2]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Payment module IPN</span>
+      <h4>The same confirmation email landed twice</h4>
+      <p>A merchant on a pre-1.7.7 store used a payment module that called <code>setCurrentState()</code> from both its redirect handler and its server to server notification for the same transaction. Both calls ran within seconds of each other, so the order got two identical "Payment accepted" rows, and the customer received the confirmation email twice, which generated a handful of confused support tickets asking if they had been charged twice.</p>
+      <p>The reconciler script found the duplicate <code>order_history</code> id on the affected orders in dry run, the merchant confirmed the payments were genuinely single charges by checking the gateway dashboard, and running with <code>DRY_RUN=false</code> removed only the later duplicate row on each order, leaving the first row and the invoice numbering untouched.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Webservice sync</span>
+      <h4>A nightly sync kept re-sending the same status</h4>
+      <p>An external order management system PUT every order to PrestaShop nightly, including its current status, without checking whether the status had actually changed since the last sync. Every night, orders that had not moved got a fresh, identical <code>order_history</code> row through <code>setWsCurrentState()</code>, and after a few months some orders had a dozen duplicate rows for the same state.</p>
+      <p>Running the scan across the whole store in dry run surfaced exactly which orders had accumulated duplicates and how many. The team fixed the sync to only PUT when the status actually changed, then ran the cleanup once with <code>DRY_RUN=false</code> to remove the backlog of duplicate rows it had already created, keeping one row per real transition.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After a cleanup run, every order's history reads as one row per real status change, with no back to back repeats left over from a retried webhook or a blind sync. The order's <code>current_state</code> was never touched, the first row of every run is always preserved for the audit trail, and nothing was deleted until a human reviewed the dry run output and confirmed it. If you maintain a module or an older store, the same guard PrestaShop core now uses, comparing the current state to the requested one before proceeding, stops new duplicates from being created in the first place.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does PrestaShop create two identical order_history rows for one status change?</summary>
+      <p>Order::setCurrentState() historically ran its full body, insert an order_history row, send the order state's email, and fire the related hooks, every time it was called, without first checking whether the order's current_state already equalled the requested id_order_state. A retried webhook, a payment module firing its IPN handler twice, or a webservice client PUTting the same state runs that body twice, so the same status gets logged, and sometimes emailed, twice.</p>
+    </details>
+    <details>
+      <summary>Is this fixed in current PrestaShop?</summary>
+      <p>PrestaShop fixed it for core back office calls in 1.7.7, in PR 20622, which added a guard that compares the current state to the requested state before proceeding. Many merchants still run older 1.6 or early 1.7 stores, and third party modules or webservice integrations that call setCurrentState directly, or POST order_histories without checking the existing state first, can still reintroduce the same pattern.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete the duplicate order_history rows?</summary>
+      <p>Only the later duplicate in each consecutive run, never the first occurrence and never the order's current_state field. order_history rows can be referenced by invoice and credit slip numbering, so the safe default is to report the duplicate ids and only delete them with an explicit DRY_RUN=false flag, keeping the earliest row of every run intact.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/prestashop/">Browse all PrestaShop field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past the shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>PrestaShop GitHub Issue #22011: When the order status is changed in the webservice, the OrderHistory instance is duplicated. <a href="https://github.com/PrestaShop/PrestaShop/issues/22011" rel="noopener">github.com/PrestaShop/PrestaShop/issues/22011</a></li>
+      <li>PrestaShop GitHub Issue #20623: setCurrentState to the same id_order_state. <a href="https://github.com/PrestaShop/PrestaShop/issues/20623" rel="noopener">github.com/PrestaShop/PrestaShop/issues/20623</a></li>
+      <li>PrestaShop GitHub Issue #15513: Update order state with Order::setCurrentState() add new line for invoice in order view. <a href="https://github.com/PrestaShop/PrestaShop/issues/15513" rel="noopener">github.com/PrestaShop/PrestaShop/issues/15513</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>PrestaShop Developer Documentation: the order_histories Webservice resource. <a href="https://devdocs.prestashop-project.org/8/webservice/resources/order_histories/" rel="noopener">devdocs.prestashop-project.org webservice resources order_histories</a></li>
+      <li>PrestaShop Developer Documentation: the order_states Webservice resource. <a href="https://devdocs.prestashop-project.org/8/webservice/resources/order_states/" rel="noopener">devdocs.prestashop-project.org webservice resources order_states</a></li>
+      <li>PrestaShop Developer Documentation: the orders Webservice resource, the current_state field. <a href="https://devdocs.prestashop-project.org/9/webservice/resources/orders/" rel="noopener">devdocs.prestashop-project.org webservice resources orders</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in PrestaShop stock, orders, order states, or the Webservice API that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clean up your order history?</h3>
+    <p>If this saved you from a confusing duplicate email or a messy audit trail, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/prestashop/">Back to all PrestaShop field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on PrestaShop.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/prestashop/assets/prestashop.js" defer></script>
+</body>
+</html>
