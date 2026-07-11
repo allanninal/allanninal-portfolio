@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Editing an Order Cancels Its Payment Collection in Medusa</title>
+<meta name="description" content="Changing a quantity or unit price on a Medusa v2 order edit cancels the payment collection and blocks capture. Learn why, and build a Python or Node.js script that safely flags the affected orders.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/order-edit-cancels-payment-collection/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Editing an Order Cancels Its Payment Collection in Medusa">
+<meta property="og:description" content="Why an order edit in Medusa v2 can cancel the payment collection without attaching a new one, and a safe Python or Node.js script that flags the orders left unable to capture.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/order-edit-cancels-payment-collection/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/order-edit-cancels-payment-collection/#article","headline":"Fix Editing an Order Cancels Its Payment Collection in Medusa","description":"Why an order edit in Medusa v2 cancels the payment collection without reliably attaching a capturable replacement, and a Python or Node.js script that finds and reports the affected orders.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/order-edit-cancels-payment-collection/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Order Edits & Totals","keywords":"Medusa order edit payment collection canceled, confirmOrderEditRequestWorkflow, capturePaymentWorkflow canceled, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Editing an order cancels its payment collection and blocks capture","item":"https://www.allanninal.dev/medusa/order-edit-cancels-payment-collection/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did editing my Medusa order cancel its payment collection?","acceptedAnswer":{"@type":"Answer","text":"In Medusa v2 the order edit workflow treats any quantity or unit price change as invalidating the order's existing totals, so as part of recalculating it cancels the current payment collection and resets payment_status to not_paid. It expects a fresh payment collection to be created for the new amount owed, but that step does not always happen, which is a known regression tracked as GitHub issue 12200."}},{"@type":"Question","name":"Can I capture a payment on a canceled payment collection?","acceptedAnswer":{"@type":"Answer","text":"No. Medusa's capturePaymentWorkflow refuses to act on a payment whose parent payment collection has a status of canceled, and returns an error like The payment: pay_... has been canceled. There is no supported route to un-cancel a payment_collection, so trying to capture against it will always fail."}},{"@type":"Question","name":"What is the safe fix when an order edit leaves only a canceled payment collection?","acceptedAnswer":{"@type":"Answer","text":"Do not try to mutate the canceled payment_collection's status. Once a human has confirmed the outstanding amount against order.summary.raw_difference_due, create a brand new payment collection for that order with POST /admin/orders/:id/payment-collections, attach a payment session, and capture against that new collection instead."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Order Edits &amp; Totals</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Order Edits &amp; Totals</p>
+    <h1>Editing an order cancels its payment collection and blocks capture</h1>
+    <p class="lead">A support agent adds a line, bumps a quantity, or corrects a unit price on an order that already has money attached to it. The edit saves fine. But now the order's payment collection shows canceled, payment_status has dropped back to not_paid, and every attempt to capture a payment on that order fails with a plain "has been canceled" error. The order is not canceled. The customer still owes money. Here is why the order edit workflow leaves orders in this state and a script that finds them safely, without guessing at a fix.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Flag and report, no silent writes</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, a regression introduced in 2.7 and tracked as GitHub issue <code>#12200</code> makes the order edit workflow (<code>beginOrderEditOrderWorkflow</code> / <code>updateOrderEditOrderWorkflow</code> into <code>confirmOrderEditRequestWorkflow</code>) treat any quantity or unit price change as invalidating the order's existing totals. As part of recalculating, it cancels the order's current <code>payment_collection</code> and resets <code>payment_status</code> to <code>not_paid</code>, expecting a fresh collection to be created for the new amount owed. That new collection does not always get created and attached, especially on force-confirmed admin edits made with the manual payment provider, so the order is left with only a permanently canceled collection. Medusa's <code>capturePaymentWorkflow</code> refuses to act on a payment whose parent collection is <code>canceled</code>, so the order can no longer be captured through the Admin API or dashboard even though it still expects payment. Run a small Python or Node.js script that lists orders with a confirmed edit, checks whether the only payment collection left is canceled while money is still owed, and reports each one for a human to review. It never tries to touch the canceled collection, it only flags.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Order edits in Medusa are supposed to be a routine thing. A customer wants one more unit, a price was quoted wrong, an item needs swapping before it ships. You open the order, add the change, and confirm it. Totals recalculate, the invoice reflects the new amount, everyone moves on.</p>
+  <p>What actually happens underneath is more drastic. Because Medusa cannot cleanly reprice one line without touching the order's whole totals snapshot, the edit workflow cancels the existing <code>payment_collection</code> outright and drops <code>payment_status</code> back to <code>not_paid</code>, on the assumption that a brand new collection will be created for whatever is now owed. In a lot of real setups, especially force-confirmed admin edits on the manual payment provider, that replacement collection never shows up. The order is left holding a payment collection stuck at <code>canceled</code>, with no live collection anywhere to capture against. Try to capture and the Admin API stops you cold: "The payment: pay_... has been canceled."</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An admin edits an order quantity or price, the order edit workflow cancels the existing payment collection expecting a replacement, but no new payment collection is attached, so capture is blocked while the order still expects payment.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="68" width="168" height="72" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="94" y="96" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Admin edits order</text>
+      <text x="94" y="114" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">qty or unit price change</text>
+      <line x1="181" y1="104" x2="223" y2="104" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="226" y="68" width="180" height="72" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="316" y="90" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">confirmOrderEditRequestWorkflow</text>
+      <text x="316" y="107" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">cancels payment_collection</text>
+      <text x="316" y="123" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">expects a fresh one to attach</text>
+      <line x1="406" y1="104" x2="460" y2="104" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="433" y="63" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="433" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">no replacement attached</text>
+      <rect x="463" y="68" width="160" height="72" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="543" y="96" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">collection: canceled</text>
+      <text x="543" y="114" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">payment_status: not_paid</text>
+      <rect x="646" y="68" width="104" height="72" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="698" y="93" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Capture</text>
+      <text x="698" y="111" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">blocked</text>
+      <line x1="625" y1="104" x2="643" y2="104" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The edit itself succeeds. The payment collection it cancels along the way is the part that never gets replaced, so capture has nothing left to act on.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a workflow ordering gap in how Medusa v2 handles order edits, not a one-off bug in a single store's setup:</p>
+  <ul>
+    <li>The order edit path, <code>beginOrderEditOrderWorkflow</code> and <code>updateOrderEditOrderWorkflow</code>, feeds into <code>confirmOrderEditRequestWorkflow</code> once the edit is confirmed. Any change to quantity or unit price is treated as invalidating the order's current totals snapshot.</li>
+    <li>As part of recalculating totals, the workflow cancels the order's existing <code>payment_collection</code>, transitioning it to <code>status: "canceled"</code>, and resets <code>order.payment_status</code> to <code>not_paid</code>. This is a regression introduced in Medusa 2.7 and tracked as GitHub issue <code>#12200</code>.</li>
+    <li>The workflow does not reliably create and attach a new, capturable payment collection in every path. Force-confirmed admin edits, particularly with the manual payment provider, are the case most often reported as leaving the order with nothing to capture against, as described in GitHub issue <code>#5612</code>.</li>
+    <li><code>capturePaymentWorkflow</code> checks the parent payment collection's status before it will act on a payment, and refuses outright when that status is <code>canceled</code>, throwing an error such as "The payment: pay_... has been canceled." This holds even though the order itself is not canceled and its <code>summary</code> still shows an amount due.</li>
+    <li>A related but separate issue, GitHub <code>#11591</code>, shows that even when a new payment collection is created, it can fail to account for amounts already paid on the order, which is one more reason to never assume the replacement collection matches what is actually owed without checking.</li>
+  </ul>
+  <p>This is a common source of confusion because nothing on the order looks broken at a glance. The order status is fine, the edit applied, the new total is correct. It is only when someone tries to capture that the "has been canceled" error surfaces, and by then the merchant is usually staring at an order that should be simple to collect on. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>There is no supported Admin API route to un-cancel a payment_collection, and writing around that by manufacturing a new collection without review risks desyncing <code>order.summary</code> and <code>difference_due</code> even further. So this is not a script you auto-fix with. The safe pattern is to detect and report only: find every order where the only payment collection left is canceled and money is still owed, hand that list to a human, and let a person decide the outstanding amount is correct before a new payment collection is created and captured against.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout and we do not try to write over the canceled collection. We list orders with a confirmed edit, expand each order's payment collections, and run a pure decision function that flags an order only when it is <code>not_paid</code>, has no live collection to capture against, has at least one canceled collection, and still has an amount due. Everything flagged goes into a report. Nothing is written unless <code>DRY_RUN</code> is off and a human has reviewed the row.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists orders with a confirmed edit, expands payment collections, classifies each order with a pure function, flags it when blocked with an amount due, and in dry run only reports it, otherwise a human reviews and a new payment collection is created and captured against.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="180" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="100" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List edited orders</text>
+      <text x="100" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">order_change: edit, confirmed</text>
+      <line x1="100" y1="80" x2="100" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Expand collections</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">payment_collections, summary</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="365" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Classify with pure fn</text>
+      <text x="365" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">classifyOrderPaymentEditState</text>
+      <line x1="460" y1="138" x2="502" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="595,106 682,138 595,170 508,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="595" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">blocked</text>
+      <text x="595" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">true?</text>
+      <text x="685" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="682" y1="138" x2="710" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, leave alone</text>
+      <line x1="595" y1="170" x2="595" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="638" y="185" width="122" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="699" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report row</text>
+      <text x="699" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">human reviews, then acts</text>
+      <path d="M710,138 C730,138 699,150 699,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only ever reports. A human reviews the amount due and, only then, creates a new payment collection to capture against, never the canceled one.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend and an admin user with rights to read orders and payments. Exchange the email and password for a JWT once, then send it as a Bearer token on every admin call. Keep everything in environment variables, never hardcoded.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, only reports order_id/amount_due pairs</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install @medusajs/js-sdk
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, only reports order_id/amount_due pairs</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Both languages exchange credentials for a token the same way. The Python version talks to the REST route directly with <code>requests</code>. The Node version uses the official <code>@medusajs/js-sdk</code>, which wraps the same login call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import Medusa from "@medusajs/js-sdk";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+
+async function login() {
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List orders with a confirmed edit and their payment collections</h3>
+      <p>Ask for orders with <code>payment_status</code>, the order's <code>summary</code>, every <code>payment_collections</code> entry, and the <code>order_change</code> relation. Page through with <code>limit</code> and <code>offset</code>. For each order, check the change history for an <code>OrderChange</code> with <code>change_type: "edit"</code> whose status is <code>requested</code> or <code>confirmed</code>, so we only look at edits that were actually applied, not left as a draft.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_FIELDS = (
+    "id,display_id,status,payment_status,*summary,"
+    "*payment_collections,*order_change"
+)
+EDIT_CHANGE_STATUSES = {"requested", "confirmed"}
+
+def has_confirmed_edit(order):
+    change = order.get("order_change") or {}
+    return (
+        change.get("change_type") == "edit"
+        and change.get("status") in EDIT_CHANGE_STATUSES
+    )
+
+def list_edited_orders(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    out, offset, limit = [], 0, 100
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/orders",
+            params={"fields": ORDER_FIELDS, "limit": limit, "offset": offset},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        out.extend(o for o in body["orders"] if has_confirmed_edit(o))
+        offset += limit
+        if offset &gt;= body["count"]:
+            return out</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_FIELDS =
+  "id,display_id,status,payment_status,*summary," +
+  "*payment_collections,*order_change";
+const EDIT_CHANGE_STATUSES = new Set(["requested", "confirmed"]);
+
+export function hasConfirmedEdit(order) {
+  const change = order.order_change || {};
+  return change.change_type === "edit" && EDIT_CHANGE_STATUSES.has(change.status);
+}
+
+async function listEditedOrders(sdk) {
+  const out = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const body = await sdk.admin.order.list({ fields: ORDER_FIELDS, limit, offset });
+    out.push(...body.orders.filter(hasConfirmedEdit));
+    offset += limit;
+    if (offset &gt;= body.count) return out;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no network calls, so it is easy to read and easy to test. An order is blocked when <code>payment_status</code> is <code>not_paid</code>, there is no payment collection with a status that could still be captured (<code>not_paid</code>, <code>awaiting</code>, <code>authorized</code>, <code>partially_authorized</code>), at least one collection is <code>canceled</code>, and the amount due is greater than zero. Anything else, including a fully refunded or canceled order, is left alone.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">CAPTURABLE_STATUSES = {"not_paid", "awaiting", "authorized", "partially_authorized"}
+
+def classify_order_payment_edit_state(order):
+    """Pure: no I/O. order has payment_status, payment_collections, summary."""
+    if order.get("payment_status") != "not_paid":
+        return {"blocked": False, "reason": None, "canceledCollectionId": None, "amountDue": 0}
+
+    collections = order.get("payment_collections") or []
+    has_capturable = any(pc.get("status") in CAPTURABLE_STATUSES for pc in collections)
+    canceled = next((pc for pc in collections if pc.get("status") == "canceled"), None)
+
+    summary = order.get("summary") or {}
+    amount_due = summary.get("raw_difference_due")
+    if amount_due is None:
+        amount_due = sum(
+            pc.get("amount", 0) for pc in collections if pc.get("status") != "captured"
+        )
+
+    if not has_capturable and canceled is not None and amount_due &gt; 0:
+        return {
+            "blocked": True,
+            "reason": "canceled_collection_blocks_capture",
+            "canceledCollectionId": canceled.get("id"),
+            "amountDue": amount_due,
+        }
+
+    return {"blocked": False, "reason": None, "canceledCollectionId": None, "amountDue": 0}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const CAPTURABLE_STATUSES = new Set(["not_paid", "awaiting", "authorized", "partially_authorized"]);
+
+export function classifyOrderPaymentEditState(order) {
+  // Pure: no I/O. order has payment_status, payment_collections, summary.
+  if (order.payment_status !== "not_paid") {
+    return { blocked: false, reason: null, canceledCollectionId: null, amountDue: 0 };
+  }
+
+  const collections = order.payment_collections || [];
+  const hasCapturable = collections.some((pc) => CAPTURABLE_STATUSES.has(pc.status));
+  const canceled = collections.find((pc) => pc.status === "canceled") || null;
+
+  let amountDue = order.summary?.raw_difference_due;
+  if (amountDue == null) {
+    amountDue = collections
+      .filter((pc) => pc.status !== "captured")
+      .reduce((sum, pc) => sum + (pc.amount || 0), 0);
+  }
+
+  if (!hasCapturable && canceled && amountDue &gt; 0) {
+    return {
+      blocked: true,
+      reason: "canceled_collection_blocks_capture",
+      canceledCollectionId: canceled.id,
+      amountDue,
+    };
+  }
+
+  return { blocked: false, reason: null, canceledCollectionId: null, amountDue: 0 };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report, never mutate the canceled collection</h3>
+      <p>When an order is blocked, emit a report row with the order id, display id, payment status, the canceled collection id, and the amount due. There is no supported route to un-cancel a payment collection, so the script never attempts that. If a human confirms the amount and turns <code>DRY_RUN</code> off, the only supported next step is creating a fresh payment collection for the difference owed, attaching a session, and capturing that new payment, all separate operator-confirmed calls.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def create_payment_collection(token, order_id, amount):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/orders/{order_id}/payment-collections",
+        json={"amount": amount},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["payment_collection"]
+
+
+def create_payment_session(token, collection_id, provider_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/payment-collections/{collection_id}/payment-sessions",
+        json={"provider_id": provider_id},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function createPaymentCollection(sdk, orderId, amount) {
+  const body = await sdk.client.fetch(`/admin/orders/${orderId}/payment-collections`, {
+    method: "POST",
+    body: { amount },
+  });
+  return body.payment_collection;
+}
+
+async function createPaymentSession(sdk, collectionId, providerId) {
+  return sdk.client.fetch(`/admin/payment-collections/${collectionId}/payment-sessions`, {
+    method: "POST",
+    body: { provider_id: providerId },
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. On every run, leave <code>DRY_RUN</code> on to only print the report rows. This script intentionally never flips to a write path on its own, since capturing the wrong amount on a re-priced order is worse than leaving it flagged. Treat the report as the trigger for a human to review <code>order.summary.raw_difference_due</code> and, only after that, run the create-collection and capture steps by hand or in a follow-up, reviewed job.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never call any route that mutates the existing canceled <code>payment_collection</code>'s status. There is not one. Always start with <code>DRY_RUN=true</code>, and only create a new payment collection and capture against it after a human has confirmed the amount matches <code>order.summary.raw_difference_due</code>.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists orders with a confirmed edit, classifies each one with a pure function, and reports every order that is blocked by a canceled payment collection with an outstanding balance. It never writes anything by default.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/order-edit-cancels-payment-collection" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_edit_cancels_payment.py</div>
+      <pre><code class="language-python">"""Find Medusa v2 orders where a confirmed order edit canceled the payment
+collection and left no capturable collection behind, while the order still
+owes money. This is not auto-fixable: there is no supported route to
+un-cancel a payment_collection. DRY_RUN=true (default) only reports the
+affected orders. Only when DRY_RUN=false and a human has reviewed the
+amount should a new payment collection be created and captured against.
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_edit_cancels_payment")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+PAYMENT_PROVIDER_ID = os.environ.get("MEDUSA_PAYMENT_PROVIDER_ID", "pp_system_default")
+
+ORDER_FIELDS = (
+    "id,display_id,status,payment_status,*summary,"
+    "*payment_collections,*order_change"
+)
+EDIT_CHANGE_STATUSES = {"requested", "confirmed"}
+CAPTURABLE_STATUSES = {"not_paid", "awaiting", "authorized", "partially_authorized"}
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def has_confirmed_edit(order):
+    change = order.get("order_change") or {}
+    return (
+        change.get("change_type") == "edit"
+        and change.get("status") in EDIT_CHANGE_STATUSES
+    )
+
+
+def list_edited_orders(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    out, offset, limit = [], 0, 100
+    while True:
+        r = requests.get(
+            f"{BASE_URL}/admin/orders",
+            params={"fields": ORDER_FIELDS, "limit": limit, "offset": offset},
+            headers=headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        out.extend(o for o in body["orders"] if has_confirmed_edit(o))
+        offset += limit
+        if offset >= body["count"]:
+            return out
+
+
+def classify_order_payment_edit_state(order):
+    """Pure: no I/O. order has payment_status, payment_collections, summary."""
+    if order.get("payment_status") != "not_paid":
+        return {"blocked": False, "reason": None, "canceledCollectionId": None, "amountDue": 0}
+
+    collections = order.get("payment_collections") or []
+    has_capturable = any(pc.get("status") in CAPTURABLE_STATUSES for pc in collections)
+    canceled = next((pc for pc in collections if pc.get("status") == "canceled"), None)
+
+    summary = order.get("summary") or {}
+    amount_due = summary.get("raw_difference_due")
+    if amount_due is None:
+        amount_due = sum(
+            pc.get("amount", 0) for pc in collections if pc.get("status") != "captured"
+        )
+
+    if not has_capturable and canceled is not None and amount_due > 0:
+        return {
+            "blocked": True,
+            "reason": "canceled_collection_blocks_capture",
+            "canceledCollectionId": canceled.get("id"),
+            "amountDue": amount_due,
+        }
+
+    return {"blocked": False, "reason": None, "canceledCollectionId": None, "amountDue": 0}
+
+
+def create_payment_collection(token, order_id, amount):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/orders/{order_id}/payment-collections",
+        json={"amount": amount},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["payment_collection"]
+
+
+def create_payment_session(token, collection_id, provider_id):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.post(
+        f"{BASE_URL}/admin/payment-collections/{collection_id}/payment-sessions",
+        json={"provider_id": provider_id},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def run():
+    token = get_token()
+    orders = list_edited_orders(token)
+
+    flagged = []
+    for order in orders:
+        result = classify_order_payment_edit_state(order)
+        if result["blocked"]:
+            flagged.append((order, result))
+
+    if not flagged:
+        log.info("No blocked orders found across %d edited order(s).", len(orders))
+        return
+
+    for order, result in flagged:
+        log.warning(
+            "Order %s (display #%s): canceled_collection=%s amount_due=%s. %s",
+            order["id"], order.get("display_id"), result["canceledCollectionId"],
+            result["amountDue"],
+            "Would report only" if DRY_RUN else "Reported, awaiting operator action",
+        )
+        if not DRY_RUN:
+            log.warning(
+                "Order %s: DRY_RUN is off, but this script never auto-creates a "
+                "payment collection. Confirm amount_due=%s against "
+                "order.summary.raw_difference_due, then call "
+                "create_payment_collection() and create_payment_session() by hand.",
+                order["id"], result["amountDue"],
+            )
+
+    log.info("Done. %d order(s) blocked by a canceled payment collection.", len(flagged))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-edit-cancels-payment.js</div>
+      <pre><code class="language-javascript">/**
+ * Find Medusa v2 orders where a confirmed order edit canceled the payment
+ * collection and left no capturable collection behind, while the order
+ * still owes money. This is not auto-fixable: there is no supported route
+ * to un-cancel a payment_collection. DRY_RUN=true (default) only reports
+ * the affected orders. Only when DRY_RUN=false and a human has reviewed
+ * the amount should a new payment collection be created and captured
+ * against.
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const PAYMENT_PROVIDER_ID = process.env.MEDUSA_PAYMENT_PROVIDER_ID || "pp_system_default";
+
+const ORDER_FIELDS =
+  "id,display_id,status,payment_status,*summary," +
+  "*payment_collections,*order_change";
+const EDIT_CHANGE_STATUSES = new Set(["requested", "confirmed"]);
+const CAPTURABLE_STATUSES = new Set(["not_paid", "awaiting", "authorized", "partially_authorized"]);
+
+export function hasConfirmedEdit(order) {
+  const change = order.order_change || {};
+  return change.change_type === "edit" && EDIT_CHANGE_STATUSES.has(change.status);
+}
+
+export function classifyOrderPaymentEditState(order) {
+  // Pure: no I/O. order has payment_status, payment_collections, summary.
+  if (order.payment_status !== "not_paid") {
+    return { blocked: false, reason: null, canceledCollectionId: null, amountDue: 0 };
+  }
+
+  const collections = order.payment_collections || [];
+  const hasCapturable = collections.some((pc) => CAPTURABLE_STATUSES.has(pc.status));
+  const canceled = collections.find((pc) => pc.status === "canceled") || null;
+
+  let amountDue = order.summary?.raw_difference_due;
+  if (amountDue == null) {
+    amountDue = collections
+      .filter((pc) => pc.status !== "captured")
+      .reduce((sum, pc) => sum + (pc.amount || 0), 0);
+  }
+
+  if (!hasCapturable && canceled && amountDue > 0) {
+    return {
+      blocked: true,
+      reason: "canceled_collection_blocks_capture",
+      canceledCollectionId: canceled.id,
+      amountDue,
+    };
+  }
+
+  return { blocked: false, reason: null, canceledCollectionId: null, amountDue: 0 };
+}
+
+async function login() {
+  const { default: Medusa } = await import("@medusajs/js-sdk");
+  const sdk = new Medusa({ baseUrl: BASE_URL, auth: { type: "jwt" } });
+  await sdk.auth.login("user", "emailpass", { email: EMAIL, password: PASSWORD });
+  return sdk;
+}
+
+async function listEditedOrders(sdk) {
+  const out = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const body = await sdk.admin.order.list({ fields: ORDER_FIELDS, limit, offset });
+    out.push(...body.orders.filter(hasConfirmedEdit));
+    offset += limit;
+    if (offset >= body.count) return out;
+  }
+}
+
+async function createPaymentCollection(sdk, orderId, amount) {
+  return sdk.client.fetch(`/admin/orders/${orderId}/payment-collections`, {
+    method: "POST",
+    body: { amount },
+  });
+}
+
+async function createPaymentSession(sdk, collectionId, providerId) {
+  return sdk.client.fetch(`/admin/payment-collections/${collectionId}/payment-sessions`, {
+    method: "POST",
+    body: { provider_id: providerId },
+  });
+}
+
+export async function run() {
+  const sdk = await login();
+  const orders = await listEditedOrders(sdk);
+
+  const flagged = [];
+  for (const order of orders) {
+    const result = classifyOrderPaymentEditState(order);
+    if (result.blocked) flagged.push([order, result]);
+  }
+
+  if (flagged.length === 0) {
+    console.log(`No blocked orders found across ${orders.length} edited order(s).`);
+    return;
+  }
+
+  for (const [order, result] of flagged) {
+    console.warn(
+      `Order ${order.id} (display #${order.display_id}): canceled_collection=${result.canceledCollectionId} amount_due=${result.amountDue}. ${DRY_RUN ? "Would report only" : "Reported, awaiting operator action"}`
+    );
+    if (!DRY_RUN) {
+      console.warn(
+        `Order ${order.id}: DRY_RUN is off, but this script never auto-creates a payment collection. Confirm amount_due=${result.amountDue} against order.summary.raw_difference_due, then call createPaymentCollection() and createPaymentSession() by hand.`
+      );
+    }
+  }
+
+  console.log(`Done. ${flagged.length} order(s) blocked by a canceled payment collection.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the one that decides the outcome, <code>classify_order_payment_edit_state</code>. It is pure, no network and no database, so the tests feed in plain order objects built from fixtures and check the answer against a healthy order, an order with an active collection, an order with only a canceled collection and an outstanding balance, and a fully refunded or canceled order that should never be flagged.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_order_edit_payment_state.py</div>
+      <pre><code class="language-python">from flag_edit_cancels_payment import classify_order_payment_edit_state
+
+
+def order(**over):
+    base = {
+        "id": "order_1",
+        "payment_status": "not_paid",
+        "summary": {"raw_difference_due": 5000},
+        "payment_collections": [
+            {"id": "paycol_1", "status": "canceled", "amount": 5000},
+        ],
+    }
+    base.update(over)
+    return base
+
+
+def test_blocked_when_only_canceled_collection_and_amount_due():
+    result = classify_order_payment_edit_state(order())
+    assert result["blocked"] is True
+    assert result["reason"] == "canceled_collection_blocks_capture"
+    assert result["canceledCollectionId"] == "paycol_1"
+    assert result["amountDue"] == 5000
+
+
+def test_not_blocked_when_healthy_paid_order():
+    o = order(payment_status="captured", summary={"raw_difference_due": 0})
+    result = classify_order_payment_edit_state(o)
+    assert result == {"blocked": False, "reason": None, "canceledCollectionId": None, "amountDue": 0}
+
+
+def test_not_blocked_when_an_active_collection_exists():
+    o = order(payment_collections=[
+        {"id": "paycol_1", "status": "canceled", "amount": 5000},
+        {"id": "paycol_2", "status": "not_paid", "amount": 5000},
+    ])
+    result = classify_order_payment_edit_state(o)
+    assert result["blocked"] is False
+
+
+def test_blocked_with_only_canceled_collection_and_outstanding_balance():
+    o = order(payment_collections=[{"id": "paycol_9", "status": "canceled", "amount": 12000}],
+              summary={"raw_difference_due": 12000})
+    result = classify_order_payment_edit_state(o)
+    assert result["blocked"] is True
+    assert result["canceledCollectionId"] == "paycol_9"
+    assert result["amountDue"] == 12000
+
+
+def test_not_blocked_when_fully_refunded_or_canceled_with_no_amount_due():
+    o = order(summary={"raw_difference_due": 0})
+    result = classify_order_payment_edit_state(o)
+    assert result["blocked"] is False
+
+
+def test_not_blocked_when_payment_status_is_not_not_paid():
+    o = order(payment_status="awaiting")
+    result = classify_order_payment_edit_state(o)
+    assert result["blocked"] is False
+
+
+def test_falls_back_to_summing_uncaptured_collections_when_summary_missing():
+    o = order(summary={}, payment_collections=[
+        {"id": "paycol_1", "status": "canceled", "amount": 3000},
+    ])
+    result = classify_order_payment_edit_state(o)
+    assert result["blocked"] is True
+    assert result["amountDue"] == 3000</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">order-edit-payment-state.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyOrderPaymentEditState } from "./flag-edit-cancels-payment.js";
+
+const order = (over = {}) => ({
+  id: "order_1",
+  payment_status: "not_paid",
+  summary: { raw_difference_due: 5000 },
+  payment_collections: [
+    { id: "paycol_1", status: "canceled", amount: 5000 },
+  ],
+  ...over,
+});
+
+test("blocked when only canceled collection and amount due", () => {
+  const result = classifyOrderPaymentEditState(order());
+  assert.equal(result.blocked, true);
+  assert.equal(result.reason, "canceled_collection_blocks_capture");
+  assert.equal(result.canceledCollectionId, "paycol_1");
+  assert.equal(result.amountDue, 5000);
+});
+
+test("not blocked when healthy paid order", () => {
+  const o = order({ payment_status: "captured", summary: { raw_difference_due: 0 } });
+  const result = classifyOrderPaymentEditState(o);
+  assert.deepEqual(result, { blocked: false, reason: null, canceledCollectionId: null, amountDue: 0 });
+});
+
+test("not blocked when an active collection exists", () => {
+  const o = order({
+    payment_collections: [
+      { id: "paycol_1", status: "canceled", amount: 5000 },
+      { id: "paycol_2", status: "not_paid", amount: 5000 },
+    ],
+  });
+  const result = classifyOrderPaymentEditState(o);
+  assert.equal(result.blocked, false);
+});
+
+test("blocked with only canceled collection and outstanding balance", () => {
+  const o = order({
+    payment_collections: [{ id: "paycol_9", status: "canceled", amount: 12000 }],
+    summary: { raw_difference_due: 12000 },
+  });
+  const result = classifyOrderPaymentEditState(o);
+  assert.equal(result.blocked, true);
+  assert.equal(result.canceledCollectionId, "paycol_9");
+  assert.equal(result.amountDue, 12000);
+});
+
+test("not blocked when fully refunded or canceled with no amount due", () => {
+  const o = order({ summary: { raw_difference_due: 0 } });
+  const result = classifyOrderPaymentEditState(o);
+  assert.equal(result.blocked, false);
+});
+
+test("not blocked when payment_status is not not_paid", () => {
+  const o = order({ payment_status: "awaiting" });
+  const result = classifyOrderPaymentEditState(o);
+  assert.equal(result.blocked, false);
+});
+
+test("falls back to summing uncaptured collections when summary missing", () => {
+  const o = order({
+    summary: {},
+    payment_collections: [{ id: "paycol_1", status: "canceled", amount: 3000 }],
+  });
+  const result = classifyOrderPaymentEditState(o);
+  assert.equal(result.blocked, true);
+  assert.equal(result.amountDue, 3000);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Force-confirmed admin edit</span>
+      <h4>The manual payment order that lost its collection</h4>
+      <p>A support team used the Admin dashboard to bump a quantity on a wholesale order paid through the manual payment provider, force-confirming the edit so it would not wait on customer approval. The edit applied and the new total looked right. Days later, finance tried to capture the outstanding balance and got a flat "The payment: pay_... has been canceled." error with no obvious next step in the dashboard.</p>
+      <p>Running the flag script in dry run surfaced the order immediately: <code>payment_status</code> was <code>not_paid</code>, the only payment collection on the order was <code>canceled</code>, and <code>summary.raw_difference_due</code> still showed the full new total owed. Finance confirmed the amount, then created a fresh payment collection and captured against that, leaving the canceled one untouched.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Batch of repriced orders</span>
+      <h4>A pricing correction across dozens of orders</h4>
+      <p>A store corrected a unit price mistake across several dozen open orders using a script that called the order edit workflow directly. Every edit succeeded, but a meaningful chunk of those orders quietly lost their payment collection to cancellation in the process, and nobody noticed until the next capture pass failed on a subset of them.</p>
+      <p>Rather than trying to guess which orders were affected, the team ran the classification function across every order touched by the batch job. It cleanly separated the ones with a live collection left to capture from the ones truly stuck on a canceled collection with money still due, so the follow-up work only touched the orders that actually needed a new payment collection.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this after any batch of order edits, or on a schedule while <code>#12200</code> remains open upstream. It never touches the canceled payment collection and never guesses at an amount to capture. It reports exactly which orders are stuck, with the amount a human needs to confirm before creating a new payment collection and capturing against it. That keeps a workflow bug from turning into an accidental over-charge or a mismatched <code>summary</code>.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did editing my Medusa order cancel its payment collection?</summary>
+      <p>In Medusa v2 the order edit workflow treats any quantity or unit price change as invalidating the order's existing totals, so as part of recalculating it cancels the current payment collection and resets payment_status to not_paid. It expects a fresh payment collection to be created for the new amount owed, but that step does not always happen, which is a known regression tracked as GitHub issue 12200.</p>
+    </details>
+    <details>
+      <summary>Can I capture a payment on a canceled payment collection?</summary>
+      <p>No. Medusa's capturePaymentWorkflow refuses to act on a payment whose parent payment collection has a status of canceled, and returns an error like The payment: pay_... has been canceled. There is no supported route to un-cancel a payment_collection, so trying to capture against it will always fail.</p>
+    </details>
+    <details>
+      <summary>What is the safe fix when an order edit leaves only a canceled payment collection?</summary>
+      <p>Do not try to mutate the canceled payment_collection's status. Once a human has confirmed the outstanding amount against order.summary.raw_difference_due, create a brand new payment collection for that order with POST /admin/orders/:id/payment-collections, attach a payment session, and capture against that new collection instead.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/medusa/">Browse all Medusa field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #12200: [Question]: Editing an order (changing quantity or item prices). <a href="https://github.com/medusajs/medusa/issues/12200" rel="noopener">github.com/medusajs/medusa/issues/12200</a></li>
+      <li>medusajs/medusa GitHub issue #5612: 'Order Edit' workflow incorrect when using manual payments. <a href="https://github.com/medusajs/medusa/issues/5612" rel="noopener">github.com/medusajs/medusa/issues/5612</a></li>
+      <li>medusajs/medusa GitHub issue #11591: Payment Collections Don't Account for Previously Paid Amounts When Creating New Collections. <a href="https://github.com/medusajs/medusa/issues/11591" rel="noopener">github.com/medusajs/medusa/issues/11591</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Payment Module (Payment Module). <a href="https://docs.medusajs.com/resources/commerce-modules/payment" rel="noopener">docs.medusajs.com/resources/commerce-modules/payment</a></li>
+      <li>Medusa Admin User Guide: Manage Order Payments in Medusa Admin. <a href="https://docs.medusajs.com/user-guide/orders/payments" rel="noopener">docs.medusajs.com/user-guide/orders/payments</a></li>
+      <li>Medusa V2 Admin API Reference. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a stuck payment collection?</h3>
+    <p>If this saved you from guessing at a fix or over-capturing on a repriced order, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Summary Drops Tax From Totals, Triggering Bogus Refunds in Medusa</title>
+<meta name="description" content="A Medusa v2 order's summary.pending_difference is computed without tax_total, so a fully paid, tax-inclusive order looks overpaid by exactly the tax amount. Learn why the summary math drops tax and build a Python or Node.js script that flags the affected orders instead of letting automation issue a bogus refund.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Order Summary Drops Tax From Totals, Triggering Bogus Refunds in Medusa">
+<meta property="og:description" content="Why a Medusa v2 order's summary.pending_difference is computed without tax_total, making a paid, tax-inclusive order look overpaid, and a Python or Node.js script that flags it instead of letting automation refund the tax amount.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/#article","headline":"Order Summary Drops Tax From Totals, Triggering Bogus Refunds in Medusa","description":"In Medusa v2, confirmed on v2.10.1, the order summary's derived totals such as accounting_total, current_order_total, and pending_difference are computed from subtotal plus shipping_total while tax_total is left out, even though order.total is computed correctly. Because pending_difference is what refund and capture workflows use to decide how much is owed, a fully paid, tax-inclusive order looks overpaid by exactly the tax amount, and any automation wired to that field can issue a refund for money that was never actually owed. A Python or Node.js script detects the exact tax-shaped drift and flags it instead of acting on it.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Order Edits & Totals","keywords":"Medusa order summary tax dropped, pending_difference, accounting_total, current_order_total, bogus refund, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Order summary drops tax from totals, triggering bogus refunds","item":"https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a fully paid Medusa order look overpaid by the tax amount?","acceptedAnswer":{"@type":"Answer","text":"In Medusa v2, confirmed on v2.10.1, the order summary's derived totals, accounting_total, current_order_total, and pending_difference, are computed from subtotal plus shipping_total, and tax_total is left out of that math, even though the authoritative order.total field is computed correctly as subtotal plus shipping plus tax minus discounts. A customer who paid the correct order.total, tax included, looks to the summary like they overpaid by exactly the tax amount, because the summary's own reference point is short by that much."}},{"@type":"Question","name":"How do I detect an order affected by this summary tax bug?","acceptedAnswer":{"@type":"Answer","text":"Pull orders with GET /admin/orders?fields=id,display_id,total,tax_total,subtotal,shipping_total,summary.accounting_total,summary.current_order_total,summary.pending_difference,summary.paid_total,summary.transaction_total,summary.refunded_total using the admin JWT, requesting the summary fields explicitly since fields=* alone will not return them. An order is affected when tax_total is greater than zero and the gap between order.total and summary.accounting_total is within a cent of tax_total itself. That signature, a drift equal to the tax and nothing else, rules out a rounding artifact or a real partial refund."}},{"@type":"Question","name":"Is it safe to auto-fix the buggy pending_difference or reverse a bogus refund?","acceptedAnswer":{"@type":"Answer","text":"No. Treat this as unsafe to auto-repair at the workflow level. Re-running Medusa's own refund or capture workflow against corrupted totals can compound the error, and Medusa has no un-refund primitive, so if a bogus refund already fired you cannot safely auto-reverse it without the customer's consent. The safe pattern is to record a corrected snapshot in your own audit store, flag any order where a refund already matched the missing tax amount, and let a human decide whether to manually re-invoice the shortfall. Until Medusa ships a fix for issue #13405, treat order.total minus summary.paid_total as the trustworthy replacement for summary.pending_difference."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Order Edits &amp; Totals</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Order Edits &amp; Totals</p>
+    <h1>Order summary drops tax from totals, triggering bogus refunds</h1>
+    <p class="lead">A customer pays the full, correct total on a tax-inclusive order. Nothing is owed, nothing is overpaid. But the order's summary in Medusa reports the exact opposite: it thinks the customer overpaid by the tax amount, because the summary's own math never added the tax in. If anything in your stack, an automation, a reconciliation job, an order-edit workflow that "refunds the difference", is wired to that summary number, it will issue a refund for money the customer never actually overpaid. Here is why the summary drops tax and a script that catches it before it costs you real money.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Flag only, never auto-refund</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, confirmed on v2.10.1, the order summary's derived totals, <code>summary.accounting_total</code>, <code>summary.current_order_total</code>, and <code>summary.pending_difference</code>, are computed from <code>subtotal + shipping_total</code>, and <code>tax_total</code> is left out of that math entirely, even though the authoritative <code>order.total</code> field is computed correctly as subtotal plus shipping plus tax minus discounts. Because <code>pending_difference</code> is the field workflows use to decide how much is still owed versus overpaid, a tax-inclusive order whose customer paid the correct <code>order.total</code> looks, to the summary, like it was overpaid by exactly the tax amount. Any automation wired to <code>pending_difference</code> can issue a refund for that phantom overpayment. Pull orders with <code>fields=id,display_id,total,tax_total,subtotal,shipping_total,summary.accounting_total,summary.pending_difference,summary.paid_total</code>, flag any order where <code>tax_total &gt; 0</code> and the gap between <code>order.total</code> and <code>summary.accounting_total</code> is within a cent of <code>tax_total</code>, and never let the buggy field drive another automated refund. Full code, tests, and citations below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every Medusa v2 order carries two different views of what it is worth. <code>order.total</code> is the authoritative number, and Medusa computes it the way you would expect: subtotal, plus shipping, plus tax, minus any discounts. That field is correct. It is not the one causing trouble.</p>
+  <p>The order's <code>summary</code> is a second, derived view meant to answer a narrower question: given what has actually been paid, captured, and refunded, how much is still pending? To answer that it needs its own reference total, and that is where the bug lives. <code>accounting_total</code>, <code>current_order_total</code>, and the <code>pending_difference</code> built from them are computed as <code>subtotal + shipping_total</code>, with <code>tax_total</code> never added in. On an order with real tax, that reference total is short by exactly the tax amount, even though the customer paid the full, correct <code>order.total</code>, tax included.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. order.total is computed correctly as subtotal plus shipping plus tax. The summary's accounting_total is computed only from subtotal plus shipping, omitting tax_total. The customer paid order.total in full, but pending_difference compares the payment against the tax-short accounting_total, so the summary reports the order as overpaid by the tax amount.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="14" width="220" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="120" y="38" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">order.total</text>
+      <text x="120" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">subtotal + shipping + tax</text>
+      <line x1="120" y1="74" x2="120" y2="100" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="102" width="220" height="52" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="120" y="123" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">customer pays in full</text>
+      <text x="120" y="140" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#4c9a2a">correct amount, tax included</text>
+      <rect x="270" y="14" width="240" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="390" y="38" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">summary.accounting_total</text>
+      <text x="390" y="55" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">subtotal + shipping, tax dropped</text>
+      <line x1="390" y1="74" x2="390" y2="100" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="270" y="102" width="240" height="52" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="390" y="123" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">reference is short</text>
+      <text x="390" y="140" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">by exactly tax_total</text>
+      <line x1="230" y1="128" x2="262" y2="128" stroke="#6b5a70" stroke-width="2"></line>
+      <text x="245" y="118" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#8800;</text>
+      <line x1="120" y1="154" x2="120" y2="180" stroke="#6b5a70" stroke-width="2" stroke-dasharray="0"></line>
+      <line x1="390" y1="154" x2="390" y2="180" stroke="#cf4b3f" stroke-width="2"></line>
+      <path d="M120,180 L390,180" stroke="#8a9a92" stroke-width="1.6" stroke-dasharray="5 4"></path>
+      <line x1="255" y1="180" x2="255" y2="203" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="130" y="205" width="250" height="30" rx="8" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="255" y="225" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">pending_difference compares paid vs. accounting_total</text>
+      <rect x="565" y="102" width="185" height="52" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="657" y="123" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">looks overpaid</text>
+      <text x="657" y="140" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">by exactly tax_total</text>
+      <line x1="512" y1="128" x2="562" y2="128" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>order.total adds tax correctly. The summary's accounting_total does not. pending_difference is built from the tax-short number, so a fully paid order reports a phantom overpayment equal to the tax.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This comes down to two totals living side by side on the same order, only one of which was built with tax in mind:</p>
+  <ul>
+    <li><code>order.total</code> is computed the standard way, subtotal plus shipping plus tax minus discounts, and it is correct on every order that has tax.</li>
+    <li>The order's <code>summary</code>, tracked as <a href="https://github.com/medusajs/medusa/issues/13405" rel="noopener">medusajs/medusa issue #13405</a>, derives <code>accounting_total</code> and <code>current_order_total</code> from <code>subtotal + shipping_total</code> alone, with no term for <code>tax_total</code> anywhere in that calculation.</li>
+    <li><code>pending_difference</code>, the field workflows use to decide whether an order still owes money or was overpaid, is built on top of that tax-short <code>accounting_total</code>, not on <code>order.total</code>.</li>
+    <li>A customer who pays the full, correct <code>order.total</code>, tax included, has genuinely paid everything owed. But compared against the summary's own reference point, that payment looks like it exceeds what was "owed" by precisely the tax amount.</li>
+    <li>Related reports, <a href="https://github.com/medusajs/medusa/issues/10686" rel="noopener">issue #10686</a> on incorrect outstanding and pending amounts, and <a href="https://github.com/medusajs/medusa/issues/13972" rel="noopener">issue #13972</a> on a rounding issue causing a one cent outstanding balance, point at the same family of problem: the summary's totals and the order's true total can silently disagree.</li>
+  </ul>
+  <p>This is a common source of confusion because nothing errors and no exception is thrown. The order looks paid, the storefront shows a normal confirmation, and the only place the mismatch shows up is in a number most people never read directly, <code>summary.pending_difference</code>. The trouble starts the moment something does read it, an admin action that "refunds the difference," a reconciliation job that trusts the summary over the order, or any automation built on the assumption that <code>pending_difference</code> means what its name says. See the citations at the end for the exact issues and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>order.total</code> is the ground truth on a Medusa order, tax included, and it is correct. <code>summary.pending_difference</code> is not a second source of truth, it is a derived number built from a total that forgot to add tax, and on any tax-inclusive order it will read wrong by exactly <code>tax_total</code>. Never let that field drive a refund or a capture decision on its own. Compute <code>order.total - summary.paid_total</code> yourself and trust that instead.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never let the buggy <code>pending_difference</code> trigger anything. We pull each order with its raw totals and its summary breakdown side by side, compute the exact drift between <code>order.total</code> and <code>summary.accounting_total</code>, and check whether that drift matches <code>tax_total</code> almost exactly. If it does, and a refund already fired for that same amount, we flag the order for manual review instead of trying to auto-correct it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the solution. The script lists orders with total, tax_total, and summary fields expanded, computes the drift between order.total and summary.accounting_total, checks whether that drift matches tax_total, and if it does it checks payment history for a bogus refund and flags the order for manual review, otherwise it moves on and trusts the summary.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List orders</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">total, tax_total, summary.*</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="102" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Compute drift</text>
+      <text x="102" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">total - accounting_total</text>
+      <line x1="198" y1="138" x2="240" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="333,106 420,138 333,170 246,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="333" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Drift equals</text>
+      <text x="333" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">tax_total?</text>
+      <text x="345" y="196" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes, flag</text>
+      <line x1="333" y1="170" x2="333" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="245" y="185" width="180" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="335" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Report for review</text>
+      <text x="335" y="224" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">no auto refund or re-charge</text>
+      <text x="450" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, matches</text>
+      <line x1="420" y1="138" x2="462" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="465" y="108" width="270" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="600" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Trust the summary</text>
+      <text x="600" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">no tax-shaped drift here</text>
+    </svg>
+    <figcaption>The script only ever reads and compares. A flagged order gets a corrected reference total and, if a refund already matched the missing tax, a tag pointing a human at it. Nothing is auto-refunded or auto-recharged.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend with an admin account that can read orders and payment collections. Exchange the email and password for a JWT once and reuse it. <code>DRY_RUN</code> defaults to true, and even when it is false, this script only writes a note or metadata flag, never a refund or a recharge.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, change to false to write a flag/note only</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, change to false to write a flag/note only</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>POST /auth/user/emailpass</code>, then send it as <code>Authorization: Bearer &lt;token&gt;</code> on every following call.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List orders with the raw totals and the summary breakdown together</h3>
+      <p>Ask for <code>total</code>, <code>tax_total</code>, <code>subtotal</code>, <code>shipping_total</code>, and the individual dotted <code>summary.*</code> fields in one call. Summary totals must be requested explicitly this way, <code>fields=*</code> alone will not return them. Page through with <code>offset</code> and <code>limit</code> using the response's <code>count</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ORDER_FIELDS = (
+    "id,display_id,total,tax_total,subtotal,shipping_total,"
+    "summary.accounting_total,summary.current_order_total,summary.pending_difference,"
+    "summary.paid_total,summary.transaction_total,summary.refunded_total"
+)
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_orders_with_summary(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ORDER_FIELDS =
+  "id,display_id,total,tax_total,subtotal,shipping_total," +
+  "summary.accounting_total,summary.current_order_total,summary.pending_difference," +
+  "summary.paid_total,summary.transaction_total,summary.refunded_total";
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function listOrdersWithSummary(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the whole decision in a function with no network calls. It takes the order's total, tax_total, and summary, and checks two things: is there tax on this order at all, and does the drift between <code>order.total</code> and <code>summary.accounting_total</code> land within a cent of <code>tax_total</code>. That signature, a gap that matches the tax and nothing else, is what separates this bug from a rounding artifact or a real partial refund. It always returns a corrected <code>pending_difference</code> too, computed directly from <code>order.total</code> and <code>summary.paid_total</code>, so callers have a trustworthy number to use in place of the buggy one.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">EPSILON = 0.01
+
+def detect_tax_dropped_from_summary(order, epsilon=EPSILON):
+    summary = order["summary"]
+    drift = order["total"] - summary["accounting_total"]
+    tax_total = order["tax_total"]
+
+    affected = tax_total > 0 and abs(drift - tax_total) <= epsilon
+    corrected_pending_difference = order["total"] - summary["paid_total"]
+
+    return {
+        "affected": affected,
+        "drift": drift,
+        "correctedPendingDifference": corrected_pending_difference,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const EPSILON = 0.01;
+
+export function detectTaxDroppedFromSummary(order, epsilon = EPSILON) {
+  const { summary } = order;
+  const drift = order.total - summary.accounting_total;
+  const taxTotal = order.tax_total;
+
+  const affected = taxTotal > 0 && Math.abs(drift - taxTotal) <= epsilon;
+  const correctedPendingDifference = order.total - summary.paid_total;
+
+  return { affected, drift, correctedPendingDifference };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Cross-check whether a bogus refund already fired</h3>
+      <p>Detecting the bug and detecting whether it already cost you money are two different questions. Pull each affected order's payment collections and their refunds, and check whether any refund amount lines up with the missing <code>tax_total</code>. That distinguishes "the bug is present but nothing acted on it yet" from "a refund already went out for money nobody actually overpaid."</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">crosscheck.py</div>
+      <pre><code class="language-python">def already_refunded_tax(order_id, tax_total, token, epsilon=EPSILON):
+    data = admin_get(
+        token,
+        f"/admin/orders/{order_id}/payment-collections",
+        {"fields": "id,status,*payments,*payments.refunds"},
+    )
+    for collection in data.get("payment_collections", []):
+        for payment in collection.get("payments") or []:
+            for refund in payment.get("refunds") or []:
+                if abs(refund.get("amount", 0) - tax_total) <= epsilon:
+                    return True
+    return False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">crosscheck.js</div>
+      <pre><code class="language-javascript">async function alreadyRefundedTax(orderId, taxTotal, token, epsilon = EPSILON) {
+  const data = await adminGet(token, `/admin/orders/${orderId}/payment-collections`, {
+    fields: "id,status,*payments,*payments.refunds",
+  });
+  for (const collection of data.payment_collections || []) {
+    for (const payment of collection.payments || []) {
+      for (const refund of payment.refunds || []) {
+        if (Math.abs((refund.amount || 0) - taxTotal) <= epsilon) return true;
+      }
+    }
+  }
+  return false;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together and flag, never auto-refund or auto-recharge</h3>
+      <p>The loop lists orders, runs the pure decision on each, and for every affected order records a reporting-only snapshot with the correct total, the buggy accounting total, and the drift. When <code>DRY_RUN=false</code> and a bogus refund already fired, the only write is a note or metadata flag on the order, never a reversing charge, since Medusa has no un-refund primitive and re-charging a customer without consent is worse than a wrong dashboard number. A human decides whether to manually re-invoice the shortfall.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never let <code>summary.pending_difference</code> drive another automated refund or capture while this bug is present. If a bogus refund already fired, do not auto-issue a reversing charge. Flag the order with <code>POST /admin/orders/:id</code> and metadata like <code>{flagged_tax_refund_drift: true, expected_manual_recharge: tax_total}</code>, gated by <code>DRY_RUN</code>, and let a human decide whether to manually re-invoice the customer through a new payment collection.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, lists every order with its raw totals and summary breakdown, runs the pure detection function, cross-checks payment history for a bogus refund, and logs one finding per affected order. It never issues a refund or a recharge.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/order-summary-tax-excluded-bogus-refund" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_tax_dropped_from_summary.py</div>
+      <pre><code class="language-python">"""Flag Medusa v2 orders whose summary reports a phantom overpayment because
+tax_total was left out of the summary's own totals math. order.total is
+computed correctly as subtotal + shipping_total + tax_total minus discounts,
+but summary.accounting_total and the pending_difference built on top of it
+are computed from subtotal + shipping_total alone (see medusajs/medusa#13405).
+A fully paid, tax-inclusive order therefore looks overpaid by exactly the
+tax amount, and anything wired to pending_difference can issue a bogus
+refund for money nobody actually overpaid. This script only flags the
+divergence, and if a refund already matched the missing tax it flags that
+too, gated behind DRY_RUN. It never issues a refund or a recharge. Safe to
+run again and again.
+
+Guide: https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_tax_dropped_from_summary")
+
+BACKEND_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+ADMIN_EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+ADMIN_PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+EPSILON = 0.01
+
+ORDER_FIELDS = (
+    "id,display_id,total,tax_total,subtotal,shipping_total,"
+    "summary.accounting_total,summary.current_order_total,summary.pending_difference,"
+    "summary.paid_total,summary.transaction_total,summary.refunded_total"
+)
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_post(token, path, json_body):
+    r = requests.post(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        json=json_body,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def detect_tax_dropped_from_summary(order, epsilon=EPSILON):
+    """Pure decision function. No I/O.
+
+    order: {
+      "total": float, "tax_total": float,
+      "summary": {"accounting_total": float, "current_order_total": float,
+                  "pending_difference": float, "paid_total": float},
+    }
+
+    Returns {"affected", "drift", "correctedPendingDifference"}.
+    """
+    summary = order["summary"]
+    drift = order["total"] - summary["accounting_total"]
+    tax_total = order["tax_total"]
+
+    affected = tax_total > 0 and abs(drift - tax_total) <= epsilon
+    corrected_pending_difference = order["total"] - summary["paid_total"]
+
+    return {
+        "affected": affected,
+        "drift": drift,
+        "correctedPendingDifference": corrected_pending_difference,
+    }
+
+
+def already_refunded_tax(order_id, tax_total, token, epsilon=EPSILON):
+    data = admin_get(
+        token,
+        f"/admin/orders/{order_id}/payment-collections",
+        {"fields": "id,status,*payments,*payments.refunds"},
+    )
+    for collection in data.get("payment_collections", []):
+        for payment in collection.get("payments") or []:
+            for refund in payment.get("refunds") or []:
+                if abs(refund.get("amount", 0) - tax_total) <= epsilon:
+                    return True
+    return False
+
+
+def flag_order(order_id, tax_total, token):
+    admin_post(token, f"/admin/orders/{order_id}", {
+        "metadata": {"flagged_tax_refund_drift": True, "expected_manual_recharge": tax_total},
+    })
+
+
+def list_orders_with_summary(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "fields": ORDER_FIELDS,
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders
+
+
+def run():
+    token = get_admin_token()
+    raw_orders = list_orders_with_summary(token)
+
+    report = {}
+    flagged = 0
+    for raw_order in raw_orders:
+        outcome = detect_tax_dropped_from_summary(raw_order)
+        if not outcome["affected"]:
+            continue
+
+        order_id = raw_order["id"]
+        report[order_id] = {
+            "correct_total": raw_order["total"],
+            "buggy_accounting_total": raw_order["summary"]["accounting_total"],
+            "drift": raw_order["tax_total"],
+        }
+
+        already_refunded = already_refunded_tax(order_id, raw_order["tax_total"], token)
+        flagged += 1
+        log.warning(
+            "Order %s tax dropped from summary: correct_total=%s buggy_accounting_total=%s "
+            "drift=%s corrected_pending_difference=%s already_refunded=%s. %s",
+            raw_order.get("display_id") or order_id,
+            raw_order["total"], raw_order["summary"]["accounting_total"],
+            outcome["drift"], outcome["correctedPendingDifference"], already_refunded,
+            "would flag for review" if DRY_RUN else "flagging for review",
+        )
+        if already_refunded and not DRY_RUN:
+            flag_order(order_id, raw_order["tax_total"], token)
+
+    log.info(
+        "Done. %d order(s) with tax dropped from the summary flagged for manual review. "
+        "No refund or recharge was issued by this script.",
+        flagged,
+    )
+    return report
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-tax-dropped-from-summary.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Medusa v2 orders whose summary reports a phantom overpayment because
+ * tax_total was left out of the summary's own totals math. order.total is
+ * computed correctly as subtotal + shipping_total + tax_total minus discounts,
+ * but summary.accounting_total and the pending_difference built on top of it
+ * are computed from subtotal + shipping_total alone (see medusajs/medusa#13405).
+ * A fully paid, tax-inclusive order therefore looks overpaid by exactly the
+ * tax amount, and anything wired to pending_difference can issue a bogus
+ * refund for money nobody actually overpaid. This script only flags the
+ * divergence, and if a refund already matched the missing tax it flags that
+ * too, gated behind DRY_RUN. It never issues a refund or a recharge. Safe to
+ * run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/order-summary-tax-excluded-bogus-refund/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const EPSILON = 0.01;
+
+const ORDER_FIELDS =
+  "id,display_id,total,tax_total,subtotal,shipping_total," +
+  "summary.accounting_total,summary.current_order_total,summary.pending_difference," +
+  "summary.paid_total,summary.transaction_total,summary.refunded_total";
+
+export function detectTaxDroppedFromSummary(order, epsilon = EPSILON) {
+  // Pure: no I/O. order = { total, tax_total,
+  // summary: { accounting_total, current_order_total, pending_difference, paid_total } }
+  const { summary } = order;
+  const drift = order.total - summary.accounting_total;
+  const taxTotal = order.tax_total;
+
+  const affected = taxTotal > 0 && Math.abs(drift - taxTotal) <= epsilon;
+  const correctedPendingDifference = order.total - summary.paid_total;
+
+  return { affected, drift, correctedPendingDifference };
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function adminPost(token, path, jsonBody) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(jsonBody),
+  });
+  if (!res.ok) throw new Error(`Medusa ${path} ${res.status}`);
+  return res.json();
+}
+
+async function alreadyRefundedTax(orderId, taxTotal, token, epsilon = EPSILON) {
+  const data = await adminGet(token, `/admin/orders/${orderId}/payment-collections`, {
+    fields: "id,status,*payments,*payments.refunds",
+  });
+  for (const collection of data.payment_collections || []) {
+    for (const payment of collection.payments || []) {
+      for (const refund of payment.refunds || []) {
+        if (Math.abs((refund.amount || 0) - taxTotal) <= epsilon) return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function flagOrder(orderId, taxTotal, token) {
+  await adminPost(token, `/admin/orders/${orderId}`, {
+    metadata: { flagged_tax_refund_drift: true, expected_manual_recharge: taxTotal },
+  });
+}
+
+async function listOrdersWithSummary(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      fields: ORDER_FIELDS,
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const rawOrders = await listOrdersWithSummary(token);
+
+  const report = {};
+  let flagged = 0;
+  for (const rawOrder of rawOrders) {
+    const outcome = detectTaxDroppedFromSummary(rawOrder);
+    if (!outcome.affected) continue;
+
+    const orderId = rawOrder.id;
+    report[orderId] = {
+      correct_total: rawOrder.total,
+      buggy_accounting_total: rawOrder.summary.accounting_total,
+      drift: rawOrder.tax_total,
+    };
+
+    const alreadyRefunded = await alreadyRefundedTax(orderId, rawOrder.tax_total, token);
+    flagged++;
+    console.warn(
+      `Order ${rawOrder.display_id || orderId} tax dropped from summary: ` +
+        `correct_total=${rawOrder.total} buggy_accounting_total=${rawOrder.summary.accounting_total} ` +
+        `drift=${outcome.drift} corrected_pending_difference=${outcome.correctedPendingDifference} ` +
+        `already_refunded=${alreadyRefunded}. ` +
+        `${DRY_RUN ? "would flag for review" : "flagging for review"}`
+    );
+    if (alreadyRefunded && !DRY_RUN) await flagOrder(orderId, rawOrder.tax_total, token);
+  }
+
+  console.log(
+    `Done. ${flagged} order(s) with tax dropped from the summary flagged for manual review. ` +
+      `No refund or recharge was issued by this script.`
+  );
+  return report;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The part worth testing is <code>detect_tax_dropped_from_summary</code>, since it decides which orders get flagged. It is pure, plain numbers in, a decision object out, so the tests need no network and no Medusa instance.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_tax_dropped_detection.py</div>
+      <pre><code class="language-python">from detect_tax_dropped_from_summary import detect_tax_dropped_from_summary
+
+
+def order(**over):
+    base = {
+        "total": 120.0,
+        "tax_total": 20.0,
+        "summary": {
+            "accounting_total": 100.0,
+            "current_order_total": 100.0,
+            "pending_difference": -20.0,
+            "paid_total": 120.0,
+        },
+    }
+    base.update(over)
+    return base
+
+
+def test_affected_when_drift_matches_tax_total():
+    result = detect_tax_dropped_from_summary(order())
+    assert result["affected"] is True
+    assert result["drift"] == 20.0
+    assert result["correctedPendingDifference"] == 0.0
+
+
+def test_not_affected_when_no_tax_on_order():
+    o = order(tax_total=0.0, total=100.0)
+    o["summary"]["accounting_total"] = 100.0
+    result = detect_tax_dropped_from_summary(o)
+    assert result["affected"] is False
+
+
+def test_not_affected_with_legitimate_partial_refund():
+    # summary correctly reflects a partial refund, drift does not match tax
+    o = order()
+    o["summary"]["accounting_total"] = 110.0  # only $10 off, not the $20 tax
+    result = detect_tax_dropped_from_summary(o)
+    assert result["affected"] is False
+
+
+def test_rounding_noise_within_epsilon_still_affected():
+    o = order()
+    o["summary"]["accounting_total"] = 100.004
+    result = detect_tax_dropped_from_summary(o)
+    assert result["affected"] is True
+
+
+def test_rounding_noise_outside_epsilon_not_affected():
+    o = order()
+    o["summary"]["accounting_total"] = 99.9  # off by 0.1 beyond the 20.0 tax match
+    result = detect_tax_dropped_from_summary(o)
+    assert result["affected"] is False
+
+
+def test_corrected_pending_difference_uses_total_minus_paid():
+    o = order(total=150.0)
+    o["summary"]["paid_total"] = 90.0
+    result = detect_tax_dropped_from_summary(o)
+    assert result["correctedPendingDifference"] == 60.0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">tax-dropped.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectTaxDroppedFromSummary } from "./detect-tax-dropped-from-summary.js";
+
+const order = (over = {}) => ({
+  total: 120.0,
+  tax_total: 20.0,
+  summary: {
+    accounting_total: 100.0,
+    current_order_total: 100.0,
+    pending_difference: -20.0,
+    paid_total: 120.0,
+  },
+  ...over,
+});
+
+test("affected when drift matches tax_total", () => {
+  const result = detectTaxDroppedFromSummary(order());
+  assert.equal(result.affected, true);
+  assert.equal(result.drift, 20.0);
+  assert.equal(result.correctedPendingDifference, 0.0);
+});
+
+test("not affected when no tax on order", () => {
+  const o = order({ tax_total: 0.0, total: 100.0 });
+  o.summary.accounting_total = 100.0;
+  const result = detectTaxDroppedFromSummary(o);
+  assert.equal(result.affected, false);
+});
+
+test("not affected with legitimate partial refund", () => {
+  const o = order();
+  o.summary.accounting_total = 110.0; // only $10 off, not the $20 tax
+  const result = detectTaxDroppedFromSummary(o);
+  assert.equal(result.affected, false);
+});
+
+test("rounding noise within epsilon still affected", () => {
+  const o = order();
+  o.summary.accounting_total = 100.004;
+  const result = detectTaxDroppedFromSummary(o);
+  assert.equal(result.affected, true);
+});
+
+test("rounding noise outside epsilon not affected", () => {
+  const o = order();
+  o.summary.accounting_total = 99.9; // off by 0.1 beyond the 20.0 tax match
+  const result = detectTaxDroppedFromSummary(o);
+  assert.equal(result.affected, false);
+});
+
+test("corrected pending difference uses total minus paid", () => {
+  const o = order({ total: 150.0 });
+  o.summary.paid_total = 90.0;
+  const result = detectTaxDroppedFromSummary(o);
+  assert.equal(result.correctedPendingDifference, 60.0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Auto-reconciliation</span>
+      <h4>The nightly job that refunded every tax-inclusive order</h4>
+      <p>A store running a nightly reconciliation job trusted <code>summary.pending_difference</code> as the source of truth for "money owed back to the customer." Every tax-inclusive order in the region came back negative by exactly its tax amount, and the job dutifully issued a small refund on each one, night after night, quietly bleeding out the tax portion of every sale.</p>
+      <p>Running the detection script against the order history flagged the exact pattern, drift equal to <code>tax_total</code> on every affected order, and the refunds already fired lined up perfectly with those amounts. The team turned off the auto-refund job, switched its "money owed" check to <code>order.total - summary.paid_total</code>, and used the flagged list to decide which customers needed a manual, deliberate re-invoice for the shortfall.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Order edit</span>
+      <h4>The support agent whose "refund the difference" button fired on a healthy order</h4>
+      <p>A support agent opened an order to adjust a line item, and the order-edit screen offered to "refund the difference" based on the summary. The order had not actually changed price, the tax was simply missing from the summary's own math, so the button was offering to refund a customer who owed nothing and had paid correctly.</p>
+      <p>Because the team had already wired detection into their admin tooling, the screen showed a warning instead: this order's pending_difference does not match its true balance, flagged for tax drift, do not refund. The agent moved on to the actual edit without triggering a refund that would have needed to be manually reversed with no way to actually undo it.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this on a schedule and every order where the summary dropped tax from its own totals gets caught before automation acts on it, with the correct total, the buggy number, and the exact drift laid out for review. Nothing gets auto-refunded and nothing gets auto-recharged. When a bogus refund already happened, the order is flagged with the amount a human should consider re-invoicing, never silently reversed. Until Medusa ships the fix tracked in issue #13405, treat <code>order.total - summary.paid_total</code> as the number you actually trust.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a fully paid Medusa order look overpaid by the tax amount?</summary>
+      <p>In Medusa v2, confirmed on v2.10.1, the order summary's derived totals, accounting_total, current_order_total, and pending_difference, are computed from subtotal plus shipping_total, and tax_total is left out of that math, even though the authoritative order.total field is computed correctly as subtotal plus shipping plus tax minus discounts. A customer who paid the correct order.total, tax included, looks to the summary like they overpaid by exactly the tax amount, because the summary's own reference point is short by that much.</p>
+    </details>
+    <details>
+      <summary>How do I detect an order affected by this summary tax bug?</summary>
+      <p>Pull orders with GET /admin/orders?fields=id,display_id,total,tax_total,subtotal,shipping_total,summary.accounting_total,summary.current_order_total,summary.pending_difference,summary.paid_total,summary.transaction_total,summary.refunded_total using the admin JWT, requesting the summary fields explicitly since fields=* alone will not return them. An order is affected when tax_total is greater than zero and the gap between order.total and summary.accounting_total is within a cent of tax_total itself. That signature, a drift equal to the tax and nothing else, rules out a rounding artifact or a real partial refund.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-fix the buggy pending_difference or reverse a bogus refund?</summary>
+      <p>No. Treat this as unsafe to auto-repair at the workflow level. Re-running Medusa's own refund or capture workflow against corrupted totals can compound the error, and Medusa has no un-refund primitive, so if a bogus refund already fired you cannot safely auto-reverse it without the customer's consent. The safe pattern is to record a corrected snapshot in your own audit store, flag any order where a refund already matched the missing tax amount, and let a human decide whether to manually re-invoice the shortfall. Until Medusa ships a fix for issue #13405, treat order.total minus summary.paid_total as the trustworthy replacement for summary.pending_difference.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #13405: Order Summary Tax Calculation Incorrect in v2.10.1, causes payment discrepancy and unintended refunds. <a href="https://github.com/medusajs/medusa/issues/13405" rel="noopener">github.com/medusajs/medusa/issues/13405</a></li>
+      <li>medusajs/medusa GitHub issue #10686: Incorrect outstanding amount and total pending amounts. <a href="https://github.com/medusajs/medusa/issues/10686" rel="noopener">github.com/medusajs/medusa/issues/10686</a></li>
+      <li>medusajs/medusa GitHub issue #13972: Rounding issue causes outstanding amount of 0.01 on order summary. <a href="https://github.com/medusajs/medusa/issues/13972" rel="noopener">github.com/medusajs/medusa/issues/13972</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Retrieve Order Totals Using Query. <a href="https://docs.medusajs.com/resources/commerce-modules/order/order-totals" rel="noopener">docs.medusajs.com/resources/commerce-modules/order/order-totals</a></li>
+      <li>Medusa Documentation: Order Transactions. <a href="https://docs.medusajs.com/resources/commerce-modules/order/transactions" rel="noopener">docs.medusajs.com/resources/commerce-modules/order/transactions</a></li>
+      <li>Medusa Core Workflows Reference: refundPaymentsWorkflow. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/refundPaymentsWorkflow" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/refundPaymentsWorkflow</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a bogus refund before it fired?</h3>
+    <p>If this saved you from refunding tax nobody overpaid, or from a confusing reconciliation, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

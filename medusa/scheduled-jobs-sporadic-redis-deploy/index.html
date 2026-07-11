@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scheduled Jobs Run Sporadically on Redis Backed Medusa Deploys</title>
+<meta name="description" content="A Medusa v2 scheduled job runs fine locally but fails sporadically on a Railway-style split server and worker deploy, with a failed BullMQ job and a Workflow with id not found stacktrace sitting in Redis. Learn why and build a Python or Node.js script that inspects the BullMQ queue and classifies each job safely.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/scheduled-jobs-sporadic-redis-deploy/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Scheduled Jobs Run Sporadically on Redis Backed Medusa Deploys">
+<meta property="og:description" content="Why a Medusa v2 scheduled job fails sporadically once workflow-engine-redis is in play on a split server and worker deploy, and a Python or Node.js script that inspects the BullMQ queue in Redis and classifies each job safely.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/scheduled-jobs-sporadic-redis-deploy/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/scheduled-jobs-sporadic-redis-deploy/#article","headline":"Scheduled Jobs Run Sporadically on Redis Backed Medusa Deploys","description":"Why a Medusa v2 scheduled job in src/jobs fails sporadically once @medusajs/workflow-engine-redis is in play on a split server and worker deploy such as Railway, with a Workflow with id not found stacktrace or a hung step stalling the single BullMQ worker, and a Python or Node.js script that inspects the BullMQ queue in Redis and classifies each job safely.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/scheduled-jobs-sporadic-redis-deploy/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Workflows & Background Jobs","keywords":"Medusa scheduled jobs sporadic, workflow-engine-redis, BullMQ queue, Workflow with id not found, Railway deploy, jobWorkerOptions concurrency, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Scheduled jobs run sporadically on Redis backed deploys","item":"https://www.allanninal.dev/medusa/scheduled-jobs-sporadic-redis-deploy/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do my Medusa scheduled jobs only fail sometimes after I moved to Redis?","acceptedAnswer":{"@type":"Answer","text":"Before a fix landed in PR #11740, workflow-engine-redis used one shared BullMQ queue for both workflow transactions and scheduled jobs. On a split deploy, a server-mode instance never loads job or workflow definitions, but it can still dequeue a scheduled-job entry from that shared queue, and then it throws Workflow with id not found because only worker-mode instances register those workflows. Which instance happens to grab the job each tick decides whether that run fails, which is exactly the sporadic pattern."}},{"@type":"Question","name":"How do I check whether a Medusa scheduled job actually failed in Redis?","acceptedAnswer":{"@type":"Answer","text":"Medusa exposes no Admin API route for the workflow or job queue, so you connect to the same Redis instance directly with ioredis and bullmq, open the Queue by name, and call getJobs with the failed, active, delayed, and waiting states. Each job carries an id that matches the job's registered name, timestamps to compute how stuck it is, attemptsMade against opts.attempts, and a stacktrace array that holds the Workflow with id not found error or a hung-step timeout."}},{"@type":"Question","name":"Is it safe to automatically remove or re-run a stuck scheduled job from Redis?","acceptedAnswer":{"@type":"Answer","text":"Not by default. Re-running a workflow blindly can double-run side effects such as inventory sync or order updates, so the safe pattern is to classify each job and only report it. An opt-in DRY_RUN=false cleanup can remove entries that are genuinely orphaned, meaning the not found failure or exhausted retries, while everything else is left for a human to confirm before manually re-invoking the workflow."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Workflows &amp; Background Jobs</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Workflows &amp; Background Jobs</p>
+    <h1>Scheduled jobs run sporadically on Redis backed deploys</h1>
+    <p class="lead">The job in <code>src/jobs</code> works every time on your laptop. In production, split across a server tier and a worker tier the way Railway and similar hosts expect, it runs most ticks fine and then, every so often, just fails. Redis ends up holding a failed BullMQ job with a stacktrace that says <code>Workflow with id "&lt;job-id&gt;" not found</code>, and nobody touched the code. Here is why the Redis backed workflow engine lets this happen, and a script that reads the queue directly and tells you which jobs are actually broken.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">ioredis and bullmq, direct to Redis</span>
+      <span class="chip">Flag and report by default</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, scheduled jobs run through <code>@medusajs/workflow-engine-redis</code>, which is backed by BullMQ queues in Redis. Before PR #11740, the module used one shared queue for both workflow transactions and scheduled jobs, so a <code>server</code>-mode instance, which never loads job or workflow definitions, could still dequeue a scheduled-job entry and throw <code>Error: Workflow with id "&lt;job-id&gt;" not found</code>, since only <code>worker</code>-mode instances register those workflows. Whichever instance happens to grab that tick decides whether the run fails, which is exactly the "runs fine locally, sporadic on a split server and worker deploy" symptom. A related cause, tracked in issue #14889, is a hanging or unbounded step inside a job's workflow, such as an unclosed stream, blocking the single default BullMQ worker, since <code>jobWorkerOptions</code> concurrency defaults to 1, stalling the whole job queue until the process restarts. Because Medusa has no Admin API for the job queue, detection connects to Redis directly with ioredis and bullmq's <code>Queue</code> class and inspects each job's state, stacktrace, and attempt count. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A scheduled job in Medusa v2 is a file in <code>src/jobs</code> that exports a handler and a <code>config.schedule</code> cron string. Under the hood, that handler is wrapped in a workflow, and the Redis backed workflow engine module, <code>@medusajs/workflow-engine-redis</code>, is what actually queues the tick and hands it to a worker to execute using BullMQ.</p>
+  <p>The trouble starts on a deploy that splits the process in two, one instance answering HTTP as a <code>server</code>, one running background work as a <code>worker</code>, which is exactly how Railway and similar hosts recommend you scale Medusa. Before PR #11740, both the workflow transactions and the scheduled jobs shared one BullMQ queue. A <code>server</code>-mode instance never loads job or workflow definitions at all, since that is not its job. But it can still be the one that dequeues an entry from the shared queue when a tick fires, and when it tries to run a workflow it never registered, it throws <code>Error: Workflow with id "&lt;job-id&gt;" not found</code>. Whether that happens depends on which instance happens to pick up the job at that exact moment, so most ticks succeed, quietly, on the worker instance, and every so often one lands on the server instance instead and fails. That is the sporadic part.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A cron tick enters one shared BullMQ queue in Redis. If the worker mode instance dequeues it, the job runs fine. If the server mode instance dequeues it, it throws Workflow with id not found, because server mode never registered that workflow.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+        <marker id="ahg" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+      </defs>
+      <rect x="10" y="82" width="150" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="85" y="107" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Cron tick fires</text>
+      <text x="85" y="124" text-anchor="middle" font-family="sans-serif" font-size="10.8" fill="#6b5a70">config.schedule</text>
+      <line x1="163" y1="112" x2="205" y2="112" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="82" width="165" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="290" y="105" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">One shared BullMQ</text>
+      <text x="290" y="122" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">queue in Redis</text>
+      <line x1="290" y1="142" x2="230" y2="172" stroke="#6b5a70" stroke-width="2" marker-end="url(#ahg)"></line>
+      <line x1="290" y1="142" x2="350" y2="172" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="120" y="175" width="185" height="50" rx="10" fill="#eef6e8" stroke="#b9d8cc"></rect>
+      <text x="212" y="196" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">worker mode dequeues</text>
+      <text x="212" y="213" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">job runs fine</text>
+      <rect x="360" y="175" width="200" height="50" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="460" y="196" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">server mode dequeues</text>
+      <text x="460" y="213" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">Workflow with id not found</text>
+      <rect x="590" y="82" width="160" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="670" y="105" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Failed job stored</text>
+      <text x="670" y="122" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">in Redis, stacktrace</text>
+      <line x1="490" y1="180" x2="620" y2="145" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Both instances share one BullMQ queue before PR #11740. Whichever instance happens to grab the tick decides whether it runs or throws a not-found error, which is why the failure looks random.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few distinct causes stack up to produce this same sporadic symptom:</p>
+  <ul>
+    <li>Prior to PR #11740, <code>@medusajs/workflow-engine-redis</code> used one shared queue for both workflow transactions and scheduled jobs, so a <code>server</code>-mode instance, which never registers job or workflow definitions, could still dequeue a scheduled-job entry. Only <code>worker</code>-mode instances register those workflows, so the server-mode dequeue throws <code>Error: Workflow with id "&lt;job-id&gt;" not found</code>.</li>
+    <li>Whether a given tick fails depends entirely on which instance's BullMQ worker happens to pick it up first, which is exactly why the failure comes and goes instead of happening every time, as reported in issue #11286 for Railway-style split deploys.</li>
+    <li>A separate root cause, issue #14889, is a hanging or unbounded step inside a job's workflow, such as an unclosed stream, blocking the single default BullMQ worker. <code>jobWorkerOptions</code> concurrency defaults to 1, so one stuck job stalls the entire job queue until the process is restarted.</li>
+    <li>Issue #8422 documents scheduled jobs failing specifically once the Redis workflow engine is in use, which is the general category this shared-queue bug and the hanging-step bug both fall under.</li>
+    <li>The failed attempt does not vanish. It is persisted in Redis as a BullMQ job carrying its own stacktrace, so the evidence is there, it is just not visible anywhere in the Medusa Admin UI or API.</li>
+  </ul>
+  <p>This is a common source of confusion because the code deployed is correct, the job definition is correct, and most runs succeed, so the instinct is to assume a flaky network or an unrelated timeout. See the citations at the end for the exact issues, the PR, and the docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Medusa gives you no Admin API route for the workflow or job queue, so you have to go to the same place the workflow engine itself reads and writes: Redis. Connect with ioredis and bullmq's own <code>Queue</code> class, using the same <code>redisUrl</code> or <code>redisOptions</code> the backend is configured with, and call <code>getJobs</code> for the <code>failed</code>, <code>active</code>, <code>delayed</code>, and <code>waiting</code> states. Each job's <code>stacktrace</code>, <code>attemptsMade</code>, and timestamps tell you exactly what happened without needing an execution history API that does not exist. Classify before you touch anything: a job failing with <code>Workflow with id .* not found</code> is the pre-#11740-style cross-mode dequeue bug, a job stuck <code>active</code> past its own step timeout with no <code>finishedOn</code> is the hanging-step bug from issue #14889, and only those two categories are candidates for a guarded cleanup.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live scheduler and we do not blindly re-run anything. We connect straight to Redis with the same connection settings the Medusa backend uses, pull the job queue's entries across every relevant state, run each one through a pure classifier, and only under an explicit <code>DRY_RUN=false</code> flag remove the entries that are safely, provably orphaned.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script connects to Redis with ioredis and bullmq, opens the job queue, fetches jobs across failed, active, delayed, and waiting states, classifies each job with a pure function, and either reports it for a human to review or, only in a non dry run guarded cleanup, removes genuinely orphaned entries.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Connect to Redis</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">ioredis + bullmq Queue</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Fetch job states</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">failed, active, delayed, waiting</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="190" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="370" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">classifyJob(job, now)</text>
+      <text x="370" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">pure decision, no I/O</text>
+      <line x1="465" y1="138" x2="507" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="600,106 687,138 600,170 513,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="600" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Orphaned or</text>
+      <text x="600" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">exhausted?</text>
+      <text x="690" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="687" y1="138" x2="715" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="595" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, just report</text>
+      <line x1="600" y1="170" x2="600" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="643" y="185" width="127" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="706" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Guarded cleanup</text>
+      <text x="706" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">only if DRY_RUN=false</text>
+      <path d="M715,138 C735,138 706,150 706,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script only reports by default. Removing a job from the queue happens only for provably orphaned entries, and only when DRY_RUN is explicitly turned off.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Point the script at the same Redis your backend uses</h3>
+      <p>The job queue lives in the Redis instance your Medusa backend already points at for <code>@medusajs/workflow-engine-redis</code>. Use the exact same URL. Also set the step timeout you expect your workflow steps to respect, so a stuck job can be told apart from one that is merely slow.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install redis
+
+export REDIS_URL="redis://localhost:6379"
+export JOB_QUEUE_NAME="medusa-job-queue"
+export STEP_TIMEOUT_MS="60000"   # how long a step should ever take
+export DRY_RUN="true"   # start safe, only logs and classifies</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">npm install ioredis bullmq
+
+export REDIS_URL="redis://localhost:6379"
+export JOB_QUEUE_NAME="medusa-job-queue"
+export STEP_TIMEOUT_MS="60000"   // how long a step should ever take
+export DRY_RUN="true"   // start safe, only logs and classifies</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Open the BullMQ job queue directly in Redis</h3>
+      <p>PR #11740 split the transaction queue and the job queue apart, so scheduled jobs now live in their own dedicated <code>jobQueueName</code>, following the <code>bull:&lt;queueName&gt;</code> key convention BullMQ itself uses. Connect once and reuse the same queue handle for every read.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os
+import redis
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+JOB_QUEUE_NAME = os.environ.get("JOB_QUEUE_NAME", "medusa-job-queue")
+
+def get_redis_client():
+    return redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+def queue_key(suffix):
+    # BullMQ's own key convention: bull:&lt;queueName&gt;:&lt;suffix&gt;
+    return f"bull:{JOB_QUEUE_NAME}:{suffix}"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">import IORedis from "ioredis";
+import { Queue } from "bullmq";
+
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const JOB_QUEUE_NAME = process.env.JOB_QUEUE_NAME || "medusa-job-queue";
+
+function getConnection() {
+  return new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+}
+
+function openJobQueue(connection) {
+  // PR #11740 split this out as a dedicated jobQueueName, separate
+  // from the workflow transaction queueName.
+  return new Queue(JOB_QUEUE_NAME, { connection });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull jobs across every state that matters</h3>
+      <p>A stuck or failed scheduled job can be sitting as <code>failed</code>, <code>active</code>, <code>delayed</code>, or <code>waiting</code>. Fetch all four in one pass so nothing is missed, and read back the fields the classifier needs: <code>id</code>, timestamps, <code>attemptsMade</code>, <code>opts</code>, and <code>failedReason</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import json
+
+STATES = ["failed", "active", "delayed", "waiting"]
+
+def fetch_jobs(client):
+    """Read BullMQ job hashes directly from Redis for every relevant state."""
+    jobs = []
+    for state in STATES:
+        job_ids = client.zrange(queue_key(state), 0, -1) if state in ("delayed",) \
+            else client.lrange(queue_key(state), 0, -1)
+        for job_id in job_ids:
+            data = client.hgetall(queue_key(job_id))
+            if not data:
+                continue
+            opts = json.loads(data.get("opts", "{}"))
+            jobs.append({
+                "id": data.get("name", job_id),
+                "timestamp": int(data.get("timestamp", 0)),
+                "processedOn": int(data["processedOn"]) if data.get("processedOn") else None,
+                "finishedOn": int(data["finishedOn"]) if data.get("finishedOn") else None,
+                "failedReason": data.get("failedReason"),
+                "attemptsMade": int(data.get("attemptsMade", 0)),
+                "opts": opts,
+            })
+    return jobs</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const STATES = ["failed", "active", "delayed", "waiting"];
+
+async function fetchJobs(jobQueue) {
+  // bullmq's own Queue.getJobs reads the same hashes this script would
+  // otherwise have to parse by hand from Redis.
+  const bullJobs = await jobQueue.getJobs(STATES);
+  return bullJobs.map((job) =&gt; ({
+    id: job.name || String(job.id),
+    timestamp: job.timestamp,
+    processedOn: job.processedOn ?? undefined,
+    finishedOn: job.finishedOn ?? undefined,
+    failedReason: job.failedReason,
+    attemptsMade: job.attemptsMade,
+    opts: { attempts: job.opts?.attempts },
+  }));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the classification in a function with no Redis, no network, and a clock passed in as an argument. Given a job and the current time, it returns one of five outcomes. This is the part we test in isolation, and it is the only place the sporadic failure gets turned into a clear label.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">import re
+
+NOT_FOUND_RE = re.compile(r"Workflow with id .* not found")
+
+def classify_job(job, now, step_timeout_ms):
+    """Pure: no I/O. job is a dict already read from Redis/BullMQ."""
+    failed_reason = job.get("failedReason")
+    if failed_reason and NOT_FOUND_RE.search(failed_reason):
+        return "orphaned-not-found"
+
+    processed_on = job.get("processedOn")
+    finished_on = job.get("finishedOn")
+    if processed_on is not None and finished_on is None and (now - processed_on) &gt; step_timeout_ms:
+        return "stuck-active"
+
+    attempts_made = job.get("attemptsMade", 0)
+    attempts_allowed = (job.get("opts") or {}).get("attempts") or 1
+    if finished_on is None and attempts_made &gt;= attempts_allowed and failed_reason:
+        return "exhausted-retries"
+
+    timestamp = job.get("timestamp")
+    if processed_on is None and timestamp is not None and (now - timestamp) &gt; step_timeout_ms:
+        return "pending-too-long"
+
+    return "healthy"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const NOT_FOUND_RE = /Workflow with id .* not found/;
+
+export function classifyJob(job, now, stepTimeoutMs) {
+  // Pure: no I/O. job is a plain object already read from Redis/BullMQ.
+  const failedReason = job.failedReason;
+  if (failedReason &amp;&amp; NOT_FOUND_RE.test(failedReason)) {
+    return "orphaned-not-found";
+  }
+
+  const { processedOn, finishedOn } = job;
+  if (processedOn !== undefined &amp;&amp; finishedOn === undefined &amp;&amp; now - processedOn &gt; stepTimeoutMs) {
+    return "stuck-active";
+  }
+
+  const attemptsMade = job.attemptsMade ?? 0;
+  const attemptsAllowed = job.opts?.attempts ?? 1;
+  if (finishedOn === undefined &amp;&amp; attemptsMade &gt;= attemptsAllowed &amp;&amp; failedReason) {
+    return "exhausted-retries";
+  }
+
+  if (processedOn === undefined &amp;&amp; job.timestamp !== undefined &amp;&amp; now - job.timestamp &gt; stepTimeoutMs) {
+    return "pending-too-long";
+  }
+
+  return "healthy";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report every classified job, and only clean up what is provably orphaned</h3>
+      <p>Log the id, the classification, the failure reason, and the matching schedule from <code>src/jobs/&lt;name&gt;.ts</code> for every job that is not healthy. Only when <code>DRY_RUN</code> is explicitly false, remove entries classified as <code>orphaned-not-found</code> or <code>exhausted-retries</code>, since those two are the ones that are safe to discard without risking a duplicate side effect. A <code>stuck-active</code> or <code>pending-too-long</code> job is left alone and reported, because removing it does not fix a hung process, it just hides the symptom.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">REMOVABLE = {"orphaned-not-found", "exhausted-retries"}
+
+def remove_job(client, job_id_key):
+    """Delete the BullMQ job hash for a genuinely orphaned entry. Never call
+    this on stuck-active or pending-too-long jobs, since removing those
+    hides a hang instead of fixing it."""
+    client.delete(job_id_key)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">const REMOVABLE = new Set(["orphaned-not-found", "exhausted-retries"]);
+
+async function removeJob(bullJob) {
+  // Delete a genuinely orphaned BullMQ job. Never call this on
+  // stuck-active or pending-too-long jobs, since removing those hides
+  // a hang instead of fixing it.
+  await bullJob.remove();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Leave <code>DRY_RUN</code> on for the first runs so you only see the classification report. Once you have confirmed which jobs are truly orphaned and, separately, confirmed your deploy is on a Medusa version with PR #11740 merged, with <code>jobWorkerOptions.concurrency</code> above 1 and explicit step timeouts, switch <code>DRY_RUN</code> off to let the script remove the orphaned entries.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never let this script re-invoke a workflow automatically. Marking a job as reviewed is not the same as confirming its side effects did not partially apply, so a manual re-trigger by an operator, using <code>medusa exec</code> against the underlying workflow, is the only safe way to replay one. Always verify the upstream fixes first: PR #11740 merged, <code>jobWorkerOptions.concurrency</code> greater than 1, and explicit timeouts on every step.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It connects to the same Redis your Medusa backend uses, reads the job queue across every relevant BullMQ state, classifies each job with a pure function, always reports what it finds, and only under an explicit <code>DRY_RUN=false</code> removes entries that are genuinely orphaned.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/scheduled-jobs-sporadic-redis-deploy" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">classify_stuck_jobs.py</div>
+      <pre><code class="language-python">"""Classify Medusa v2 scheduled job entries sitting in the Redis backed
+BullMQ job queue, because a server-mode instance dequeued a job from a
+shared queue before PR #11740 and threw Workflow with id not found, or
+a hanging step stalled the single default BullMQ worker (issue #14889).
+DRY_RUN=true only reports the classified jobs. Only removes entries
+classified as genuinely orphaned, never re-runs a workflow.
+"""
+import os
+import re
+import json
+import time
+import logging
+
+import redis
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("classify_stuck_jobs")
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+JOB_QUEUE_NAME = os.environ.get("JOB_QUEUE_NAME", "medusa-job-queue")
+STEP_TIMEOUT_MS = int(os.environ.get("STEP_TIMEOUT_MS", "60000"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+STATES = ["failed", "active", "delayed", "waiting"]
+NOT_FOUND_RE = re.compile(r"Workflow with id .* not found")
+REMOVABLE = {"orphaned-not-found", "exhausted-retries"}
+
+
+def get_redis_client():
+    return redis.Redis.from_url(REDIS_URL, decode_responses=True)
+
+
+def queue_key(suffix):
+    # BullMQ's own key convention: bull:&lt;queueName&gt;:&lt;suffix&gt;
+    return f"bull:{JOB_QUEUE_NAME}:{suffix}"
+
+
+def fetch_jobs(client):
+    """Read BullMQ job hashes directly from Redis for every relevant state."""
+    jobs = []
+    for state in STATES:
+        job_ids = client.zrange(queue_key(state), 0, -1) if state == "delayed" \
+            else client.lrange(queue_key(state), 0, -1)
+        for job_id in job_ids:
+            data = client.hgetall(queue_key(job_id))
+            if not data:
+                continue
+            opts = json.loads(data.get("opts", "{}"))
+            jobs.append({
+                "redis_key": queue_key(job_id),
+                "id": data.get("name", job_id),
+                "timestamp": int(data.get("timestamp", 0)),
+                "processedOn": int(data["processedOn"]) if data.get("processedOn") else None,
+                "finishedOn": int(data["finishedOn"]) if data.get("finishedOn") else None,
+                "failedReason": data.get("failedReason"),
+                "attemptsMade": int(data.get("attemptsMade", 0)),
+                "opts": opts,
+            })
+    return jobs
+
+
+def classify_job(job, now, step_timeout_ms):
+    """Pure: no I/O. job is a dict already read from Redis/BullMQ."""
+    failed_reason = job.get("failedReason")
+    if failed_reason and NOT_FOUND_RE.search(failed_reason):
+        return "orphaned-not-found"
+
+    processed_on = job.get("processedOn")
+    finished_on = job.get("finishedOn")
+    if processed_on is not None and finished_on is None and (now - processed_on) &gt; step_timeout_ms:
+        return "stuck-active"
+
+    attempts_made = job.get("attemptsMade", 0)
+    attempts_allowed = (job.get("opts") or {}).get("attempts") or 1
+    if finished_on is None and attempts_made &gt;= attempts_allowed and failed_reason:
+        return "exhausted-retries"
+
+    timestamp = job.get("timestamp")
+    if processed_on is None and timestamp is not None and (now - timestamp) &gt; step_timeout_ms:
+        return "pending-too-long"
+
+    return "healthy"
+
+
+def remove_job(client, redis_key):
+    """Delete the BullMQ job hash for a genuinely orphaned entry. Never call
+    this on stuck-active or pending-too-long jobs, since removing those
+    hides a hang instead of fixing it."""
+    client.delete(redis_key)
+
+
+def run():
+    client = get_redis_client()
+    now = int(time.time() * 1000)
+    jobs = fetch_jobs(client)
+
+    flagged = []
+    for job in jobs:
+        classification = classify_job(job, now, STEP_TIMEOUT_MS)
+        if classification == "healthy":
+            continue
+        flagged.append((job, classification))
+        log.warning(
+            "Job %s classified %s. failedReason=%s attemptsMade=%s/%s",
+            job["id"], classification, job.get("failedReason"),
+            job.get("attemptsMade"), (job.get("opts") or {}).get("attempts"),
+        )
+
+    if not flagged:
+        log.info("No stuck or orphaned jobs across %d entr(y/ies).", len(jobs))
+        return
+
+    if not DRY_RUN:
+        for job, classification in flagged:
+            if classification in REMOVABLE:
+                log.info("Removing orphaned job %s (%s).", job["id"], classification)
+                remove_job(client, job["redis_key"])
+
+    log.info("Done. %d job(s) %s.", len(flagged), "to review" if DRY_RUN else "processed")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify-stuck-jobs.js</div>
+      <pre><code class="language-javascript">/**
+ * Classify Medusa v2 scheduled job entries sitting in the Redis backed
+ * BullMQ job queue, because a server-mode instance dequeued a job from a
+ * shared queue before PR #11740 and threw Workflow with id not found, or
+ * a hanging step stalled the single default BullMQ worker (issue #14889).
+ * DRY_RUN=true only reports the classified jobs. Only removes entries
+ * classified as genuinely orphaned, never re-runs a workflow.
+ */
+import { pathToFileURL } from "node:url";
+import IORedis from "ioredis";
+import { Queue } from "bullmq";
+
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+const JOB_QUEUE_NAME = process.env.JOB_QUEUE_NAME || "medusa-job-queue";
+const STEP_TIMEOUT_MS = Number(process.env.STEP_TIMEOUT_MS || 60000);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const STATES = ["failed", "active", "delayed", "waiting"];
+const NOT_FOUND_RE = /Workflow with id .* not found/;
+const REMOVABLE = new Set(["orphaned-not-found", "exhausted-retries"]);
+
+export function classifyJob(job, now, stepTimeoutMs) {
+  // Pure: no I/O. job is a plain object already read from Redis/BullMQ.
+  const failedReason = job.failedReason;
+  if (failedReason &amp;&amp; NOT_FOUND_RE.test(failedReason)) {
+    return "orphaned-not-found";
+  }
+
+  const { processedOn, finishedOn } = job;
+  if (processedOn !== undefined &amp;&amp; finishedOn === undefined &amp;&amp; now - processedOn &gt; stepTimeoutMs) {
+    return "stuck-active";
+  }
+
+  const attemptsMade = job.attemptsMade ?? 0;
+  const attemptsAllowed = job.opts?.attempts ?? 1;
+  if (finishedOn === undefined &amp;&amp; attemptsMade &gt;= attemptsAllowed &amp;&amp; failedReason) {
+    return "exhausted-retries";
+  }
+
+  if (processedOn === undefined &amp;&amp; job.timestamp !== undefined &amp;&amp; now - job.timestamp &gt; stepTimeoutMs) {
+    return "pending-too-long";
+  }
+
+  return "healthy";
+}
+
+function getConnection() {
+  return new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+}
+
+function openJobQueue(connection) {
+  // PR #11740 split this out as a dedicated jobQueueName, separate
+  // from the workflow transaction queueName.
+  return new Queue(JOB_QUEUE_NAME, { connection });
+}
+
+async function fetchJobs(jobQueue) {
+  const bullJobs = await jobQueue.getJobs(STATES);
+  return bullJobs.map((job) =&gt; ({
+    bullJob: job,
+    id: job.name || String(job.id),
+    timestamp: job.timestamp,
+    processedOn: job.processedOn ?? undefined,
+    finishedOn: job.finishedOn ?? undefined,
+    failedReason: job.failedReason,
+    attemptsMade: job.attemptsMade,
+    opts: { attempts: job.opts?.attempts },
+  }));
+}
+
+async function removeJob(bullJob) {
+  // Delete a genuinely orphaned BullMQ job. Never call this on
+  // stuck-active or pending-too-long jobs, since removing those hides
+  // a hang instead of fixing it.
+  await bullJob.remove();
+}
+
+export async function run() {
+  const connection = getConnection();
+  const jobQueue = openJobQueue(connection);
+  const now = Date.now();
+
+  try {
+    const jobs = await fetchJobs(jobQueue);
+    const flagged = [];
+
+    for (const job of jobs) {
+      const classification = classifyJob(job, now, STEP_TIMEOUT_MS);
+      if (classification === "healthy") continue;
+      flagged.push({ job, classification });
+      console.warn(
+        `Job ${job.id} classified ${classification}. failedReason=${job.failedReason} attemptsMade=${job.attemptsMade}/${job.opts.attempts}`
+      );
+    }
+
+    if (flagged.length === 0) {
+      console.log(`No stuck or orphaned jobs across ${jobs.length} entr(y/ies).`);
+      return;
+    }
+
+    if (!DRY_RUN) {
+      for (const { job, classification } of flagged) {
+        if (REMOVABLE.has(classification)) {
+          console.log(`Removing orphaned job ${job.id} (${classification}).`);
+          await removeJob(job.bullJob);
+        }
+      }
+    }
+
+    console.log(`Done. ${flagged.length} job(s) ${DRY_RUN ? "to review" : "processed"}.`);
+  } finally {
+    await jobQueue.close();
+    connection.disconnect();
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is <code>classify_job</code>. It is pure, no Redis and no network, just plain job objects and a fixed clock, so the tests check every branch of the classification directly.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_scheduled_classify_job.py</div>
+      <pre><code class="language-python">from classify_stuck_jobs import classify_job
+
+NOW = 1_800_000_000_000
+STEP_TIMEOUT_MS = 60_000
+
+
+def job(**over):
+    base = {
+        "id": "job-transaction-sync-job",
+        "timestamp": NOW - 1_000,
+        "processedOn": None,
+        "finishedOn": None,
+        "failedReason": None,
+        "attemptsMade": 0,
+        "opts": {"attempts": 3},
+    }
+    base.update(over)
+    return base
+
+
+def test_healthy_when_freshly_queued():
+    assert classify_job(job(), NOW, STEP_TIMEOUT_MS) == "healthy"
+
+
+def test_orphaned_not_found_from_failed_reason():
+    j = job(failedReason='Error: Workflow with id "job-transaction-sync-job" not found')
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "orphaned-not-found"
+
+
+def test_stuck_active_when_processed_but_not_finished_past_timeout():
+    j = job(processedOn=NOW - STEP_TIMEOUT_MS - 1)
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "stuck-active"
+
+
+def test_not_stuck_active_when_within_timeout():
+    j = job(processedOn=NOW - 1_000)
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "healthy"
+
+
+def test_exhausted_retries_when_attempts_used_up():
+    j = job(attemptsMade=3, opts={"attempts": 3}, failedReason="boom")
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "exhausted-retries"
+
+
+def test_not_exhausted_when_finished_even_if_attempts_high():
+    j = job(attemptsMade=3, opts={"attempts": 3}, failedReason="boom", finishedOn=NOW)
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "healthy"
+
+
+def test_pending_too_long_when_never_processed():
+    j = job(timestamp=NOW - STEP_TIMEOUT_MS - 1)
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "pending-too-long"
+
+
+def test_not_found_takes_priority_over_other_signals():
+    j = job(
+        failedReason='Workflow with id "x" not found',
+        processedOn=NOW - STEP_TIMEOUT_MS - 1,
+        attemptsMade=3,
+        opts={"attempts": 3},
+    )
+    assert classify_job(j, NOW, STEP_TIMEOUT_MS) == "orphaned-not-found"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify-jobs.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyJob } from "./classify-stuck-jobs.js";
+
+const NOW = 1_800_000_000_000;
+const STEP_TIMEOUT_MS = 60_000;
+
+const job = (over = {}) =&gt; ({
+  id: "job-transaction-sync-job",
+  timestamp: NOW - 1_000,
+  processedOn: undefined,
+  finishedOn: undefined,
+  failedReason: undefined,
+  attemptsMade: 0,
+  opts: { attempts: 3 },
+  ...over,
+});
+
+test("healthy when freshly queued", () =&gt; {
+  assert.equal(classifyJob(job(), NOW, STEP_TIMEOUT_MS), "healthy");
+});
+
+test("orphaned-not-found from failedReason", () =&gt; {
+  const j = job({ failedReason: 'Error: Workflow with id "job-transaction-sync-job" not found' });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "orphaned-not-found");
+});
+
+test("stuck-active when processed but not finished past timeout", () =&gt; {
+  const j = job({ processedOn: NOW - STEP_TIMEOUT_MS - 1 });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "stuck-active");
+});
+
+test("not stuck-active when within timeout", () =&gt; {
+  const j = job({ processedOn: NOW - 1_000 });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "healthy");
+});
+
+test("exhausted-retries when attempts used up", () =&gt; {
+  const j = job({ attemptsMade: 3, opts: { attempts: 3 }, failedReason: "boom" });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "exhausted-retries");
+});
+
+test("not exhausted when finished even if attempts high", () =&gt; {
+  const j = job({ attemptsMade: 3, opts: { attempts: 3 }, failedReason: "boom", finishedOn: NOW });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "healthy");
+});
+
+test("pending-too-long when never processed", () =&gt; {
+  const j = job({ timestamp: NOW - STEP_TIMEOUT_MS - 1 });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "pending-too-long");
+});
+
+test("not-found takes priority over other signals", () =&gt; {
+  const j = job({
+    failedReason: 'Workflow with id "x" not found',
+    processedOn: NOW - STEP_TIMEOUT_MS - 1,
+    attemptsMade: 3,
+    opts: { attempts: 3 },
+  });
+  assert.equal(classifyJob(j, NOW, STEP_TIMEOUT_MS), "orphaned-not-found");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Split Railway deploy</span>
+      <h4>The nightly sync that failed one night in five</h4>
+      <p>A team ran their Medusa backend on Railway with two services, one set to <code>server</code> mode for the storefront API, one set to <code>worker</code> mode for background jobs, following the standard worker mode guidance. A nightly inventory sync job was scheduled at 2am. Most nights it completed on time. On some nights, seemingly at random, it failed with no output beyond a stacktrace no one was looking at.</p>
+      <p>Connecting to their Redis instance directly with the script here showed several past entries in the failed state whose <code>failedReason</code> matched <code>Workflow with id "inventory-sync-job" not found</code>. Every one of those failures traced back to a tick that had been dequeued by the server-mode service instead of the worker-mode one, exactly the pre-#11740 shared-queue behavior, and upgrading to a version with that fix merged stopped it from recurring.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Hanging step</span>
+      <h4>The job queue that quietly stopped ticking</h4>
+      <p>A store's scheduled export job opened a file stream to write a report and never closed it on one edge case input. With <code>jobWorkerOptions</code> concurrency left at its default of 1, that one hung job blocked every other scheduled job behind it in the same queue, and none of them ran again until the process was restarted.</p>
+      <p>Running the classifier against the job queue showed a single job stuck in the <code>active</code> state with no <code>finishedOn</code>, its <code>processedOn</code> timestamp far older than the step timeout, which the script labeled <code>stuck-active</code>. The team left that entry alone as instructed, fixed the stream handling and set an explicit step timeout, and raised <code>jobWorkerOptions.concurrency</code> above 1 so a single hung job could no longer stall the whole queue.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this classifier whenever a scheduled job's effects look inconsistent, and trust its report over guesswork. It never re-invokes a workflow and never removes a job unless that job is provably orphaned, so it can never double-run a side effect or paper over a real hang. The durable fix stays at the infrastructure level: confirm your Medusa version has PR #11740 merged so the job queue is separate from the transaction queue, set <code>jobWorkerOptions.concurrency</code> above 1, and give every workflow step an explicit timeout so one bad step can never again stall the entire schedule.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do my Medusa scheduled jobs only fail sometimes after I moved to Redis?</summary>
+      <p>Before a fix landed in PR #11740, workflow-engine-redis used one shared BullMQ queue for both workflow transactions and scheduled jobs. On a split deploy, a server-mode instance never loads job or workflow definitions, but it can still dequeue a scheduled-job entry from that shared queue, and then it throws Workflow with id not found because only worker-mode instances register those workflows. Which instance happens to grab the job each tick decides whether that run fails, which is exactly the sporadic pattern.</p>
+    </details>
+    <details>
+      <summary>How do I check whether a Medusa scheduled job actually failed in Redis?</summary>
+      <p>Medusa exposes no Admin API route for the workflow or job queue, so you connect to the same Redis instance directly with ioredis and bullmq, open the Queue by name, and call getJobs with the failed, active, delayed, and waiting states. Each job carries an id that matches the job's registered name, timestamps to compute how stuck it is, attemptsMade against opts.attempts, and a stacktrace array that holds the Workflow with id not found error or a hung-step timeout.</p>
+    </details>
+    <details>
+      <summary>Is it safe to automatically remove or re-run a stuck scheduled job from Redis?</summary>
+      <p>Not by default. Re-running a workflow blindly can double-run side effects such as inventory sync or order updates, so the safe pattern is to classify each job and only report it. An opt-in DRY_RUN=false cleanup can remove entries that are genuinely orphaned, meaning the not found failure or exhausted retries, while everything else is left for a human to confirm before manually re-invoking the workflow.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+    <a href="/medusa/">Browse all Medusa field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #11286: Scheduled jobs run sporadically when deployed to Railway, and Redis instance stores failed job with error stacktrace. <a href="https://github.com/medusajs/medusa/issues/11286" rel="noopener">github.com/medusajs/medusa/issues/11286</a></li>
+      <li>medusajs/medusa GitHub issue #8422: Scheduled Jobs fail when @medusajs/workflow-engine-redis is used. <a href="https://github.com/medusajs/medusa/issues/8422" rel="noopener">github.com/medusajs/medusa/issues/8422</a></li>
+      <li>medusajs/medusa GitHub issue #14889: Medusa stops executing jobs after some point. <a href="https://github.com/medusajs/medusa/issues/14889" rel="noopener">github.com/medusajs/medusa/issues/14889</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Redis Workflow Engine Module. <a href="https://docs.medusajs.com/resources/infrastructure-modules/workflow-engine/redis" rel="noopener">docs.medusajs.com/resources/infrastructure-modules/workflow-engine/redis</a></li>
+      <li>Medusa Documentation: Scheduled Jobs. <a href="https://docs.medusajs.com/learn/fundamentals/scheduled-jobs" rel="noopener">docs.medusajs.com/learn/fundamentals/scheduled-jobs</a></li>
+      <li>Medusa Documentation: Locking Operations in Workflows. <a href="https://docs.medusajs.com/learn/fundamentals/workflows/locks" rel="noopener">docs.medusajs.com/learn/fundamentals/workflows/locks</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this explain a job that failed for no reason?</h3>
+    <p>If this saved you from chasing a phantom Redis or network issue, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

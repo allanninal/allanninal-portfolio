@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Stale Inventory Reservations Left Behind After Fulfillment in Medusa</title>
+<meta name="description" content="An order is fulfilled or cancelled, but its ReservationItem row is never deleted. Learn why Medusa v2 sometimes leaves fulfillment reservations behind and build a Python or Node.js reconciler that finds and safely deletes only the stale ones.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Stale Inventory Reservations Left Behind After Fulfillment in Medusa">
+<meta property="og:description" content="Why Medusa v2 sometimes fails to delete a ReservationItem after a line item is fulfilled or an order is cancelled, and a safe Python or Node.js reconciler that deletes only the stale reservations.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/#article","headline":"Fix Stale Inventory Reservations Left Behind After Fulfillment in Medusa","description":"Why Medusa v2 sometimes fails to delete a ReservationItem after a line item is fulfilled or an order is cancelled, and a safe Python or Node.js reconciler that deletes only the stale reservations tied to terminal orders.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory & Reservations","keywords":"Medusa reservation, ReservationItem, stale reservation, fulfillment, reserved_quantity, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Fulfillment sometimes leaves a stale inventory reservation","item":"https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a completed Medusa order still hold an inventory reservation?","acceptedAnswer":{"@type":"Answer","text":"Medusa v2 creates a ReservationItem for a line item when it is purchased, and the intended lifecycle is to delete that row once the line item is fulfilled. The delete step is not transactionally guaranteed against the rest of the create-fulfillment workflow, so when a variant has multiple inventory items or the fulfillment and order completion handlers race or partially fail, the reservation can survive even though the order is complete or cancelled."}},{"@type":"Question","name":"Is it safe to delete Medusa reservations left over after fulfillment with a script?","acceptedAnswer":{"@type":"Answer","text":"Yes, when the script only deletes a reservation after confirming its line_item_id belongs to an order whose status is completed or canceled and whose fulfillment_status is fulfilled, delivered, or canceled. Requiring both the order status and the fulfillment status to be terminal before deleting keeps the script from ever touching a reservation an in-progress order still needs."}},{"@type":"Question","name":"What happens to reserved_quantity when a stale reservation is deleted?","acceptedAnswer":{"@type":"Answer","text":"Medusa's inventory level counters recompute automatically off the ReservationItem table. Once the stale row is deleted through DELETE /admin/reservations/{id}, reserved_quantity at that location drops by the reservation's quantity and available_quantity goes back up, with no separate location level PATCH needed."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Inventory & Reservations</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory & Reservations</p>
+    <h1>Fulfillment sometimes leaves a stale inventory reservation</h1>
+    <p class="lead">The order says fulfilled, or even cancelled, but the inventory level does not agree. A handful of units at one location are still shown as reserved, and nobody purchased them anymore. Here is why Medusa v2 sometimes fails to clean up a reservation after a line item is fulfilled and a small reconciler that finds only the stale rows and deletes them safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2 automatically creates a <code>ReservationItem</code> (<code>res_...</code>) linking an <code>inventory_item_id</code>, <code>location_id</code>, and the order's <code>line_item_id</code> whenever a line item is purchased, and the intended lifecycle deletes that row once the line item is fulfilled. GitHub issue #11266 documents that this delete step is not transactionally guaranteed: when a variant has multiple inventory items, or the fulfillment and order completion event handlers race or partially fail, the reservation can be left behind while stock is still counted against it. Because reservations are keyed by <code>line_item_id</code> rather than recomputed from order state, nothing else in Medusa retries the cleanup once it fails. Run a script that pulls terminal orders (<code>completed</code> or <code>canceled</code>, with a matching terminal <code>fulfillment_status</code>), lists the reservations tied to their line items, and deletes only the ones that should have been cleaned up already. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When a customer buys something, Medusa writes a <code>ReservationItem</code> row that holds stock against that specific line item, inventory item, and location. That is correct and expected. The row is meant to be temporary. Once the order is fulfilled, the create-fulfillment workflow is supposed to delete the reservation, because the stock has now actually left the building and does not need to be held anymore, only subtracted.</p>
+  <p>The trouble is that delete step is not wrapped in the same transaction as the rest of fulfillment. A variant can be backed by more than one inventory item, which means more than one reservation to clean up per line item. Event handlers for fulfillment and order completion can also race each other or fail partway through. When either of those happens, some or all of the <code>ReservationItem</code> rows for that order's line items survive, even though the stock was already subtracted and allocated. Nothing in Medusa notices the row is now orphaned, because reservations are keyed by <code>line_item_id</code>, not recomputed from the order's current state. The reservation just sits there, permanently holding <code>reserved_quantity</code> against an order that is done.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A line item is fulfilled, the create-fulfillment workflow tries to delete its ReservationItem, but the delete is not transactionally guaranteed and can fail or partially run, so the reservation survives and reserved quantity stays inflated even though the order is complete.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="160" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Line item fulfilled</text>
+      <text x="90" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">order completes</text>
+      <line x1="90" y1="86" x2="90" y2="112" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="114" width="230" height="72" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="125" y="138" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Workflow tries to delete</text>
+      <text x="125" y="154" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">the ReservationItem</text>
+      <text x="125" y="171" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">not transactionally guaranteed</text>
+      <line x1="240" y1="150" x2="282" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="261" y="112" text-anchor="middle" font-family="sans-serif" font-size="21" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="261" y="200" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">race or partial failure</text>
+      <rect x="285" y="118" width="170" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="370" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Reservation survives</text>
+      <text x="370" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">row still exists</text>
+      <line x1="455" y1="150" x2="497" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="500" y="118" width="140" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="570" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">reserved_quantity</text>
+      <text x="570" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">stays inflated</text>
+      <line x1="640" y1="150" x2="672" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="675" y="112" width="70" height="76" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="710" y="140" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Available</text>
+      <text x="710" y="157" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stock</text>
+      <text x="710" y="174" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">too low</text>
+    </svg>
+    <figcaption>The order finishes, but the delete step that should have removed its reservation is not guaranteed to run. The row is orphaned and keeps stock locked up at that location.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Reservations are created eagerly, at the moment of purchase, and cleaned up by one narrow step that has to run at exactly the right time. A few common ways stores end up with stale rows:</p>
+  <ul>
+    <li>A variant is backed by more than one inventory item, so one line item requires deleting more than one <code>ReservationItem</code>. If the workflow errors out after deleting only the first, the rest are orphaned.</li>
+    <li>The fulfillment event handler and the order completion event handler race each other, and whichever one is supposed to run the reservation cleanup either runs twice, harmlessly, or does not run at all.</li>
+    <li>An order is cancelled instead of fulfilled, and the cancellation path does not reliably fire the same reservation cleanup that a normal fulfillment would have triggered. GitHub issue #11703 documents a related gap where cancelling a fulfillment does not even recreate the first reservation correctly.</li>
+    <li>A partial failure anywhere in the create-fulfillment workflow leaves the workflow in a state where later steps, including reservation deletion, never execute, but earlier steps like stock allocation already committed.</li>
+  </ul>
+  <p>Nothing re-checks or retries this cleanup later. <code>ReservationItem</code> rows are keyed by <code>line_item_id</code>, not recomputed from the order's or fulfillment's current state, so once the delete step is missed, the row is permanently stuck, silently shrinking available stock at that location. See the citations at the end for the exact issue and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A reservation left over after fulfillment is only safe to delete once you know, with certainty, that the order it belongs to is truly finished. That means checking both the order's overall status and its fulfillment status, not just one of them. An order can be <code>completed</code> but the check should still confirm <code>fulfillment_status</code> reads <code>fulfilled</code>, <code>delivered</code>, or <code>canceled</code>, because a reservation tied to any order that is still active, pending, or in progress must be left alone. Deleting that reservation too early would let a real order oversell.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch active fulfillment. The job pulls closed orders, collects their line item ids, lists the reservations tied to those line items, runs a pure decision function that only flags a reservation stale when its order's status and fulfillment status are both terminal, and only then deletes it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script pulls completed or canceled orders, collects their line item ids, lists reservations for those line items, runs a pure function that checks the order status and fulfillment status are both terminal, then either deletes the stale reservation when dry run is off or keeps it.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Pull closed orders</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">completed, canceled</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Collect line item ids</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">order.items[].id</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List reservations</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">by line_item_id</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Order status and</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">fulfillment terminal?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, dry run off</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">no, keep</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="610" y="185" width="140" height="55" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="680" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Reservation kept</text>
+      <text x="680" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">order still in progress</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">DELETE reservation</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">reserved_quantity drops</text>
+    </svg>
+    <figcaption>Every reservation is checked against its order's status and fulfillment status first. Only a reservation tied to a fully terminal order is ever deleted, and only with DRY_RUN off.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. Keep the backend URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Pull closed and cancelled orders with their line items</h3>
+      <p>Ask for orders whose status is <code>completed</code> or <code>canceled</code>, and read back the fields the decision needs: the id, display id, status, fulfillment status, and every line item. Paginate with <code>offset</code> and <code>limit</code>, stopping once the offset reaches the reported <code>count</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_closed_orders(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "status[]": ["completed", "canceled"],
+            "fields": "id,display_id,status,fulfillment_status,*items",
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL;
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (Array.isArray(value)) {
+      for (const v of value) url.searchParams.append(key, v);
+    } else {
+      url.searchParams.set(key, value);
+    }
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function listClosedOrders(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      "status[]": ["completed", "canceled"],
+      fields: "id,display_id,status,fulfillment_status,*items",
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List the reservations tied to those orders' line items</h3>
+      <p>Batch the collected line item ids into the <code>line_item_id</code> filter on <code>/admin/reservations</code>. This route accepts an array, so a single call, or a small number of chunked calls for a very large backlog, returns every reservation still attached to those orders.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def chunk(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+def list_reservations_for_line_items(token, line_item_ids):
+    reservations = []
+    for batch in chunk(line_item_ids, 100):
+        data = admin_get(token, "/admin/reservations", {
+            "line_item_id[]": batch,
+            "fields": "id,line_item_id,inventory_item_id,location_id,quantity,created_at",
+            "limit": 200,
+        })
+        reservations.extend(data["reservations"])
+    return reservations</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">function chunk(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+async function listReservationsForLineItems(token, lineItemIds) {
+  const reservations = [];
+  for (const batch of chunk(lineItemIds, 100)) {
+    const data = await adminGet(token, "/admin/reservations", {
+      "line_item_id[]": batch,
+      fields: "id,line_item_id,inventory_item_id,location_id,quantity,created_at",
+      limit: 200,
+    });
+    reservations.push(...data.reservations);
+  }
+  return reservations;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the list of orders and the list of reservations and returns only the matches. It builds a lookup from <code>line_item_id</code> to the order that owns it, then keeps a reservation only when that order's status is in <code>{"completed", "canceled"}</code> and its fulfillment status is in <code>{"fulfilled", "delivered", "canceled"}</code>. It never touches the network, so it is trivial to unit test with fixture arrays.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">TERMINAL_ORDER_STATUSES = {"completed", "canceled"}
+TERMINAL_FULFILLMENT_STATUSES = {"fulfilled", "delivered", "canceled"}
+
+def find_stale_reservations(orders, reservations):
+    line_item_to_order = {}
+    for order in orders:
+        for item in order.get("items") or []:
+            line_item_to_order[item["id"]] = order
+
+    stale = []
+    for reservation in reservations:
+        line_item_id = reservation.get("line_item_id")
+        if not line_item_id:
+            continue
+        order = line_item_to_order.get(line_item_id)
+        if order is None:
+            continue
+        if order.get("status") not in TERMINAL_ORDER_STATUSES:
+            continue
+        if order.get("fulfillment_status") not in TERMINAL_FULFILLMENT_STATUSES:
+            continue
+        stale.append({
+            "reservation_id": reservation["id"],
+            "order_id": order["id"],
+            "line_item_id": line_item_id,
+            "quantity": reservation["quantity"],
+        })
+    return stale</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const TERMINAL_ORDER_STATUSES = new Set(["completed", "canceled"]);
+const TERMINAL_FULFILLMENT_STATUSES = new Set(["fulfilled", "delivered", "canceled"]);
+
+export function findStaleReservations(orders, reservations) {
+  const lineItemToOrder = new Map();
+  for (const order of orders) {
+    for (const item of order.items || []) {
+      lineItemToOrder.set(item.id, order);
+    }
+  }
+
+  const stale = [];
+  for (const reservation of reservations) {
+    const lineItemId = reservation.line_item_id;
+    if (!lineItemId) continue;
+    const order = lineItemToOrder.get(lineItemId);
+    if (!order) continue;
+    if (!TERMINAL_ORDER_STATUSES.has(order.status)) continue;
+    if (!TERMINAL_FULFILLMENT_STATUSES.has(order.fulfillment_status)) continue;
+    stale.push({
+      reservation_id: reservation.id,
+      order_id: order.id,
+      line_item_id: lineItemId,
+      quantity: reservation.quantity,
+    });
+  }
+  return stale;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Delete only the stale reservations</h3>
+      <p>For each match, call <code>DELETE /admin/reservations/{reservation_id}</code>, the same route the admin dashboard's Delete reservation action uses. Medusa's inventory level counters recompute automatically off the <code>ReservationItem</code> table once the row is gone, so no separate location level PATCH is needed. Log every deletion, including the order id, for audit.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">def delete_reservation(token, reservation_id):
+    r = requests.delete(
+        f"{BACKEND_URL}/admin/reservations/{reservation_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">async function deleteReservation(token, reservationId) {
+  const res = await fetch(`${BACKEND_URL}/admin/reservations/${reservationId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on DELETE /admin/reservations/${reservationId}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only prints a report of every stale reservation it found, with the reservation id, order id, line item id, inventory item id, location id, and quantity. Read the report, agree with it, then switch it off to let it delete. Run it as a scheduled reconciler, for example nightly.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never relax the requirement that both the order status and the fulfillment status be terminal before deleting. Deleting a reservation is irreversible, and misclassifying an in-progress order as done would let it oversell.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs a full report before writing anything, respects the dry run flag, and is safe to run again and again because it only ever deletes a reservation whose owning order is fully terminal on both status and fulfillment status.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/stale-reservation-after-fulfillment" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_stale_reservations.py</div>
+      <pre><code class="language-python">"""Find and delete Medusa inventory reservations left over after fulfillment.
+
+Medusa v2 creates a ReservationItem linking an inventory_item_id, location_id,
+and the order's line_item_id whenever a line item is purchased. The intended
+lifecycle deletes that row once the line item is fulfilled, but the delete step
+is not transactionally guaranteed. When a variant has multiple inventory items,
+or the fulfillment and order completion handlers race or partially fail, the
+reservation can survive an order that is already completed or canceled. This
+lists closed orders, resolves the reservations tied to their line items, and
+deletes only the ones whose order status and fulfillment status are both
+terminal.
+Run as a scheduled reconciler. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_stale_reservations")
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+TERMINAL_ORDER_STATUSES = {"completed", "canceled"}
+TERMINAL_FULFILLMENT_STATUSES = {"fulfilled", "delivered", "canceled"}
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def admin_delete(token, path):
+    r = requests.delete(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def find_stale_reservations(orders, reservations):
+    """Pure decision function. No I/O.
+
+    orders: [{"id": str, "status": str, "fulfillment_status": str, "items": [{"id": str}]}]
+    reservations: [{"id": str, "line_item_id": str | None, "quantity": int, ...}]
+
+    Returns a list of {"reservation_id", "order_id", "line_item_id", "quantity"}
+    for every reservation whose owning order is completed or canceled AND whose
+    fulfillment_status is fulfilled, delivered, or canceled.
+    """
+    line_item_to_order = {}
+    for order in orders:
+        for item in order.get("items") or []:
+            line_item_to_order[item["id"]] = order
+
+    stale = []
+    for reservation in reservations:
+        line_item_id = reservation.get("line_item_id")
+        if not line_item_id:
+            continue
+        order = line_item_to_order.get(line_item_id)
+        if order is None:
+            continue
+        if order.get("status") not in TERMINAL_ORDER_STATUSES:
+            continue
+        if order.get("fulfillment_status") not in TERMINAL_FULFILLMENT_STATUSES:
+            continue
+        stale.append({
+            "reservation_id": reservation["id"],
+            "order_id": order["id"],
+            "line_item_id": line_item_id,
+            "quantity": reservation["quantity"],
+        })
+    return stale
+
+
+def chunk(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def list_closed_orders(token):
+    orders = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/orders", {
+            "status[]": ["completed", "canceled"],
+            "fields": "id,display_id,status,fulfillment_status,*items",
+            "limit": limit,
+            "offset": offset,
+        })
+        orders.extend(data["orders"])
+        offset += limit
+        if offset >= data["count"]:
+            return orders
+
+
+def list_reservations_for_line_items(token, line_item_ids):
+    reservations = []
+    for batch in chunk(line_item_ids, 100):
+        if not batch:
+            continue
+        data = admin_get(token, "/admin/reservations", {
+            "line_item_id[]": batch,
+            "fields": "id,line_item_id,inventory_item_id,location_id,quantity,created_at",
+            "limit": 200,
+        })
+        reservations.extend(data["reservations"])
+    return reservations
+
+
+def run():
+    token = get_admin_token()
+    orders = list_closed_orders(token)
+    line_item_ids = [item["id"] for order in orders for item in (order.get("items") or [])]
+    reservations = list_reservations_for_line_items(token, line_item_ids)
+
+    matches = find_stale_reservations(orders, reservations)
+
+    for match in matches:
+        log.warning(
+            "Stale reservation %s on order %s, line_item %s, quantity %s. %s",
+            match["reservation_id"], match["order_id"], match["line_item_id"], match["quantity"],
+            "Would delete" if DRY_RUN else "Deleting",
+        )
+        if not DRY_RUN:
+            admin_delete(token, f"/admin/reservations/{match['reservation_id']}")
+
+    log.info("Done. %d stale reservation(s) %s.", len(matches), "found" if DRY_RUN else "deleted")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-stale-reservations.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and delete Medusa inventory reservations left over after fulfillment.
+ *
+ * Medusa v2 creates a ReservationItem linking an inventory_item_id, location_id,
+ * and the order's line_item_id whenever a line item is purchased. The intended
+ * lifecycle deletes that row once the line item is fulfilled, but the delete step
+ * is not transactionally guaranteed. When a variant has multiple inventory items,
+ * or the fulfillment and order completion handlers race or partially fail, the
+ * reservation can survive an order that is already completed or canceled. This
+ * lists closed orders, resolves the reservations tied to their line items, and
+ * deletes only the ones whose order status and fulfillment status are both
+ * terminal.
+ * Run as a scheduled reconciler. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/stale-reservation-after-fulfillment/
+ */
+import { pathToFileURL } from "node:url";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const TERMINAL_ORDER_STATUSES = new Set(["completed", "canceled"]);
+const TERMINAL_FULFILLMENT_STATUSES = new Set(["fulfilled", "delivered", "canceled"]);
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, status: string, fulfillment_status: string, items: { id: string }[] }[]} orders
+ * @param {{ id: string, line_item_id: string | null, quantity: number }[]} reservations
+ * @returns {{ reservation_id: string, order_id: string, line_item_id: string, quantity: number }[]}
+ *
+ * Returns one entry for every reservation whose owning order is completed or
+ * canceled AND whose fulfillment_status is fulfilled, delivered, or canceled.
+ */
+export function findStaleReservations(orders, reservations) {
+  const lineItemToOrder = new Map();
+  for (const order of orders) {
+    for (const item of order.items || []) {
+      lineItemToOrder.set(item.id, order);
+    }
+  }
+
+  const stale = [];
+  for (const reservation of reservations) {
+    const lineItemId = reservation.line_item_id;
+    if (!lineItemId) continue;
+    const order = lineItemToOrder.get(lineItemId);
+    if (!order) continue;
+    if (!TERMINAL_ORDER_STATUSES.has(order.status)) continue;
+    if (!TERMINAL_FULFILLMENT_STATUSES.has(order.fulfillment_status)) continue;
+    stale.push({
+      reservation_id: reservation.id,
+      order_id: order.id,
+      line_item_id: lineItemId,
+      quantity: reservation.quantity,
+    });
+  }
+  return stale;
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (Array.isArray(value)) {
+      for (const v of value) url.searchParams.append(key, v);
+    } else {
+      url.searchParams.set(key, value);
+    }
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function adminDelete(token, path) {
+  const res = await fetch(`${BACKEND_URL}${path}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on DELETE ${path}`);
+  return res.json();
+}
+
+function chunk(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+async function listClosedOrders(token) {
+  const orders = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/orders", {
+      "status[]": ["completed", "canceled"],
+      fields: "id,display_id,status,fulfillment_status,*items",
+      limit,
+      offset,
+    });
+    orders.push(...data.orders);
+    offset += limit;
+    if (offset >= data.count) return orders;
+  }
+}
+
+async function listReservationsForLineItems(token, lineItemIds) {
+  const reservations = [];
+  for (const batch of chunk(lineItemIds, 100)) {
+    if (!batch.length) continue;
+    const data = await adminGet(token, "/admin/reservations", {
+      "line_item_id[]": batch,
+      fields: "id,line_item_id,inventory_item_id,location_id,quantity,created_at",
+      limit: 200,
+    });
+    reservations.push(...data.reservations);
+  }
+  return reservations;
+}
+
+export async function run() {
+  const token = await getAdminToken();
+  const orders = await listClosedOrders(token);
+  const lineItemIds = orders.flatMap((order) => (order.items || []).map((item) => item.id));
+  const reservations = await listReservationsForLineItems(token, lineItemIds);
+
+  const matches = findStaleReservations(orders, reservations);
+
+  for (const match of matches) {
+    console.warn(
+      `Stale reservation ${match.reservation_id} on order ${match.order_id}, line_item ${match.line_item_id}, quantity ${match.quantity}. ${DRY_RUN ? "Would delete" : "Deleting"}`
+    );
+    if (!DRY_RUN) {
+      await adminDelete(token, `/admin/reservations/${match.reservation_id}`);
+    }
+  }
+
+  console.log(`Done. ${matches.length} stale reservation(s) ${DRY_RUN ? "found" : "deleted"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>find_stale_reservations</code> is the part most worth testing, because it decides which reservations are safe to delete. It is pure, so the test needs no network and no Medusa backend. It just feeds in plain fixture arrays of orders and reservations and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_stale_reservation.py</div>
+      <pre><code class="language-python">from find_stale_reservations import find_stale_reservations
+
+
+def order(**over):
+    base = {
+        "id": "order_1",
+        "status": "completed",
+        "fulfillment_status": "fulfilled",
+        "items": [{"id": "item_1"}],
+    }
+    base.update(over)
+    return base
+
+
+def reservation(**over):
+    base = {"id": "res_1", "line_item_id": "item_1", "quantity": 2}
+    base.update(over)
+    return base
+
+
+def test_flags_reservation_when_order_completed_and_fulfilled():
+    result = find_stale_reservations([order()], [reservation()])
+    assert result == [
+        {"reservation_id": "res_1", "order_id": "order_1", "line_item_id": "item_1", "quantity": 2}
+    ]
+
+
+def test_flags_reservation_when_order_canceled_and_fulfillment_canceled():
+    o = order(status="canceled", fulfillment_status="canceled")
+    result = find_stale_reservations([o], [reservation()])
+    assert len(result) == 1
+
+
+def test_keeps_reservation_when_order_still_in_progress():
+    o = order(status="pending", fulfillment_status="not_fulfilled")
+    result = find_stale_reservations([o], [reservation()])
+    assert result == []
+
+
+def test_keeps_reservation_when_order_completed_but_fulfillment_not_terminal():
+    o = order(status="completed", fulfillment_status="partially_fulfilled")
+    result = find_stale_reservations([o], [reservation()])
+    assert result == []
+
+
+def test_keeps_reservation_with_no_matching_line_item():
+    result = find_stale_reservations([order()], [reservation(line_item_id="item_unknown")])
+    assert result == []
+
+
+def test_keeps_reservation_with_no_line_item_id():
+    result = find_stale_reservations([order()], [reservation(line_item_id=None)])
+    assert result == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">stale-reservation.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findStaleReservations } from "./find-stale-reservations.js";
+
+const order = (over = {}) => ({
+  id: "order_1",
+  status: "completed",
+  fulfillment_status: "fulfilled",
+  items: [{ id: "item_1" }],
+  ...over,
+});
+
+const reservation = (over = {}) => ({
+  id: "res_1",
+  line_item_id: "item_1",
+  quantity: 2,
+  ...over,
+});
+
+test("flags reservation when order completed and fulfilled", () => {
+  const result = findStaleReservations([order()], [reservation()]);
+  assert.deepEqual(result, [
+    { reservation_id: "res_1", order_id: "order_1", line_item_id: "item_1", quantity: 2 },
+  ]);
+});
+
+test("flags reservation when order canceled and fulfillment canceled", () => {
+  const o = order({ status: "canceled", fulfillment_status: "canceled" });
+  const result = findStaleReservations([o], [reservation()]);
+  assert.equal(result.length, 1);
+});
+
+test("keeps reservation when order still in progress", () => {
+  const o = order({ status: "pending", fulfillment_status: "not_fulfilled" });
+  const result = findStaleReservations([o], [reservation()]);
+  assert.deepEqual(result, []);
+});
+
+test("keeps reservation when order completed but fulfillment not terminal", () => {
+  const o = order({ status: "completed", fulfillment_status: "partially_fulfilled" });
+  const result = findStaleReservations([o], [reservation()]);
+  assert.deepEqual(result, []);
+});
+
+test("keeps reservation with no matching line item", () => {
+  const result = findStaleReservations([order()], [reservation({ line_item_id: "item_unknown" })]);
+  assert.deepEqual(result, []);
+});
+
+test("keeps reservation with no line_item_id", () => {
+  const result = findStaleReservations([order()], [reservation({ line_item_id: null })]);
+  assert.deepEqual(result, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Multi-warehouse variant</span>
+      <h4>The variant split across two inventory items forgot half its cleanup</h4>
+      <p>A furniture store stocked one variant across two inventory items, a main warehouse and an overflow location, because a single order could pull from either. When an order fulfilled, the workflow deleted the reservation tied to the main warehouse's inventory item, but the overflow location's reservation was left standing after a partial failure downstream.</p>
+      <p>Running the reconciler in dry run surfaced every one of those overflow reservations, all tied to orders that were fully <code>completed</code> and <code>fulfilled</code>. The team reviewed the report, ran it for real, and the overflow location's available stock came back within minutes.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Cancelled order</span>
+      <h4>The cancelled order that kept holding stock for months</h4>
+      <p>A customer's order was cancelled after a chargeback, and the order and its fulfillment both correctly flipped to <code>canceled</code>. But the reservation cleanup that should have run alongside the cancellation never fired, so the item's <code>reserved_quantity</code> at that location stayed inflated for months without anyone noticing until stock counts stopped matching.</p>
+      <p>The reconciler matched the reservation's line item back to that now fully canceled order, flagged it stale, and a single <code>DELETE /admin/reservations/{id}</code> call brought the count back in line the same day it was found.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs as a scheduled reconciler, reserved quantity always reflects stock that a genuinely active order still needs. Reservations left behind by a partial fulfillment failure or a cancellation that skipped its cleanup step get cleared automatically, with a full audit log of every deletion. In-progress orders are never touched, because the order status check and the fulfillment status check both have to agree before anything is removed.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a completed Medusa order still hold an inventory reservation?</summary>
+      <p>Medusa v2 creates a ReservationItem for a line item when it is purchased, and the intended lifecycle is to delete that row once the line item is fulfilled. The delete step is not transactionally guaranteed against the rest of the create-fulfillment workflow, so when a variant has multiple inventory items or the fulfillment and order completion handlers race or partially fail, the reservation can survive even though the order is complete or cancelled.</p>
+    </details>
+    <details>
+      <summary>Is it safe to delete Medusa reservations left over after fulfillment with a script?</summary>
+      <p>Yes, when the script only deletes a reservation after confirming its line_item_id belongs to an order whose status is completed or canceled and whose fulfillment_status is fulfilled, delivered, or canceled. Requiring both the order status and the fulfillment status to be terminal before deleting keeps the script from ever touching a reservation an in-progress order still needs.</p>
+    </details>
+    <details>
+      <summary>What happens to reserved_quantity when a stale reservation is deleted?</summary>
+      <p>Medusa's inventory level counters recompute automatically off the ReservationItem table. Once the stale row is deleted through DELETE /admin/reservations/{id}, reserved_quantity at that location drops by the reservation's quantity and available_quantity goes back up, with no separate location level PATCH needed.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Order fulfillment is not deleting inventory item reservations sometimes. Medusa GitHub Issue #11266. <a href="https://github.com/medusajs/medusa/issues/11266" rel="noopener">github.com/medusajs/medusa/issues/11266</a></li>
+      <li>Medusa Admin User Guide: Manage Reservations. <a href="https://docs.medusajs.com/user-guide/inventory/reservations" rel="noopener">docs.medusajs.com/user-guide/inventory/reservations</a></li>
+      <li>Cancelling fulfillment does not recreate the first reservation. Medusa GitHub Issue #11703. <a href="https://github.com/medusajs/medusa/issues/11703" rel="noopener">github.com/medusajs/medusa/issues/11703</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: ReservationItem, Inventory Module Data Models. <a href="https://docs.medusajs.com/resources/references/inventory-next/models/ReservationItem" rel="noopener">docs.medusajs.com/resources/references/inventory-next/models/ReservationItem</a></li>
+      <li>Medusa Documentation: Inventory Module in Medusa Flows. <a href="https://docs.medusajs.com/resources/commerce-modules/inventory/inventory-in-flows" rel="noopener">docs.medusajs.com/resources/commerce-modules/inventory/inventory-in-flows</a></li>
+      <li>Medusa V2 Admin API Reference. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa storefront access, pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this free up your stock?</h3>
+    <p>If this saved you from a phantom out of stock item or a stock count that would not add up, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

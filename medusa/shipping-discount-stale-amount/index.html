@@ -1,0 +1,997 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix a Shipping Discount That Uses a Stale Shipping Amount in Medusa</title>
+<meta name="description" content="After a Medusa v2 cart changes, a percentage-off shipping promotion can keep discounting the old shipping price instead of the freshly recalculated one. Learn why the two recompute steps disagree and build a Python or Node.js script that flags and safely re-triggers the fix.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/shipping-discount-stale-amount/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix a Shipping Discount That Uses a Stale Shipping Amount in Medusa">
+<meta property="og:description" content="Why a Medusa v2 shipping promotion discounts the old shipping price after a cart change, and a Python or Node.js script that flags and safely re-triggers the recompute.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/shipping-discount-stale-amount/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/shipping-discount-stale-amount/#article","headline":"Fix a Shipping Discount That Uses a Stale Shipping Amount in Medusa","description":"Why a Medusa v2 shipping promotion discounts the old shipping price after a cart change, and a Python or Node.js script that flags and safely re-triggers the recompute against the current shipping amount.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/shipping-discount-stale-amount/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Pricing and Promotions","keywords":"Medusa shipping discount stale amount, refreshCartShippingMethodsWorkflow, updateCartPromotionsWorkflow, ShippingMethodAdjustment, computeActions, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Shipping discount uses a stale shipping amount after cart changes","item":"https://www.allanninal.dev/medusa/shipping-discount-stale-amount/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my Medusa shipping discount not match the current shipping price?","acceptedAnswer":{"@type":"Answer","text":"When a cart item changes, Medusa runs refreshCartItemsWorkflow, which recalculates any calculated shipping option's price in one step and separately recomputes promotion adjustments in another step. Because those two steps each fetch cart state independently, the promotion step can compute the shipping discount against the shipping amount as it stood before the shipping refresh, leaving a ShippingMethodAdjustment that reflects the old price instead of the new one."}},{"@type":"Question","name":"Is it safe to auto-correct a stale shipping discount on a live cart?","acceptedAnswer":{"@type":"Answer","text":"Not by silently rewriting it. A shopper can be mid checkout, and the underlying issue is workflow ordering, not bad data, so a manual patch can be undone by the next cart update anyway. The safe pattern is to flag the mismatch, then re-apply the same promotion codes through the store API's own promotions route, which forces Medusa to recompute the adjustment against the current shipping amount using its own workflow."}},{"@type":"Question","name":"What about orders that already completed with the stale shipping discount?","acceptedAnswer":{"@type":"Answer","text":"Do not auto-correct a completed order. Once an order is placed the total is captured and rewriting it is unsafe to automate. Flag it for support to review and issue a manual refund or credit through the order edit or a manual payment adjustment, the same way you would handle any other money-affecting discrepancy."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Pricing &amp; Promotions</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Pricing &amp; Promotions</p>
+    <h1>Shipping discount uses a stale shipping amount after cart changes</h1>
+    <p class="lead">A customer has a percentage-off shipping promotion applied, then adds another item or changes a quantity. The shipping price recalculates the way it should. But the discount sitting next to it does not move with it, it is still computed off the shipping price from before the change. The cart total ends up wrong by exactly the difference, and nothing in the UI tells anyone why. Here is why Medusa's own recompute steps can disagree with each other, and a script that finds the carts where this happened and safely re-triggers the fix.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin and Store API</span>
+      <span class="chip">Flag first, repair behind DRY_RUN</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>In Medusa v2, adding or updating a cart item runs <code>refreshCartItemsWorkflow</code>, which triggers <code>refreshCartShippingMethodsWorkflow</code> to recalculate a calculated shipping option's price, and separately runs <code>updateCartPromotionsWorkflow</code> to recompute promotion adjustments. Because those are two independent workflow steps that each fetch and pass cart state on their own, the promotion step's <code>computeActions</code> can compute the shipping discount against the shipping amount as it stood before the shipping refresh finished, so the stored <code>ShippingMethodAdjustment</code> reflects the old price, not the new one (<a href="https://github.com/medusajs/medusa/issues/14484" rel="noopener">Medusa GitHub issue #14484</a>). Run a small Python or Node.js script that recomputes what each shipping adjustment should be from the promotion's own rule and the cart's current shipping amount, flags the carts where the stored value disagrees, and, behind a <code>DRY_RUN</code> guard, re-applies the same promotion code through the store API so Medusa recomputes it for real.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A shipping promotion in Medusa v2 does not store a fixed discount amount. It stores a rule, for example one hundred percent off shipping, and Medusa computes the actual number from that rule against the shipping method's current price whenever the cart's promotions are recomputed.</p>
+  <p>The trouble is that a single cart change can trigger two separate recomputations that are supposed to agree but do not always run in the order the numbers need. Adding an item or changing a quantity kicks off <code>refreshCartItemsWorkflow</code>. That workflow calls <code>refreshCartShippingMethodsWorkflow</code>, which updates the price of any calculated shipping option, and it also calls <code>updateCartPromotionsWorkflow</code>, which asks the promotion module to recompute every adjustment, including the shipping one. Both of those are separate workflow steps, and each one fetches and passes cart state on its own rather than sharing one consistent snapshot. When the promotion step runs its <code>computeActions</code> logic before the shipping refresh's new price is visible to it, the discount gets calculated against the old shipping amount. The result sits right there on the cart, a <code>ShippingMethodAdjustment</code> whose <code>amount</code> is stale, while <code>shipping_methods[i].amount</code> itself is already correct.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A cart item change triggers refreshCartItemsWorkflow, which runs a shipping refresh step and a promotion recompute step separately. The promotion step reads the shipping amount before the refresh is visible, so the stored shipping discount stays stale while the shipping price itself is already correct.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Cart item changes</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">refreshCartItemsWorkflow</text>
+      <line x1="97" y1="80" x2="97" y2="103" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="185" y1="50" x2="220" y2="50" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="105" width="175" height="65" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="97" y="130" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Shipping refresh step</text>
+      <text x="97" y="147" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">recalculates shipping</text>
+      <text x="97" y="161" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">amount, its own snapshot</text>
+      <rect x="223" y="20" width="200" height="65" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="323" y="46" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Promotion recompute step</text>
+      <text x="323" y="63" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">updateCartPromotionsWorkflow</text>
+      <text x="323" y="77" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">reads shipping amount separately</text>
+      <line x1="423" y1="52" x2="465" y2="52" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="444" y="35" text-anchor="middle" font-family="sans-serif" font-size="18" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="444" y="99" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">reads before refresh visible</text>
+      <rect x="468" y="20" width="160" height="65" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="548" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Adjustment stale</text>
+      <text x="548" y="63" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">computed off old</text>
+      <text x="548" y="77" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">shipping amount</text>
+      <line x1="651" y1="52" x2="669" y2="52" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="632" y="20" width="118" height="65" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="46" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Cart total</text>
+      <text x="691" y="63" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">off by the delta</text>
+      <line x1="97" y1="170" x2="97" y2="196" stroke="#6b5a70" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="97" y="212" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">shipping_methods[i].amount is already correct</text>
+    </svg>
+    <figcaption>Both workflow steps run correctly on their own. The shipping amount refreshes, but the promotion step can compute the discount before that refresh is visible to it, so only the adjustment stays stale.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>Every one of these is a normal part of Medusa v2's cart workflows, and the mismatch only shows up when they land in a certain order:</p>
+  <ul>
+    <li>Adding or updating a cart item runs <code>refreshCartItemsWorkflow</code>, which in turn triggers <code>refreshCartShippingMethodsWorkflow</code> to recalculate the price of any calculated shipping option.</li>
+    <li>The same item change also runs <code>updateCartPromotionsWorkflow</code> to recompute every promotion adjustment on the cart, including any shipping discount.</li>
+    <li>Those are two separate workflow steps. Each one fetches and passes cart state independently rather than sharing one consistent snapshot across the whole workflow run.</li>
+    <li>The promotion module's <code>computeActions</code> for shipping methods, in <code>packages/modules/promotion/src/utils/compute-actions/shipping-methods.ts</code>, derives the percentage-off amount from the shipping method's amount as it reads it at that point, which can be the value from before the shipping refresh step's change becomes visible.</li>
+    <li>The result is a <code>ShippingMethodAdjustment</code> whose <code>amount</code> reflects the old shipping price, sitting next to a <code>shipping_methods[i].amount</code> that is already the new, correct one.</li>
+  </ul>
+  <p>This is a common source of confusion because both numbers look plausible on their own, the shipping price is right and the discount percentage is right, they just were not computed against each other at the same moment. See the citations at the end for the exact GitHub issue and the docs on how promotion adjustments work.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>This is not bad data sitting in a database column, it is a cart-level pricing bug caused by workflow ordering. That means a script should never reach in and overwrite the <code>ShippingMethodAdjustment.amount</code> directly, since the next cart update can just recompute it wrong again, and a live cart can be mid checkout right now. The safe pattern is to recompute what the adjustment should be with a pure, testable rule, flag the carts where it disagrees with what is stored, and repair by re-triggering Medusa's own recompute, not by hand-patching the number.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout and we do not write straight to a cart's adjustment amount. We fetch each cart's current shipping method amount and its promotions, pull each promotion's live rule, and run a pure function that computes what the shipping adjustment should be right now. Where that disagrees with what is stored, past a small tolerance, we flag it. Behind <code>DRY_RUN</code>, the repair step re-applies the same promotion codes through the store API's cart promotions route, which forces Medusa to run <code>updateCartPromotionsWorkflow</code> again against the now-current shipping amount.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script reads each cart's shipping methods and promotions, computes the expected shipping adjustment from the live rule and current shipping amount, flags carts where the stored adjustment is stale, then either logs it in dry run or re-applies the promotion codes to force Medusa to recompute for real.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="180" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="100" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Read cart shipping</text>
+      <text x="100" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">amount, adjustments</text>
+      <line x1="100" y1="80" x2="100" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Fetch live promotion rule</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">application_method.value</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="275" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="367" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Compute expected</text>
+      <text x="367" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">vs stored adjustment</text>
+      <line x1="460" y1="138" x2="502" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="595,106 682,138 595,170 508,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="595" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Delta over</text>
+      <text x="595" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">tolerance?</text>
+      <text x="685" y="128" font-family="sans-serif" font-size="10.5" fill="#6b5a70" font-weight="700">yes</text>
+      <line x1="682" y1="138" x2="710" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, leave alone</text>
+      <line x1="595" y1="170" x2="595" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="638" y="185" width="122" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="699" y="203" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Log or re-apply</text>
+      <text x="699" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">promo codes</text>
+      <path d="M710,138 C730,138 699,150 699,183" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The script flags first. Repair means re-applying the promotion code so Medusa's own workflow recomputes the adjustment, never a direct write to the stored amount.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an admin session and the base URL</h3>
+      <p>Point the script at your Medusa backend and an admin user with rights to read carts, orders, and promotions. Exchange the email and password for a JWT once, then send it as a Bearer token on every admin call. Store carts also need the publishable API key when read from the store side. Keep everything in environment variables, never hardcoded.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export MEDUSA_PUBLISHABLE_KEY="pk_..."
+export DRY_RUN="true"   # start safe, only logs stored vs expected amount</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export MEDUSA_PUBLISHABLE_KEY="pk_..."
+export DRY_RUN="true"   // start safe, only logs stored vs expected amount</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Authenticate and list carts with their shipping methods</h3>
+      <p>Exchange credentials for a token, then ask for carts along with their shipping totals, shipping methods, each method's adjustments, and applied promotions. Recently updated carts are the ones most likely to have hit the ordering bug, since it only shows up right after an item change.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+CART_FIELDS = (
+    "id,shipping_total,item_total,"
+    "*shipping_methods,*shipping_methods.adjustments,*promotions"
+)
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def get_cart(token, cart_id):
+    r = requests.get(
+        f"{BASE_URL}/store/carts/{cart_id}",
+        params={"fields": CART_FIELDS},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-publishable-api-key": os.environ.get("MEDUSA_PUBLISHABLE_KEY", ""),
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["cart"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL;
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD;
+const PUBLISHABLE_KEY = process.env.MEDUSA_PUBLISHABLE_KEY || "";
+
+const CART_FIELDS =
+  "id,shipping_total,item_total," +
+  "*shipping_methods,*shipping_methods.adjustments,*promotions";
+
+async function getToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function getCart(token, cartId) {
+  const url = new URL(`${BASE_URL}/store/carts/${cartId}`);
+  url.searchParams.set("fields", CART_FIELDS);
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "x-publishable-api-key": PUBLISHABLE_KEY,
+    },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.cart;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Fetch each promotion's live rule</h3>
+      <p>For every promotion code on a flagged cart, read the promotion's <code>application_method</code> to get its <code>type</code> and <code>value</code>. Only <code>target_type === "shipping_methods"</code> promotions are relevant here, since a product or order discount does not touch shipping at all.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def get_promotion(token, promotion_id):
+    r = requests.get(
+        f"{BASE_URL}/admin/promotions/{promotion_id}",
+        params={"fields": "id,code,application_method.value,application_method.target_type,application_method.type"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["promotion"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function getPromotion(token, promotionId) {
+  const url = new URL(`${BASE_URL}/admin/promotions/${promotionId}`);
+  url.searchParams.set(
+    "fields",
+    "id,code,application_method.value,application_method.target_type,application_method.type"
+  );
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.promotion;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in a function with no network calls, so it is easy to read and easy to test. Given the shipping method's current amount and the promotion's application method, it returns what the adjustment amount should be right now. The caller compares that to the persisted adjustment and derives the delta, so the function itself never touches a cart or a database.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">TOLERANCE = 0.01
+
+def compute_expected_shipping_adjustment(shipping_method, promotion):
+    """Pure: no I/O. shipping_method is {"id","amount"}.
+    promotion is {"id","code","application_method": {"type","value","target_type"}}.
+    Returns None when the promotion does not target shipping methods."""
+    app = promotion["application_method"]
+    if app["target_type"] != "shipping_methods":
+        return None
+    amount = shipping_method["amount"]
+    if app["type"] == "percentage":
+        adjustment_amount = amount * (app["value"] / 100)
+    else:
+        adjustment_amount = min(app["value"], amount)
+    return {"adjustment_amount": adjustment_amount, "is_stale": False, "delta": 0}
+
+
+def evaluate_stale_adjustment(shipping_method, promotion, stored_amount):
+    """Pure: no I/O. Combines the expected amount with the persisted stored_amount
+    (read by the caller) to produce delta and is_stale."""
+    expected = compute_expected_shipping_adjustment(shipping_method, promotion)
+    if expected is None:
+        return None
+    delta = stored_amount - expected["adjustment_amount"]
+    expected["delta"] = delta
+    expected["is_stale"] = abs(delta) &gt; TOLERANCE
+    return expected</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const TOLERANCE = 0.01;
+
+export function computeExpectedShippingAdjustment(shippingMethod, promotion) {
+  // Pure: no I/O. shippingMethod is { id, amount }.
+  // promotion is { id, code, application_method: { type, value, target_type } }.
+  // Returns null when the promotion does not target shipping methods.
+  const app = promotion.application_method;
+  if (app.target_type !== "shipping_methods") return null;
+  const amount = shippingMethod.amount;
+  const adjustmentAmount =
+    app.type === "percentage" ? amount * (app.value / 100) : Math.min(app.value, amount);
+  return { adjustment_amount: adjustmentAmount, is_stale: false, delta: 0 };
+}
+
+export function evaluateStaleAdjustment(shippingMethod, promotion, storedAmount) {
+  // Pure: no I/O. Combines the expected amount with the persisted storedAmount
+  // (read by the caller) to produce delta and is_stale.
+  const expected = computeExpectedShippingAdjustment(shippingMethod, promotion);
+  if (expected === null) return null;
+  const delta = storedAmount - expected.adjustment_amount;
+  expected.delta = delta;
+  expected.is_stale = Math.abs(delta) &gt; TOLERANCE;
+  return expected;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Repair by re-applying the promotion code, behind a dry run guard</h3>
+      <p>When <code>DRY_RUN</code> is true, only log the cart id, shipping method id, promotion code, stored amount, expected amount, and delta for every flagged cart. When it is false, call the store API's cart promotions route with the same codes the cart already has. Re-applying the codes forces Medusa to run <code>updateCartPromotionsWorkflow</code> again, now against the current, already-refreshed <code>shipping_methods[i].amount</code>, which is exactly what should have happened the first time.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def reapply_promotions(token, cart_id, promo_codes):
+    r = requests.post(
+        f"{BASE_URL}/store/carts/{cart_id}/promotions",
+        json={"promo_codes": promo_codes},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-publishable-api-key": os.environ.get("MEDUSA_PUBLISHABLE_KEY", ""),
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["cart"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function reapplyPromotions(token, cartId, promoCodes) {
+  const res = await fetch(`${BASE_URL}/store/carts/${cartId}/promotions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "x-publishable-api-key": PUBLISHABLE_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ promo_codes: promoCodes }),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.cart;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never write the recomputed number straight into a cart's <code>ShippingMethodAdjustment.amount</code>. Start with <code>DRY_RUN=true</code>, review the exact list of flagged carts, then flip it off to let the script re-apply the promotion codes and let Medusa recompute for real. For an order that already completed with the stale amount, do not auto-correct it, since the total is already captured. Flag it for support to review manually.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It authenticates, reads a cart's shipping methods and promotions, fetches each promotion's live rule, flags every stale shipping adjustment with a pure function, and either logs the repair or re-applies the promotion codes depending on <code>DRY_RUN</code>.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/shipping-discount-stale-amount" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_shipping_discount.py</div>
+      <pre><code class="language-python">"""Flag Medusa v2 carts whose shipping promotion adjustment was computed against
+a stale shipping amount, and safely repair by re-applying the same promotion
+codes so Medusa's own updateCartPromotionsWorkflow recomputes it for real.
+Never writes ShippingMethodAdjustment.amount directly. DRY_RUN=true only logs
+stored vs expected. Safe to run again and again, one cart at a time.
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_shipping_discount")
+
+BASE_URL = os.environ.get("MEDUSA_BACKEND_URL", "http://localhost:9000")
+EMAIL = os.environ.get("MEDUSA_ADMIN_EMAIL", "admin@example.com")
+PASSWORD = os.environ.get("MEDUSA_ADMIN_PASSWORD", "supersecret")
+PUBLISHABLE_KEY = os.environ.get("MEDUSA_PUBLISHABLE_KEY", "")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+TOLERANCE = 0.01
+
+CART_FIELDS = (
+    "id,shipping_total,item_total,"
+    "*shipping_methods,*shipping_methods.adjustments,*promotions"
+)
+
+
+def get_token():
+    r = requests.post(
+        f"{BASE_URL}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def get_cart(token, cart_id):
+    r = requests.get(
+        f"{BASE_URL}/store/carts/{cart_id}",
+        params={"fields": CART_FIELDS},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-publishable-api-key": PUBLISHABLE_KEY,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["cart"]
+
+
+def get_promotion(token, promotion_id):
+    r = requests.get(
+        f"{BASE_URL}/admin/promotions/{promotion_id}",
+        params={"fields": "id,code,application_method.value,application_method.target_type,application_method.type"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["promotion"]
+
+
+def compute_expected_shipping_adjustment(shipping_method, promotion):
+    """Pure: no I/O. shipping_method is {"id","amount"}.
+    promotion is {"id","code","application_method": {"type","value","target_type"}}.
+    Returns None when the promotion does not target shipping methods."""
+    app = promotion["application_method"]
+    if app["target_type"] != "shipping_methods":
+        return None
+    amount = shipping_method["amount"]
+    if app["type"] == "percentage":
+        adjustment_amount = amount * (app["value"] / 100)
+    else:
+        adjustment_amount = min(app["value"], amount)
+    return {"adjustment_amount": adjustment_amount, "is_stale": False, "delta": 0}
+
+
+def evaluate_stale_adjustment(shipping_method, promotion, stored_amount):
+    """Pure: no I/O. Combines the expected amount with the persisted stored_amount
+    (read by the caller) to produce delta and is_stale."""
+    expected = compute_expected_shipping_adjustment(shipping_method, promotion)
+    if expected is None:
+        return None
+    delta = stored_amount - expected["adjustment_amount"]
+    expected["delta"] = delta
+    expected["is_stale"] = abs(delta) &gt; TOLERANCE
+    return expected
+
+
+def reapply_promotions(token, cart_id, promo_codes):
+    r = requests.post(
+        f"{BASE_URL}/store/carts/{cart_id}/promotions",
+        json={"promo_codes": promo_codes},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-publishable-api-key": PUBLISHABLE_KEY,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["cart"]
+
+
+def find_stale_shipping_adjustments(token, cart_id):
+    cart = get_cart(token, cart_id)
+    promotions_by_code = {p["code"]: p for p in cart.get("promotions", [])}
+    flagged = []
+    for method in cart.get("shipping_methods", []):
+        shipping_method = {"id": method["id"], "amount": method["amount"]}
+        for adj in method.get("adjustments", []) or []:
+            code = adj.get("code")
+            promo = promotions_by_code.get(code)
+            if promo is None:
+                continue
+            promotion = get_promotion(token, promo["id"])
+            result = evaluate_stale_adjustment(shipping_method, promotion, adj["amount"])
+            if result is None or not result["is_stale"]:
+                continue
+            flagged.append({
+                "cart_id": cart_id,
+                "shipping_method_id": method["id"],
+                "promotion_code": code,
+                "stored_amount": adj["amount"],
+                "expected_amount": result["adjustment_amount"],
+                "delta": result["delta"],
+            })
+    return flagged, list(promotions_by_code.keys())
+
+
+def run(cart_ids=None):
+    token = get_token()
+    cart_ids = cart_ids or os.environ.get("CART_IDS", "").split(",")
+    cart_ids = [c.strip() for c in cart_ids if c.strip()]
+
+    total_flagged = 0
+    for cart_id in cart_ids:
+        flagged, codes = find_stale_shipping_adjustments(token, cart_id)
+        for f in flagged:
+            log.info(
+                "Cart %s shipping method %s promo %s: stored=%s expected=%s delta=%s. %s",
+                f["cart_id"], f["shipping_method_id"], f["promotion_code"],
+                f["stored_amount"], f["expected_amount"], f["delta"],
+                "Would re-apply" if DRY_RUN else "Re-applying",
+            )
+            if not DRY_RUN:
+                reapply_promotions(token, cart_id, codes)
+            total_flagged += 1
+
+    log.info("Done. %d stale shipping adjustment(s) %s.", total_flagged, "to repair" if DRY_RUN else "repaired")
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-shipping-discount.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag Medusa v2 carts whose shipping promotion adjustment was computed against
+ * a stale shipping amount, and safely repair by re-applying the same promotion
+ * codes so Medusa's own updateCartPromotionsWorkflow recomputes it for real.
+ * Never writes ShippingMethodAdjustment.amount directly. DRY_RUN=true only logs
+ * stored vs expected. Safe to run again and again, one cart at a time.
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const PUBLISHABLE_KEY = process.env.MEDUSA_PUBLISHABLE_KEY || "";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const TOLERANCE = 0.01;
+
+const CART_FIELDS =
+  "id,shipping_total,item_total," +
+  "*shipping_methods,*shipping_methods.adjustments,*promotions";
+
+export function computeExpectedShippingAdjustment(shippingMethod, promotion) {
+  // Pure: no I/O. shippingMethod is { id, amount }.
+  // promotion is { id, code, application_method: { type, value, target_type } }.
+  // Returns null when the promotion does not target shipping methods.
+  const app = promotion.application_method;
+  if (app.target_type !== "shipping_methods") return null;
+  const amount = shippingMethod.amount;
+  const adjustmentAmount =
+    app.type === "percentage" ? amount * (app.value / 100) : Math.min(app.value, amount);
+  return { adjustment_amount: adjustmentAmount, is_stale: false, delta: 0 };
+}
+
+export function evaluateStaleAdjustment(shippingMethod, promotion, storedAmount) {
+  // Pure: no I/O. Combines the expected amount with the persisted storedAmount
+  // (read by the caller) to produce delta and is_stale.
+  const expected = computeExpectedShippingAdjustment(shippingMethod, promotion);
+  if (expected === null) return null;
+  const delta = storedAmount - expected.adjustment_amount;
+  expected.delta = delta;
+  expected.is_stale = Math.abs(delta) &gt; TOLERANCE;
+  return expected;
+}
+
+async function getToken() {
+  const res = await fetch(`${BASE_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function getCart(token, cartId) {
+  const url = new URL(`${BASE_URL}/store/carts/${cartId}`);
+  url.searchParams.set("fields", CART_FIELDS);
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "x-publishable-api-key": PUBLISHABLE_KEY,
+    },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.cart;
+}
+
+async function getPromotion(token, promotionId) {
+  const url = new URL(`${BASE_URL}/admin/promotions/${promotionId}`);
+  url.searchParams.set(
+    "fields",
+    "id,code,application_method.value,application_method.target_type,application_method.type"
+  );
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.promotion;
+}
+
+async function reapplyPromotions(token, cartId, promoCodes) {
+  const res = await fetch(`${BASE_URL}/store/carts/${cartId}/promotions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "x-publishable-api-key": PUBLISHABLE_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ promo_codes: promoCodes }),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.cart;
+}
+
+async function findStaleShippingAdjustments(token, cartId) {
+  const cart = await getCart(token, cartId);
+  const promotionsByCode = new Map((cart.promotions || []).map((p) => [p.code, p]));
+  const flagged = [];
+  for (const method of cart.shipping_methods || []) {
+    const shippingMethod = { id: method.id, amount: method.amount };
+    for (const adj of method.adjustments || []) {
+      const promo = promotionsByCode.get(adj.code);
+      if (!promo) continue;
+      const promotion = await getPromotion(token, promo.id);
+      const result = evaluateStaleAdjustment(shippingMethod, promotion, adj.amount);
+      if (!result || !result.is_stale) continue;
+      flagged.push({
+        cart_id: cartId,
+        shipping_method_id: method.id,
+        promotion_code: adj.code,
+        stored_amount: adj.amount,
+        expected_amount: result.adjustment_amount,
+        delta: result.delta,
+      });
+    }
+  }
+  return { flagged, codes: [...promotionsByCode.keys()] };
+}
+
+export async function run(cartIds) {
+  const token = await getToken();
+  const ids = (cartIds || (process.env.CART_IDS || "").split(","))
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  let totalFlagged = 0;
+  for (const cartId of ids) {
+    const { flagged, codes } = await findStaleShippingAdjustments(token, cartId);
+    for (const f of flagged) {
+      console.log(
+        `Cart ${f.cart_id} shipping method ${f.shipping_method_id} promo ${f.promotion_code}: stored=${f.stored_amount} expected=${f.expected_amount} delta=${f.delta}. ${DRY_RUN ? "Would re-apply" : "Re-applying"}`
+      );
+      if (!DRY_RUN) await reapplyPromotions(token, cartId, codes);
+      totalFlagged++;
+    }
+  }
+
+  console.log(`Done. ${totalFlagged} stale shipping adjustment(s) ${DRY_RUN ? "to repair" : "repaired"}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The function worth testing is the pure decision, <code>evaluate_stale_adjustment</code> and the <code>compute_expected_shipping_adjustment</code> it wraps. Both take plain objects and do no fetching, so the tests need no Medusa backend and no network at all.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_shipping_discount.py</div>
+      <pre><code class="language-python">from reconcile_shipping_discount import (
+    compute_expected_shipping_adjustment,
+    evaluate_stale_adjustment,
+)
+
+
+def shipping_method(**over):
+    base = {"id": "sm_1", "amount": 1079}
+    base.update(over)
+    return base
+
+
+def promotion(**over):
+    base = {
+        "id": "promo_1",
+        "code": "FREESHIP",
+        "application_method": {"type": "percentage", "value": 100, "target_type": "shipping_methods"},
+    }
+    base.update(over)
+    return base
+
+
+def test_percentage_full_off_matches_current_amount():
+    result = compute_expected_shipping_adjustment(shipping_method(), promotion())
+    assert result["adjustment_amount"] == 1079
+
+
+def test_percentage_partial_off():
+    promo = promotion(application_method={"type": "percentage", "value": 50, "target_type": "shipping_methods"})
+    result = compute_expected_shipping_adjustment(shipping_method(), promo)
+    assert result["adjustment_amount"] == 539.5
+
+
+def test_fixed_amount_capped_at_shipping_amount():
+    promo = promotion(application_method={"type": "fixed", "value": 5000, "target_type": "shipping_methods"})
+    result = compute_expected_shipping_adjustment(shipping_method(amount=1079), promo)
+    assert result["adjustment_amount"] == 1079
+
+
+def test_non_shipping_target_returns_none():
+    promo = promotion(application_method={"type": "percentage", "value": 100, "target_type": "items"})
+    assert compute_expected_shipping_adjustment(shipping_method(), promo) is None
+
+
+def test_stale_when_stored_amount_is_from_before_refresh():
+    result = evaluate_stale_adjustment(shipping_method(), promotion(), 929)
+    assert result["is_stale"] is True
+    assert result["delta"] == 929 - 1079
+
+
+def test_not_stale_when_stored_matches_expected():
+    result = evaluate_stale_adjustment(shipping_method(), promotion(), 1079)
+    assert result["is_stale"] is False
+    assert result["delta"] == 0
+
+
+def test_not_stale_within_tolerance():
+    result = evaluate_stale_adjustment(shipping_method(), promotion(), 1079.005)
+    assert result["is_stale"] is False
+
+
+def test_none_when_promotion_not_shipping_targeted():
+    promo = promotion(application_method={"type": "percentage", "value": 100, "target_type": "items"})
+    assert evaluate_stale_adjustment(shipping_method(), promo, 929) is None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">shipping-discount.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  computeExpectedShippingAdjustment,
+  evaluateStaleAdjustment,
+} from "./reconcile-shipping-discount.js";
+
+const shippingMethod = (over = {}) => ({ id: "sm_1", amount: 1079, ...over });
+
+const promotion = (over = {}) => ({
+  id: "promo_1",
+  code: "FREESHIP",
+  application_method: { type: "percentage", value: 100, target_type: "shipping_methods" },
+  ...over,
+});
+
+test("percentage full off matches current amount", () => {
+  const result = computeExpectedShippingAdjustment(shippingMethod(), promotion());
+  assert.equal(result.adjustment_amount, 1079);
+});
+
+test("percentage partial off", () => {
+  const promo = promotion({ application_method: { type: "percentage", value: 50, target_type: "shipping_methods" } });
+  const result = computeExpectedShippingAdjustment(shippingMethod(), promo);
+  assert.equal(result.adjustment_amount, 539.5);
+});
+
+test("fixed amount capped at shipping amount", () => {
+  const promo = promotion({ application_method: { type: "fixed", value: 5000, target_type: "shipping_methods" } });
+  const result = computeExpectedShippingAdjustment(shippingMethod({ amount: 1079 }), promo);
+  assert.equal(result.adjustment_amount, 1079);
+});
+
+test("non shipping target returns null", () => {
+  const promo = promotion({ application_method: { type: "percentage", value: 100, target_type: "items" } });
+  assert.equal(computeExpectedShippingAdjustment(shippingMethod(), promo), null);
+});
+
+test("stale when stored amount is from before refresh", () => {
+  const result = evaluateStaleAdjustment(shippingMethod(), promotion(), 929);
+  assert.equal(result.is_stale, true);
+  assert.equal(result.delta, 929 - 1079);
+});
+
+test("not stale when stored matches expected", () => {
+  const result = evaluateStaleAdjustment(shippingMethod(), promotion(), 1079);
+  assert.equal(result.is_stale, false);
+  assert.equal(result.delta, 0);
+});
+
+test("not stale within tolerance", () => {
+  const result = evaluateStaleAdjustment(shippingMethod(), promotion(), 1079.005);
+  assert.equal(result.is_stale, false);
+});
+
+test("null when promotion not shipping targeted", () => {
+  const promo = promotion({ application_method: { type: "percentage", value: 100, target_type: "items" } });
+  assert.equal(evaluateStaleAdjustment(shippingMethod(), promo, 929), null);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Free shipping promo</span>
+      <h4>The cart that quietly kept a shipping charge</h4>
+      <p>A store ran a free shipping over threshold promotion, one hundred percent off the shipping method. A shopper qualified, saw shipping drop to zero, then added one more item that bumped them into a different calculated shipping rate. The shipping price recalculated correctly to the new, higher amount, but the stored discount stayed at the old, lower amount, so the cart total showed a small leftover shipping charge on an order that was supposed to ship free.</p>
+      <p>Running the reconciler against recent carts surfaced the exact delta between the stored and expected adjustment. Re-applying the promotion code through the store API fixed the live cart before checkout, and the team used the same flagged list to spot the pattern across other free shipping carts that day.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Draft order support</span>
+      <h4>The completed order with the wrong shipping discount</h4>
+      <p>A support ticket came in about an order total that did not match the fifty percent off shipping promotion the customer expected. Pulling the order's shipping methods and adjustments showed the discount had in fact been computed against the shipping amount from before a last-minute quantity change, the same stale-amount pattern, just already captured on a completed order.</p>
+      <p>Because the order was already paid, the team did not try to auto-correct it. The reconciler's output was enough to confirm the exact expected versus stored amounts, and support issued a manual credit for the difference instead of rewriting a captured total.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>Run this against active and recently updated carts, or sweep pending draft orders the same way. It never rewrites a <code>ShippingMethodAdjustment.amount</code> directly. It tells you exactly which shipping discounts were computed against a stale amount, and the only write it makes, behind <code>DRY_RUN=false</code>, is re-applying the promotion codes so Medusa's own workflow recomputes the number the way it should have the first time. Completed orders are flagged for a human, never auto-corrected.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my Medusa shipping discount not match the current shipping price?</summary>
+      <p>When a cart item changes, Medusa runs refreshCartItemsWorkflow, which recalculates any calculated shipping option's price in one step and separately recomputes promotion adjustments in another step. Because those two steps each fetch cart state independently, the promotion step can compute the shipping discount against the shipping amount as it stood before the shipping refresh, leaving a ShippingMethodAdjustment that reflects the old price instead of the new one.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-correct a stale shipping discount on a live cart?</summary>
+      <p>Not by silently rewriting it. A shopper can be mid checkout, and the underlying issue is workflow ordering, not bad data, so a manual patch can be undone by the next cart update anyway. The safe pattern is to flag the mismatch, then re-apply the same promotion codes through the store API's own promotions route, which forces Medusa to recompute the adjustment against the current shipping amount using its own workflow.</p>
+    </details>
+    <details>
+      <summary>What about orders that already completed with the stale shipping discount?</summary>
+      <p>Do not auto-correct a completed order. Once an order is placed the total is captured and rewriting it is unsafe to automate. Flag it for support to review and issue a manual refund or credit through the order edit or a manual payment adjustment, the same way you would handle any other money-affecting discrepancy.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>medusajs/medusa GitHub issue #14484: Shipping promotion discount uses stale shipping amount when cart items change (V2). <a href="https://github.com/medusajs/medusa/issues/14484" rel="noopener">github.com/medusajs/medusa/issues/14484</a></li>
+      <li>medusajs/medusa GitHub issue #14819: Shipping method adjustment uses gross (tax-inclusive) amount instead of pre-tax amount, causing negative cart total when promotion covers full shipping cost. <a href="https://github.com/medusajs/medusa/issues/14819" rel="noopener">github.com/medusajs/medusa/issues/14819</a></li>
+      <li>Medusa Documentation: Promotions Adjustments in Carts. <a href="https://docs.medusajs.com/resources/commerce-modules/cart/promotions" rel="noopener">docs.medusajs.com/resources/commerce-modules/cart/promotions</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Promotions Adjustments in Carts. <a href="https://docs.medusajs.com/resources/commerce-modules/cart/promotions" rel="noopener">docs.medusajs.com/resources/commerce-modules/cart/promotions</a></li>
+      <li>Medusa Documentation: Promotion Actions. <a href="https://docs.medusajs.com/resources/commerce-modules/promotion/actions" rel="noopener">docs.medusajs.com/resources/commerce-modules/promotion/actions</a></li>
+      <li>Medusa V2 Store API Reference. <a href="https://docs.medusajs.com/api/store" rel="noopener">docs.medusajs.com/api/store</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a stale shipping discount before it shipped?</h3>
+    <p>If this saved you a wrong cart total or a confused refund request, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,1044 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Medusa Reservation Update Events That Never Fire</title>
+<meta name="description" content="A reservation's quantity, line item, or location changes, but no RESERVATION_ITEM_UPDATED event ever arrives. Learn why Medusa v2 fired the wrong event constant and build a Python or Node.js reconciler that finds and reports the drifted reservations.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Medusa Reservation Update Events That Never Fire">
+<meta property="og:description" content="Why Medusa v2's InventoryModuleService.updateReservationItem emitted the wrong event constant, and a safe Python or Node.js reconciler that finds every reservation that drifted out of sync because of it.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/#article","headline":"Fix Medusa Reservation Update Events That Never Fire","description":"Why Medusa v2's InventoryModuleService.updateReservationItem emitted inventory-item.updated instead of reservation-item.updated, silently breaking subscriber-based stock sync, and a safe Python or Node.js reconciler that reports every reservation that drifted because of it.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory & Reservations","keywords":"Medusa reservation, RESERVATION_ITEM_UPDATED, InventoryModuleService, updateReservationItem, reserved_quantity, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Medusa field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"Reservation update event never fires","item":"https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my subscriber for RESERVATION_ITEM_UPDATED never run in Medusa v2?","acceptedAnswer":{"@type":"Answer","text":"Medusa v2's InventoryModuleService.updateReservationItem emitted the wrong event constant. Whenever a reservation's quantity, line item, or location changed, whether through the admin UI, the Admin API, or an internal workflow like order fulfillment or cancellation, it fired inventory-item.updated instead of reservation-item.updated. Since a subscriber registers for the exact event name RESERVATION_ITEM_UPDATED, it never receives a notification for these changes. This is confirmed in medusajs/medusa#11704 and fixed in PR #11714."}},{"@type":"Question","name":"How do I detect reservations that drifted because the update event never fired?","acceptedAnswer":{"@type":"Answer","text":"Run a reconciliation pass rather than relying on the missing event. For each stock location, page through GET /admin/reservations with fields for quantity, line_item_id, inventory_item_id, location_id, and updated_at, and compare each reservation's live quantity against the last-synced snapshot your stock-sync script persisted. Cross-check GET /admin/inventory-items/{id}/location-levels so a reserved_quantity that drifted from the sum of live reservations at that location is also flagged, since an external system built on the subscriber may never have heard about the change."}},{"@type":"Question","name":"Is it safe to auto-correct drifted reservations with a script?","acceptedAnswer":{"@type":"Answer","text":"By default the script only reports drifted reservation ids with their old and new quantity and the computed drift, it does not silently rewrite anything. Re-saving a reservation with the same quantity will not retrigger the buggy emit path, so the safe repair is for your own stock-sync consumer to adopt the live quantity as its new last-synced baseline and forward the corrected delta to whatever system it feeds, rather than mutating Medusa reservations the script does not own. Writing anything requires an explicit --apply flag."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Inventory &amp; Reservations</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory &amp; Reservations</p>
+    <h1>Reservation update event never fires</h1>
+    <p class="lead">You change a reservation's quantity, move it to a different line item, or shift it to another location, and your subscriber never wakes up. No error, no log line, nothing. Here is why Medusa v2 silently fired the wrong event on every reservation update and a small reconciler that finds every reservation that drifted out of sync because that event never arrived.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Admin API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>GitHub issue #11704 confirms that Medusa v2's <code>InventoryModuleService.updateReservationItem</code> emitted the wrong event constant. Whenever a reservation's quantity, line item, or location changed, whether from the admin UI, the Admin API, or an internal workflow like order fulfillment or cancellation, it fired <code>inventory-item.updated</code> (<code>InventoryEvents.INVENTORY_ITEM_UPDATED</code>) instead of <code>reservation-item.updated</code> (<code>RESERVATION_ITEM_UPDATED</code>). PR #11714 fixes the constant, but any store still on an affected version, or any store that needs to check whether it already drifted, needs to reconcile what the missing events should have delivered. Run a script that pages through every reservation per stock location, compares the live quantity against your stock-sync script's last-synced snapshot, and cross-checks each inventory item's <code>reserved_quantity</code> against the sum of its live reservations, then reports the mismatches. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Medusa's event system works on an honor system between the emitter and the subscriber. A subscriber registers for one exact event name, for example <code>reservation-item.updated</code>, and Medusa's workflow engine emits an event under some name whenever a service method runs. If those two names do not match character for character, the subscriber simply never fires. No exception is thrown anywhere, because nothing is wrong from the emitter's point of view. It emitted a valid event, just the wrong one.</p>
+  <p>That is exactly what happened here. <code>InventoryModuleService.updateReservationItem</code> is the method that runs whenever a reservation's <code>quantity</code>, <code>line_item_id</code>, or <code>location_id</code> changes. Instead of emitting <code>RESERVATION_ITEM_UPDATED</code>, it emitted <code>INVENTORY_ITEM_UPDATED</code>, the constant meant for changes to the inventory item itself. A subscriber written against <code>RESERVATION_ITEM_UPDATED</code>, which is the only event name that makes semantic sense to listen for here, gets nothing. Any stock-sync integration, cache invalidation, or downstream notification built purely on that subscriber quietly stops keeping up with reservation changes, and nobody notices until the numbers stop matching.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A reservation's quantity is updated, updateReservationItem runs, but it emits inventory-item.updated instead of reservation-item.updated, so the subscriber listening for RESERVATION_ITEM_UPDATED never fires and the external stock-sync system drifts out of sync.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#9a8ba0"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="170" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="48" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Reservation quantity</text>
+      <text x="95" y="66" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">changed by admin or API</text>
+      <line x1="95" y1="86" x2="95" y2="112" stroke="#9a8ba0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="114" width="230" height="72" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="125" y="138" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">updateReservationItem</text>
+      <text x="125" y="154" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">runs and emits an event</text>
+      <line x1="240" y1="150" x2="282" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="261" y="112" text-anchor="middle" font-family="sans-serif" font-size="21" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="261" y="200" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">wrong constant emitted</text>
+      <rect x="285" y="118" width="190" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="380" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">inventory-item.updated</text>
+      <text x="380" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">not reservation-item.updated</text>
+      <line x1="475" y1="150" x2="517" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="520" y="118" width="150" height="64" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="595" y="144" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Subscriber</text>
+      <text x="595" y="161" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55635d">never fires</text>
+      <line x1="670" y1="150" x2="700" y2="150" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="700" y="112" width="50" height="76" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="725" y="140" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Stock</text>
+      <text x="725" y="157" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">sync</text>
+      <text x="725" y="174" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">drifts</text>
+    </svg>
+    <figcaption>The reservation really changed, and Medusa really emitted an event. It was just the wrong event, so a subscriber listening for RESERVATION_ITEM_UPDATED never hears about it.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The bug lives in the event constant chosen inside one service method, and it triggers on any path that ends up calling it. A few common ways stores hit this:</p>
+  <ul>
+    <li>An admin user changes a reservation's quantity directly in the Medusa admin UI, which calls the same underlying <code>updateReservationItem</code> service method.</li>
+    <li>An integration calls the Admin API to update a reservation's quantity, line item, or location as part of a custom workflow.</li>
+    <li>Internal Medusa workflows update a reservation's quantity during order fulfillment or cancellation, for example when partially fulfilling a line item shrinks the remaining reserved amount.</li>
+    <li>Related issue #11691 documents a broader pattern where inventory updates fail to emit the events other parts of Medusa, like cache revalidation, depend on, suggesting this class of gap is not limited to just this one method.</li>
+  </ul>
+  <p>None of this throws an error anywhere. The reservation update itself succeeds and the database is correct. Only the event that was supposed to tell everyone else about it goes to the wrong listener. See the citations at the end for the exact issue and fix.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot fix a missed event by listening harder. If <code>RESERVATION_ITEM_UPDATED</code> was never emitted, no subscriber configuration change makes it appear after the fact. Detection has to be a reconciliation pass, not an event listener: compare what the live reservations actually say right now against what your last-synced snapshot believes, and treat any mismatch as a symptom of the gap. That is also why the safe repair is to update your own stock-sync baseline and forward the corrected delta, not to poke the Medusa reservation itself, since a no-op re-save will not retrigger the buggy emit path anyway.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch live reservations by default. The job pulls every reservation per stock location, runs a pure diff against the last-synced quantities your own stock-sync script keeps, and reports every reservation whose live quantity has moved. Only with an explicit apply flag does it also cross-check inventory-item reserved_quantity for a deeper drift signal and let the caller update its own baseline.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script lists reservations per stock location, loads the last-synced quantity snapshot, runs a pure diff function that flags any reservation whose live quantity differs from the snapshot, then either reports the drift in dry run or updates the sync baseline and forwards the delta when running with apply.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List reservations</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">per stock location</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Load last-synced</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">quantity snapshot</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Diff live vs synced</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">pure function, per res_id</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Quantity</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">diverged?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, --apply</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="590" y="198" font-family="sans-serif" font-size="10.5" fill="#9a8ba0" font-weight="700">no, in sync</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#9a8ba0" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="610" y="185" width="140" height="55" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="680" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#2a1730">Left alone</text>
+      <text x="680" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#6b5a70">nothing to fix</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Update baseline</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">forward delta downstream</text>
+    </svg>
+    <figcaption>The reconciler only ever reports drift by default. With DRY_RUN off, it updates its own last-synced baseline and forwards the corrected delta, it never mutates a Medusa reservation it does not own.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Authenticate against the Admin API</h3>
+      <p>Exchange the admin email and password for a JWT at <code>/auth/user/emailpass</code>, then send it as a <code>Bearer</code> token on every <code>/admin/*</code> call. Keep the backend URL and credentials in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, change to false to apply</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, change to false to apply</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>List every reservation for a stock location</h3>
+      <p>Ask for reservations at one <code>sloc_...</code> location at a time, and read back the fields the diff needs: the id, quantity, line item id, inventory item id, location id, and when it was last updated. Page through with <code>offset</code> and <code>limit</code> against the <code>{reservations, count, offset, limit}</code> envelope.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+def list_reservations_for_location(token, location_id):
+    reservations = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/reservations", {
+            "location_id": location_id,
+            "fields": "id,quantity,line_item_id,inventory_item_id,location_id,updated_at,*inventory_item",
+            "limit": limit,
+            "offset": offset,
+        })
+        reservations.extend(data["reservations"])
+        offset += limit
+        if offset >= data["count"]:
+            return reservations</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const BACKEND_URL = process.env.MEDUSA_BACKEND_URL;
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function listReservationsForLocation(token, locationId) {
+  const reservations = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/reservations", {
+      location_id: locationId,
+      fields: "id,quantity,line_item_id,inventory_item_id,location_id,updated_at,*inventory_item",
+      limit,
+      offset,
+    });
+    reservations.push(...data.reservations);
+    offset += limit;
+    if (offset >= data.count) return reservations;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the diff in its own function that takes the live reservations and the last-synced quantity map your stock-sync script persists, keyed by <code>res_...</code> id, and returns only the ones that diverged. This is the exact recomputation a working <code>RESERVATION_ITEM_UPDATED</code> subscriber would have done incrementally, one event at a time. Since those events never arrived, the reconciler has to run the same comparison as a full diff, every time.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def diff_reservation_sync(live, last_synced):
+    """live: [{"id", "quantity", "location_id", "updated_at"}]
+    last_synced: {res_id: {"quantity", "updated_at"}}
+    Returns [{"id", "drift", "stale_since"}] for every reservation whose
+    live quantity differs from (or is missing from) the last-synced map.
+    """
+    drifted = []
+    for r in live:
+        prev = last_synced.get(r["id"])
+        if prev is not None and prev["quantity"] == r["quantity"]:
+            continue
+        prev_quantity = prev["quantity"] if prev else 0
+        stale_since = prev["updated_at"] if prev else r["updated_at"]
+        drifted.append({
+            "id": r["id"],
+            "drift": r["quantity"] - prev_quantity,
+            "stale_since": stale_since,
+        })
+    return drifted</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function diffReservationSync(live, lastSynced) {
+  return live
+    .filter((r) => {
+      const prev = lastSynced[r.id];
+      return !prev || prev.quantity !== r.quantity;
+    })
+    .map((r) => ({
+      id: r.id,
+      drift: r.quantity - (lastSynced[r.id]?.quantity ?? 0),
+      staleSince: lastSynced[r.id]?.updated_at ?? r.updated_at,
+    }));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Cross-check reserved_quantity at each location level</h3>
+      <p>A drifted reservation is one signal. A second, independent signal is when an inventory item's <code>reserved_quantity</code> at a location no longer equals the sum of its live reservation quantities there. An external system built purely on the missing subscriber may have drifted from Medusa's authoritative <code>reserved_quantity</code> even for a reservation that has not changed again since. Pull the location levels and compare.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def location_level_mismatches(reservations_by_location, location_levels):
+    """location_levels: [{"location_id", "reserved_quantity", "inventory_item_id"}]
+    Flags a location level whose reserved_quantity does not equal the sum
+    of live reservation quantities Medusa reports for that location.
+    """
+    mismatches = []
+    for level in location_levels:
+        live_sum = sum(
+            r["quantity"] for r in reservations_by_location.get(level["location_id"], [])
+            if r["inventory_item_id"] == level["inventory_item_id"]
+        )
+        if live_sum != level["reserved_quantity"]:
+            mismatches.append({
+                "location_id": level["location_id"],
+                "inventory_item_id": level["inventory_item_id"],
+                "reserved_quantity": level["reserved_quantity"],
+                "live_sum": live_sum,
+            })
+    return mismatches
+
+def fetch_location_levels(token, inventory_item_id):
+    data = admin_get(token, f"/admin/inventory-items/{inventory_item_id}/location-levels")
+    return data["inventory_item"]["location_levels"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">export function locationLevelMismatches(reservationsByLocation, locationLevels) {
+  const mismatches = [];
+  for (const level of locationLevels) {
+    const liveReservations = reservationsByLocation[level.location_id] || [];
+    const liveSum = liveReservations
+      .filter((r) => r.inventory_item_id === level.inventory_item_id)
+      .reduce((sum, r) => sum + r.quantity, 0);
+    if (liveSum !== level.reserved_quantity) {
+      mismatches.push({
+        location_id: level.location_id,
+        inventory_item_id: level.inventory_item_id,
+        reserved_quantity: level.reserved_quantity,
+        live_sum: liveSum,
+      });
+    }
+  }
+  return mismatches;
+}
+
+async function fetchLocationLevels(token, inventoryItemId) {
+  const data = await adminGet(token, `/admin/inventory-items/${inventoryItemId}/location-levels`);
+  return data.inventory_item.location_levels;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Update your own baseline, do not silently rewrite Medusa</h3>
+      <p>When run with <code>--apply</code>, the script does not call <code>POST /admin/reservations/{id}</code> to re-save the same quantity, since that will not retrigger the buggy emit path anyway and is not a fix for anything. Instead it takes the confirmed live quantity as the new last-synced baseline for that <code>res_...</code> id and forwards the corrected reserved delta to whatever external system your stock-sync consumer feeds. It never mutates a Medusa reservation it does not own.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step5.py</div>
+      <pre><code class="language-python">def apply_baseline_update(sync_store, drifted_entry, live_quantity, live_updated_at, forward_delta):
+    """sync_store is your own last-synced persistence, not Medusa.
+    forward_delta(res_id, drift) pushes the corrected change to whatever
+    external system your stock-sync consumer feeds.
+    """
+    sync_store[drifted_entry["id"]] = {"quantity": live_quantity, "updated_at": live_updated_at}
+    forward_delta(drifted_entry["id"], drifted_entry["drift"])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step5.js</div>
+      <pre><code class="language-javascript">function applyBaselineUpdate(syncStore, drifted, liveQuantity, liveUpdatedAt, forwardDelta) {
+  syncStore[drifted.id] = { quantity: liveQuantity, updated_at: liveUpdatedAt };
+  forwardDelta(drifted.id, drifted.drift);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard and an explicit apply flag</h3>
+      <p>The loop ties every piece together. On the first few runs, leave <code>DRY_RUN</code> on so the script only prints a report of every drifted reservation and every location level mismatch it found. Read the report, agree with it, then rerun with <code>DRY_RUN=false</code> and <code>--apply</code> to let it update your own sync baseline. Run it as a scheduled reconciler, for example hourly, since without a working event you cannot know when the next change lands.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never let the script write to Medusa reservations it does not own. Re-emitting the missed transition means correcting your own stock-sync baseline and forwarding the delta downstream, not calling <code>POST /admin/reservations/{id}</code> as a no-op re-save.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs a full report before writing anything, respects the dry run flag, and requires an explicit <code>--apply</code> flag before it updates its own last-synced baseline for any drifted reservation.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/reservation-updated-event-not-firing" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_reservation_sync.py</div>
+      <pre><code class="language-python">"""Reconcile Medusa reservations whose update event never fired.
+
+Medusa v2's InventoryModuleService.updateReservationItem emitted the wrong
+event constant (confirmed in medusajs/medusa#11704, fixed in PR #11714): it
+fired inventory-item.updated instead of reservation-item.updated whenever a
+reservation's quantity, line item, or location changed, whether from the
+admin UI, the Admin API, or an internal workflow like order fulfillment or
+cancellation. A subscriber registered for RESERVATION_ITEM_UPDATED never
+receives that change, so a stock-sync integration built on it silently
+drifts. This lists reservations per stock location, diffs their live
+quantity against a last-synced snapshot, and cross-checks reserved_quantity
+at each location level against the sum of live reservations there.
+By default it only reports drift. Pass --apply to also update the sync
+baseline and forward the corrected delta downstream.
+Run as a scheduled reconciler. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/
+"""
+import os
+import sys
+import json
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_reservation_sync")
+
+BACKEND_URL = os.environ["MEDUSA_BACKEND_URL"]
+ADMIN_EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+ADMIN_PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+SYNC_STATE_PATH = os.environ.get("SYNC_STATE_PATH", "reservation_sync_state.json")
+
+
+def get_admin_token():
+    r = requests.post(
+        f"{BACKEND_URL}/auth/user/emailpass",
+        json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def admin_get(token, path, params=None):
+    r = requests.get(
+        f"{BACKEND_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params or {},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def diff_reservation_sync(live, last_synced):
+    """Pure decision function. No I/O.
+
+    live: [{"id": str, "quantity": int, "location_id": str, "updated_at": str}]
+    last_synced: {res_id: {"quantity": int, "updated_at": str}}
+
+    Returns [{"id", "drift", "stale_since"}] for every reservation whose
+    live quantity differs from (or is missing from) the last-synced map.
+    """
+    drifted = []
+    for r in live:
+        prev = last_synced.get(r["id"])
+        if prev is not None and prev["quantity"] == r["quantity"]:
+            continue
+        prev_quantity = prev["quantity"] if prev else 0
+        stale_since = prev["updated_at"] if prev else r["updated_at"]
+        drifted.append({
+            "id": r["id"],
+            "drift": r["quantity"] - prev_quantity,
+            "stale_since": stale_since,
+        })
+    return drifted
+
+
+def location_level_mismatches(reservations_by_location, location_levels):
+    """Pure decision function. No I/O.
+
+    Flags a location level whose reserved_quantity does not equal the sum
+    of live reservation quantities for that location and inventory item.
+    """
+    mismatches = []
+    for level in location_levels:
+        live_sum = sum(
+            r["quantity"] for r in reservations_by_location.get(level["location_id"], [])
+            if r["inventory_item_id"] == level["inventory_item_id"]
+        )
+        if live_sum != level["reserved_quantity"]:
+            mismatches.append({
+                "location_id": level["location_id"],
+                "inventory_item_id": level["inventory_item_id"],
+                "reserved_quantity": level["reserved_quantity"],
+                "live_sum": live_sum,
+            })
+    return mismatches
+
+
+def list_stock_locations(token):
+    data = admin_get(token, "/admin/stock-locations", {"limit": 200})
+    return data["stock_locations"]
+
+
+def list_reservations_for_location(token, location_id):
+    reservations = []
+    offset = 0
+    limit = 100
+    while True:
+        data = admin_get(token, "/admin/reservations", {
+            "location_id": location_id,
+            "fields": "id,quantity,line_item_id,inventory_item_id,location_id,updated_at,*inventory_item",
+            "limit": limit,
+            "offset": offset,
+        })
+        reservations.extend(data["reservations"])
+        offset += limit
+        if offset >= data["count"]:
+            return reservations
+
+
+def fetch_location_levels(token, inventory_item_id):
+    data = admin_get(token, f"/admin/inventory-items/{inventory_item_id}/location-levels")
+    return data["inventory_item"]["location_levels"]
+
+
+def load_sync_state(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_sync_state(path, state):
+    with open(path, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+
+
+def forward_delta(res_id, drift):
+    log.info("Forwarding corrected delta for %s: %+d to downstream stock system", res_id, drift)
+
+
+def run():
+    apply = "--apply" in sys.argv
+    token = get_admin_token()
+    sync_state = load_sync_state(SYNC_STATE_PATH)
+
+    locations = list_stock_locations(token)
+    all_reservations = []
+    reservations_by_location = {}
+    for location in locations:
+        loc_id = location["id"]
+        res_list = list_reservations_for_location(token, loc_id)
+        reservations_by_location[loc_id] = res_list
+        all_reservations.extend(res_list)
+
+    drifted = diff_reservation_sync(all_reservations, sync_state)
+
+    for entry in drifted:
+        log.warning(
+            "Reservation %s drifted (%+d) stale since %s. %s",
+            entry["id"], entry["drift"], entry["stale_since"],
+            "Would update baseline" if DRY_RUN or not apply else "Updating baseline",
+        )
+        if not DRY_RUN and apply:
+            live = next(r for r in all_reservations if r["id"] == entry["id"])
+            sync_state[entry["id"]] = {"quantity": live["quantity"], "updated_at": live["updated_at"]}
+            forward_delta(entry["id"], entry["drift"])
+
+    inventory_item_ids = {r["inventory_item_id"] for r in all_reservations}
+    all_mismatches = []
+    for iitem_id in inventory_item_ids:
+        levels = fetch_location_levels(token, iitem_id)
+        mismatches = location_level_mismatches(reservations_by_location, levels)
+        all_mismatches.extend(mismatches)
+
+    for mismatch in all_mismatches:
+        log.warning(
+            "Location level mismatch at %s for %s: reserved_quantity=%s live_sum=%s",
+            mismatch["location_id"], mismatch["inventory_item_id"],
+            mismatch["reserved_quantity"], mismatch["live_sum"],
+        )
+
+    if not DRY_RUN and apply:
+        save_sync_state(SYNC_STATE_PATH, sync_state)
+
+    log.info(
+        "Done. %d drifted reservation(s), %d location level mismatch(es). %s",
+        len(drifted), len(all_mismatches),
+        "Baseline updated" if (not DRY_RUN and apply) else "Report only",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-reservation-sync.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile Medusa reservations whose update event never fired.
+ *
+ * Medusa v2's InventoryModuleService.updateReservationItem emitted the wrong
+ * event constant (confirmed in medusajs/medusa#11704, fixed in PR #11714): it
+ * fired inventory-item.updated instead of reservation-item.updated whenever a
+ * reservation's quantity, line item, or location changed, whether from the
+ * admin UI, the Admin API, or an internal workflow like order fulfillment or
+ * cancellation. A subscriber registered for RESERVATION_ITEM_UPDATED never
+ * receives that change, so a stock-sync integration built on it silently
+ * drifts. This lists reservations per stock location, diffs their live
+ * quantity against a last-synced snapshot, and cross-checks reserved_quantity
+ * at each location level against the sum of live reservations there.
+ * By default it only reports drift. Pass --apply to also update the sync
+ * baseline and forward the corrected delta downstream.
+ * Run as a scheduled reconciler. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/medusa/reservation-updated-event-not-firing/
+ */
+import { pathToFileURL } from "node:url";
+import { readFile, writeFile } from "node:fs/promises";
+
+const BACKEND_URL = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const ADMIN_EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const ADMIN_PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const SYNC_STATE_PATH = process.env.SYNC_STATE_PATH || "reservation_sync_state.json";
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * @param {{ id: string, quantity: number, location_id: string, updated_at: string }[]} live
+ * @param {Record<string, { quantity: number, updated_at: string }>} lastSynced
+ * @returns {{ id: string, drift: number, staleSince: string }[]}
+ *
+ * Returns one entry for every reservation whose live quantity diverged from
+ * (or is missing from) the last-synced map, with the signed drift and how
+ * long it has been stale.
+ */
+export function diffReservationSync(live, lastSynced) {
+  return live
+    .filter((r) => {
+      const prev = lastSynced[r.id];
+      return !prev || prev.quantity !== r.quantity;
+    })
+    .map((r) => ({
+      id: r.id,
+      drift: r.quantity - (lastSynced[r.id]?.quantity ?? 0),
+      staleSince: lastSynced[r.id]?.updated_at ?? r.updated_at,
+    }));
+}
+
+/**
+ * Pure decision function. No I/O.
+ *
+ * Flags a location level whose reserved_quantity does not equal the sum of
+ * live reservation quantities for that location and inventory item.
+ */
+export function locationLevelMismatches(reservationsByLocation, locationLevels) {
+  const mismatches = [];
+  for (const level of locationLevels) {
+    const liveReservations = reservationsByLocation[level.location_id] || [];
+    const liveSum = liveReservations
+      .filter((r) => r.inventory_item_id === level.inventory_item_id)
+      .reduce((sum, r) => sum + r.quantity, 0);
+    if (liveSum !== level.reserved_quantity) {
+      mismatches.push({
+        location_id: level.location_id,
+        inventory_item_id: level.inventory_item_id,
+        reserved_quantity: level.reserved_quantity,
+        live_sum: liveSum,
+      });
+    }
+  }
+  return mismatches;
+}
+
+async function getAdminToken() {
+  const res = await fetch(`${BACKEND_URL}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa auth ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function adminGet(token, path, params = {}) {
+  const url = new URL(`${BACKEND_URL}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status} on GET ${path}`);
+  return res.json();
+}
+
+async function listStockLocations(token) {
+  const data = await adminGet(token, "/admin/stock-locations", { limit: 200 });
+  return data.stock_locations;
+}
+
+async function listReservationsForLocation(token, locationId) {
+  const reservations = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const data = await adminGet(token, "/admin/reservations", {
+      location_id: locationId,
+      fields: "id,quantity,line_item_id,inventory_item_id,location_id,updated_at,*inventory_item",
+      limit,
+      offset,
+    });
+    reservations.push(...data.reservations);
+    offset += limit;
+    if (offset >= data.count) return reservations;
+  }
+}
+
+async function fetchLocationLevels(token, inventoryItemId) {
+  const data = await adminGet(token, `/admin/inventory-items/${inventoryItemId}/location-levels`);
+  return data.inventory_item.location_levels;
+}
+
+async function loadSyncState(path) {
+  try {
+    const text = await readFile(path, "utf8");
+    return JSON.parse(text);
+  } catch {
+    return {};
+  }
+}
+
+async function saveSyncState(path, state) {
+  await writeFile(path, JSON.stringify(state, null, 2));
+}
+
+function forwardDelta(resId, drift) {
+  console.log(`Forwarding corrected delta for ${resId}: ${drift >= 0 ? "+" : ""}${drift} to downstream stock system`);
+}
+
+export async function run() {
+  const apply = process.argv.includes("--apply");
+  const token = await getAdminToken();
+  const syncState = await loadSyncState(SYNC_STATE_PATH);
+
+  const locations = await listStockLocations(token);
+  const allReservations = [];
+  const reservationsByLocation = {};
+  for (const location of locations) {
+    const resList = await listReservationsForLocation(token, location.id);
+    reservationsByLocation[location.id] = resList;
+    allReservations.push(...resList);
+  }
+
+  const drifted = diffReservationSync(allReservations, syncState);
+
+  for (const entry of drifted) {
+    console.warn(
+      `Reservation ${entry.id} drifted (${entry.drift >= 0 ? "+" : ""}${entry.drift}) stale since ${entry.staleSince}. ${
+        DRY_RUN || !apply ? "Would update baseline" : "Updating baseline"
+      }`
+    );
+    if (!DRY_RUN && apply) {
+      const live = allReservations.find((r) => r.id === entry.id);
+      syncState[entry.id] = { quantity: live.quantity, updated_at: live.updated_at };
+      forwardDelta(entry.id, entry.drift);
+    }
+  }
+
+  const inventoryItemIds = new Set(allReservations.map((r) => r.inventory_item_id));
+  const allMismatches = [];
+  for (const iitemId of inventoryItemIds) {
+    const levels = await fetchLocationLevels(token, iitemId);
+    allMismatches.push(...locationLevelMismatches(reservationsByLocation, levels));
+  }
+
+  for (const mismatch of allMismatches) {
+    console.warn(
+      `Location level mismatch at ${mismatch.location_id} for ${mismatch.inventory_item_id}: reserved_quantity=${mismatch.reserved_quantity} live_sum=${mismatch.live_sum}`
+    );
+  }
+
+  if (!DRY_RUN && apply) {
+    await saveSyncState(SYNC_STATE_PATH, syncState);
+  }
+
+  console.log(
+    `Done. ${drifted.length} drifted reservation(s), ${allMismatches.length} location level mismatch(es). ${
+      !DRY_RUN && apply ? "Baseline updated" : "Report only"
+    }.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p><code>diffReservationSync</code> is the part most worth testing, because it decides which reservations the report calls drifted. It is pure, so the test needs no network and no Medusa backend. It just feeds in plain fixture arrays and a plain object map and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_reservation_diff.py</div>
+      <pre><code class="language-python">from reconcile_reservation_sync import diff_reservation_sync
+
+
+def res(**over):
+    base = {"id": "res_1", "quantity": 5, "location_id": "sloc_1", "updated_at": "2026-07-10T00:00:00Z"}
+    base.update(over)
+    return base
+
+
+def test_flags_reservation_missing_from_last_synced():
+    result = diff_reservation_sync([res()], {})
+    assert result == [{"id": "res_1", "drift": 5, "stale_since": "2026-07-10T00:00:00Z"}]
+
+
+def test_flags_reservation_when_quantity_changed():
+    last_synced = {"res_1": {"quantity": 3, "updated_at": "2026-07-01T00:00:00Z"}}
+    result = diff_reservation_sync([res(quantity=7)], last_synced)
+    assert result == [{"id": "res_1", "drift": 4, "stale_since": "2026-07-01T00:00:00Z"}]
+
+
+def test_no_drift_when_quantity_matches():
+    last_synced = {"res_1": {"quantity": 5, "updated_at": "2026-07-01T00:00:00Z"}}
+    result = diff_reservation_sync([res()], last_synced)
+    assert result == []
+
+
+def test_negative_drift_when_quantity_decreased():
+    last_synced = {"res_1": {"quantity": 9, "updated_at": "2026-07-01T00:00:00Z"}}
+    result = diff_reservation_sync([res(quantity=2)], last_synced)
+    assert result == [{"id": "res_1", "drift": -7, "stale_since": "2026-07-01T00:00:00Z"}]
+
+
+def test_multiple_reservations_only_flags_changed_ones():
+    last_synced = {
+        "res_1": {"quantity": 5, "updated_at": "2026-07-01T00:00:00Z"},
+        "res_2": {"quantity": 1, "updated_at": "2026-07-02T00:00:00Z"},
+    }
+    live = [res(id="res_1", quantity=5), res(id="res_2", quantity=3)]
+    result = diff_reservation_sync(live, last_synced)
+    assert result == [{"id": "res_2", "drift": 2, "stale_since": "2026-07-02T00:00:00Z"}]
+
+
+def test_empty_live_list_returns_empty():
+    assert diff_reservation_sync([], {"res_1": {"quantity": 5, "updated_at": "2026-07-01T00:00:00Z"}}) == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reservation-diff.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { diffReservationSync } from "./reconcile-reservation-sync.js";
+
+const res = (over = {}) => ({
+  id: "res_1",
+  quantity: 5,
+  location_id: "sloc_1",
+  updated_at: "2026-07-10T00:00:00Z",
+  ...over,
+});
+
+test("flags reservation missing from last synced", () => {
+  const result = diffReservationSync([res()], {});
+  assert.deepEqual(result, [{ id: "res_1", drift: 5, staleSince: "2026-07-10T00:00:00Z" }]);
+});
+
+test("flags reservation when quantity changed", () => {
+  const lastSynced = { res_1: { quantity: 3, updated_at: "2026-07-01T00:00:00Z" } };
+  const result = diffReservationSync([res({ quantity: 7 })], lastSynced);
+  assert.deepEqual(result, [{ id: "res_1", drift: 4, staleSince: "2026-07-01T00:00:00Z" }]);
+});
+
+test("no drift when quantity matches", () => {
+  const lastSynced = { res_1: { quantity: 5, updated_at: "2026-07-01T00:00:00Z" } };
+  const result = diffReservationSync([res()], lastSynced);
+  assert.deepEqual(result, []);
+});
+
+test("negative drift when quantity decreased", () => {
+  const lastSynced = { res_1: { quantity: 9, updated_at: "2026-07-01T00:00:00Z" } };
+  const result = diffReservationSync([res({ quantity: 2 })], lastSynced);
+  assert.deepEqual(result, [{ id: "res_1", drift: -7, staleSince: "2026-07-01T00:00:00Z" }]);
+});
+
+test("multiple reservations only flags changed ones", () => {
+  const lastSynced = {
+    res_1: { quantity: 5, updated_at: "2026-07-01T00:00:00Z" },
+    res_2: { quantity: 1, updated_at: "2026-07-02T00:00:00Z" },
+  };
+  const live = [res({ id: "res_1", quantity: 5 }), res({ id: "res_2", quantity: 3 })];
+  const result = diffReservationSync(live, lastSynced);
+  assert.deepEqual(result, [{ id: "res_2", drift: 2, staleSince: "2026-07-02T00:00:00Z" }]);
+});
+
+test("empty live list returns empty", () => {
+  const result = diffReservationSync([], { res_1: { quantity: 5, updated_at: "2026-07-01T00:00:00Z" } });
+  assert.deepEqual(result, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Partial fulfillment</span>
+      <h4>The 3PL integration that quietly stopped matching</h4>
+      <p>A homeware brand ran a third-party logistics integration that kept its own count of reserved stock, fed entirely by a subscriber on <code>RESERVATION_ITEM_UPDATED</code>. When staff partially fulfilled orders, Medusa's own workflow shrank the remaining reservation quantity, but because that update fired <code>inventory-item.updated</code> instead, the 3PL's count never moved. Within a few weeks its reserved totals were meaningfully higher than Medusa's.</p>
+      <p>Running the reconciler in dry run surfaced every reservation whose live quantity no longer matched the 3PL's last-synced snapshot, each one tied to a partial fulfillment that had happened days or weeks earlier. The team reviewed the report, ran it with <code>--apply</code>, and the 3PL's baseline caught up the same day.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Admin edit</span>
+      <h4>The manual quantity edit nobody downstream heard about</h4>
+      <p>A support agent edited a reservation's quantity directly in the Medusa admin to correct a mistaken order change. The edit saved cleanly and looked correct in the admin UI. But the store's stock-sync worker, which existed specifically to catch changes like this, never ran, because the event it was listening for was never the one Medusa emitted.</p>
+      <p>The location level cross-check in the reconciler caught it independently of the reservation diff, since <code>reserved_quantity</code> no longer summed to the live reservations at that location. That flag led the team straight to the one edited reservation, and a manual baseline correction closed the gap without touching the reservation itself.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs as a scheduled reconciler, a reservation change that Medusa's own event never announced still gets caught within one run. The report shows exactly which <code>res_...</code> ids drifted, by how much, and since when, plus any location level whose <code>reserved_quantity</code> no longer matches its live reservations. Nothing about a live Medusa reservation is ever rewritten. Only your own stock-sync baseline moves, and only with <code>--apply</code>.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my subscriber for RESERVATION_ITEM_UPDATED never run in Medusa v2?</summary>
+      <p>Medusa v2's InventoryModuleService.updateReservationItem emitted the wrong event constant. Whenever a reservation's quantity, line item, or location changed, whether through the admin UI, the Admin API, or an internal workflow like order fulfillment or cancellation, it fired inventory-item.updated instead of reservation-item.updated. Since a subscriber registers for the exact event name RESERVATION_ITEM_UPDATED, it never receives a notification for these changes. This is confirmed in medusajs/medusa#11704 and fixed in PR #11714.</p>
+    </details>
+    <details>
+      <summary>How do I detect reservations that drifted because the update event never fired?</summary>
+      <p>Run a reconciliation pass rather than relying on the missing event. For each stock location, page through GET /admin/reservations with fields for quantity, line_item_id, inventory_item_id, location_id, and updated_at, and compare each reservation's live quantity against the last-synced snapshot your stock-sync script persisted. Cross-check GET /admin/inventory-items/{id}/location-levels so a reserved_quantity that drifted from the sum of live reservations at that location is also flagged, since an external system built on the subscriber may never have heard about the change.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-correct drifted reservations with a script?</summary>
+      <p>By default the script only reports drifted reservation ids with their old and new quantity and the computed drift, it does not silently rewrite anything. Re-saving a reservation with the same quantity will not retrigger the buggy emit path, so the safe repair is for your own stock-sync consumer to adopt the live quantity as its new last-synced baseline and forward the corrected delta to whatever system it feeds, rather than mutating Medusa reservations the script does not own. Writing anything requires an explicit --apply flag.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>[Bug]: RESERVATION_ITEM_UPDATED event not triggering. Medusa GitHub Issue #11704. <a href="https://github.com/medusajs/medusa/issues/11704" rel="noopener">github.com/medusajs/medusa/issues/11704</a></li>
+      <li>[Bug]: Inventory updates do not emit Events, preventing Cache Revalidation. Medusa GitHub Issue #11691. <a href="https://github.com/medusajs/medusa/issues/11691" rel="noopener">github.com/medusajs/medusa/issues/11691</a></li>
+      <li>fix(inventory): Wrong event emitted on reservation update. Medusa GitHub PR #11714. <a href="https://github.com/medusajs/medusa/pull/11714" rel="noopener">github.com/medusajs/medusa/pull/11714</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>Medusa Documentation: Events and Subscribers. <a href="https://docs.medusajs.com/learn/fundamentals/events-and-subscribers" rel="noopener">docs.medusajs.com/learn/fundamentals/events-and-subscribers</a></li>
+      <li>Medusa Documentation: Emit Workflow and Service Events. <a href="https://docs.medusajs.com/learn/fundamentals/events-and-subscribers/emit-event" rel="noopener">docs.medusajs.com/learn/fundamentals/events-and-subscribers/emit-event</a></li>
+      <li>Medusa V2 Admin API Reference. <a href="https://docs.medusajs.com/api/admin" rel="noopener">docs.medusajs.com/api/admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa storefront access, pricing, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch your drift?</h3>
+    <p>If this saved you from a stock-sync integration that quietly stopped matching Medusa, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>

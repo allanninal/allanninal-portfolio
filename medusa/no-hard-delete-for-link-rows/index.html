@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Medusa Link Table Rows That Never Get Hard Deleted</title>
+<meta name="description" content="Medusa v2's link.dismiss and link.delete only soft-delete or cascade-delete pivot rows, so a product, sales channel, or variant removed outside a workflow leaves link table rows behind forever. Learn why, and build a Python or Node.js reconciler that finds and safely clears them.">
+<link rel="canonical" href="https://www.allanninal.dev/medusa/no-hard-delete-for-link-rows/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Medusa Link Table Rows That Never Get Hard Deleted">
+<meta property="og:description" content="Why Medusa v2 module links only expose soft-delete style operations, and a safe Python or Node.js script that finds and clears link table rows left behind after an entity is removed.">
+<meta property="og:url" content="https://www.allanninal.dev/medusa/no-hard-delete-for-link-rows/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/medusa/assets/medusa.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/medusa/no-hard-delete-for-link-rows/#article","headline":"Fix Medusa Link Table Rows That Never Get Hard Deleted","description":"Medusa v2's link.dismiss and dismissRemoteLinkStep only soft-delete link table rows, and link.delete only cascades when the link definition opts in, so a product, sales channel, or variant removed outside a workflow leaves rows behind with no public API to purge them. A safe Python or Node.js reconciler finds and, only when confirmed, hard-deletes those rows.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/medusa/no-hard-delete-for-link-rows/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Module Links & Migrations","keywords":"Medusa v2 link.dismiss, dismissRemoteLinkStep, link table hard delete, getLinkModule, product_sales_channel pivot, orphaned link row, Medusa Admin API, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/medusa/"},{"@type":"ListItem","position":2,"name":"No API to hard delete link table rows after entity removal","item":"https://www.allanninal.dev/medusa/no-hard-delete-for-link-rows/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does Medusa never remove link table rows for good?","acceptedAnswer":{"@type":"Answer","text":"Medusa v2 workflows are built to be reversible through compensation, and an irreversible hard delete of a pivot row cannot be undone if a later step fails. So the only built-in operations are link.dismiss, which sets deleted_at on the row, and link.delete, which cascades only when the link definition asks for it. Neither one purges a row for good, a gap Medusa's core team confirmed is by design in medusajs/medusa#13315."}},{"@type":"Question","name":"What happens to a link row when the entity it points to is deleted outside a workflow?","acceptedAnswer":{"@type":"Answer","text":"If a product, sales channel, or variant is removed straight through its module's repository or a script that bypasses the delete workflow, the matching link table row is never touched. It is left behind either as a live-looking row pointing at an id that no longer exists, or as an already soft-deleted row, and no public API will ever purge either one."}},{"@type":"Question","name":"Is there any safe way to actually hard delete an orphaned link row?","acceptedAnswer":{"@type":"Answer","text":"Yes, but it uses an undocumented escape hatch, not a public API. Resolve the underlying pivot service directly with link.getLinkModule for the two modules involved, then call its own delete method with the exact orphaned ids you confirmed through detection. If that pivot service is unavailable for a given pair, fall back to a parameterized DELETE against the specific pivot table filtered by those exact ids, never a blanket delete with no id filter."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/medusa/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / medusa</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/medusa/">Field notes</a> / Module Links &amp; Migrations</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Module Links &amp; Migrations</p>
+    <h1>No API to hard delete link table rows after entity removal</h1>
+    <p class="lead">You deleted a product, a sales channel, or a variant, and the link table row that connected it to something else is still sitting there. You look for a way to purge it for good and there is not one. Medusa's own link.dismiss only soft-deletes the row, and link.delete only cascades when the link was configured to. Here is why Medusa keeps it that way on purpose, and a small script that finds every row this leaves behind and clears the confirmed ones safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Medusa Link module and Query</span>
+      <span class="chip">Safe by default (report first)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Medusa v2's Module Links deliberately expose only soft-delete style operations. <code>link.dismiss()</code>, and the <code>dismissRemoteLinkStep</code> workflow step, mark a link table row, such as <code>product_sales_channel</code> or <code>product_variant_inventory_item</code>, with <code>deleted_at</code> rather than removing it. <code>link.delete()</code> only cascades when the link definition is configured to cascade, it is not a general hard-delete. Medusa's core team confirmed on GitHub that this is by design, because a workflow step that performs an irreversible delete cannot be undone by compensation if a later step fails. So when a linked entity is permanently removed straight through its module's repository, or a script that bypasses the workflow, the link table row is left behind, either live and pointing at a now-missing id, or soft-deleted and never purged. Run a small Python or Node.js script that resolves the pivot service directly, classifies every row against the live parent ids, and only hard-deletes the confirmed orphans under a dry run guard. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When you connect two Medusa modules with a link, the relationship lives in its own pivot table, separate from both modules. That table has a <code>deleted_at</code> column and Medusa's public API only ever writes to it in one direction: it can mark a row deleted, and it can cascade a delete when the link definition says to. There is no third operation that says "remove this row from the table entirely, no matter what."</p>
+  <p>That gap is not an oversight. Every built-in Medusa workflow step is designed to be reversible through compensation, so if a later step in the same workflow fails, an earlier step can undo itself. An irreversible hard delete of a pivot row cannot be undone that way, so no core step is allowed to perform one. The cost is that once an entity on one side of a link is gone for good, whatever is left in the link table for it can outlive the entity indefinitely, since nothing in the public API will ever clear it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A product is removed through a raw repository call or a script that bypasses the delete workflow. The product_sales_channel link row is never touched by link.dismiss or link.delete, so it stays in the table pointing at a prod_ id that no longer exists, with no public API able to purge it.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6b5a70"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#2a1730">Entity removed</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#6b5a70">bypasses the workflow</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#6b5a70" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="180" height="66" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="308" y="92" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">link.dismiss / link.delete</text>
+      <text x="308" y="110" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">never called for this row</text>
+      <line x1="401" y1="103" x2="460" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="430" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="430" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">no hard delete exists</text>
+      <rect x="463" y="70" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="538" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Row survives</text>
+      <text x="538" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55635d">live or soft-deleted forever</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Pivot table</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">grows forever</text>
+      <line x1="616" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Neither link.dismiss nor link.delete is a hard delete on its own. Once a linked entity is gone, whatever is left in the pivot table for it has no public path to be purged.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The gap is structural, not a bug you can configure away. A few common ways link tables end up carrying dead rows:</p>
+  <ul>
+    <li>A product, sales channel, or variant is deleted through its module's repository directly, or in a script that never routes through the entity's normal delete workflow, so <code>dismissRemoteLinkStep</code> is never invoked for its link rows.</li>
+    <li><code>link.dismiss()</code> is called, which sets <code>deleted_at</code> on the row, but nothing afterward ever hard-deletes it, since no public method exists to do that, so soft-deleted rows accumulate indefinitely.</li>
+    <li>A link definition's cascade option only removes rows for entities deleted through Medusa's own delete paths. An entity removed outside those paths leaves the link row live, still pointing at an id that no longer resolves to anything.</li>
+    <li>A migration, seed reset, or bulk cleanup script deletes rows straight from a module's table, skipping the link layer entirely no matter how the link itself is configured.</li>
+  </ul>
+  <p>This is a common source of confusion because the store still looks correct on the surface. Queries that join through the link may silently drop rows once the parent is gone, or worse, some code paths may still surface a stale row before anyone notices. Medusa's core team confirmed on GitHub that this is by design, not a bug, because a hard delete of a pivot row cannot be reversed by workflow compensation. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A link table row cannot tell you on its own whether it is healthy, dangling, or already soft-deleted, because Medusa's public API was never meant to answer that question either. The only way to know is to resolve the underlying pivot service directly with <code>link.getLinkModule</code>, an undocumented escape hatch the maintainers themselves point to, list every row including soft-deleted ones, and classify each one against the set of ids that are still actually alive. That classification is a pure decision function, not a Medusa bug to patch, so the fix is a reconciliation script that reports first and only hard-deletes what a human has confirmed.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch a live link operation. We add a job that resolves the pivot service for a known module pair, lists every row including soft-deleted ones, fetches the live ids on both sides, and classifies each row as active, soft-deleted, or dangling. Anything not already fine is reported, and only hard-deleted through the pivot service's own delete method when a human turns off the dry run flag.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Resolve the pivot service with link.getLinkModule. List every row including soft-deleted ones. Fetch the live ids on both sides. Classify each row as active, orphan soft deleted, orphan dangling, or ok. If it is reportable, report it, and only hard-delete through the pivot service under DRY_RUN=false. Otherwise leave the row alone.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#c026d3"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#fbf0fe" stroke="#e6bef2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Resolve pivot service</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">link.getLinkModule</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#c026d3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">List rows, with_deleted</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">and live ids on both sides</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#c026d3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#e6bef2"></rect>
+      <text x="362" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#2a1730">Classify each row</text>
+      <text x="362" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#6b5a70">pure decision function</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#c026d3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 677,138 590,170 503,138" fill="#fbf0fe" stroke="#e6bef2"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">Reportable</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#2a1730">orphan?</text>
+      <text x="680" y="128" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes</text>
+      <line x1="677" y1="138" x2="705" y2="138" stroke="#c026d3" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="605" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, leave alone</text>
+      <line x1="590" y1="170" x2="590" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="633" y="185" width="115" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="690" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Skip, fine</text>
+      <text x="690" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55635d">row is healthy</text>
+      <rect x="700" y="80" width="55" height="1" fill="none"></rect>
+      <text x="720" y="118" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#c026d3">Report/delete</text>
+      <text x="720" y="133" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55635d">under DRY_RUN=false</text>
+    </svg>
+    <figcaption>Only a row confirmed as orphaned by the pure classifier gets flagged, and only a human turning off dry run lets the script hard-delete it through the pivot service's own escape hatch.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get an Admin API session</h3>
+      <p>Medusa Admin auth is a JWT, not a long-lived static token. Exchange an admin email and password for a token at <code>POST /auth/user/emailpass</code>, then send it back as <code>Authorization: Bearer &lt;token&gt;</code> on every <code>/admin/*</code> call. Keep the backend URL, email, and password in environment variables.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   # start safe, report only</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export MEDUSA_BACKEND_URL="http://localhost:9000"
+export MEDUSA_ADMIN_EMAIL="admin@example.com"
+export MEDUSA_ADMIN_PASSWORD="supersecret"
+export DRY_RUN="true"   // start safe, report only</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Resolve the pivot service directly, inside a medusa exec script</h3>
+      <p>This part cannot run from an outside script over HTTP, since <code>getLinkModule</code> is a container-level API. Run it from a <code>medusa exec</code> script so it can resolve the Link module and the pivot service for the pair you are checking, such as Product and Sales Channel, and list every row including the soft-deleted ones.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">medusa exec script (TypeScript, for reference)</div>
+      <pre><code class="language-python"># This part of the fix lives in your Medusa project's TypeScript source,
+# run with `npx medusa exec ./src/scripts/list-link-rows.ts`, not in the
+# external Python or Node.js script below.
+#
+#   import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils"
+#
+#   export default async function listLinkRows({ container }) {
+#     const link = container.resolve(ContainerRegistrationKeys.LINK)
+#     const linkModule = link.getLinkModule(
+#       Modules.PRODUCT, "product_id",
+#       Modules.SALES_CHANNEL, "sales_channel_id",
+#     )
+#     const rows = await linkModule.list({}, { withDeleted: true })
+#     # rows: [{ product_id, sales_channel_id, deleted_at }, ...]
+#     # Write rows to a JSON file, or expose them through your own admin
+#     # route, so the external script in step 3 can read them over HTTP.
+#   }
+#
+# getLinkModule is undocumented for querying too, so this is the same
+# workaround the Medusa maintainers point to on GitHub issue #13315.</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">medusa exec script (TypeScript, for reference)</div>
+      <pre><code class="language-javascript">// This part of the fix lives in your Medusa project's TypeScript source,
+// run with `npx medusa exec ./src/scripts/list-link-rows.ts`, not in the
+// external Python or Node.js script below.
+//
+//   import { ContainerRegistrationKeys, Modules } from "@medusajs/framework/utils";
+//
+//   export default async function listLinkRows({ container }) {
+//     const link = container.resolve(ContainerRegistrationKeys.LINK);
+//     const linkModule = link.getLinkModule(
+//       Modules.PRODUCT, "product_id",
+//       Modules.SALES_CHANNEL, "sales_channel_id"
+//     );
+//     const rows = await linkModule.list({}, { withDeleted: true });
+//     // rows: [{ product_id, sales_channel_id, deleted_at }, ...]
+//     // Write rows to a JSON file, or expose them through your own admin
+//     // route, so the external script in step 3 can read them over HTTP.
+//   }
+//
+// getLinkModule is undocumented for querying too, so this is the same
+// workaround the Medusa maintainers point to on GitHub issue #13315.</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the live parent ids and the link rows over HTTP</h3>
+      <p>Page through <code>GET /admin/products?fields=id</code> and <code>GET /admin/sales-channels?fields=id</code> for the live ids on both sides, and read the link rows your step 2 exec script exposed. This external script never guesses at the pivot data itself, it only reads what the container-level script already collected.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import os, requests
+
+BASE = os.environ["MEDUSA_BACKEND_URL"]
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+
+def login():
+    r = requests.post(
+        f"{BASE}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+def list_live_ids(token, resource, key):
+    ids, offset, limit = [], 0, 200
+    while True:
+        r = requests.get(
+            f"{BASE}/admin/{resource}",
+            params={"fields": "id", "limit": limit, "offset": offset},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        ids.extend(row["id"] for row in body[key])
+        offset += limit
+        if offset >= body["count"]:
+            return ids</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const BASE = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+
+async function login() {
+  const res = await fetch(`${BASE}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function listLiveIds(token, resource, key) {
+  const ids = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const url = new URL(`${BASE}/admin/${resource}`);
+    url.searchParams.set("fields", "id");
+    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("offset", String(offset));
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Medusa ${res.status}`);
+    const body = await res.json();
+    ids.push(...body[key].map((row) => row.id));
+    offset += limit;
+    if (offset >= body.count) return ids;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Classify every row with one pure function</h3>
+      <p>The decision belongs in its own function that takes a row and the two live id sets, since all the I/O already happened. A soft-deleted row is always reportable, since no API will ever purge it. A live-looking row pointing at a gone parent is the dangerous case, since a query might still surface it. Everything else is fine.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def classify_link_row(row, live_left_ids, live_right_ids):
+    if row.get("deleted_at") is not None:
+        return "orphan_soft_deleted"
+    if row["left_id"] not in live_left_ids or row["right_id"] not in live_right_ids:
+        return "orphan_dangling"
+    return "ok"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function classifyLinkRow(row, liveLeftIds, liveRightIds) {
+  if (row.deletedAt !== null) return "orphan_soft_deleted";
+  if (!liveLeftIds.has(row.leftId) || !liveRightIds.has(row.rightId)) return "orphan_dangling";
+  return "ok";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report, then hard-delete confirmed orphans behind DRY_RUN</h3>
+      <p>By default the script only logs each row's classification, table name, both-side ids, and a timestamp. Only if <code>DRY_RUN=false</code> and a human has reviewed the report should a second <code>medusa exec</code> script call the pivot service's own <code>delete</code> method with the exact orphaned ids. If <code>getLinkModule</code> is unavailable or unstable for a given pair, fall back to a parameterized <code>DELETE</code> against the specific pivot table filtered by those exact ids, never a blanket delete with no id filter.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair (TypeScript, for reference)</div>
+      <pre><code class="language-python"># Hard delete, and the dismiss step before it, both run from inside Medusa,
+# not from this external script. In a medusa exec script or a workflow:
+#
+#   await link.dismiss({
+#     [Modules.PRODUCT]: { product_id },
+#     [Modules.SALES_CHANNEL]: { sales_channel_id },
+#   })
+#
+#   const linkModule = link.getLinkModule(
+#     Modules.PRODUCT, "product_id",
+#     Modules.SALES_CHANNEL, "sales_channel_id",
+#   )
+#   await linkModule.delete({ product_id: [orphanedIds] })
+#
+# Only run the delete call once DRY_RUN=false and the report above has
+# been reviewed by a human. Log every row deleted, table name, both-side
+# ids, and timestamp, before removal, since this bypasses workflow
+# compensation and is irreversible.</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair (TypeScript, for reference)</div>
+      <pre><code class="language-javascript">// Hard delete, and the dismiss step before it, both run from inside Medusa,
+// not from this external script. In a medusa exec script or a workflow:
+//
+//   await link.dismiss({
+//     [Modules.PRODUCT]: { product_id },
+//     [Modules.SALES_CHANNEL]: { sales_channel_id },
+//   });
+//
+//   const linkModule = link.getLinkModule(
+//     Modules.PRODUCT, "product_id",
+//     Modules.SALES_CHANNEL, "sales_channel_id"
+//   );
+//   await linkModule.delete({ product_id: [orphanedIds] });
+//
+// Only run the delete call once DRY_RUN=false and the report above has
+// been reviewed by a human. Log every row deleted, table name, both-side
+// ids, and timestamp, before removal, since this bypasses workflow
+// compensation and is irreversible.</code></pre>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Leave <code>DRY_RUN=true</code> so the script only reports classified rows. Hard-deleting a link row bypasses workflow compensation entirely and cannot be undone, so it only ever runs against the exact ids collected during detection, logged first, never a blanket delete against a table with no id filter.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It logs in, pulls every live id on both sides of a known link pair, reads the link rows a companion medusa exec script exposed, classifies each one with the pure decision function, and reports every row that is not already fine. The hard-delete call itself stays documented rather than executed here, since <code>getLinkModule</code> only resolves from inside a Medusa server context.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/medusa-fixes/tree/main/no-hard-delete-for-link-rows" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the medusa-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">classify_link_rows.py</div>
+      <pre><code class="language-python">"""Classify Medusa link table rows left behind because there is no hard delete.
+
+Medusa v2's Module Links deliberately expose only soft-delete style operations.
+link.dismiss (and the dismissRemoteLinkStep workflow step) marks a link table
+row with deleted_at rather than removing it, and link.delete only cascades when
+the link definition is configured to. Medusa's core team confirmed on GitHub
+(medusajs/medusa#13315) this is by design, not a bug, because a workflow step
+must be reversible through compensation, and an irreversible hard delete of a
+pivot row cannot be undone. When a linked entity is removed outside a workflow,
+the matching link row is left behind, either live and pointing at a gone id, or
+already soft-deleted, and no public API will ever purge either one.
+
+This script reads the live ids on both sides of a known link pair over the
+Admin API, reads the raw link rows a companion medusa exec script exposed
+(since getLinkModule only resolves inside a Medusa server context), classifies
+every row with a pure function, and reports every row that is not already fine.
+It only reports by default. Hard-deleting a confirmed orphan must run from
+inside Medusa through link.getLinkModule, so that part is documented in the
+guide, not executed by this external script.
+"""
+import os
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("classify_link_rows")
+
+BASE = os.environ["MEDUSA_BACKEND_URL"]
+EMAIL = os.environ["MEDUSA_ADMIN_EMAIL"]
+PASSWORD = os.environ["MEDUSA_ADMIN_PASSWORD"]
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
+def login():
+    r = requests.post(
+        f"{BASE}/auth/user/emailpass",
+        json={"email": EMAIL, "password": PASSWORD},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["token"]
+
+
+def list_live_ids(token, resource, key):
+    ids, offset, limit = [], 0, 200
+    while True:
+        r = requests.get(
+            f"{BASE}/admin/{resource}",
+            params={"fields": "id", "limit": limit, "offset": offset},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json()
+        ids.extend(row["id"] for row in body[key])
+        offset += limit
+        if offset >= body["count"]:
+            return ids
+
+
+def list_link_rows(token):
+    # Exposed by a companion medusa exec script that resolved
+    # link.getLinkModule(...) and called linkModule.list({}, { withDeleted: true }).
+    # Expected shape: [{"left_id": ..., "right_id": ..., "deleted_at": ... or None}, ...]
+    r = requests.get(
+        f"{BASE}/admin/link-rows",
+        params={"pair": "product_sales_channel"},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["rows"]
+
+
+def classify_link_row(row, live_left_ids, live_right_ids):
+    if row.get("deleted_at") is not None:
+        return "orphan_soft_deleted"
+    if row["left_id"] not in live_left_ids or row["right_id"] not in live_right_ids:
+        return "orphan_dangling"
+    return "ok"
+
+
+def run():
+    token = login()
+    live_left_ids = set(list_live_ids(token, "products", "products"))
+    live_right_ids = set(list_live_ids(token, "sales-channels", "sales_channels"))
+    rows = list_link_rows(token)
+
+    reportable = 0
+    for row in rows:
+        status = classify_link_row(row, live_left_ids, live_right_ids)
+        if status == "ok":
+            continue
+        reportable += 1
+        log.warning(
+            "Link row %s -> %s is %s. %s",
+            row["left_id"], row["right_id"], status,
+            "would report" if DRY_RUN else "confirmed, hard delete runs server-side",
+        )
+    log.info("Done. %d reportable row(s) out of %d total.", reportable, len(rows))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify-link-rows.js</div>
+      <pre><code class="language-javascript">/**
+ * Classify Medusa link table rows left behind because there is no hard delete.
+ *
+ * Medusa v2's Module Links deliberately expose only soft-delete style operations.
+ * link.dismiss (and the dismissRemoteLinkStep workflow step) marks a link table
+ * row with deleted_at rather than removing it, and link.delete only cascades when
+ * the link definition is configured to. Medusa's core team confirmed on GitHub
+ * (medusajs/medusa#13315) this is by design, not a bug, because a workflow step
+ * must be reversible through compensation, and an irreversible hard delete of a
+ * pivot row cannot be undone. When a linked entity is removed outside a workflow,
+ * the matching link row is left behind, either live and pointing at a gone id, or
+ * already soft-deleted, and no public API will ever purge either one.
+ *
+ * This script reads the live ids on both sides of a known link pair over the
+ * Admin API, reads the raw link rows a companion medusa exec script exposed
+ * (since getLinkModule only resolves inside a Medusa server context), classifies
+ * every row with a pure function, and reports every row that is not already fine.
+ * It only reports by default. Hard-deleting a confirmed orphan must run from
+ * inside Medusa through link.getLinkModule, so that part is documented in the
+ * guide, not executed by this external script.
+ *
+ * Guide: https://www.allanninal.dev/medusa/no-hard-delete-for-link-rows/
+ */
+import { pathToFileURL } from "node:url";
+
+const BASE = process.env.MEDUSA_BACKEND_URL || "http://localhost:9000";
+const EMAIL = process.env.MEDUSA_ADMIN_EMAIL || "admin@example.com";
+const PASSWORD = process.env.MEDUSA_ADMIN_PASSWORD || "supersecret";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+export function classifyLinkRow(row, liveLeftIds, liveRightIds) {
+  if (row.deletedAt !== null) return "orphan_soft_deleted";
+  if (!liveLeftIds.has(row.leftId) || !liveRightIds.has(row.rightId)) return "orphan_dangling";
+  return "ok";
+}
+
+async function login() {
+  const res = await fetch(`${BASE}/auth/user/emailpass`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.token;
+}
+
+async function listLiveIds(token, resource, key) {
+  const ids = [];
+  let offset = 0;
+  const limit = 200;
+  while (true) {
+    const url = new URL(`${BASE}/admin/${resource}`);
+    url.searchParams.set("fields", "id");
+    url.searchParams.set("limit", String(limit));
+    url.searchParams.set("offset", String(offset));
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) throw new Error(`Medusa ${res.status}`);
+    const body = await res.json();
+    ids.push(...body[key].map((row) => row.id));
+    offset += limit;
+    if (offset >= body.count) return ids;
+  }
+}
+
+async function listLinkRows(token) {
+  // Exposed by a companion medusa exec script that resolved
+  // link.getLinkModule(...) and called linkModule.list({}, { withDeleted: true }).
+  // Expected shape: [{ leftId, rightId, deletedAt: string|null }, ...]
+  const url = new URL(`${BASE}/admin/link-rows`);
+  url.searchParams.set("pair", "product_sales_channel");
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!res.ok) throw new Error(`Medusa ${res.status}`);
+  const body = await res.json();
+  return body.rows;
+}
+
+export async function run() {
+  const token = await login();
+  const liveLeftIds = new Set(await listLiveIds(token, "products", "products"));
+  const liveRightIds = new Set(await listLiveIds(token, "sales-channels", "sales_channels"));
+  const rows = await listLinkRows(token);
+
+  let reportable = 0;
+  for (const row of rows) {
+    const status = classifyLinkRow(row, liveLeftIds, liveRightIds);
+    if (status === "ok") continue;
+    reportable++;
+    console.warn(
+      `Link row ${row.leftId} -> ${row.rightId} is ${status}. ${DRY_RUN ? "would report" : "confirmed, hard delete runs server-side"}`
+    );
+  }
+  console.log(`Done. ${reportable} reportable row(s) out of ${rows.length} total.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classifier is the part most worth testing, because it decides which rows get reported and which are safe to leave alone. Because <code>classify_link_row</code> is pure, taking only a row and the two live id sets, the test needs no network and no Medusa backend. It just feeds in fixture rows and checks the classification.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_hard_delete_link_rows.py</div>
+      <pre><code class="language-python">from classify_link_rows import classify_link_row
+
+
+def row(**over):
+    base = {"left_id": "prod_1", "right_id": "sc_1", "deleted_at": None}
+    base.update(over)
+    return base
+
+
+def test_ok_when_both_parents_live():
+    assert classify_link_row(row(), {"prod_1"}, {"sc_1"}) == "ok"
+
+
+def test_orphan_dangling_when_left_parent_gone():
+    result = classify_link_row(row(left_id="prod_999"), {"prod_1"}, {"sc_1"})
+    assert result == "orphan_dangling"
+
+
+def test_orphan_dangling_when_right_parent_gone():
+    result = classify_link_row(row(right_id="sc_999"), {"prod_1"}, {"sc_1"})
+    assert result == "orphan_dangling"
+
+
+def test_orphan_dangling_when_both_parents_gone():
+    result = classify_link_row(row(left_id="prod_999", right_id="sc_999"), {"prod_1"}, {"sc_1"})
+    assert result == "orphan_dangling"
+
+
+def test_orphan_soft_deleted_even_when_parents_live():
+    r = row(deleted_at="2026-07-01T00:00:00Z")
+    assert classify_link_row(r, {"prod_1"}, {"sc_1"}) == "orphan_soft_deleted"
+
+
+def test_orphan_soft_deleted_when_parents_also_gone():
+    r = row(left_id="prod_999", deleted_at="2026-07-01T00:00:00Z")
+    assert classify_link_row(r, {"prod_1"}, {"sc_1"}) == "orphan_soft_deleted"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify-link-rows.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyLinkRow } from "./classify-link-rows.js";
+
+const row = (over = {}) =&gt; ({ leftId: "prod_1", rightId: "sc_1", deletedAt: null, ...over });
+
+test("ok when both parents live", () =&gt; {
+  assert.equal(classifyLinkRow(row(), new Set(["prod_1"]), new Set(["sc_1"])), "ok");
+});
+
+test("orphan dangling when left parent gone", () =&gt; {
+  const result = classifyLinkRow(row({ leftId: "prod_999" }), new Set(["prod_1"]), new Set(["sc_1"]));
+  assert.equal(result, "orphan_dangling");
+});
+
+test("orphan dangling when right parent gone", () =&gt; {
+  const result = classifyLinkRow(row({ rightId: "sc_999" }), new Set(["prod_1"]), new Set(["sc_1"]));
+  assert.equal(result, "orphan_dangling");
+});
+
+test("orphan dangling when both parents gone", () =&gt; {
+  const result = classifyLinkRow(row({ leftId: "prod_999", rightId: "sc_999" }), new Set(["prod_1"]), new Set(["sc_1"]));
+  assert.equal(result, "orphan_dangling");
+});
+
+test("orphan soft deleted even when parents live", () =&gt; {
+  const r = row({ deletedAt: "2026-07-01T00:00:00Z" });
+  assert.equal(classifyLinkRow(r, new Set(["prod_1"]), new Set(["sc_1"])), "orphan_soft_deleted");
+});
+
+test("orphan soft deleted when parents also gone", () =&gt; {
+  const r = row({ leftId: "prod_999", deletedAt: "2026-07-01T00:00:00Z" });
+  assert.equal(classifyLinkRow(r, new Set(["prod_1"]), new Set(["sc_1"])), "orphan_soft_deleted");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Sales channel cleanup</span>
+      <h4>A retired sales channel left thousands of link rows behind</h4>
+      <p>A retailer shut down a seasonal sales channel at the end of a promotion by deleting it through a one-off script that called the module's repository directly, since it was faster than reasoning through the workflow. Every <code>product_sales_channel</code> row for that channel was left in place, still pointing at a <code>sc_</code> id that no longer resolved to anything.</p>
+      <p>The reconciliation script resolved the pivot service, listed every row including soft-deleted ones, and classified thousands of rows as <code>orphan_dangling</code> in minutes. The team reviewed the report, then ran the hard-delete step from inside a <code>medusa exec</code> script against the exact ids, clearing the table without touching any channel still in use.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Variant migration</span>
+      <h4>A bulk variant import piled up soft-deleted inventory links</h4>
+      <p>During a catalog migration, an engineer called <code>link.dismiss</code> directly on thousands of stale <code>product_variant_inventory_item</code> rows to clear old variants quickly, expecting the rows to disappear. They stayed in the table with <code>deleted_at</code> set, since dismiss only ever soft-deletes, and every later query that listed the pivot table without filtering kept counting them.</p>
+      <p>Running the classifier flagged every one of them as <code>orphan_soft_deleted</code> regardless of whether the parent variant still existed, matching the rule that soft-deleted rows are always reportable. The team confirmed the list, then hard-deleted the confirmed batch through <code>getLinkModule</code>, and later queries against the pivot table stopped over-counting.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, dangling and soft-deleted link rows get caught within a day instead of accumulating silently for months. Every hard delete stays a deliberate, logged, confirmed step through the pivot service's own escape hatch, or a narrowly filtered parameterized delete when that service is unavailable, never a blanket delete against a table Medusa's public API was never designed to purge.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does Medusa never remove link table rows for good?</summary>
+      <p>Medusa v2 workflows are built to be reversible through compensation, and an irreversible hard delete of a pivot row cannot be undone if a later step fails. So the only built-in operations are link.dismiss, which sets deleted_at on the row, and link.delete, which cascades only when the link definition asks for it. Neither one purges a row for good, a gap Medusa's core team confirmed is by design in medusajs/medusa#13315.</p>
+    </details>
+    <details>
+      <summary>What happens to a link row when the entity it points to is deleted outside a workflow?</summary>
+      <p>If a product, sales channel, or variant is removed straight through its module's repository or a script that bypasses the delete workflow, the matching link table row is never touched. It is left behind either as a live-looking row pointing at an id that no longer exists, or as an already soft-deleted row, and no public API will ever purge either one.</p>
+    </details>
+    <details>
+      <summary>Is there any safe way to actually hard delete an orphaned link row?</summary>
+      <p>Yes, but it uses an undocumented escape hatch, not a public API. Resolve the underlying pivot service directly with link.getLinkModule for the two modules involved, then call its own delete method with the exact orphaned ids you confirmed through detection. If that pivot service is unavailable for a given pair, fall back to a parameterized DELETE against the specific pivot table filtered by those exact ids, never a blanket delete with no id filter.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/medusa/">Browse all Medusa.js field notes</a>
+    <a href="/shopify/orders-stuck-unpaid-mark-as-paid/">Shopify orders stuck Unpaid after a payment made outside checkout</a>
+    <a href="/shopify/orders-stuck-unfulfilled/">Shopify orders stuck Unfulfilled past your shipping SLA</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>[Bug]: Missing way to hard-delete link table entries. <a href="https://github.com/medusajs/medusa/issues/13315" rel="noopener">github.com/medusajs/medusa/issues/13315</a></li>
+      <li>Link API medusa v2, Discussion #10108. <a href="https://github.com/medusajs/medusa/discussions/10108" rel="noopener">github.com/medusajs/medusa/discussions/10108</a></li>
+      <li>Link, Medusa Documentation. <a href="https://docs.medusajs.com/learn/fundamentals/module-links/link" rel="noopener">docs.medusajs.com/learn/fundamentals/module-links/link</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>dismissRemoteLinkStep, Medusa Core Workflows Reference. <a href="https://docs.medusajs.com/resources/references/medusa-workflows/steps/dismissRemoteLinkStep" rel="noopener">docs.medusajs.com/resources/references/medusa-workflows/steps/dismissRemoteLinkStep</a></li>
+      <li>Link, Medusa Documentation. <a href="https://docs.medusajs.com/learn/fundamentals/module-links/link" rel="noopener">docs.medusajs.com/learn/fundamentals/module-links/link</a></li>
+      <li>Query, Medusa Documentation. <a href="https://docs.medusajs.com/learn/fundamentals/module-links/query" rel="noopener">docs.medusajs.com/learn/fundamentals/module-links/query</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in Medusa pricing, regions, inventory, orders, promotions, or workflows that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a dangling link row for you?</h3>
+    <p>If this caught a row that was going to keep haunting your queries, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/medusa/">Back to all Medusa.js field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on Medusa.js.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/medusa/assets/medusa.js" defer></script>
+</body>
+</html>
