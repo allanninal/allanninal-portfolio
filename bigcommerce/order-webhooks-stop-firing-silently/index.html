@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Order Webhooks That Stop Firing Silently</title>
+<meta name="description" content="Order webhooks in BigCommerce can go dark with no error anywhere in the control panel. Learn how auto-deactivation and domain-level rate limiting cause this, how to detect the gap, and a Python or Node.js script that flags it safely.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Order Webhooks That Stop Firing Silently">
+<meta property="og:description" content="Why BigCommerce order webhooks stop delivering with no dashboard alert, and a safe Python or Node.js script that detects the gap and flags it for repair instead of blindly reactivating.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/#article","headline":"Fix BigCommerce Order Webhooks That Stop Firing Silently","description":"BigCommerce auto-deactivates a webhook subscription after roughly 48 hours of failed deliveries, and separately blocklists an entire destination domain for 3 minutes if its rolling success rate drops below 90 percent. Both happen silently, with no dashboard alert. This is how to detect the gap and safely flag it for repair.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Webhooks","keywords":"BigCommerce webhooks, webhook deactivation, is_active false, v3/hooks, domain blocklisting, order webhooks, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Order webhooks stop firing entirely with no surfaced error","item":"https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my BigCommerce order webhooks just stop, with nothing in the control panel?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce retries a failing webhook destination on a backoff schedule for roughly 48 hours and then permanently flips that subscription's is_active to false. The only notice is an email to the address on file for the subscribing app, nothing appears in the store control panel, so orders keep being created normally while the hook silently stops delivering."}},{"@type":"Question","name":"My hooks still show is_active true, so why are events missing?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce also tracks a rolling 2 minute success and failure ratio per destination domain once it has sent 100 or more requests, and will blocklist the whole domain for 3 minutes if the success rate drops below 90 percent. During that window deliveries fail even though the hook record itself still reads is_active true, which looks identical to everything just stopping."}},{"@type":"Question","name":"Is it safe to just flip is_active back to true on a deactivated hook?","acceptedAnswer":{"@type":"Answer","text":"No. The underlying delivery failure, a bad endpoint, expired auth, or a TLS or certificate issue, is still unresolved, so reactivating blindly just restarts the same failure loop. Confirm the destination returns a healthy response first, then reactivate with a guarded PUT wrapped in a dry run, and if the hook has been disabled long enough to risk 90 day pruning, recreate it fresh with POST instead of trusting the old record."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Webhooks</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Webhooks</p>
+    <h1>Order webhooks stop firing entirely with no surfaced error</h1>
+    <p class="lead">Orders keep coming in, the storefront looks fine, and then you notice your fulfillment queue or inventory sync has not heard from BigCommerce in hours. Nothing in the control panel says a webhook died. BigCommerce quietly disables a subscription after it keeps failing to deliver, and separately can blocklist your whole receiving domain for a few minutes at a time if its short-term success rate dips, and neither event shows up as an alert anywhere you would normally look. Here is why that happens and a small script that finds the gap and flags it instead of guessing.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Hooks API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce retries a failing webhook destination on a backoff schedule for roughly 48 hours, and if it still is not returning HTTP 200, it permanently flips that subscription's <code>is_active</code> to <code>false</code>, emailing only the address on file for the subscribing app. Separately, once a destination domain has received 100 or more requests, BigCommerce tracks a rolling 2 minute success and failure ratio and will blocklist that whole domain for 3 minutes if the success rate drops below 90 percent, which looks like everything stopped even though the hook still shows <code>is_active:true</code>. Neither mechanism raises a dashboard alert. Pull recent orders with <code>GET /v2/orders</code>, pull your subscriptions with <code>GET /v3/hooks</code>, and diff both against your own webhook receiver log to catch the gap. Full detection code, tests, and a guarded (dry run) repair path are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A BigCommerce webhook subscription is a promise, not a guarantee. When your endpoint stops answering with a 200, either because it is down, redeployed with a broken route, behind an expired certificate, or rejecting the payload for an auth reason, BigCommerce does not just give up on the next event. It retries the delivery on a backoff schedule for roughly 48 hours. If your endpoint still has not recovered by the end of that window, BigCommerce permanently disables the subscription by setting <code>is_active</code> to <code>false</code>.</p>
+  <p>The only notice of that deactivation is an email, sent to whatever address is on file for the app that created the subscription, not to the store owner, not to the control panel, and not to any webhook of your own. If that inbox is unmonitored, or the subscribing app is one of several integrations on the store, the disabling can go unnoticed for days. Meanwhile orders, customers, and everything else in the store keep being created completely normally. Nothing on the storefront or in the order list looks wrong.</p>
+  <p>There is a second, separate failure mode that is even harder to see. BigCommerce tracks delivery success against each destination domain in a rolling 2 minute window, and once it has sent 100 or more requests to that domain, it will blocklist the entire domain for 3 minutes if the success rate in that window drops below 90 percent. During that 3 minute window, deliveries to every hook pointed at that domain fail, even ones with a completely healthy <code>is_active:true</code> record, which reads identically to a wider outage from the receiving side.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. BigCommerce retries a failing webhook destination for about 48 hours, then flips is_active to false and only emails the subscribing app's address, with nothing visible in the control panel, while orders keep being created normally.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="72" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="100" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Order event</text>
+      <text x="85" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">store/order/*</text>
+      <line x1="163" y1="105" x2="203" y2="105" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="206" y="72" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="286" y="96" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Retries ~48h</text>
+      <text x="286" y="114" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">destination not 200</text>
+      <line x1="369" y1="105" x2="438" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="403" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="403" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Window expires</text>
+      <rect x="441" y="72" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="521" y="96" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">is_active: false</text>
+      <text x="521" y="114" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">email only, no dashboard alert</text>
+      <line x1="601" y1="105" x2="633" y2="105" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="636" y="72" width="115" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="693" y="96" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Events</text>
+      <text x="693" y="114" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stop cold</text>
+      <rect x="206" y="164" width="350" height="46" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="381" y="192" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">Orders keep being created normally the whole time</text>
+      <line x1="286" y1="138" x2="286" y2="162" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+    </svg>
+    <figcaption>Retries run quietly for about two days, then the hook is permanently disabled with only an email to the subscribing app's address. Nothing shows in the store control panel, and orders keep flowing the entire time.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce is protecting itself and its delivery infrastructure from endpoints that cannot keep up, but the way it does that leaves store owners with no visible signal. The common paths into this:</p>
+  <ul>
+    <li>Your receiving endpoint redeploys with a broken route, an expired TLS certificate, or a changed auth check, and every delivery for roughly the next 48 hours comes back as a non-200, until BigCommerce permanently sets <code>is_active</code> to <code>false</code> on that subscription.</li>
+    <li>The deactivation email goes to the address on file for the app that created the hook, not to the store owner, so if that app is a third-party integration or an old internal tool, nobody who can fix the receiver ever sees the notice.</li>
+    <li>Your destination domain receives 100 or more webhook requests in a short window and its rolling success rate dips below 90 percent, for example during a deploy, a database failover, or a brief spike in 5xx responses, triggering a 3 minute domain-wide blocklist that fails hooks which still show <code>is_active:true</code>.</li>
+    <li>A hook has sat unused or already disabled for around 90 days and gets pruned entirely, so even a well-intentioned reactivation attempt on an old hook id can silently do nothing.</li>
+  </ul>
+  <p>In every one of these cases the store's control panel looks completely normal, because there is no webhook-of-webhooks and no dashboard banner for either mechanism. The only ground truth is comparing what orders actually happened against what your own systems actually received. See the citations at the end for the exact support threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p><code>is_active:true</code> on a hook record is not proof that hook is delivering. It only proves BigCommerce has not yet permanently disabled it. The reliable check is to compare three things: the timestamped orders that actually happened, the webhook deliveries your own receiver actually logged, and each hook's current <code>is_active</code> and <code>updated_at</code>. A hook with <code>is_active:false</code> is a clear deactivation. A hook that still reads <code>is_active:true</code> but has a delivery gap larger than your normal latency is the quieter, domain-blocklisting kind of failure, and both need a human, not an automatic flip back to on.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live checkout or order flow. We add a job that pulls recent orders, pulls the store's current hook subscriptions, diffs both against the store's own webhook receiver log, and turns any mismatch into a named finding instead of a silent gap.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists recent orders, lists the store's webhook subscriptions, reads the webhook receiver log, and compares all three. A hook that is inactive or has a stale delivery gap is reported as a finding, and only after the destination is confirmed healthy is a guarded reactivation attempted.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="45" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Scheduled job</text>
+      <text x="90" y="62" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a timer</text>
+      <line x1="90" y1="78" x2="90" y2="104" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="106" width="205" height="58" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="128" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">GET /v2/orders</text>
+      <text x="112" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">recent order timestamps</text>
+      <rect x="10" y="172" width="205" height="58" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="194" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">GET /v3/hooks</text>
+      <text x="112" y="212" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">is_active, scope, updated_at</text>
+      <line x1="215" y1="135" x2="257" y2="150" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <line x1="215" y1="201" x2="257" y2="165" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="120" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="146" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Diff vs receiver log</text>
+      <text x="350" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">detect_webhook_gap()</text>
+      <line x1="440" y1="150" x2="482" y2="150" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,118 662,150 575,182 488,150" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="145" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Gap or</text>
+      <text x="575" y="160" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">inactive?</text>
+      <text x="583" y="210" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, nothing to report</text>
+      <line x1="575" y1="182" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="665" y="140" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="150" x2="690" y2="150" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="20" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="43" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report finding</text>
+      <text x="684" y="60" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">hook id, scope, reason</text>
+      <path d="M690,150 C712,150 684,130 684,80" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job only reports a finding, naming the hook id, scope, and destination. A guarded reactivation is a separate, deliberate step taken only after the destination is confirmed healthy.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (read) and Webhooks scope so it can list orders and hooks and, later, perform a guarded reactivation. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="1"
+export STALE_AFTER_MINUTES="30"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="1"
+export STALE_AFTER_MINUTES="30"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 orders and V3 hooks REST APIs</h3>
+      <p>Orders live under <code>https://api.bigcommerce.com/stores/{store_hash}/v2/</code>, hooks live under the V3 base and wrap results in <code>{data, meta.pagination}</code>. The same token in the <code>X-Auth-Token</code> header works for both. A small helper handles GET and PUT and raises on a non-2xx response.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V2 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_put(base, path, body):
+    r = requests.put(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE_V2 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(base, path, body) {
+  const res = await fetch(`${base}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the three inputs the decision needs</h3>
+      <p>Call <code>GET /v2/orders?min_date_created={ISO date}&amp;sort=date_created:desc</code> for a timestamped ground-truth list of order events. Call <code>GET /v3/hooks</code> (optionally <code>?is_active=true</code>) for every subscription's <code>id</code>, <code>scope</code>, <code>destination</code>, <code>is_active</code>, and <code>updated_at</code>. And read your own webhook receiver log table for the timestamps you actually got, grouped by scope.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def recent_orders(lookback_days):
+    orders = []
+    page = 1
+    while True:
+        batch = bc_get(API_BASE_V2, "/orders", {
+            "min_date_created": f"-{lookback_days} days",
+            "sort": "date_created:desc",
+            "page": page,
+            "limit": 50,
+        })
+        if not batch:
+            return orders
+        orders.extend(batch)
+        page += 1
+
+def current_hooks():
+    result = bc_get(API_BASE_V3, "/hooks", {"limit": 250})
+    return result.get("data", []) if isinstance(result, dict) else result</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function recentOrders(lookbackDays) {
+  const orders = [];
+  let page = 1;
+  while (true) {
+    const batch = await bcGet(API_BASE_V2, "/orders", {
+      min_date_created: `-${lookbackDays} days`,
+      sort: "date_created:desc",
+      page,
+      limit: 50,
+    });
+    if (!batch.length) return orders;
+    orders.push(...batch);
+    page += 1;
+  }
+}
+
+async function currentHooks() {
+  const result = await bcGet(API_BASE_V3, "/hooks", { limit: 250 });
+  return Array.isArray(result) ? result : result.data || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the order timestamps, your webhook log timestamps grouped by scope, the raw hook records, and the current time, and returns a list of findings. Any hook matching <code>store/order/*</code> or <code>store/customer/*</code> with <code>is_active:false</code> is a deactivation. Any hook still <code>is_active:true</code> whose scope's last received delivery is older than the newest matching order event, by more than the stale threshold, is a silent delivery gap.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect.py</div>
+      <pre><code class="language-python">from datetime import datetime, timedelta, timezone
+
+def _parse(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+def _scope_matches(scope):
+    return scope.startswith("store/order/") or scope.startswith("store/customer/")
+
+def detect_webhook_gap(order_timestamps, webhook_log_timestamps, hook_records, now, stale_after_minutes=30):
+    findings = []
+    now_dt = _parse(now)
+    latest_order = max((_parse(t) for t in order_timestamps), default=None)
+
+    for hook in hook_records:
+        scope = hook.get("scope", "")
+        if not _scope_matches(scope):
+            continue
+
+        if not hook.get("is_active", True):
+            findings.append({
+                "hook_id": hook.get("id"), "scope": scope,
+                "destination": hook.get("destination"), "is_active": False,
+                "reason": "deactivated",
+            })
+            continue
+
+        if latest_order is None:
+            continue
+
+        log_times = webhook_log_timestamps.get(scope, [])
+        last_received = max((_parse(t) for t in log_times), default=None)
+
+        gap_reference = last_received or latest_order
+        stale_cutoff = now_dt - timedelta(minutes=stale_after_minutes)
+
+        if latest_order > gap_reference and gap_reference < stale_cutoff:
+            findings.append({
+                "hook_id": hook.get("id"), "scope": scope,
+                "destination": hook.get("destination"), "is_active": True,
+                "reason": "stale_no_recent_delivery",
+            })
+
+    return findings</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect.js</div>
+      <pre><code class="language-javascript">function scopeMatches(scope) {
+  return scope.startsWith("store/order/") || scope.startsWith("store/customer/");
+}
+
+export function detectWebhookGap(orderTimestamps, webhookLogTimestamps, hookRecords, now, staleAfterMinutes = 30) {
+  const findings = [];
+  const nowMs = new Date(now).getTime();
+  const orderMs = orderTimestamps.map((t) => new Date(t).getTime());
+  const latestOrder = orderMs.length ? Math.max(...orderMs) : null;
+
+  for (const hook of hookRecords) {
+    const scope = hook.scope || "";
+    if (!scopeMatches(scope)) continue;
+
+    if (hook.is_active === false) {
+      findings.push({ hook_id: hook.id, scope, destination: hook.destination, is_active: false, reason: "deactivated" });
+      continue;
+    }
+
+    if (latestOrder === null) continue;
+
+    const logTimes = (webhookLogTimestamps[scope] || []).map((t) => new Date(t).getTime());
+    const lastReceived = logTimes.length ? Math.max(...logTimes) : null;
+
+    const gapReference = lastReceived ?? latestOrder;
+    const staleCutoff = nowMs - staleAfterMinutes * 60 * 1000;
+
+    if (latestOrder > gapReference &amp;&amp; gapReference < staleCutoff) {
+      findings.push({ hook_id: hook.id, scope, destination: hook.destination, is_active: true, reason: "stale_no_recent_delivery" });
+    }
+  }
+
+  return findings;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report the finding, do not auto-fix it</h3>
+      <p>Every finding names the hook id, scope, destination, and reason. That is the whole output on a normal run. Reactivating is deliberately a separate, manual-gated step, because the receiver's underlying problem is still there until someone confirms otherwise.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">report.py</div>
+      <pre><code class="language-python">def report_finding(finding):
+    log.warning(
+        "webhook gap: hook_id=%s scope=%s destination=%s is_active=%s reason=%s",
+        finding["hook_id"], finding["scope"], finding["destination"],
+        finding["is_active"], finding["reason"],
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">report.js</div>
+      <pre><code class="language-javascript">function reportFinding(finding) {
+  console.warn(
+    `webhook gap: hook_id=${finding.hook_id} scope=${finding.scope} destination=${finding.destination} is_active=${finding.is_active} reason=${finding.reason}`
+  );
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard on reactivation</h3>
+      <p>The loop pulls all three inputs, runs the pure function, and reports every finding. Only after a manual HEAD or GET check confirms the destination now returns a healthy response should reactivation run, and even then it goes through <code>PUT /v3/hooks/{hook_id}</code> with <code>{"is_active": true}</code> behind <code>DRY_RUN</code>, which logs the intended call and skips it unless <code>DRY_RUN=false</code>. If a hook has been disabled long enough to risk the 90 day pruning window, recreate it fresh with <code>POST /v3/hooks</code> instead of trusting the old id.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never flip <code>is_active</code> back to true automatically. Confirm the destination is actually healthy first, keep <code>DRY_RUN=true</code> until you have reviewed the findings, and treat a hook disabled for a long stretch as a candidate for a fresh <code>POST /v3/hooks</code> rather than a reactivated old one.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pulls the three inputs, runs the pure gap detector, logs every finding, and only attempts a guarded, dry-run-respecting reactivation when explicitly told to.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/order-webhooks-stop-firing-silently" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_webhook_gap.py</div>
+      <pre><code class="language-python">"""Detect BigCommerce order webhooks that stopped firing with no surfaced error.
+
+BigCommerce retries a failing webhook destination on a backoff schedule for
+roughly 48 hours, then permanently sets is_active to false on that subscription,
+emailing only the address on file for the subscribing app. Separately, once a
+destination domain has received 100 or more requests, BigCommerce tracks a
+rolling 2 minute success and failure ratio and blocklists the whole domain for
+3 minutes if the success rate drops below 90 percent, which can fail deliveries
+even on a hook that still reads is_active:true. Neither mechanism raises a
+dashboard alert. This job pulls recent orders, the store's current hook
+subscriptions, and the store's own webhook receiver log, and reports any hook
+that is deactivated or has gone stale with no recent delivery. It never
+auto-reactivates; repair is a separate, guarded, dry-run-respecting step.
+
+Guide: https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/
+"""
+import os
+import logging
+from datetime import datetime, timedelta
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_webhook_gap")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V2 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "1"))
+STALE_AFTER_MINUTES = int(os.environ.get("STALE_AFTER_MINUTES", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_put(base, path, body):
+    r = requests.put(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def _parse(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _scope_matches(scope):
+    return scope.startswith("store/order/") or scope.startswith("store/customer/")
+
+
+def detect_webhook_gap(order_timestamps, webhook_log_timestamps, hook_records, now, stale_after_minutes=30):
+    """Pure decision. No network, no side effects.
+
+    order_timestamps: ISO8601 date_created/date_modified values from GET /v2/orders.
+    webhook_log_timestamps: {scope: [received_at ISO8601, ...]} from the store's
+        own webhook receiver log.
+    hook_records: raw items from GET /v3/hooks, each with id, scope, destination,
+        is_active, updated_at.
+    now: ISO8601 current time, injected for testability.
+    stale_after_minutes: threshold beyond normal delivery latency before a
+        still-active hook counts as stale.
+
+    Returns a list of finding dicts: {hook_id, scope, destination, is_active, reason}
+    with reason in {"deactivated", "stale_no_recent_delivery"}.
+    """
+    findings = []
+    now_dt = _parse(now)
+    latest_order = max((_parse(t) for t in order_timestamps), default=None)
+
+    for hook in hook_records:
+        scope = hook.get("scope", "")
+        if not _scope_matches(scope):
+            continue
+
+        if not hook.get("is_active", True):
+            findings.append({
+                "hook_id": hook.get("id"),
+                "scope": scope,
+                "destination": hook.get("destination"),
+                "is_active": False,
+                "reason": "deactivated",
+            })
+            continue
+
+        if latest_order is None:
+            continue
+
+        log_times = webhook_log_timestamps.get(scope, [])
+        last_received = max((_parse(t) for t in log_times), default=None)
+
+        gap_reference = last_received or latest_order
+        stale_cutoff = now_dt - timedelta(minutes=stale_after_minutes)
+
+        if latest_order > gap_reference and gap_reference < stale_cutoff:
+            findings.append({
+                "hook_id": hook.get("id"),
+                "scope": scope,
+                "destination": hook.get("destination"),
+                "is_active": True,
+                "reason": "stale_no_recent_delivery",
+            })
+
+    return findings
+
+
+def recent_orders(lookback_days):
+    """Page through recent orders as a timestamped ground-truth event list."""
+    orders = []
+    page = 1
+    while True:
+        batch = bc_get(API_BASE_V2, "/orders", {
+            "min_date_created": f"-{lookback_days} days",
+            "sort": "date_created:desc",
+            "page": page,
+            "limit": 50,
+        })
+        if not batch:
+            return orders
+        orders.extend(batch)
+        page += 1
+
+
+def current_hooks():
+    result = bc_get(API_BASE_V3, "/hooks", {"limit": 250})
+    return result.get("data", []) if isinstance(result, dict) else result
+
+
+def load_webhook_log_timestamps():
+    """Read your own webhook receiver log table, grouped by scope.
+
+    Replace this with a real query against your receiver's storage. Left as a
+    stub here since the log table is store-specific infrastructure.
+    """
+    return {}
+
+
+def reactivate_hook(hook_id):
+    """Guarded reactivation. Only call this after confirming the destination
+    is healthy again. Always wrapped in DRY_RUN.
+    """
+    if DRY_RUN:
+        log.info("DRY_RUN: would PUT /v3/hooks/%s {'is_active': True}", hook_id)
+        return None
+    return bc_put(API_BASE_V3, f"/hooks/{hook_id}", {"is_active": True})
+
+
+def run():
+    orders = recent_orders(LOOKBACK_DAYS)
+    order_timestamps = [o.get("date_modified") or o.get("date_created") for o in orders if o.get("date_created")]
+    hooks = current_hooks()
+    webhook_log_timestamps = load_webhook_log_timestamps()
+    now = datetime.utcnow().isoformat() + "Z"
+
+    findings = detect_webhook_gap(order_timestamps, webhook_log_timestamps, hooks, now, STALE_AFTER_MINUTES)
+
+    for finding in findings:
+        log.warning(
+            "webhook gap: hook_id=%s scope=%s destination=%s is_active=%s reason=%s",
+            finding["hook_id"], finding["scope"], finding["destination"],
+            finding["is_active"], finding["reason"],
+        )
+
+    log.info("Done. %d order(s) checked, %d hook finding(s).", len(orders), len(findings))
+    return findings
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-webhook-gap.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect BigCommerce order webhooks that stopped firing with no surfaced error.
+ *
+ * BigCommerce retries a failing webhook destination on a backoff schedule for
+ * roughly 48 hours, then permanently sets is_active to false on that
+ * subscription, emailing only the address on file for the subscribing app.
+ * Separately, once a destination domain has received 100 or more requests,
+ * BigCommerce tracks a rolling 2 minute success and failure ratio and
+ * blocklists the whole domain for 3 minutes if the success rate drops below
+ * 90 percent, which can fail deliveries even on a hook that still reads
+ * is_active:true. Neither mechanism raises a dashboard alert. This job pulls
+ * recent orders, the store's current hook subscriptions, and the store's own
+ * webhook receiver log, and reports any hook that is deactivated or has gone
+ * stale with no recent delivery. It never auto-reactivates; repair is a
+ * separate, guarded, dry-run-respecting step.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/order-webhooks-stop-firing-silently/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE_V2 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 1);
+const STALE_AFTER_MINUTES = Number(process.env.STALE_AFTER_MINUTES || 30);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+function scopeMatches(scope) {
+  return scope.startsWith("store/order/") || scope.startsWith("store/customer/");
+}
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * orderTimestamps: ISO8601 date_created/date_modified values from GET /v2/orders.
+ * webhookLogTimestamps: {scope: [receivedAt ISO8601, ...]} from the store's own
+ *   webhook receiver log.
+ * hookRecords: raw items from GET /v3/hooks, each with id, scope, destination,
+ *   is_active, updated_at.
+ * now: ISO8601 current time, injected for testability.
+ * staleAfterMinutes: threshold beyond normal delivery latency before a
+ *   still-active hook counts as stale.
+ *
+ * Returns a list of finding objects: {hook_id, scope, destination, is_active, reason}
+ * with reason in "deactivated" or "stale_no_recent_delivery".
+ */
+export function detectWebhookGap(orderTimestamps, webhookLogTimestamps, hookRecords, now, staleAfterMinutes = 30) {
+  const findings = [];
+  const nowMs = new Date(now).getTime();
+  const orderMs = orderTimestamps.map((t) => new Date(t).getTime()).filter((t) => Number.isFinite(t));
+  const latestOrder = orderMs.length ? Math.max(...orderMs) : null;
+
+  for (const hook of hookRecords) {
+    const scope = hook.scope || "";
+    if (!scopeMatches(scope)) continue;
+
+    if (hook.is_active === false) {
+      findings.push({
+        hook_id: hook.id,
+        scope,
+        destination: hook.destination,
+        is_active: false,
+        reason: "deactivated",
+      });
+      continue;
+    }
+
+    if (latestOrder === null) continue;
+
+    const logTimes = (webhookLogTimestamps[scope] || [])
+      .map((t) => new Date(t).getTime())
+      .filter((t) => Number.isFinite(t));
+    const lastReceived = logTimes.length ? Math.max(...logTimes) : null;
+
+    const gapReference = lastReceived ?? latestOrder;
+    const staleCutoff = nowMs - staleAfterMinutes * 60 * 1000;
+
+    if (latestOrder > gapReference &amp;&amp; gapReference < staleCutoff) {
+      findings.push({
+        hook_id: hook.id,
+        scope,
+        destination: hook.destination,
+        is_active: true,
+        reason: "stale_no_recent_delivery",
+      });
+    }
+  }
+
+  return findings;
+}
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(base, path, body) {
+  const res = await fetch(`${base}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function recentOrders(lookbackDays) {
+  const orders = [];
+  let page = 1;
+  while (true) {
+    const batch = await bcGet(API_BASE_V2, "/orders", {
+      min_date_created: `-${lookbackDays} days`,
+      sort: "date_created:desc",
+      page,
+      limit: 50,
+    });
+    if (!batch.length) return orders;
+    orders.push(...batch);
+    page += 1;
+  }
+}
+
+async function currentHooks() {
+  const result = await bcGet(API_BASE_V3, "/hooks", { limit: 250 });
+  return Array.isArray(result) ? result : result.data || [];
+}
+
+function loadWebhookLogTimestamps() {
+  // Replace this with a real query against your receiver's storage. Left as
+  // a stub here since the log table is store-specific infrastructure.
+  return {};
+}
+
+async function reactivateHook(hookId) {
+  if (DRY_RUN) {
+    console.log(`DRY_RUN: would PUT /v3/hooks/${hookId} {"is_active": true}`);
+    return null;
+  }
+  return bcPut(API_BASE_V3, `/hooks/${hookId}`, { is_active: true });
+}
+
+export async function run() {
+  const orders = await recentOrders(LOOKBACK_DAYS);
+  const orderTimestamps = orders.map((o) => o.date_modified || o.date_created).filter(Boolean);
+  const hooks = await currentHooks();
+  const webhookLogTimestamps = loadWebhookLogTimestamps();
+  const now = new Date().toISOString();
+
+  const findings = detectWebhookGap(orderTimestamps, webhookLogTimestamps, hooks, now, STALE_AFTER_MINUTES);
+
+  for (const finding of findings) {
+    console.warn(
+      `webhook gap: hook_id=${finding.hook_id} scope=${finding.scope} destination=${finding.destination} is_active=${finding.is_active} reason=${finding.reason}`
+    );
+  }
+
+  console.log(`Done. ${orders.length} order(s) checked, ${findings.length} hook finding(s).`);
+  return findings;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The gap detector is the part most worth testing, because it decides whether a real hook gets reported as broken. Because <code>detect_webhook_gap</code> takes only plain values, including an injected <code>now</code>, and returns a plain list, the test needs no network and no BigCommerce store. It just feeds in plain objects and checks the findings.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_order_webhook_gap.py</div>
+      <pre><code class="language-python">from detect_webhook_gap import detect_webhook_gap
+
+NOW = "2026-07-10T12:00:00Z"
+
+
+def hook(id_=1, scope="store/order/statusUpdated", is_active=True, destination="https://example.com/hooks"):
+    return {"id": id_, "scope": scope, "destination": destination, "is_active": is_active, "updated_at": NOW}
+
+
+def test_no_findings_when_everything_is_current():
+    orders = ["2026-07-10T11:55:00Z"]
+    log = {"store/order/statusUpdated": ["2026-07-10T11:56:00Z"]}
+    assert detect_webhook_gap(orders, log, [hook()], NOW) == []
+
+
+def test_flags_deactivated_hook_regardless_of_delivery_log():
+    orders = ["2026-07-10T11:55:00Z"]
+    log = {"store/order/statusUpdated": ["2026-07-10T11:56:00Z"]}
+    findings = detect_webhook_gap(orders, log, [hook(is_active=False)], NOW)
+    assert len(findings) == 1
+    assert findings[0]["reason"] == "deactivated"
+    assert findings[0]["is_active"] is False
+
+
+def test_flags_stale_active_hook_with_no_recent_delivery():
+    orders = ["2026-07-10T11:55:00Z"]
+    log = {"store/order/statusUpdated": ["2026-07-10T10:00:00Z"]}
+    findings = detect_webhook_gap(orders, log, [hook()], NOW, stale_after_minutes=30)
+    assert len(findings) == 1
+    assert findings[0]["reason"] == "stale_no_recent_delivery"
+
+
+def test_no_finding_when_gap_is_within_stale_threshold():
+    orders = ["2026-07-10T11:55:00Z"]
+    log = {"store/order/statusUpdated": ["2026-07-10T11:45:00Z"]}
+    assert detect_webhook_gap(orders, log, [hook()], NOW, stale_after_minutes=30) == []
+
+
+def test_ignores_hooks_outside_order_and_customer_scope():
+    orders = ["2026-07-10T11:55:00Z"]
+    log = {}
+    findings = detect_webhook_gap(orders, log, [hook(scope="store/product/updated", is_active=False)], NOW)
+    assert findings == []
+
+
+def test_no_findings_when_there_are_no_orders_at_all():
+    assert detect_webhook_gap([], {}, [hook()], NOW) == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-webhook-gap.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectWebhookGap } from "./detect-webhook-gap.js";
+
+const NOW = "2026-07-10T12:00:00Z";
+
+const hook = ({ id = 1, scope = "store/order/statusUpdated", isActive = true, destination = "https://example.com/hooks" } = {}) =&gt; ({
+  id, scope, destination, is_active: isActive, updated_at: NOW,
+});
+
+test("no findings when everything is current", () =&gt; {
+  const orders = ["2026-07-10T11:55:00Z"];
+  const log = { "store/order/statusUpdated": ["2026-07-10T11:56:00Z"] };
+  assert.deepEqual(detectWebhookGap(orders, log, [hook()], NOW), []);
+});
+
+test("flags deactivated hook regardless of delivery log", () =&gt; {
+  const orders = ["2026-07-10T11:55:00Z"];
+  const log = { "store/order/statusUpdated": ["2026-07-10T11:56:00Z"] };
+  const findings = detectWebhookGap(orders, log, [hook({ isActive: false })], NOW);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].reason, "deactivated");
+  assert.equal(findings[0].is_active, false);
+});
+
+test("flags stale active hook with no recent delivery", () =&gt; {
+  const orders = ["2026-07-10T11:55:00Z"];
+  const log = { "store/order/statusUpdated": ["2026-07-10T10:00:00Z"] };
+  const findings = detectWebhookGap(orders, log, [hook()], NOW, 30);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].reason, "stale_no_recent_delivery");
+});
+
+test("no finding when gap is within stale threshold", () =&gt; {
+  const orders = ["2026-07-10T11:55:00Z"];
+  const log = { "store/order/statusUpdated": ["2026-07-10T11:45:00Z"] };
+  assert.deepEqual(detectWebhookGap(orders, log, [hook()], NOW, 30), []);
+});
+
+test("ignores hooks outside order and customer scope", () =&gt; {
+  const orders = ["2026-07-10T11:55:00Z"];
+  const findings = detectWebhookGap(orders, {}, [hook({ scope: "store/product/updated", isActive: false })], NOW);
+  assert.deepEqual(findings, []);
+});
+
+test("no findings when there are no orders at all", () =&gt; {
+  assert.deepEqual(detectWebhookGap([], {}, [hook()], NOW), []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Redeployed receiver</span>
+      <h4>The integration that broke its own auth check on deploy</h4>
+      <p>A fulfillment integration redeployed its webhook receiver with a stricter signature check, and a header mismatch meant every delivery started failing. Nobody noticed for two days, since orders kept flowing and the store's admin showed nothing unusual. Then the deactivation email landed in an inbox nobody read regularly, and by the time someone found it, the fulfillment queue was a full day behind.</p>
+      <p>Now a scheduled check compares order timestamps against the webhook receiver log every 15 minutes. The first run after the auth check broke immediately reported a stale_no_recent_delivery finding, hours before the 48 hour deactivation would have even kicked in.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Domain blocklisted mid-deploy</span>
+      <h4>The brief outage that looked like a bigger one</h4>
+      <p>During a routine deploy, a receiver returned 5xx for about ninety seconds while new pods came up. That was enough to drop the domain's rolling success rate below 90 percent, and BigCommerce blocklisted the whole domain for 3 minutes. Every hook pointed at that domain, still showing is_active true, failed to deliver during the window, and the on-call engineer briefly assumed a full outage.</p>
+      <p>The gap detector flagged the affected scopes as stale_no_recent_delivery with is_active still true, which matched the domain blocklisting pattern rather than a deactivation, so the team knew immediately it was a transient issue and not a broken subscription needing repair.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a deactivated hook or a stale, silently-blocked one is a named finding within minutes, not a mystery discovered days later from a backed-up fulfillment queue. Nothing gets reactivated automatically. A human confirms the receiver is healthy first, and only a long-disabled hook gets recreated fresh rather than trusted as-is.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my BigCommerce order webhooks just stop, with nothing in the control panel?</summary>
+      <p>BigCommerce retries a failing webhook destination on a backoff schedule for roughly 48 hours and then permanently flips that subscription's is_active to false. The only notice is an email to the address on file for the subscribing app, nothing appears in the store control panel, so orders keep being created normally while the hook silently stops delivering.</p>
+    </details>
+    <details>
+      <summary>My hooks still show is_active true, so why are events missing?</summary>
+      <p>BigCommerce also tracks a rolling 2 minute success and failure ratio per destination domain once it has sent 100 or more requests, and will blocklist the whole domain for 3 minutes if the success rate drops below 90 percent. During that window deliveries fail even though the hook record itself still reads is_active true, which looks identical to everything just stopping.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just flip is_active back to true on a deactivated hook?</summary>
+      <p>No. The underlying delivery failure, a bad endpoint, expired auth, or a TLS or certificate issue, is still unresolved, so reactivating blindly just restarts the same failure loop. Confirm the destination returns a healthy response first, then reactivate with a guarded PUT wrapped in a dry run, and if the hook has been disabled long enough to risk 90 day pruning, recreate it fresh with POST instead of trusting the old record.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Support: how to avoid webhooks deactivation, it happens periodically. <a href="https://support.bigcommerce.com/s/question/0D54O00006SyE1pSAF/how-to-avoid-webhooks-deactivation-it-happens-periodically?language=en_US" rel="noopener">support.bigcommerce.com how to avoid webhooks deactivation</a></li>
+      <li>BigCommerce Support: webhooks stopped firing today. <a href="https://support.bigcommerce.com/s/question/0D54O000067lCpeSAE/webhooks-stopped-firing-today?language=en_US" rel="noopener">support.bigcommerce.com webhooks stopped firing today</a></li>
+      <li>BigCommerce Support: order webhook not firing. <a href="https://support.bigcommerce.com/s/question/0D51B00004L8koGSAR/order-webhook-not-firing?language=en_US" rel="noopener">support.bigcommerce.com order webhook not firing</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: webhooks overview, retry schedule, and deactivation. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks" rel="noopener">developer.bigcommerce.com webhooks overview</a></li>
+      <li>BigCommerce Docs: webhooks overview. <a href="https://docs.bigcommerce.com/developer/docs/integrations/webhooks/overview" rel="noopener">docs.bigcommerce.com webhooks overview</a></li>
+      <li>BigCommerce Developer Center: webhooks admin, the /v3/hooks endpoints. <a href="https://developer.bigcommerce.com/docs/webhooks/webhooks/webhooks-admin" rel="noopener">developer.bigcommerce.com webhooks admin</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silent webhook gap?</h3>
+    <p>If this saved you from a mystery fulfillment backlog or caught a deactivated hook before it cost you a day, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

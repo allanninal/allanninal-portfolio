@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Status Webhook Payload That Only Carries an Order id</title>
+<meta name="description" content="The store/order/statusUpdated webhook payload carries only an order id, never the new status. Learn why a failed follow-up GET silently drops status changes and build a Python or Node.js reconciler that finds and repairs the gaps.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Status Webhook Payload That Only Carries an Order id">
+<meta property="og:description" content="Why the store/order/statusUpdated webhook never tells you the new status, how a failed follow-up GET drops updates silently, and a safe Python or Node.js reconciler that finds and reports the gaps.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/#article","headline":"Fix BigCommerce Status Webhook Payload That Only Carries an Order id","description":"The store/order/statusUpdated webhook's data object carries only {type, id}, never the resulting status_id. If the required follow-up GET /v2/orders/{id} fails, times out, or the app crashes first, the status change is thrown away with nothing left to replay from. Here is why, how to detect the gaps by state diffing, and a safe Python or Node.js reconciler that reports them.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Webhooks","keywords":"BigCommerce store/order/statusUpdated, webhook payload, status_id, V2 Orders API, v3/hooks, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Status webhook payload carries only an id, hiding dropped updates","item":"https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does the store/order/statusUpdated webhook not just tell me the new status?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce webhook payloads are deliberately thin. The data object for store/order/statusUpdated carries only {\"type\":\"order\",\"id\":<order_id>}, BigCommerce's own docs describe it as containing only the order id. The webhook exists to tell you something changed on that order, not what changed. You are expected to make a follow-up GET /v2/orders/{id} to learn the actual status_id."}},{"@type":"Question","name":"If the follow-up GET fails, will BigCommerce resend the webhook?","acceptedAnswer":{"@type":"Answer","text":"No. BigCommerce only retries a webhook delivery when your endpoint itself fails to return a 2xx response, and it deactivates the hook after about 48 hours of failures. If your endpoint returns 200 OK and only your own internal follow-up GET to fetch the order fails afterward, that is invisible to BigCommerce. From its perspective the delivery already succeeded, so nothing is ever retried."}},{"@type":"Question","name":"How do I find status changes that were dropped this way?","acceptedAnswer":{"@type":"Answer","text":"Do not rely on webhook delivery history, BigCommerce does not expose it. Instead, keep a local last-known status_id per order_id, then periodically call GET /v2/orders?min_date_modified=... to list orders modified since your last check. Compare each returned status_id against your local record. Any order with no local record, or a mismatched status_id, is a dropped update. Also confirm the hook is still is_active:true via GET /v3/hooks."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Webhooks</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Webhooks</p>
+    <h1>Status webhook payload carries only an id, hiding dropped updates</h1>
+    <p class="lead">A store/order/statusUpdated webhook fires. Your endpoint receives it, returns 200 OK, and BigCommerce considers the job done. But the payload never told you what the new status actually is, only which order changed. If the follow-up call you make to find out fails, times out, or your app crashes before it finishes, the notification is gone. There is no record that anything changed, no queue to replay from, and BigCommerce will never resend it because as far as it is concerned, delivery already succeeded. Here is why that gap exists and a small reconciler that finds the orders it left behind.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 Orders API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>The <code>store/order/statusUpdated</code> scope's <code>data</code> object carries only <code>{"type":"order","id":&lt;order_id&gt;}</code>, never the resulting status_id or status text. Your app is required to make a synchronous follow-up <code>GET /v2/orders/{id}</code> to learn what actually changed. If that GET fails, times out, hits a rate limit, or the app crashes between the webhook arriving and the GET completing, the update is dropped with nothing left to retry from, because a webhook that BigCommerce delivered successfully (200 OK) is never resent even if your own internal follow-up call fails afterward. Run a small Python or Node.js reconciler that keeps a local last-known status_id per order, periodically lists orders modified since the last check with <code>GET /v2/orders?min_date_modified=...</code>, and flags any order whose status_id does not match what you have on record. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce webhook payloads are deliberately thin. When an order's status changes, the <code>store/order/statusUpdated</code> event fires with a <code>data</code> object that BigCommerce's own docs describe as containing "only the order id", something like <code>{"scope":"store/order/statusUpdated","data":{"type":"order","id":1234},"hash":"...","producer":"stores/{store_hash}"}</code>. There is no <code>status_id</code>, no <code>status</code> text, nothing about what actually changed, just a pointer telling you to go look.</p>
+  <p>So every consumer of this webhook is required to do the same thing: receive the event, then make a synchronous <code>GET /v2/orders/{id}</code> to find out what the new status_id actually is. That follow-up call is where the real risk sits. If it fails, times out, gets rate limited, or the process crashes in the window between the webhook landing and the GET completing, the information "this order's status changed" is gone. There is no local record of the event, no queue entry, nothing to retry, because the webhook itself carried no state to replay from in the first place.</p>
+  <p>BigCommerce's own retry behavior makes this worse in a way that is easy to miss. If your webhook endpoint itself returns a 5xx or times out, BigCommerce retries delivery for about 48 hours and then deactivates the hook, setting <code>is_active:false</code>. But that retry logic only covers the delivery of the webhook itself. If your endpoint answers 200 OK right away and only your own internal follow-up GET fails afterward, BigCommerce never sees a failure at all. From its side, that delivery succeeded. Nothing is queued, nothing is retried, and the dropped status change is invisible until someone notices the order looks stale.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A store order statusUpdated webhook fires with a payload containing only an order id. The app returns 200 OK to BigCommerce, then makes a follow-up GET to fetch the real status, but that GET fails, so the new status_id is never recorded and BigCommerce never retries because the webhook delivery itself already succeeded.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">statusUpdated</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">{type, id} only</text>
+      <line x1="163" y1="103" x2="205" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="70" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="283" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">App returns</text>
+      <text x="283" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">200 OK</text>
+      <line x1="361" y1="103" x2="403" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="406" y="70" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="481" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Follow-up GET</text>
+      <text x="481" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">/v2/orders/{id}</text>
+      <line x1="559" y1="103" x2="605" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="582" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="582" y="130" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">GET fails or crashes</text>
+      <rect x="608" y="70" width="142" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="679" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Status change</text>
+      <text x="679" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">never recorded</text>
+      <text x="679" y="160" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">no retry, BigCommerce</text>
+      <text x="679" y="175" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">saw delivery succeed</text>
+    </svg>
+    <figcaption>The webhook already told BigCommerce it succeeded the moment your endpoint answered 200 OK. The follow-up GET that actually reveals the new status is on its own, with nothing to retry it if it fails.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few things push stores toward this exact gap:</p>
+  <ul>
+    <li>The webhook payload for <code>store/order/statusUpdated</code> is designed to be a thin notification, <code>{"type":"order","id":&lt;order_id&gt;}</code>, so every consumer must independently fetch the order to learn anything about what changed.</li>
+    <li>BigCommerce's retry and auto-deactivation logic (about 48 hours of retries, then <code>is_active:false</code>) only covers failures in delivering the webhook itself. A 200 OK response ends BigCommerce's responsibility for that event immediately, even if your own processing fails one line of code later.</li>
+    <li>The follow-up <code>GET /v2/orders/{id}</code> is a normal API call subject to normal failure modes: network timeouts, transient 5xx from BigCommerce, rate limiting under bursty traffic, or the consuming process crashing or being redeployed mid-request.</li>
+    <li>There is no BigCommerce-exposed delivery log or dead-letter queue for a webhook that was received successfully but whose internal handling failed afterward, so the gap is invisible unless the merchant's own system tracks state per order.</li>
+  </ul>
+  <p>This matches what BigCommerce's own developer docs say about the payload shape, and it is the same pattern merchants report in support threads where an order's webhook fired but the fetched status still came back stale or wrong. See the citations at the end for the exact references.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot ask BigCommerce which webhooks silently failed after your own 200 OK, that information does not exist on their side. The only way to find a dropped status change is to compare your own last-known state for each order against what BigCommerce's Orders API says right now. <code>GET /v2/orders?min_date_modified=...</code> becomes the reconciliation source of truth, not the webhook stream, and the webhook becomes just a low-latency hint that something might be worth checking sooner.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the webhook handler's fast path. We add a separate reconciliation job that periodically pulls every order modified since the last successful pass, compares each one's status_id against a locally stored last-known value, and reports any mismatch as a dropped update for a human or an automated re-sync to pick up.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled reconciler lists orders modified since the last check, compares each order's status_id against a locally stored last-known status_id, and if they differ or no local record exists it flags the order as a dropped update for repair, otherwise it takes no action.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List modified orders</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">min_date_modified</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Compare status_id</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">vs last-known local</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Mismatch or</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">no record?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, in sync</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag dropped</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">update, re-sync</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The reconciler never guesses. It re-derives the truth from BigCommerce's own Orders API and only flags the orders where the local shadow copy disagrees with what BigCommerce says right now.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (read) scope so it can list and read orders, and give it access to <code>/v3/hooks</code> so it can confirm the webhook is still active. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export RECONCILE_LOOKBACK_HOURS="24"
+export DRY_RUN="true"   # start safe, change to false to write local state</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export RECONCILE_LOOKBACK_HOURS="24"
+export DRY_RUN="true"   // start safe, change to false to write local state</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 Orders API and the v3 Hooks API</h3>
+      <p>Order listing and reads go to <code>https://api.bigcommerce.com/stores/{store_hash}/v2/</code>, hook status checks go to the same host under <code>/v3/hooks</code>, both with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and raises on a non-2xx response.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_HOST = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_HOST}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_HOST = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_HOST}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List orders modified since the last reconciliation pass</h3>
+      <p>Call <code>GET /v2/orders?min_date_modified=&lt;ISO8601 last-checked timestamp&gt;&amp;limit=250&amp;page=&lt;n&gt;</code>, paginated, to get every order BigCommerce has touched since the last time this job ran successfully. For each order, keep <code>id</code>, <code>status_id</code>, <code>status</code>, and <code>date_modified</code>, that is all the decision needs.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def orders_modified_since(last_checked_iso8601):
+    page = 1
+    while True:
+        orders = bc_get("/v2/orders", {
+            "min_date_modified": last_checked_iso8601,
+            "limit": 250,
+            "page": page,
+        })
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+def hook_is_active(scope="store/order/statusUpdated"):
+    hooks = bc_get("/v3/hooks")
+    for hook in hooks.get("data", []):
+        if hook.get("scope") == scope:
+            return hook.get("is_active", False)
+    return False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* ordersModifiedSince(lastCheckedIso8601) {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet("/v2/orders", {
+      min_date_modified: lastCheckedIso8601,
+      limit: 250,
+      page,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function hookIsActive(scope = "store/order/statusUpdated") {
+  const hooks = await bcGet("/v3/hooks");
+  for (const hook of hooks.data || []) {
+    if (hook.scope === scope) return Boolean(hook.is_active);
+  }
+  return false;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Diff against the last-known status, with one pure function</h3>
+      <p>Keep the decision in its own function that takes your locally stored last-known status_id per order_id, plus the freshly fetched orders, and returns the list of mismatches. No local record for an order_id at all counts as a mismatch too, since it means this order's status change was never recorded locally in the first place.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">diff.py</div>
+      <pre><code class="language-python">def diff_order_status(known_status_by_order_id, fetched_orders):
+    mismatches = []
+    for order in fetched_orders:
+        order_id = order["id"]
+        known = known_status_by_order_id.get(order_id)
+        if known is None or known != order["status_id"]:
+            mismatches.append({
+                "order_id": order_id,
+                "previous_known_status_id": known,
+                "current_status_id": order["status_id"],
+                "date_modified": order["date_modified"],
+            })
+    return mismatches</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">diff.js</div>
+      <pre><code class="language-javascript">export function diffOrderStatus(knownStatusByOrderId, fetchedOrders) {
+  const mismatches = [];
+  for (const order of fetchedOrders) {
+    const orderId = order.id;
+    const known = knownStatusByOrderId.has(orderId) ? knownStatusByOrderId.get(orderId) : null;
+    if (known === null || known !== order.status_id) {
+      mismatches.push({
+        order_id: orderId,
+        previous_known_status_id: known,
+        current_status_id: order.status_id,
+        date_modified: order.date_modified,
+      });
+    }
+  }
+  return mismatches;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Re-derive truth from BigCommerce, never write a status back</h3>
+      <p>For every order_id flagged by the diff, the repair is to re-fetch <code>GET /v2/orders/{id}</code> and take its <code>status_id</code>, <code>status</code>, and <code>date_modified</code> as authoritative. There is no <code>PUT /v2/orders/{id}</code> here. BigCommerce's own record of the order status is already correct, the bug is only in the local shadow copy, so the fix is to update that local copy, guarded by the same <code>DRY_RUN</code> flag as everything else.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">repair.py</div>
+      <pre><code class="language-python">def refetch_order(order_id):
+    return bc_get(f"/v2/orders/{order_id}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">repair.js</div>
+      <pre><code class="language-javascript">async function refetchOrder(orderId) {
+  return bcGet(`/v2/orders/${orderId}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop lists orders modified since the last successful pass, diffs them against local state, re-fetches every flagged order to confirm the authoritative status_id, and, unless <code>DRY_RUN</code> is on, updates only the local last-known-status record. Any re-fetch that fails again is logged with the order id and timestamp so it is retried on the next pass instead of being silently dropped a second time. Run it on a schedule that fits how often webhooks fire for your store, once every 15 to 60 minutes is a reasonable start.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never call <code>PUT /v2/orders/{id}</code> to set a status_id from this job, the merchant's real status is already correct in BigCommerce, only the local mirror is wrong. Writing a guessed status back to BigCommerce risks overwriting a status that has since moved on again.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever updates its own local shadow record, never BigCommerce's order status.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/status-webhook-payload-missing-detail" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_order_status.py</div>
+      <pre><code class="language-python">"""Find BigCommerce order status changes dropped by a thin webhook payload.
+
+The store/order/statusUpdated webhook's data object carries only
+{"type":"order","id":&lt;order_id&gt;}, never the resulting status_id. Consumers are
+required to make a follow-up GET /v2/orders/{id} to learn what actually
+changed. If that follow-up GET fails, times out, hits a rate limit, or the app
+crashes before it completes, the status change is dropped with nothing left to
+retry from, because a webhook BigCommerce delivered successfully (200 OK) is
+never resent even if your own internal follow-up call fails afterward. This
+job keeps a local last-known status_id per order, lists every order modified
+since the last successful pass, diffs their status_id against local state, and
+re-fetches each mismatch from BigCommerce so a human or a re-sync can repair
+the local shadow copy. It never writes a status back to BigCommerce. Run on a
+schedule. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_order_status")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_HOST = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+RECONCILE_LOOKBACK_HOURS = int(os.environ.get("RECONCILE_LOOKBACK_HOURS", "24"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+STATUS_UPDATED_SCOPE = "store/order/statusUpdated"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_HOST}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def diff_order_status(known_status_by_order_id, fetched_orders):
+    """Pure decision. No network, no side effects.
+
+    For each order in fetched_orders (dict with at least id, status_id,
+    date_modified), look up the locally stored last-known status_id. If there
+    is no local record, or it disagrees with the order's current status_id,
+    the order is a dropped update. Returns the list of all such mismatches,
+    empty if everything is in sync.
+    """
+    mismatches = []
+    for order in fetched_orders:
+        order_id = order["id"]
+        known = known_status_by_order_id.get(order_id)
+        if known is None or known != order["status_id"]:
+            mismatches.append({
+                "order_id": order_id,
+                "previous_known_status_id": known,
+                "current_status_id": order["status_id"],
+                "date_modified": order["date_modified"],
+            })
+    return mismatches
+
+
+def orders_modified_since(last_checked_iso8601):
+    page = 1
+    while True:
+        orders = bc_get(
+            "/v2/orders",
+            {
+                "min_date_modified": last_checked_iso8601,
+                "limit": 250,
+                "page": page,
+            },
+        )
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+
+def hook_is_active(scope=STATUS_UPDATED_SCOPE):
+    hooks = bc_get("/v3/hooks")
+    for hook in hooks.get("data", []):
+        if hook.get("scope") == scope:
+            return hook.get("is_active", False)
+    return False
+
+
+def refetch_order(order_id):
+    return bc_get(f"/v2/orders/{order_id}")
+
+
+def run(known_status_by_order_id=None, last_checked_iso8601=None):
+    """known_status_by_order_id and last_checked_iso8601 would normally come
+    from your own persistence layer (database, file, cache). Kept as
+    parameters here so the wiring stays testable and swappable.
+    """
+    known_status_by_order_id = known_status_by_order_id or {}
+    if last_checked_iso8601 is None:
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=RECONCILE_LOOKBACK_HOURS)
+        last_checked_iso8601 = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+    if not hook_is_active():
+        log.warning(
+            "store/order/statusUpdated hook is not active. This explains a "
+            "systemic gap, not just isolated follow-up GET failures."
+        )
+
+    fetched_orders = list(orders_modified_since(last_checked_iso8601))
+    mismatches = diff_order_status(known_status_by_order_id, fetched_orders)
+
+    repaired = 0
+    still_failing = 0
+    for mismatch in mismatches:
+        order_id = mismatch["order_id"]
+        try:
+            order = refetch_order(order_id)
+        except requests.RequestException as exc:
+            log.error(
+                "Re-fetch failed for order_id=%s at %s: %s",
+                order_id, mismatch["date_modified"], exc,
+            )
+            still_failing += 1
+            continue
+
+        log.info(
+            "order_id=%s previous_known_status_id=%s current_status_id=%s (%s)",
+            order_id, mismatch["previous_known_status_id"], order.get("status_id"),
+            "dry run" if DRY_RUN else "repairing local mirror",
+        )
+        if not DRY_RUN:
+            known_status_by_order_id[order_id] = order.get("status_id")
+        repaired += 1
+
+    log.info(
+        "Done. %d dropped update(s) found, %d %s, %d failed re-fetch and will retry next pass.",
+        len(mismatches), repaired, "to repair" if DRY_RUN else "repaired", still_failing,
+    )
+    return known_status_by_order_id
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-order-status.js</div>
+      <pre><code class="language-javascript">/**
+ * Find BigCommerce order status changes dropped by a thin webhook payload.
+ *
+ * The store/order/statusUpdated webhook's data object carries only
+ * {"type":"order","id":&lt;order_id&gt;}, never the resulting status_id. Consumers
+ * are required to make a follow-up GET /v2/orders/{id} to learn what actually
+ * changed. If that follow-up GET fails, times out, hits a rate limit, or the
+ * app crashes before it completes, the status change is dropped with nothing
+ * left to retry from, because a webhook BigCommerce delivered successfully
+ * (200 OK) is never resent even if your own internal follow-up call fails
+ * afterward. This job keeps a local last-known status_id per order, lists
+ * every order modified since the last successful pass, diffs their status_id
+ * against local state, and re-fetches each mismatch from BigCommerce so a
+ * human or a re-sync can repair the local shadow copy. It never writes a
+ * status back to BigCommerce. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/status-webhook-payload-missing-detail/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_HOST = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+const RECONCILE_LOOKBACK_HOURS = Number(process.env.RECONCILE_LOOKBACK_HOURS || 24);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const STATUS_UPDATED_SCOPE = "store/order/statusUpdated";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * For each order in fetchedOrders (object with at least id, status_id,
+ * date_modified), look up the locally stored last-known status_id. If there
+ * is no local record, or it disagrees with the order's current status_id,
+ * the order is a dropped update. Returns the list of all such mismatches,
+ * empty if everything is in sync.
+ */
+export function diffOrderStatus(knownStatusByOrderId, fetchedOrders) {
+  const mismatches = [];
+  for (const order of fetchedOrders) {
+    const orderId = order.id;
+    const known = knownStatusByOrderId.has(orderId) ? knownStatusByOrderId.get(orderId) : null;
+    if (known === null || known !== order.status_id) {
+      mismatches.push({
+        order_id: orderId,
+        previous_known_status_id: known,
+        current_status_id: order.status_id,
+        date_modified: order.date_modified,
+      });
+    }
+  }
+  return mismatches;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_HOST}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function* ordersModifiedSince(lastCheckedIso8601) {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet("/v2/orders", {
+      min_date_modified: lastCheckedIso8601,
+      limit: 250,
+      page,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function hookIsActive(scope = STATUS_UPDATED_SCOPE) {
+  const hooks = await bcGet("/v3/hooks");
+  for (const hook of hooks.data || []) {
+    if (hook.scope === scope) return Boolean(hook.is_active);
+  }
+  return false;
+}
+
+async function refetchOrder(orderId) {
+  return bcGet(`/v2/orders/${orderId}`);
+}
+
+export async function run({ knownStatusByOrderId = new Map(), lastCheckedIso8601 } = {}) {
+  if (!lastCheckedIso8601) {
+    const cutoff = new Date(Date.now() - RECONCILE_LOOKBACK_HOURS * 60 * 60 * 1000);
+    lastCheckedIso8601 = cutoff.toISOString().slice(0, 19);
+  }
+
+  if (!(await hookIsActive())) {
+    console.warn(
+      "store/order/statusUpdated hook is not active. This explains a systemic gap, not just isolated follow-up GET failures."
+    );
+  }
+
+  const fetchedOrders = [];
+  for await (const order of ordersModifiedSince(lastCheckedIso8601)) fetchedOrders.push(order);
+
+  const mismatches = diffOrderStatus(knownStatusByOrderId, fetchedOrders);
+
+  let repaired = 0;
+  let stillFailing = 0;
+  for (const mismatch of mismatches) {
+    const orderId = mismatch.order_id;
+    let order;
+    try {
+      order = await refetchOrder(orderId);
+    } catch (err) {
+      console.error(`Re-fetch failed for order_id=${orderId} at ${mismatch.date_modified}: ${err.message}`);
+      stillFailing += 1;
+      continue;
+    }
+
+    console.log(
+      `order_id=${orderId} previous_known_status_id=${mismatch.previous_known_status_id} ` +
+      `current_status_id=${order.status_id} (${DRY_RUN ? "dry run" : "repairing local mirror"})`
+    );
+    if (!DRY_RUN) knownStatusByOrderId.set(orderId, order.status_id);
+    repaired += 1;
+  }
+
+  console.log(
+    `Done. ${mismatches.length} dropped update(s) found, ${repaired} ${DRY_RUN ? "to repair" : "repaired"}, ` +
+    `${stillFailing} failed re-fetch and will retry next pass.`
+  );
+  return knownStatusByOrderId;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The diff rule is the part most worth testing, because it decides which orders get treated as dropped updates. Because <code>diff_order_status</code> takes only plain values and returns a plain list, the test needs no network and no BigCommerce store. It just feeds in constructed dicts and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_status_reconciler.py</div>
+      <pre><code class="language-python">from reconcile_order_status import diff_order_status
+
+
+def order(id_=1, status_id=11, date_modified="2026-07-10T12:00:00"):
+    return {"id": id_, "status_id": status_id, "date_modified": date_modified}
+
+
+def test_no_local_record_is_a_mismatch():
+    result = diff_order_status({}, [order(id_=1, status_id=11)])
+    assert result == [{
+        "order_id": 1,
+        "previous_known_status_id": None,
+        "current_status_id": 11,
+        "date_modified": "2026-07-10T12:00:00",
+    }]
+
+
+def test_matching_status_is_a_no_op():
+    known = {1: 11}
+    result = diff_order_status(known, [order(id_=1, status_id=11)])
+    assert result == []
+
+
+def test_stale_status_is_a_mismatch():
+    known = {1: 7}
+    result = diff_order_status(known, [order(id_=1, status_id=11)])
+    assert result == [{
+        "order_id": 1,
+        "previous_known_status_id": 7,
+        "current_status_id": 11,
+        "date_modified": "2026-07-10T12:00:00",
+    }]
+
+
+def test_empty_fetched_orders_returns_empty_list():
+    assert diff_order_status({1: 11}, []) == []
+
+
+def test_mixed_batch_only_flags_the_mismatches():
+    known = {1: 11, 2: 7}
+    fetched = [order(id_=1, status_id=11), order(id_=2, status_id=10), order(id_=3, status_id=5)]
+    result = diff_order_status(known, fetched)
+    order_ids = sorted(m["order_id"] for m in result)
+    assert order_ids == [2, 3]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-order-status.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { diffOrderStatus } from "./reconcile-order-status.js";
+
+const order = ({ id = 1, status_id = 11, date_modified = "2026-07-10T12:00:00" } = {}) =&gt; ({
+  id, status_id, date_modified,
+});
+
+test("no local record is a mismatch", () =&gt; {
+  const result = diffOrderStatus(new Map(), [order({ id: 1, status_id: 11 })]);
+  assert.deepEqual(result, [{
+    order_id: 1,
+    previous_known_status_id: null,
+    current_status_id: 11,
+    date_modified: "2026-07-10T12:00:00",
+  }]);
+});
+
+test("matching status is a no-op", () =&gt; {
+  const known = new Map([[1, 11]]);
+  const result = diffOrderStatus(known, [order({ id: 1, status_id: 11 })]);
+  assert.deepEqual(result, []);
+});
+
+test("stale status is a mismatch", () =&gt; {
+  const known = new Map([[1, 7]]);
+  const result = diffOrderStatus(known, [order({ id: 1, status_id: 11 })]);
+  assert.deepEqual(result, [{
+    order_id: 1,
+    previous_known_status_id: 7,
+    current_status_id: 11,
+    date_modified: "2026-07-10T12:00:00",
+  }]);
+});
+
+test("empty fetched orders returns empty list", () =&gt; {
+  assert.deepEqual(diffOrderStatus(new Map([[1, 11]]), []), []);
+});
+
+test("mixed batch only flags the mismatches", () =&gt; {
+  const known = new Map([[1, 11], [2, 7]]);
+  const fetched = [order({ id: 1, status_id: 11 }), order({ id: 2, status_id: 10 }), order({ id: 3, status_id: 5 })];
+  const result = diffOrderStatus(known, fetched);
+  const orderIds = result.map((m) =&gt; m.order_id).sort();
+  assert.deepEqual(orderIds, [2, 3]);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Rate limited during a sale</span>
+      <h4>The store whose follow-up GETs started 429ing at peak traffic</h4>
+      <p>A store running a flash sale saw a burst of order status changes fire in a short window. Every webhook arrived and was acknowledged with 200 OK, but the app's follow-up GET calls to fetch each order's real status started hitting BigCommerce's rate limit. Those failed lookups were logged and forgotten, since nothing about the webhook itself had failed, so nothing retried.</p>
+      <p>The reconciler now runs every 15 minutes during known high-traffic windows. It lists everything modified since the last pass, catches every order whose status_id never matched what was recorded locally, and re-fetches just those. The gap closes within one run instead of sitting unnoticed until a customer asks where their shipment confirmation went.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Crash mid-deploy</span>
+      <h4>The deploy that landed between webhook receipt and the follow-up call</h4>
+      <p>A routine deploy restarted the app's webhook worker at an unlucky moment, right after a statusUpdated event had been acknowledged but before the follow-up GET to fetch the new status had completed. BigCommerce considered that delivery done. The app never got a second chance at it.</p>
+      <p>Because the reconciler does not depend on the webhook stream at all, it caught the order on its very next scheduled pass, saw the status_id had never been recorded locally, re-fetched the order directly from BigCommerce, and closed the gap without anyone needing to know a deploy had even caused it.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, a dropped status update is never more than one reconciliation pass away from being found and reported, whether the follow-up GET failed from a timeout, a rate limit, or a crash mid-request. The reconciler never guesses at a status and never writes one back to BigCommerce, it only ever repairs its own local shadow copy from the order record BigCommerce already has.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does the store/order/statusUpdated webhook not just tell me the new status?</summary>
+      <p>BigCommerce webhook payloads are deliberately thin. The data object for store/order/statusUpdated carries only {"type":"order","id":&lt;order_id&gt;}, BigCommerce's own docs describe it as containing only the order id. The webhook exists to tell you something changed on that order, not what changed. You are expected to make a follow-up GET /v2/orders/{id} to learn the actual status_id.</p>
+    </details>
+    <details>
+      <summary>If the follow-up GET fails, will BigCommerce resend the webhook?</summary>
+      <p>No. BigCommerce only retries a webhook delivery when your endpoint itself fails to return a 2xx response, and it deactivates the hook after about 48 hours of failures. If your endpoint returns 200 OK and only your own internal follow-up GET to fetch the order fails afterward, that is invisible to BigCommerce. From its perspective the delivery already succeeded, so nothing is ever retried.</p>
+    </details>
+    <details>
+      <summary>How do I find status changes that were dropped this way?</summary>
+      <p>Do not rely on webhook delivery history, BigCommerce does not expose it. Instead, keep a local last-known status_id per order_id, then periodically call GET /v2/orders?min_date_modified=... to list orders modified since your last check. Compare each returned status_id against your local record. Any order with no local record, or a mismatched status_id, is a dropped update. Also confirm the hook is still is_active:true via GET /v3/hooks.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Dev Center: the store/order/statusUpdated webhook model and its payload shape. <a href="https://developer.bigcommerce.com/api-reference/store-management/webhooks/models/store-order-statusupdated" rel="noopener">developer.bigcommerce.com store/order/statusUpdated</a></li>
+      <li>BigCommerce Developer Center: webhooks overview, scope, data, hash, and producer fields. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks" rel="noopener">developer.bigcommerce.com webhooks overview</a></li>
+      <li>BigCommerce Support Community: an order webhook firing but the follow-up order fetch returning an unexpected or stale status. <a href="https://support.bigcommerce.com/s/question/0D54O00006sUZ1uSAG/order-created-webhook-callback-and-get-order-api-call-is-returning-statusid-0-incomplete-for-successful-orders?language=en_US" rel="noopener">support.bigcommerce.com order created webhook callback status_id issue</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Docs: webhooks overview, the event payload structure, and how producer/scope/data/hash fit together. <a href="https://docs.bigcommerce.com/developer/docs/integrations/webhooks/overview" rel="noopener">docs.bigcommerce.com webhooks overview</a></li>
+      <li>BigCommerce Docs: Get Order, including status_id, status, and date_modified fields used for reconciliation. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order" rel="noopener">docs.bigcommerce.com get order</a></li>
+      <li>BigCommerce Docs: Webhooks v3, listing and updating hooks, and the is_active field. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/integrations/webhooks" rel="noopener">docs.bigcommerce.com webhooks v3</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a gap you would have otherwise missed?</h3>
+    <p>If this saved you from silently losing order status changes, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
