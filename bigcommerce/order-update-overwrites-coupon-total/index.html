@@ -1,0 +1,1027 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Order Updates That Overwrite a Coupon Discount</title>
+<meta name="description" content="A PUT to /v2/orders/{id} for an unrelated field silently zeroes out a previously applied coupon discount. Learn why coupon_discount is server-derived, not writable, and build a Python or Node.js script that detects and reports orders where a coupon was overwritten.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Order Updates That Overwrite a Coupon Discount">
+<meta property="og:description" content="Why a PUT to /v2/orders/{id} recalculates totals and can silently wipe a coupon discount, and a safe Python or Node.js script that detects and reports the corruption instead of blindly rewriting totals.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/#article","headline":"Fix BigCommerce Order Updates That Overwrite a Coupon Discount","description":"Why a PUT to /v2/orders/{id} that touches an unrelated field can recalculate totals and silently wipe a previously applied coupon discount, and a safe Python or Node.js script that detects and reports the corruption instead of blindly rewriting totals.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders","keywords":"BigCommerce coupon_discount, PUT /v2/orders, order coupons, discount_amount, total_inc_tax, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Order update call recalculates and overwrites a coupon adjusted total","item":"https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does updating an unrelated order field wipe out a coupon discount?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce's V2 Orders API treats coupon_discount as a read-only value calculated from the /v2/orders/{id}/coupons sub-resource and each line item's applied_discounts. There is no writable coupon_discount field to resend. When a PUT to /v2/orders/{id} changes any total-affecting property, line items, subtotal or total fields, shipping, handling, wrapping, or fees, BigCommerce recalculates the order totals from the current line items and cost fields, and per BigCommerce's own documentation the PUT request clears all discounts and promotions applied to the changed order line items."}},{"@type":"Question","name":"Can I just resend the coupon_discount value on every PUT to be safe?","acceptedAnswer":{"@type":"Answer","text":"No. coupon_discount is not an independently writable field on the order record, so there is nothing to resend that BigCommerce will honor. The only sanctioned way to protect a total that already reflects a coupon is to include a matching total_ex_tax and total_inc_tax pair in the same PUT request, computed from the untouched line items plus the original discount, and to never send a partial total update."}},{"@type":"Question","name":"Should a reconciliation script auto-fix an order once it detects a wiped-out coupon?","acceptedAnswer":{"@type":"Answer","text":"Treat it as report-only by default. There is no safe idempotent call to reapply a coupon on a completed order, and forcing total_ex_tax and total_inc_tax back down risks conflicting with payment or refund records already captured on the order's transactions. Only under an explicit allow-write flag should the script resend the last known-good total pair together, then re-fetch the order to confirm the fix before marking it reconciled."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Orders</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Orders</p>
+    <h1>Order update call recalculates and overwrites a coupon adjusted total</h1>
+    <p class="lead">A customer checks out with a coupon applied. Weeks later, someone updates the order's staff notes, or a shipping cost, through <code>PUT /v2/orders/{id}</code>. The unrelated field saves fine, but the coupon discount is gone and the total has quietly grown back toward the pre-discount price. BigCommerce has no writable <code>coupon_discount</code> field, so a PUT that touches any total-affecting property recalculates the order from its line items and cost fields and clears the discounts that were riding on top. Here is why that gap opens up and a script that detects and reports it, without guessing at an unsafe auto-fix.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 Orders API</span>
+      <span class="chip">Safe by default (report only)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's V2 Orders API treats <code>coupon_discount</code> as a read-only, server-derived value, calculated from the <code>/v2/orders/{id}/coupons</code> sub-resource and each line item's <code>applied_discounts</code>, not stored as an independently editable field on the order record. When a <code>PUT /v2/orders/{id}</code> changes any total-affecting property, line items, <code>subtotal_ex_tax</code>/<code>subtotal_inc_tax</code>, <code>total_ex_tax</code>/<code>total_inc_tax</code>, shipping, handling, wrapping, or fees, BigCommerce recalculates the subtotal and total fields from the current line items and cost fields, and per BigCommerce's own documentation the PUT request clears all discounts and promotions applied to the changed order line items. Because there is no writable <code>coupon_discount</code> field to resend, a PUT aimed at something as unrelated as <code>staff_notes</code> can silently zero out a previously applied coupon discount. Run a small Python or Node.js script that snapshots each order's coupon state right after checkout, then on a schedule diffs the live order against that snapshot and the <code>/v2/orders/{id}/coupons</code> sub-resource to flag exactly which orders lost their discount and by how much. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When an order is placed with a coupon, BigCommerce records the coupon's effect in two places: the <code>/v2/orders/{id}/coupons</code> sub-resource, which lists the coupon code, its amount, and its discount type, and the order's own <code>coupon_discount</code> field, which reflects that discount in the order total. The order's <code>coupon_discount</code> looks like a normal field when you read it back from <code>GET /v2/orders/{id}</code>, so it is easy to assume it behaves like any other stored value that survives an update to some other part of the order.</p>
+  <p>It does not. <code>coupon_discount</code> is computed on the way out, the same way a read-only label is. There is no matching writable field on the PUT payload for it. So when an integration or a staff member sends a PUT to change something that has nothing to do with the discount, a shipping cost adjustment, a customer message, an internal note, BigCommerce still has to recompute the order's totals because that PUT touched a total-affecting property. It rebuilds <code>subtotal_ex_tax</code>, <code>subtotal_inc_tax</code>, <code>total_ex_tax</code>, and <code>total_inc_tax</code> from the current line items and cost fields, and BigCommerce's own documentation says plainly that the PUT request clears all discounts and promotions applied to the changed order line items. The coupon sub-resource may still list the code as active, but the live order's <code>coupon_discount</code> has dropped to zero or shrunk, and the total has crept back up without anyone touching pricing on purpose.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. An order is placed with a coupon applied. Later, a PUT to the order for an unrelated field triggers BigCommerce to recalculate totals from line items, which clears the coupon discount, so the live order shows a higher total than the coupon sub-resource implies it should.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="155" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="87" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Order placed</text>
+      <text x="87" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">coupon applied</text>
+      <line x1="168" y1="103" x2="210" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="213" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="293" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">PUT unrelated field</text>
+      <text x="293" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">e.g. staff_notes</text>
+      <line x1="376" y1="103" x2="445" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Totals recalculated</text>
+      <rect x="448" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">coupon_discount 0</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">discount cleared</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Total</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">grows back</text>
+      <line x1="611" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The coupon sub-resource still lists the code as active, but the live order's coupon_discount has been recalculated to zero and the total has quietly grown back.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is not a bug so much as a consequence of how BigCommerce models order totals. A few common ways stores end up with a coupon silently stripped from a completed order:</p>
+  <ul>
+    <li>A support agent or internal tool sends <code>PUT /v2/orders/{id}</code> with only <code>{"staff_notes": "..."}</code> or <code>{"customer_message": "..."}</code>, not realizing that other total-affecting fields on the same PUT call trigger a full recalculation from line items.</li>
+    <li>An integration adjusts <code>shipping_cost_ex_tax</code>, <code>handling_cost_ex_tax</code>, or a fee on the order after checkout, for example to reflect an actual carrier rate, without also resending matching <code>total_ex_tax</code>/<code>total_inc_tax</code> values that account for the coupon.</li>
+    <li>A line item edit, quantity change, price override, or add/remove, is made through the API, which BigCommerce's own docs confirm clears discounts and promotions on the changed line items.</li>
+    <li>There is no writable <code>coupon_discount</code> field at all, so even a well-intentioned caller trying to "preserve" the discount has no field to resend it in; the only lever that works is resending the total pair.</li>
+  </ul>
+  <p>Because the order's <code>status</code> and <code>date_modified</code> both look normal after this kind of PUT, and the coupon sub-resource can still list the coupon as technically "on file," nothing about the order record shouts that the discount silently disappeared from the customer-facing total. See the citations at the end for the exact API reference and the community thread describing this behavior.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The order's <code>coupon_discount</code> field is a snapshot of a calculation, not a stored fact. The <code>/v2/orders/{id}/coupons</code> sub-resource is the source of truth for what discount should still be applied. So the safe pattern is not "try to write coupon_discount back," there is no such field, it is "keep a snapshot of the known-good state right after checkout, then periodically diff the live order and the coupons sub-resource against that snapshot to catch the moment a PUT wiped the discount out." We report every affected order with the expected versus observed discount delta and the coupon codes involved, and we never auto-rewrite totals unless an operator explicitly opts in.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout or the order-update flow. We add a reconciliation job that lists recently modified orders, reads each one's current totals and its coupons sub-resource, compares that against a stored snapshot from right after the order was created, and flags any order where the coupon discount has gone missing without a matching drop in the total.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists recently modified orders, reads each order plus its coupons sub-resource, and compares that against a stored snapshot. If the coupon should still apply but the live discount and total do not reconcile, the order is flagged for review, otherwise no action is taken.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List modified orders</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">since last run</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Read order + coupons</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">totals, coupon_discount</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Discount still</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">reconciles?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#8a93a8" stroke-width="2"></line>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, report only</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#4c9a2a" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag order</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">expected vs. observed</text>
+      <path d="M575,170 C575,190 610,190 616,205" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job only reports the orders where the coupons sub-resource still lists an active coupon but the live total no longer reflects it. Nothing is auto-rewritten by default.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (modify) scope so it can read coupons and, if you later opt in to writes, update totals. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="14"
+export DRY_RUN="true"   # start safe, report only by default</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="14"
+export DRY_RUN="true"   // start safe, report only by default</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 Orders REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v2/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and PUT and raises on a non-2xx response. We reuse it to list orders, read the coupons sub-resource, and, only under an explicit opt-in, write the corrected total pair.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List modified orders and read each one's coupons</h3>
+      <p>Call <code>GET /v2/orders?min_date_modified={since}&amp;limit=250</code>, paginated via <code>page</code>, to get orders touched since the last run. For each one, call <code>GET /v2/orders/{id}</code> for <code>coupon_discount</code>, <code>discount_amount</code>, <code>subtotal_ex_tax</code>, <code>total_ex_tax</code>, <code>total_inc_tax</code>, and <code>date_modified</code>, then call <code>GET /v2/orders/{id}/coupons</code> for the coupon sub-resource, the source of truth for what discount should still be applied.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def modified_orders(since_iso):
+    page = 1
+    while True:
+        orders = bc_get("/orders", {
+            "min_date_modified": since_iso,
+            "page": page,
+            "limit": 250,
+        })
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+def order_coupons(order_id):
+    return bc_get(f"/orders/{order_id}/coupons")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* modifiedOrders(sinceIso) {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet("/orders", {
+      min_date_modified: sinceIso,
+      page,
+      limit: 250,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderCoupons(orderId) {
+  return bcGet(`/orders/${orderId}/coupons`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes a stored snapshot, the live order, and the active coupons, and returns whether the order is corrupted. It compares the expected discount, the sum of every active coupon's <code>discount</code>, against what actually happened to <code>coupon_discount</code> and the total. A drop in <code>coupon_discount</code> paired with a total that did not fall by roughly the same amount means the discount was recalculated away, not legitimately superseded by an unrelated line-item change.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+
+RECONCILE_TOLERANCE = Decimal("0.99")
+
+def detect_coupon_overwrite(snapshot, live, active_coupons):
+    expected_discount = sum((c["discount"] for c in active_coupons), Decimal("0"))
+
+    if expected_discount &lt;= 0:
+        return {"order_id": live["order_id"], "is_corrupted": False,
+                "expected_discount": expected_discount, "observed_discount": live["coupon_discount"],
+                "delta_missing": Decimal("0")}
+
+    if live["coupon_discount"] &gt;= snapshot["coupon_discount"]:
+        return {"order_id": live["order_id"], "is_corrupted": False,
+                "expected_discount": expected_discount, "observed_discount": live["coupon_discount"],
+                "delta_missing": Decimal("0")}
+
+    if live["date_modified"] == snapshot["date_modified"]:
+        return {"order_id": live["order_id"], "is_corrupted": False,
+                "expected_discount": expected_discount, "observed_discount": live["coupon_discount"],
+                "delta_missing": Decimal("0")}
+
+    delta = snapshot["total_inc_tax"] - live["total_inc_tax"]
+
+    if delta &lt; expected_discount * RECONCILE_TOLERANCE:
+        delta_missing = expected_discount - (snapshot["coupon_discount"] - live["coupon_discount"])
+        return {"order_id": live["order_id"], "is_corrupted": True,
+                "expected_discount": expected_discount, "observed_discount": live["coupon_discount"],
+                "delta_missing": delta_missing}
+
+    return {"order_id": live["order_id"], "is_corrupted": False,
+            "expected_discount": expected_discount, "observed_discount": live["coupon_discount"],
+            "delta_missing": Decimal("0")}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const RECONCILE_TOLERANCE = 0.99;
+
+export function detectCouponOverwrite(snapshot, live, activeCoupons) {
+  const expectedDiscount = activeCoupons.reduce((sum, c) =&gt; sum + c.discount, 0);
+
+  if (expectedDiscount &lt;= 0) {
+    return { orderId: live.orderId, isCorrupted: false, expectedDiscount, observedDiscount: live.couponDiscount, deltaMissing: 0 };
+  }
+  if (live.couponDiscount &gt;= snapshot.couponDiscount) {
+    return { orderId: live.orderId, isCorrupted: false, expectedDiscount, observedDiscount: live.couponDiscount, deltaMissing: 0 };
+  }
+  if (live.dateModified === snapshot.dateModified) {
+    return { orderId: live.orderId, isCorrupted: false, expectedDiscount, observedDiscount: live.couponDiscount, deltaMissing: 0 };
+  }
+
+  const delta = snapshot.totalIncTax - live.totalIncTax;
+
+  if (delta &lt; expectedDiscount * RECONCILE_TOLERANCE) {
+    const deltaMissing = expectedDiscount - (snapshot.couponDiscount - live.couponDiscount);
+    return { orderId: live.orderId, isCorrupted: true, expectedDiscount, observedDiscount: live.couponDiscount, deltaMissing };
+  }
+
+  return { orderId: live.orderId, isCorrupted: false, expectedDiscount, observedDiscount: live.couponDiscount, deltaMissing: 0 };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report, never auto-fix, unless explicitly opted in</h3>
+      <p>By default this job only logs the affected order id, the expected versus observed discount, and the coupon codes involved. There is no writable <code>coupon_discount</code> field, so forcing <code>total_ex_tax</code>/<code>total_inc_tax</code> back down risks double-adjusting tax or shipping math, or conflicting with payment and refund records already captured under <code>/v2/orders/{id}/transactions</code>. The one sanctioned corrective action, gated behind an explicit <code>--allow-write</code> flag, is a single PUT that resends the last known-good <code>total_ex_tax</code> and <code>total_inc_tax</code> together, never a partial update, followed by a GET to confirm the fix before marking the order reconciled.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def reapply_known_good_totals(order_id, total_ex_tax, total_inc_tax):
+    # Only ever called under an explicit --allow-write flag, never by default.
+    return bc_put(f"/orders/{order_id}", {
+        "total_ex_tax": str(total_ex_tax),
+        "total_inc_tax": str(total_inc_tax),
+    })</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function reapplyKnownGoodTotals(orderId, totalExTax, totalIncTax) {
+  // Only ever called under an explicit --allow-write flag, never by default.
+  return bcPut(`/orders/${orderId}`, {
+    total_ex_tax: String(totalExTax),
+    total_inc_tax: String(totalIncTax),
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. With <code>DRY_RUN=true</code>, the default, the script only logs the {order_id, expected_discount, observed_discount, delta_missing, coupon codes} tuple for every order it flags. Read the output, verify it against a few orders in the admin, and only pass <code>--allow-write</code> once you trust the reconciliation. Run it on a schedule that matches how often staff or integrations touch existing orders, for example once a day.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never resend a partial total update. If you do opt into writes, only send <code>total_ex_tax</code> and <code>total_inc_tax</code> together, computed from the untouched line items plus the original coupon discount, and always re-fetch the order afterward to confirm <code>coupon_discount</code> and the totals match the snapshot before calling it reconciled.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and by default only reports the orders where a coupon discount was silently recalculated away, leaving the actual write for an explicit opt-in.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/order-update-overwrites-coupon-total" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_coupon_overwrite.py</div>
+      <pre><code class="language-python">"""Detect BigCommerce orders whose coupon discount was silently recalculated away.
+
+BigCommerce's V2 Orders API treats coupon_discount as a read-only, server-derived
+value, calculated from the /v2/orders/{id}/coupons sub-resource and each line
+item's applied_discounts, not stored as an independently editable field on the
+order record. When a PUT to /v2/orders/{id} changes any total-affecting property,
+line items, subtotal_ex_tax/subtotal_inc_tax, total_ex_tax/total_inc_tax, shipping,
+handling, wrapping, or fees, BigCommerce recalculates the subtotal and total
+fields from the current line items and cost fields, and per BigCommerce's own
+documentation the PUT request clears all discounts and promotions applied to the
+changed order line items. Because there is no writable coupon_discount field to
+resend, a PUT aimed at an unrelated field can silently zero out or shrink a
+previously applied coupon discount. This job diffs each modified order against a
+stored known-good snapshot and the live coupons sub-resource, and reports the
+orders where the discount no longer reconciles. Report only by default. Run on a
+schedule. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/
+"""
+import os
+import logging
+from decimal import Decimal
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_coupon_overwrite")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+RECONCILE_TOLERANCE = Decimal("0.99")
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def detect_coupon_overwrite(snapshot: dict, live: dict, active_coupons: list) -&gt; dict:
+    """Pure decision. No network, no side effects.
+
+    snapshot/live = {order_id, coupon_discount, total_inc_tax, total_ex_tax, date_modified}
+    active_coupons = list of {code, discount, type}
+
+    expected_discount = sum of every active coupon's discount. If there is no
+    active discount expected, or the live coupon_discount did not drop below
+    the snapshot, or nothing has actually changed (same date_modified), the
+    order is not corrupted. Otherwise, compare how much the total actually
+    fell against how much the coupon discount alone should account for. If
+    the total fell by meaningfully less than the expected discount, the
+    discount was recalculated away rather than legitimately superseded by an
+    unrelated line-item change, so the order is flagged as corrupted with the
+    missing delta.
+    """
+    expected_discount = sum((c["discount"] for c in active_coupons), Decimal("0"))
+
+    result = {
+        "order_id": live["order_id"],
+        "is_corrupted": False,
+        "expected_discount": expected_discount,
+        "observed_discount": live["coupon_discount"],
+        "delta_missing": Decimal("0"),
+    }
+
+    if expected_discount &lt;= 0:
+        return result
+
+    if live["coupon_discount"] &gt;= snapshot["coupon_discount"]:
+        return result
+
+    if live["date_modified"] == snapshot["date_modified"]:
+        return result
+
+    delta = snapshot["total_inc_tax"] - live["total_inc_tax"]
+
+    if delta &lt; expected_discount * RECONCILE_TOLERANCE:
+        result["is_corrupted"] = True
+        result["delta_missing"] = expected_discount - (
+            snapshot["coupon_discount"] - live["coupon_discount"]
+        )
+
+    return result
+
+
+def modified_orders():
+    """Page through orders modified within the lookback window."""
+    page = 1
+    while True:
+        orders = bc_get(
+            "/orders",
+            {
+                "min_date_modified": f"-{LOOKBACK_DAYS} days",
+                "page": page,
+                "limit": 250,
+            },
+        )
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+
+def order_coupons(order_id):
+    return bc_get(f"/orders/{order_id}/coupons")
+
+
+def load_snapshot(order_id):
+    """Placeholder for your local snapshot store, keyed by order id, recorded
+    at the last known-good state (e.g. right after the store/order/created
+    webhook). Replace with a real database or file lookup."""
+    return None
+
+
+def reapply_known_good_totals(order_id, total_ex_tax, total_inc_tax):
+    # Only ever called under an explicit --allow-write flag, never by default.
+    return bc_put(
+        f"/orders/{order_id}",
+        {"total_ex_tax": str(total_ex_tax), "total_inc_tax": str(total_inc_tax)},
+    )
+
+
+def run(allow_write=False):
+    flagged = 0
+    checked = 0
+
+    for order in modified_orders():
+        order_id = order["id"]
+        snapshot = load_snapshot(order_id)
+        if snapshot is None:
+            continue
+
+        checked += 1
+        coupons = order_coupons(order_id)
+        active_coupons = [
+            {"code": c.get("code"), "discount": Decimal(str(c.get("discount", "0"))), "type": c.get("type")}
+            for c in coupons or []
+        ]
+
+        live = {
+            "order_id": order_id,
+            "coupon_discount": Decimal(str(order.get("coupon_discount", "0"))),
+            "total_inc_tax": Decimal(str(order.get("total_inc_tax", "0"))),
+            "total_ex_tax": Decimal(str(order.get("total_ex_tax", "0"))),
+            "date_modified": order.get("date_modified"),
+        }
+
+        result = detect_coupon_overwrite(snapshot, live, active_coupons)
+
+        if not result["is_corrupted"]:
+            continue
+
+        codes = ", ".join(c["code"] for c in active_coupons if c.get("code"))
+        log.warning(
+            "order_id=%s coupon overwrite detected. expected_discount=%s observed_discount=%s "
+            "delta_missing=%s coupons=%s",
+            order_id, result["expected_discount"], result["observed_discount"],
+            result["delta_missing"], codes,
+        )
+        flagged += 1
+
+        if allow_write and not DRY_RUN:
+            reapply_known_good_totals(
+                order_id, snapshot["total_ex_tax"], snapshot["total_inc_tax"]
+            )
+            confirm = bc_get(f"/orders/{order_id}")
+            confirmed = Decimal(str(confirm.get("coupon_discount", "0"))) &gt;= snapshot["coupon_discount"]
+            log.info("order_id=%s reconciled=%s", order_id, confirmed)
+
+    log.info("Done. %d order(s) checked, %d order(s) flagged for a wiped coupon discount.", checked, flagged)
+
+
+if __name__ == "__main__":
+    run(allow_write=os.environ.get("ALLOW_WRITE", "false").lower() == "true")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-coupon-overwrite.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect BigCommerce orders whose coupon discount was silently recalculated away.
+ *
+ * BigCommerce's V2 Orders API treats coupon_discount as a read-only, server-derived
+ * value, calculated from the /v2/orders/{id}/coupons sub-resource and each line
+ * item's applied_discounts, not stored as an independently editable field on the
+ * order record. When a PUT to /v2/orders/{id} changes any total-affecting property,
+ * line items, subtotal_ex_tax/subtotal_inc_tax, total_ex_tax/total_inc_tax, shipping,
+ * handling, wrapping, or fees, BigCommerce recalculates the subtotal and total
+ * fields from the current line items and cost fields, and per BigCommerce's own
+ * documentation the PUT request clears all discounts and promotions applied to the
+ * changed order line items. Because there is no writable coupon_discount field to
+ * resend, a PUT aimed at an unrelated field can silently zero out or shrink a
+ * previously applied coupon discount. This job diffs each modified order against a
+ * stored known-good snapshot and the live coupons sub-resource, and reports the
+ * orders where the discount no longer reconciles. Report only by default.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/order-update-overwrites-coupon-total/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 14);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const ALLOW_WRITE = (process.env.ALLOW_WRITE || "false").toLowerCase() === "true";
+
+const RECONCILE_TOLERANCE = 0.99;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * snapshot/live = {orderId, couponDiscount, totalIncTax, totalExTax, dateModified}
+ * activeCoupons = list of {code, discount, type}
+ *
+ * expectedDiscount = sum of every active coupon's discount. If there is no
+ * active discount expected, or the live couponDiscount did not drop below the
+ * snapshot, or nothing has actually changed (same dateModified), the order is
+ * not corrupted. Otherwise, compare how much the total actually fell against
+ * how much the coupon discount alone should account for. If the total fell by
+ * meaningfully less than the expected discount, the discount was recalculated
+ * away rather than legitimately superseded by an unrelated line-item change,
+ * so the order is flagged as corrupted with the missing delta.
+ */
+export function detectCouponOverwrite(snapshot, live, activeCoupons) {
+  const expectedDiscount = activeCoupons.reduce((sum, c) =&gt; sum + c.discount, 0);
+
+  const result = {
+    orderId: live.orderId,
+    isCorrupted: false,
+    expectedDiscount,
+    observedDiscount: live.couponDiscount,
+    deltaMissing: 0,
+  };
+
+  if (expectedDiscount &lt;= 0) return result;
+  if (live.couponDiscount &gt;= snapshot.couponDiscount) return result;
+  if (live.dateModified === snapshot.dateModified) return result;
+
+  const delta = snapshot.totalIncTax - live.totalIncTax;
+
+  if (delta &lt; expectedDiscount * RECONCILE_TOLERANCE) {
+    result.isCorrupted = true;
+    result.deltaMissing = expectedDiscount - (snapshot.couponDiscount - live.couponDiscount);
+  }
+
+  return result;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function* modifiedOrders() {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet("/orders", {
+      min_date_modified: `-${LOOKBACK_DAYS} days`,
+      page,
+      limit: 250,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderCoupons(orderId) {
+  return bcGet(`/orders/${orderId}/coupons`);
+}
+
+function loadSnapshot(_orderId) {
+  // Placeholder for your local snapshot store, keyed by order id, recorded at
+  // the last known-good state (e.g. right after the store/order/created
+  // webhook). Replace with a real database or file lookup.
+  return null;
+}
+
+async function reapplyKnownGoodTotals(orderId, totalExTax, totalIncTax) {
+  // Only ever called under an explicit --allow-write flag, never by default.
+  return bcPut(`/orders/${orderId}`, {
+    total_ex_tax: String(totalExTax),
+    total_inc_tax: String(totalIncTax),
+  });
+}
+
+export async function run(allowWrite = ALLOW_WRITE) {
+  let flagged = 0;
+  let checked = 0;
+
+  for await (const order of modifiedOrders()) {
+    const orderId = order.id;
+    const snapshot = loadSnapshot(orderId);
+    if (!snapshot) continue;
+
+    checked += 1;
+    const coupons = await orderCoupons(orderId);
+    const activeCoupons = (coupons || []).map((c) =&gt; ({
+      code: c.code,
+      discount: Number.parseFloat(c.discount || "0"),
+      type: c.type,
+    }));
+
+    const live = {
+      orderId,
+      couponDiscount: Number.parseFloat(order.coupon_discount || "0"),
+      totalIncTax: Number.parseFloat(order.total_inc_tax || "0"),
+      totalExTax: Number.parseFloat(order.total_ex_tax || "0"),
+      dateModified: order.date_modified,
+    };
+
+    const result = detectCouponOverwrite(snapshot, live, activeCoupons);
+
+    if (!result.isCorrupted) continue;
+
+    const codes = activeCoupons.map((c) =&gt; c.code).filter(Boolean).join(", ");
+    console.warn(
+      `order_id=${orderId} coupon overwrite detected. expected_discount=${result.expectedDiscount} ` +
+      `observed_discount=${result.observedDiscount} delta_missing=${result.deltaMissing} coupons=${codes}`
+    );
+    flagged += 1;
+
+    if (allowWrite &amp;&amp; !DRY_RUN) {
+      await reapplyKnownGoodTotals(orderId, snapshot.totalExTax, snapshot.totalIncTax);
+      const confirm = await bcGet(`/orders/${orderId}`);
+      const confirmed = Number.parseFloat(confirm.coupon_discount || "0") &gt;= snapshot.couponDiscount;
+      console.log(`order_id=${orderId} reconciled=${confirmed}`);
+    }
+  }
+
+  console.log(`Done. ${checked} order(s) checked, ${flagged} order(s) flagged for a wiped coupon discount.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get reported as corrupted. Because <code>detect_coupon_overwrite</code> takes only plain snapshot and coupon values and returns a plain result, the test needs no network and no BigCommerce store. It just feeds in fixture snapshots and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_overwrites_coupon_discount.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+
+from detect_coupon_overwrite import detect_coupon_overwrite
+
+
+def snapshot(coupon_discount="10.00", total_inc_tax="90.00", date_modified="2026-07-01T10:00:00Z"):
+    return {
+        "order_id": 501,
+        "coupon_discount": Decimal(coupon_discount),
+        "total_inc_tax": Decimal(total_inc_tax),
+        "total_ex_tax": Decimal(total_inc_tax),
+        "date_modified": date_modified,
+    }
+
+
+def live(coupon_discount="10.00", total_inc_tax="90.00", date_modified="2026-07-01T10:00:00Z"):
+    return {
+        "order_id": 501,
+        "coupon_discount": Decimal(coupon_discount),
+        "total_inc_tax": Decimal(total_inc_tax),
+        "total_ex_tax": Decimal(total_inc_tax),
+        "date_modified": date_modified,
+    }
+
+
+def coupon(discount="10.00", code="SAVE10"):
+    return {"code": code, "discount": Decimal(discount), "type": 1}
+
+
+def test_not_corrupted_when_nothing_changed():
+    result = detect_coupon_overwrite(snapshot(), live(), [coupon()])
+    assert result["is_corrupted"] is False
+
+
+def test_not_corrupted_when_no_active_coupon():
+    result = detect_coupon_overwrite(snapshot(coupon_discount="0.00"), live(coupon_discount="0.00"), [])
+    assert result["is_corrupted"] is False
+
+
+def test_corrupted_when_discount_wiped_but_total_unchanged():
+    live_order = live(coupon_discount="0.00", total_inc_tax="90.00", date_modified="2026-07-05T10:00:00Z")
+    result = detect_coupon_overwrite(snapshot(), live_order, [coupon()])
+    assert result["is_corrupted"] is True
+    assert result["delta_missing"] == Decimal("10.00")
+
+
+def test_not_corrupted_when_total_dropped_by_the_expected_discount():
+    live_order = live(coupon_discount="0.00", total_inc_tax="80.00", date_modified="2026-07-05T10:00:00Z")
+    result = detect_coupon_overwrite(snapshot(), live_order, [coupon()])
+    assert result["is_corrupted"] is False
+
+
+def test_not_corrupted_when_discount_increased():
+    live_order = live(coupon_discount="15.00", total_inc_tax="85.00", date_modified="2026-07-05T10:00:00Z")
+    result = detect_coupon_overwrite(snapshot(), live_order, [coupon(discount="15.00")])
+    assert result["is_corrupted"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-coupon-overwrite.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { detectCouponOverwrite } from "./detect-coupon-overwrite.js";
+
+const snapshot = ({ couponDiscount = 10, totalIncTax = 90, dateModified = "2026-07-01T10:00:00Z" } = {}) =&gt; ({
+  orderId: 501, couponDiscount, totalIncTax, totalExTax: totalIncTax, dateModified,
+});
+
+const live = ({ couponDiscount = 10, totalIncTax = 90, dateModified = "2026-07-01T10:00:00Z" } = {}) =&gt; ({
+  orderId: 501, couponDiscount, totalIncTax, totalExTax: totalIncTax, dateModified,
+});
+
+const coupon = ({ discount = 10, code = "SAVE10" } = {}) =&gt; ({ code, discount, type: 1 });
+
+test("not corrupted when nothing changed", () =&gt; {
+  const result = detectCouponOverwrite(snapshot(), live(), [coupon()]);
+  assert.equal(result.isCorrupted, false);
+});
+
+test("not corrupted when no active coupon", () =&gt; {
+  const result = detectCouponOverwrite(
+    snapshot({ couponDiscount: 0 }),
+    live({ couponDiscount: 0 }),
+    []
+  );
+  assert.equal(result.isCorrupted, false);
+});
+
+test("corrupted when discount wiped but total unchanged", () =&gt; {
+  const liveOrder = live({ couponDiscount: 0, totalIncTax: 90, dateModified: "2026-07-05T10:00:00Z" });
+  const result = detectCouponOverwrite(snapshot(), liveOrder, [coupon()]);
+  assert.equal(result.isCorrupted, true);
+  assert.equal(result.deltaMissing, 10);
+});
+
+test("not corrupted when total dropped by the expected discount", () =&gt; {
+  const liveOrder = live({ couponDiscount: 0, totalIncTax: 80, dateModified: "2026-07-05T10:00:00Z" });
+  const result = detectCouponOverwrite(snapshot(), liveOrder, [coupon()]);
+  assert.equal(result.isCorrupted, false);
+});
+
+test("not corrupted when discount increased", () =&gt; {
+  const liveOrder = live({ couponDiscount: 15, totalIncTax: 85, dateModified: "2026-07-05T10:00:00Z" });
+  const result = detectCouponOverwrite(snapshot(), liveOrder, [coupon({ discount: 15 })]);
+  assert.equal(result.isCorrupted, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Staff notes wiped a promo</span>
+      <h4>The support team that broke a discount while leaving a note</h4>
+      <p>A support agent added an internal note to a customer's order using an in-house tool that sent the full order object back on every save, including recalculated total fields. The order had a 15 percent off coupon applied at checkout. After the note was saved, the customer's invoice total had quietly grown back toward full price, and nobody noticed until the customer complained about being overcharged on a partial refund calculated off the wrong total.</p>
+      <p>The reconciliation job now runs nightly. It compares every order modified that day against its checkout-time snapshot and the live coupons sub-resource. It caught this exact order the next morning, days before the refund would have gone out at the wrong amount, and reported the expected discount, the observed discount, and the coupon code so support could recalculate the refund by hand.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Shipping cost correction</span>
+      <h4>The fulfillment integration that corrected a shipping estimate</h4>
+      <p>A warehouse integration updated <code>shipping_cost_ex_tax</code> on orders once the real carrier rate was known, replacing the storefront's estimate. That PUT recalculated the order totals from the current line items and cleared the coupon discount that had been applied at checkout, even though shipping was the only thing the integration meant to touch.</p>
+      <p>Because the reconciliation job treats the coupons sub-resource as the source of truth rather than trusting the order's own <code>coupon_discount</code> field, it flagged every affected order the same way. The fix was on the integration side, resend <code>total_ex_tax</code> and <code>total_inc_tax</code> together whenever shipping changes, but the reconciliation job is what caught the pattern before it reached a large batch of orders.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no order with a coupon silently loses its discount without someone finding out within a day. The report tells you exactly which orders, what discount was expected, what discount survived, and which coupon codes were involved, so a human can decide the right correction, a manual total fix, a partial refund adjustment, or a process change on the calling integration, instead of a script guessing and rewriting a completed order's totals on its own.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does updating an unrelated order field wipe out a coupon discount?</summary>
+      <p>BigCommerce's V2 Orders API treats coupon_discount as a read-only value calculated from the /v2/orders/{id}/coupons sub-resource and each line item's applied_discounts. There is no writable coupon_discount field to resend. When a PUT to /v2/orders/{id} changes any total-affecting property, line items, subtotal or total fields, shipping, handling, wrapping, or fees, BigCommerce recalculates the order totals from the current line items and cost fields, and per BigCommerce's own documentation the PUT request clears all discounts and promotions applied to the changed order line items.</p>
+    </details>
+    <details>
+      <summary>Can I just resend the coupon_discount value on every PUT to be safe?</summary>
+      <p>No. coupon_discount is not an independently writable field on the order record, so there is nothing to resend that BigCommerce will honor. The only sanctioned way to protect a total that already reflects a coupon is to include a matching total_ex_tax and total_inc_tax pair in the same PUT request, computed from the untouched line items plus the original discount, and to never send a partial total update.</p>
+    </details>
+    <details>
+      <summary>Should a reconciliation script auto-fix an order once it detects a wiped-out coupon?</summary>
+      <p>Treat it as report-only by default. There is no safe idempotent call to reapply a coupon on a completed order, and forcing total_ex_tax and total_inc_tax back down risks conflicting with payment or refund records already captured on the order's transactions. Only under an explicit allow-write flag should the script resend the last known-good total pair together, then re-fetch the order to confirm the fix before marking it reconciled.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce API Reference: Update Order, PUT /v2/orders/{id} clears discounts and promotions on changed line items. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/update-order" rel="noopener">docs.bigcommerce.com update order</a></li>
+      <li>BigCommerce Developer Center: Orders Overview, order totals and status model. <a href="https://developer.bigcommerce.com/docs/store-operations/orders" rel="noopener">developer.bigcommerce.com orders overview</a></li>
+      <li>bigcommerce-api-php Issue #144: order and coupon behavior on update. <a href="https://github.com/bigcommerce/bigcommerce-api-php/issues/144" rel="noopener">github.com bigcommerce-api-php issue #144</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce API Reference: Update Order (V2), the fields that trigger a total recalculation. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/update-order" rel="noopener">docs.bigcommerce.com update order (V2)</a></li>
+      <li>BigCommerce API Reference: Get Order, the coupon_discount and total fields returned. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-order" rel="noopener">docs.bigcommerce.com get order</a></li>
+      <li>BigCommerce API Reference: List Order Coupons, the /v2/orders/{id}/coupons sub-resource. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/order-coupons/get-order-coupons" rel="noopener">docs.bigcommerce.com list order coupons</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a coupon that quietly disappeared?</h3>
+    <p>If this saved you from an under-refund, an overcharged customer, or a pile of manual order audits, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/build/">Build</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
