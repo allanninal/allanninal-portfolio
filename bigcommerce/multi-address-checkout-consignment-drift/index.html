@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Multi-Address Checkout Consignment Drift</title>
+<meta name="description" content="BigCommerce's multi-address checkout splits a cart into per-address consignments, and a slow network or retried call can leave an item duplicated or unassigned by the time the order converts. Learn why this happens and build a Python or Node.js script that detects the drift.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Multi-Address Checkout Consignment Drift">
+<meta property="og:description" content="Why shipping to multiple addresses can produce a line item to address mapping that does not match what the customer actually chose, and a safe Python or Node.js script that detects the drift for a human to review.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/#article","headline":"Fix BigCommerce Multi-Address Checkout Consignment Drift","description":"BigCommerce's multi-address checkout represents each destination as a separate consignment, and a slow network, a retried request, or a client that skips a re-fetch can leave an item duplicated across consignments or unassigned to any of them by the time the checkout converts to an order. A safe Python or Node.js script that detects and reports the drift, without ever auto-fixing the assignment.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Checkout / Carts","keywords":"BigCommerce multi-address checkout, consignments, assignItemsToAddress, order_address_id, order shipping addresses, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Ship to multiple addresses produces inconsistent line item to address mapping","item":"https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a BigCommerce multi-address order end up with items on the wrong address, or no address at all?","acceptedAnswer":{"@type":"Answer","text":"Multi-address checkout represents each destination as its own consignment object holding its own line items, and the storefront or headless client must call assignItemsToAddress or unassignItemsToAddress once per address as the shopper works through the flow. These are sequential, independent calls against a mutable checkout resource with optimistic-concurrency version checks. A slow network, a retried request, or a client that does not re-fetch the checkout state between calls can leave an item counted in two consignments or in none by the time the checkout converts to an order, and that drift becomes permanent once conversion stamps each order line item with a single order_address_id."}},{"@type":"Question","name":"Can a script safely reassign the drifted items to the right address after the order is placed?","acceptedAnswer":{"@type":"Answer","text":"No. Line-item-to-address assignment reflects which physical address the customer wanted a given item shipped to, and a script cannot safely infer that intent after the fact. The safe pattern is to detect and report the drift, and for orders still Incomplete or Pending, surface the order_id, product_id, and unassigned or duplicated quantity to a human queue. Consignments only exist pre-conversion on the checkout object, so any real fix requires cancelling and refunding the order for a re-checkout, or a manual merchant-initiated edit in the control panel."}},{"@type":"Question","name":"How do I detect consignment drift after an order has already converted?","acceptedAnswer":{"@type":"Answer","text":"Pull GET /v2/orders/{order_id}/products and GET /v2/orders/{order_id}/shipping_addresses, then cross-tab by order_address_id. Every shipping address should have at least one line item whose order_address_id equals it, and the summed quantity per order_address_id for a product_id should equal that product_id's total quantity on the order. Rows with order_address_id 0 or null on a physical line item are unassigned, and any product_id whose summed quantity across all order_address_id groups exceeds the quantity ordered is duplicated."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Checkout / Carts</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Checkout / Carts</p>
+    <h1>Ship to multiple addresses produces inconsistent line item to address mapping</h1>
+    <p class="lead">A shopper splits their cart across three addresses. Two weeks later, support finds a jacket that was supposed to go to their sister's house is missing from every shipping address on the order, while a different item shows up twice. BigCommerce's multi-address checkout builds the order from a sequence of independent API calls against a mutable checkout, and if one of those calls is slow, retried, or skipped, the resulting order can drift from what the customer actually chose, silently and permanently. Here is why that gap opens up and a script that finds the drift so a human can fix it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce Checkout Consignments + V2 Orders API</span>
+      <span class="chip">Report only, never auto-repair</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce represents each shipping destination in a multi-address checkout as its own consignment object holding its own line_items (item_id and quantity), and the storefront or headless client is responsible for calling assignItemsToAddress or unassignItemsToAddress (or POST/PUT <code>/checkouts/{id}/consignments</code>) once per address as the shopper works through the flow. Because these are sequential, independent calls against a mutable checkout with optimistic-concurrency version checks, a slow network, a retried request, or a client that does not re-fetch checkout state between calls can leave an item duplicated across consignments or unassigned to any of them by the time the checkout converts to an order. Once converted, each order line item is stamped with a single order_address_id, so the drift becomes permanent and silent. Pull <code>GET /v2/orders/{order_id}/products</code> and <code>GET /v2/orders/{order_id}/shipping_addresses</code>, cross-tab by order_address_id, and flag any unassigned or duplicated quantity for a human, never an auto-fix. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Multi-address checkout is not a single atomic operation on BigCommerce. When a shopper splits their cart, the checkout object holds a list of consignments, one per destination address, and each consignment carries its own line_items array of item_id and quantity pairs. As the shopper assigns items to addresses in the storefront UI, the client fires a sequence of calls, assignItemsToAddress for each address, sometimes followed by unassignItemsToAddress when the shopper changes their mind and moves an item elsewhere.</p>
+  <p>Every one of those calls is independent and sequential, and the checkout resource itself is mutable with an optimistic-concurrency version field. If the network is slow, if a call times out and the client retries it, or if the client's local view of the checkout falls behind because it never re-fetched state between two of those calls, an item can end up counted in two consignments at once, or dropped from all of them. Nothing in the flow forces these calls to be transactional across the whole cart. Whatever the consignments say at the moment checkout converts to an order is what gets stamped onto the order's line items, one order_address_id per line item, permanently.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A shopper assigns items to address A and address B through two separate, sequential API calls. A retried or delayed call causes one item to be counted in both consignments and another item to be assigned to neither, and once the checkout converts to an order this drift becomes a permanent mismatch.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="150" height="56" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">assignItemsToAddress</text>
+      <text x="85" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">address A, item X</text>
+      <line x1="163" y1="48" x2="205" y2="48" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="20" width="150" height="56" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="283" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">assignItemsToAddress</text>
+      <text x="283" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">address B, item X (retry)</text>
+      <text x="410" y="30" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="90" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">no re-fetch between calls</text>
+      <line x1="361" y1="48" x2="440" y2="48" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="443" y="20" width="150" height="56" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="518" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">item X in both</text>
+      <text x="518" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">consignment A and B</text>
+      <line x1="518" y1="76" x2="518" y2="112" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="10" y="115" width="230" height="56" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="125" y="139" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Checkout converts to order</text>
+      <text x="125" y="156" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">consignments freeze into order state</text>
+      <line x1="240" y1="143" x2="278" y2="143" stroke="#3466e0" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="281" y="115" width="220" height="56" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="391" y="139" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">order_address_id stamped once</text>
+      <text x="391" y="156" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">drift becomes permanent, silent</text>
+      <rect x="443" y="115" width="150" height="56" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="518" y="139" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">item Y</text>
+      <text x="518" y="156" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">never assigned</text>
+    </svg>
+    <figcaption>Two sequential, independent calls against a mutable checkout can leave one item double-counted and another dropped entirely. Once the checkout converts, both problems are frozen into the order.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The consignment model puts the burden of consistency on the calling client, not on BigCommerce's checkout state machine. A few concrete ways the mapping drifts:</p>
+  <ul>
+    <li>The storefront or headless client calls assignItemsToAddress for address A, the request is slow, the UI times out and retries, and the retry lands after the shopper has already moved on to assigning the same item to address B, so the item is now claimed by both consignments.</li>
+    <li>A client reads a stale local copy of the checkout (an outdated version) between two address-assignment steps, so its second call operates on an item_id and quantity it thinks is still unassigned, when in fact an earlier call already claimed it, or vice versa, leaving a gap.</li>
+    <li>The shopper unassigns an item from one address to move it to another (unassignItemsToAddress followed by assignItemsToAddress), and the two calls do not both complete, for example the tab is closed, the network drops, or a validation error only surfaces on the second call, leaving the item unassigned entirely.</li>
+    <li>A custom or headless checkout implementation batches consignment updates client-side and sends them out of order relative to the optimistic-concurrency version the checkout resource expects, so one write silently loses to another instead of being rejected outright.</li>
+  </ul>
+  <p>None of this throws a visible error to the merchant. The order converts successfully, the payment captures successfully, and the only trace of the problem is a mismatch between what the consignments said pre-conversion and what order_address_id groupings say post-conversion. See the citations at the end for the exact API references.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Pre-conversion consignments are the customer's actual intent. Post-conversion order_address_id groupings are what BigCommerce recorded. The two can disagree, and once conversion has happened there is no API that lets you safely rewrite which address an already-placed line item belongs to. So the only sound move is detection: cross-tab <code>GET /v2/orders/{id}/products</code> against <code>GET /v2/orders/{id}/shipping_addresses</code> by order_address_id, find any product_id whose assigned quantity does not add up, and hand it to a human. Never call POST or PUT on consignments after conversion. Consignments only exist on the pre-conversion checkout object.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live multi-address checkout flow. We add a reconciliation job that reads an order's shipping addresses and line items, runs a pure comparison function, and produces a drift report per product_id for orders still early enough in their lifecycle for a human to act on it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job reads an order's shipping addresses and line items, computes expected versus actual quantity per product_id grouped by order_address_id, and if quantities disagree it reports the order as unassigned or duplicated for a human queue, otherwise it reports the order as ok.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Reconciliation job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a schedule</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">GET order_products</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">GET shipping_addresses</text>
+      <line x1="225" y1="138" x2="264" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="267" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="359" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">find_consignment_drift</text>
+      <text x="359" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">group by order_address_id</text>
+      <line x1="452" y1="138" x2="491" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 665,138 580,170 495,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">qty matches</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">per address?</text>
+      <text x="668" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="665" y1="138" x2="693" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="20" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="43" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">status: ok</text>
+      <text x="684" y="60" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">no action needed</text>
+      <path d="M693,138 C715,138 684,120 684,80" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></path>
+      <text x="588" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, drift found</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">unassigned or</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">duplicated: report</text>
+      <path d="M580,170 C580,200 618,213 618,213" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job never writes to consignments or to the order. It only reports a drift record per product_id so a human can decide what to do next.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (read) scope so it can read shipping addresses, products, and pre-conversion consignments. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="14"
+export DRY_RUN="true"   # start safe, change to false to write status_id 12</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="14"
+export DRY_RUN="true"   // start safe, change to false to write status_id 12</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 Orders API and the checkout consignments endpoint</h3>
+      <p>Order reads go to <code>https://api.bigcommerce.com/stores/{store_hash}/v2/</code> with the token in the <code>X-Auth-Token</code> header. Pre-conversion consignment reads, when a headless checkout is still involved, go to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/checkouts/{checkout_id}/consignments</code>. A small helper handles GET and raises on a non-2xx response, and a separate PUT helper is reserved for the one write this job makes, flipping a stuck order's status_id, never touching consignments or order line items.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V2 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_put(base, path, body):
+    r = requests.put(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE_V2 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(base, path, body) {
+  const res = await fetch(`${base}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the order's shipping addresses and line items</h3>
+      <p>Call <code>GET /v2/orders/{id}/shipping_addresses</code> for the distinct ship-to addresses created for the order, and <code>GET /v2/orders/{id}/products</code> for the line items, each carrying product_id, quantity, and the order_address_id linking it to one of those addresses. When a headless or custom checkout is still involved and you want to diff against the original intent, also pull <code>GET /v3/checkouts/{checkout_id}/consignments</code> before conversion.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def order_shipping_addresses(order_id):
+    return bc_get(API_BASE_V2, f"/orders/{order_id}/shipping_addresses")
+
+def order_products(order_id):
+    return bc_get(API_BASE_V2, f"/orders/{order_id}/products")
+
+def checkout_consignments(checkout_id):
+    payload = bc_get(API_BASE_V3, f"/checkouts/{checkout_id}/consignments")
+    return payload.get("data", []) if isinstance(payload, dict) else payload</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function orderShippingAddresses(orderId) {
+  return bcGet(API_BASE_V2, `/orders/${orderId}/shipping_addresses`);
+}
+
+async function orderProducts(orderId) {
+  return bcGet(API_BASE_V2, `/orders/${orderId}/products`);
+}
+
+async function checkoutConsignments(checkoutId) {
+  const payload = await bcGet(API_BASE_V3, `/checkouts/${checkoutId}/consignments`);
+  return Array.isArray(payload) ? payload : payload.data || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the drift detection in its own function that takes the pre-conversion consignments and the post-conversion order line items, and returns one drift record per product_id. It never fixes anything, it only compares expected quantity per item_id against actual quantity per product_id, flags unassigned quantity (order_address_id 0 or null), and flags duplicated quantity (actual exceeds expected).</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_consignment_drift(consignments, order_products):
+    expected_qty = {}
+    for c in consignments or []:
+        for li in c.get("line_items", []) or []:
+            product_id = li["item_id"]
+            expected_qty[product_id] = expected_qty.get(product_id, 0) + li.get("quantity", 0)
+
+    actual_qty = {}
+    unassigned_qty = {}
+    for row in order_products or []:
+        product_id = row["product_id"]
+        qty = row.get("quantity", 0)
+        actual_qty[product_id] = actual_qty.get(product_id, 0) + qty
+        addr_id = row.get("order_address_id")
+        if addr_id in (0, None):
+            unassigned_qty[product_id] = unassigned_qty.get(product_id, 0) + qty
+
+    product_ids = set(expected_qty) | set(actual_qty)
+    drift = []
+    for product_id in sorted(product_ids):
+        expected = expected_qty.get(product_id, 0)
+        actual = actual_qty.get(product_id, 0)
+        unassigned = unassigned_qty.get(product_id, 0)
+        duplicated = max(0, actual - expected) if actual &gt; expected else 0
+
+        if unassigned &gt; 0:
+            status = "unassigned"
+        elif actual != expected and duplicated &gt; 0:
+            status = "duplicated"
+        else:
+            status = "ok"
+
+        drift.append({
+            "product_id": product_id, "expected_qty": expected, "actual_qty": actual,
+            "unassigned_qty": unassigned, "duplicated_qty": duplicated, "status": status,
+        })
+    return drift</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findConsignmentDrift(consignments, orderProducts) {
+  const expectedQty = new Map();
+  for (const c of consignments || []) {
+    for (const li of c.line_items || []) {
+      const productId = li.item_id;
+      expectedQty.set(productId, (expectedQty.get(productId) || 0) + (li.quantity || 0));
+    }
+  }
+
+  const actualQty = new Map();
+  const unassignedQty = new Map();
+  for (const row of orderProducts || []) {
+    const productId = row.product_id;
+    const qty = row.quantity || 0;
+    actualQty.set(productId, (actualQty.get(productId) || 0) + qty);
+    if (row.order_address_id === 0 || row.order_address_id === null || row.order_address_id === undefined) {
+      unassignedQty.set(productId, (unassignedQty.get(productId) || 0) + qty);
+    }
+  }
+
+  const productIds = new Set([...expectedQty.keys(), ...actualQty.keys()]);
+  const drift = [];
+  for (const productId of [...productIds].sort((a, b) =&gt; a - b)) {
+    const expected = expectedQty.get(productId) || 0;
+    const actual = actualQty.get(productId) || 0;
+    const unassigned = unassignedQty.get(productId) || 0;
+    const duplicated = actual &gt; expected ? actual - expected : 0;
+
+    let status = "ok";
+    if (unassigned &gt; 0) status = "unassigned";
+    else if (actual !== expected &amp;&amp; duplicated &gt; 0) status = "duplicated";
+
+    drift.push({ product_id: productId, expected_qty: expected, actual_qty: actual,
+      unassigned_qty: unassigned, duplicated_qty: duplicated, status });
+  }
+  return drift;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Surface drift on open orders, never touch converted consignments</h3>
+      <p>When an order is still Incomplete (status_id 0) or Pending (status_id 1) and has unassigned_qty greater than 0, the safe action is to leave it unshipped and mark it for a human queue with <code>PUT /v2/orders/{id}</code> setting <code>status_id</code> to 12 (Manual Verification Required). Never call POST or PUT on <code>/consignments</code> after conversion. Consignments only exist pre-conversion on the checkout object, and fixing a converted order means cancelling and refunding it (status_id 5) for the customer to re-checkout, or a manual merchant edit in the control panel, both human-in-the-loop.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">MANUAL_VERIFICATION_REQUIRED = 12
+OPEN_STATUS_IDS = {0, 1}  # Incomplete, Pending
+
+def flag_for_manual_verification(order_id):
+    return bc_put(API_BASE_V2, f"/orders/{order_id}", {"status_id": MANUAL_VERIFICATION_REQUIRED})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">const MANUAL_VERIFICATION_REQUIRED = 12;
+const OPEN_STATUS_IDS = new Set([0, 1]); // Incomplete, Pending
+
+async function flagForManualVerification(orderId) {
+  return bcPut(API_BASE_V2, `/orders/${orderId}`, { status_id: MANUAL_VERIFICATION_REQUIRED });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: pull the order's shipping addresses and products, run <code>find_consignment_drift</code>, log every non-ok record with the order_id, product_id, and quantities, and only flip status_id to 12 for open orders (status_id 0 or 1) when <code>DRY_RUN</code> is false. Read the dry run output, agree with it, then switch it off. Run it on a schedule, for example every few hours, so drifted multi-address orders reach a human queue quickly instead of shipping incomplete or duplicated.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never write to consignments once an order has converted. The only write this job ever makes is flipping status_id to 12 on an open order so a human reviews it. Reassigning a placed line item to a different address is not something a script can do safely, because only the customer or a merchant knows the intended destination.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and never mutates a converted order's line items or consignments, it only reports drift and, optionally, flags open orders for manual review.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/multi-address-checkout-consignment-drift" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_consignment_drift.py</div>
+      <pre><code class="language-python">"""Detect BigCommerce multi-address checkout consignment drift.
+
+Multi-address checkout represents each shipping destination as its own
+consignment object holding its own line_items (item_id and quantity), and the
+storefront or headless client is responsible for calling assignItemsToAddress
+or unassignItemsToAddress (or POST/PUT /checkouts/{id}/consignments) once per
+address as the shopper works through the flow. Because these are sequential,
+independent calls against a mutable checkout resource with optimistic
+concurrency version checks, a slow network, a retried request, or a client
+that does not re-fetch checkout state between calls can leave an item
+duplicated across consignments or unassigned to any of them by the time the
+checkout converts to an order. Once converted, each order line item is
+stamped with a single order_address_id, so the drift becomes a permanent,
+silent mismatch between what the customer intended per address and what the
+order record shows.
+
+This job never repairs the mapping. It reports drift per product_id, and for
+orders still Incomplete or Pending with unassigned quantity, it can flag the
+order for manual verification (status_id 12) so a human reviews it before it
+ships. Consignments only exist pre-conversion on the checkout object; once an
+order has converted, the only real fixes are cancelling and refunding the
+order for a re-checkout, or a manual merchant edit in the control panel.
+
+Guide: https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_consignment_drift")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V2 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+MANUAL_VERIFICATION_REQUIRED = 12
+OPEN_STATUS_IDS = {0, 1}  # Incomplete, Pending
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_put(base, path, body):
+    r = requests.put(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def find_consignment_drift(consignments: list, order_products: list) -&gt; list:
+    """Pure decision. No network, no side effects.
+
+    consignments: pre-conversion checkout consignments, each
+        {"consignment_id": str, "line_items": [{"item_id": str, "quantity": int}], "address_id": str}
+    order_products: post-conversion order line items from GET /v2/orders/{id}/products, each
+        {"id": int, "product_id": int, "quantity": int, "order_address_id": int}
+
+    Returns a list of drift records, one per product_id, of shape:
+        {"product_id": int, "expected_qty": int, "actual_qty": int,
+         "unassigned_qty": int, "duplicated_qty": int, "status": "unassigned"|"duplicated"|"ok"}
+
+    expected_qty is the sum of quantity across all consignment line_items for
+    that item_id (item_id maps 1:1 to product_id in this store's checkout
+    flow). actual_qty is the sum of quantity across all order_products rows
+    for that product_id. unassigned_qty is the portion of actual_qty whose
+    order_address_id is 0 or None, meaning it was never bound to any of the
+    shipping addresses created for the order. duplicated_qty is
+    max(0, actual_qty - expected_qty) when actual_qty exceeds expected_qty.
+    status is "unassigned" if unassigned_qty &gt; 0, else "duplicated" if
+    actual_qty != expected_qty and duplicated_qty &gt; 0, else "ok". Callers
+    should pass only physical line items in order_products so digital,
+    non-shippable products (order_address_id 0 by design) do not produce
+    false positives.
+    """
+    expected_qty = {}
+    for consignment in consignments or []:
+        for line_item in consignment.get("line_items", []) or []:
+            product_id = line_item["item_id"]
+            expected_qty[product_id] = expected_qty.get(product_id, 0) + line_item.get("quantity", 0)
+
+    actual_qty = {}
+    unassigned_qty = {}
+    for row in order_products or []:
+        product_id = row["product_id"]
+        qty = row.get("quantity", 0)
+        actual_qty[product_id] = actual_qty.get(product_id, 0) + qty
+
+        order_address_id = row.get("order_address_id")
+        if order_address_id in (0, None):
+            unassigned_qty[product_id] = unassigned_qty.get(product_id, 0) + qty
+
+    product_ids = set(expected_qty) | set(actual_qty)
+    drift = []
+    for product_id in sorted(product_ids):
+        expected = expected_qty.get(product_id, 0)
+        actual = actual_qty.get(product_id, 0)
+        unassigned = unassigned_qty.get(product_id, 0)
+        duplicated = (actual - expected) if actual &gt; expected else 0
+
+        if unassigned &gt; 0:
+            status = "unassigned"
+        elif actual != expected and duplicated &gt; 0:
+            status = "duplicated"
+        else:
+            status = "ok"
+
+        drift.append({
+            "product_id": product_id,
+            "expected_qty": expected,
+            "actual_qty": actual,
+            "unassigned_qty": unassigned,
+            "duplicated_qty": duplicated,
+            "status": status,
+        })
+    return drift
+
+
+def candidate_orders():
+    """Page through orders within the lookback window."""
+    page = 1
+    while True:
+        orders = bc_get(
+            API_BASE_V2,
+            "/orders",
+            {"min_date_created": f"-{LOOKBACK_DAYS} days", "page": page, "limit": 50},
+        )
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+
+def order_shipping_addresses(order_id):
+    return bc_get(API_BASE_V2, f"/orders/{order_id}/shipping_addresses")
+
+
+def order_products(order_id):
+    return bc_get(API_BASE_V2, f"/orders/{order_id}/products")
+
+
+def checkout_consignments(checkout_id):
+    payload = bc_get(API_BASE_V3, f"/checkouts/{checkout_id}/consignments")
+    return payload.get("data", []) if isinstance(payload, dict) else payload
+
+
+def flag_for_manual_verification(order_id):
+    return bc_put(API_BASE_V2, f"/orders/{order_id}", {"status_id": MANUAL_VERIFICATION_REQUIRED})
+
+
+def run():
+    reported = 0
+    flagged = 0
+
+    for order in candidate_orders():
+        order_id = order["id"]
+        status_id = order.get("status_id")
+
+        addresses = order_shipping_addresses(order_id)
+        if len(addresses) &lt; 2:
+            continue  # not a multi-address order, nothing to reconcile
+
+        products = order_products(order_id)
+        checkout_id = order.get("checkout_id")
+        consignments = checkout_consignments(checkout_id) if checkout_id else []
+
+        drift = find_consignment_drift(consignments, products)
+        problems = [d for d in drift if d["status"] != "ok"]
+        if not problems:
+            continue
+
+        reported += 1
+        for record in problems:
+            log.warning(
+                "order_id=%s product_id=%s status=%s expected_qty=%s actual_qty=%s "
+                "unassigned_qty=%s duplicated_qty=%s",
+                order_id, record["product_id"], record["status"], record["expected_qty"],
+                record["actual_qty"], record["unassigned_qty"], record["duplicated_qty"],
+            )
+
+        has_unassigned = any(d["unassigned_qty"] &gt; 0 for d in problems)
+        if has_unassigned and status_id in OPEN_STATUS_IDS:
+            log.info(
+                "order_id=%s eligible for manual verification flag (%s)",
+                order_id, "dry run" if DRY_RUN else "flagging",
+            )
+            if not DRY_RUN:
+                flag_for_manual_verification(order_id)
+            flagged += 1
+
+    log.info(
+        "Done. %d order(s) with drift, %d order(s) %s for manual verification.",
+        reported, flagged, "to flag" if DRY_RUN else "flagged",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-consignment-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect BigCommerce multi-address checkout consignment drift.
+ *
+ * Multi-address checkout represents each shipping destination as its own
+ * consignment object holding its own line_items (item_id and quantity), and
+ * the storefront or headless client is responsible for calling
+ * assignItemsToAddress or unassignItemsToAddress (or POST/PUT
+ * /checkouts/{id}/consignments) once per address as the shopper works
+ * through the flow. Because these are sequential, independent calls against
+ * a mutable checkout resource with optimistic concurrency version checks, a
+ * slow network, a retried request, or a client that does not re-fetch
+ * checkout state between calls can leave an item duplicated across
+ * consignments or unassigned to any of them by the time the checkout
+ * converts to an order. Once converted, each order line item is stamped
+ * with a single order_address_id, so the drift becomes a permanent, silent
+ * mismatch between what the customer intended per address and what the
+ * order record shows.
+ *
+ * This job never repairs the mapping. It reports drift per product_id, and
+ * for orders still Incomplete or Pending with unassigned quantity, it can
+ * flag the order for manual verification (status_id 12) so a human reviews
+ * it before it ships.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/multi-address-checkout-consignment-drift/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE_V2 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 14);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const MANUAL_VERIFICATION_REQUIRED = 12;
+const OPEN_STATUS_IDS = new Set([0, 1]); // Incomplete, Pending
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * consignments: pre-conversion checkout consignments, each
+ *   { consignment_id, line_items: [{ item_id, quantity }], address_id }
+ * orderProducts: post-conversion order line items from GET /v2/orders/{id}/products, each
+ *   { id, product_id, quantity, order_address_id }
+ *
+ * Returns a list of drift records, one per product_id:
+ *   { product_id, expected_qty, actual_qty, unassigned_qty, duplicated_qty, status }
+ *
+ * expectedQty is the sum of quantity across all consignment line_items for
+ * that item_id (item_id maps 1:1 to product_id in this store's checkout
+ * flow). actualQty is the sum of quantity across all orderProducts rows for
+ * that product_id. unassignedQty is the portion of actualQty whose
+ * order_address_id is 0 or null/undefined, meaning it was never bound to any
+ * of the shipping addresses created for the order. duplicatedQty is
+ * max(0, actualQty - expectedQty) when actualQty exceeds expectedQty. status
+ * is "unassigned" if unassignedQty > 0, else "duplicated" if actualQty !==
+ * expectedQty and duplicatedQty > 0, else "ok". Callers should pass only
+ * physical line items in orderProducts so digital, non-shippable products
+ * (order_address_id 0 by design) do not produce false positives.
+ */
+export function findConsignmentDrift(consignments, orderProducts) {
+  const expectedQty = new Map();
+  for (const consignment of consignments || []) {
+    for (const lineItem of consignment.line_items || []) {
+      const productId = lineItem.item_id;
+      expectedQty.set(productId, (expectedQty.get(productId) || 0) + (lineItem.quantity || 0));
+    }
+  }
+
+  const actualQty = new Map();
+  const unassignedQty = new Map();
+  for (const row of orderProducts || []) {
+    const productId = row.product_id;
+    const qty = row.quantity || 0;
+    actualQty.set(productId, (actualQty.get(productId) || 0) + qty);
+
+    const orderAddressId = row.order_address_id;
+    if (orderAddressId === 0 || orderAddressId === null || orderAddressId === undefined) {
+      unassignedQty.set(productId, (unassignedQty.get(productId) || 0) + qty);
+    }
+  }
+
+  const productIds = new Set([...expectedQty.keys(), ...actualQty.keys()]);
+  const drift = [];
+  for (const productId of [...productIds].sort((a, b) =&gt; a - b)) {
+    const expected = expectedQty.get(productId) || 0;
+    const actual = actualQty.get(productId) || 0;
+    const unassigned = unassignedQty.get(productId) || 0;
+    const duplicated = actual &gt; expected ? actual - expected : 0;
+
+    let status = "ok";
+    if (unassigned &gt; 0) status = "unassigned";
+    else if (actual !== expected &amp;&amp; duplicated &gt; 0) status = "duplicated";
+
+    drift.push({
+      product_id: productId,
+      expected_qty: expected,
+      actual_qty: actual,
+      unassigned_qty: unassigned,
+      duplicated_qty: duplicated,
+      status,
+    });
+  }
+  return drift;
+}
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(base, path, body) {
+  const res = await fetch(`${base}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function* candidateOrders() {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet(API_BASE_V2, "/orders", {
+      min_date_created: `-${LOOKBACK_DAYS} days`,
+      page,
+      limit: 50,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderShippingAddresses(orderId) {
+  return bcGet(API_BASE_V2, `/orders/${orderId}/shipping_addresses`);
+}
+
+async function orderProducts(orderId) {
+  return bcGet(API_BASE_V2, `/orders/${orderId}/products`);
+}
+
+async function checkoutConsignments(checkoutId) {
+  const payload = await bcGet(API_BASE_V3, `/checkouts/${checkoutId}/consignments`);
+  return Array.isArray(payload) ? payload : payload.data || [];
+}
+
+async function flagForManualVerification(orderId) {
+  return bcPut(API_BASE_V2, `/orders/${orderId}`, { status_id: MANUAL_VERIFICATION_REQUIRED });
+}
+
+export async function run() {
+  let reported = 0;
+  let flagged = 0;
+
+  for await (const order of candidateOrders()) {
+    const orderId = order.id;
+    const statusId = order.status_id;
+
+    const addresses = await orderShippingAddresses(orderId);
+    if (addresses.length &lt; 2) continue; // not a multi-address order, nothing to reconcile
+
+    const products = await orderProducts(orderId);
+    const checkoutId = order.checkout_id;
+    const consignments = checkoutId ? await checkoutConsignments(checkoutId) : [];
+
+    const drift = findConsignmentDrift(consignments, products);
+    const problems = drift.filter((d) =&gt; d.status !== "ok");
+    if (!problems.length) continue;
+
+    reported += 1;
+    for (const record of problems) {
+      console.warn(
+        `order_id=${orderId} product_id=${record.product_id} status=${record.status} ` +
+        `expected_qty=${record.expected_qty} actual_qty=${record.actual_qty} ` +
+        `unassigned_qty=${record.unassigned_qty} duplicated_qty=${record.duplicated_qty}`
+      );
+    }
+
+    const hasUnassigned = problems.some((d) =&gt; d.unassigned_qty &gt; 0);
+    if (hasUnassigned &amp;&amp; OPEN_STATUS_IDS.has(statusId)) {
+      console.log(
+        `order_id=${orderId} eligible for manual verification flag (${DRY_RUN ? "dry run" : "flagging"})`
+      );
+      if (!DRY_RUN) await flagForManualVerification(orderId);
+      flagged += 1;
+    }
+  }
+
+  console.log(
+    `Done. ${reported} order(s) with drift, ${flagged} order(s) ${DRY_RUN ? "to flag" : "flagged"} for manual verification.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The drift comparison is the part most worth testing, because it decides which orders reach a human queue. Because <code>find_consignment_drift</code> takes only plain lists of dicts and returns a plain list of dicts, the test needs no network and no BigCommerce store. It just feeds in consignments and order_products and checks the resulting drift records.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_multi_address_drift.py</div>
+      <pre><code class="language-python">from find_consignment_drift import find_consignment_drift
+
+
+def consignment(item_id, quantity, address_id="addr_1"):
+    return {"consignment_id": f"c_{address_id}", "address_id": address_id,
+            "line_items": [{"item_id": item_id, "quantity": quantity}]}
+
+
+def product_row(product_id, quantity, order_address_id, row_id=1):
+    return {"id": row_id, "product_id": product_id, "quantity": quantity,
+            "order_address_id": order_address_id}
+
+
+def test_ok_when_every_item_assigned_once_and_quantities_match():
+    consignments = [consignment(101, 2, "addr_1"), consignment(102, 1, "addr_2")]
+    products = [product_row(101, 2, 10, 1), product_row(102, 1, 11, 2)]
+    drift = find_consignment_drift(consignments, products)
+    assert all(d["status"] == "ok" for d in drift)
+
+
+def test_unassigned_when_order_address_id_is_zero():
+    consignments = [consignment(101, 3, "addr_1")]
+    products = [product_row(101, 3, 0, 1)]
+    drift = find_consignment_drift(consignments, products)
+    record = next(d for d in drift if d["product_id"] == 101)
+    assert record["status"] == "unassigned"
+    assert record["unassigned_qty"] == 3
+
+
+def test_unassigned_when_order_address_id_is_none():
+    consignments = [consignment(101, 1, "addr_1")]
+    products = [product_row(101, 1, None, 1)]
+    drift = find_consignment_drift(consignments, products)
+    record = next(d for d in drift if d["product_id"] == 101)
+    assert record["status"] == "unassigned"
+
+
+def test_duplicated_when_actual_quantity_exceeds_expected():
+    consignments = [consignment(101, 1, "addr_1")]
+    products = [product_row(101, 1, 10, 1), product_row(101, 1, 11, 2)]
+    drift = find_consignment_drift(consignments, products)
+    record = next(d for d in drift if d["product_id"] == 101)
+    assert record["status"] == "duplicated"
+    assert record["expected_qty"] == 1
+    assert record["actual_qty"] == 2
+    assert record["duplicated_qty"] == 1
+
+
+def test_ok_when_no_consignments_and_no_products():
+    assert find_consignment_drift([], []) == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-consignment-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findConsignmentDrift } from "./find-consignment-drift.js";
+
+const consignment = (itemId, quantity, addressId = "addr_1") => ({
+  consignment_id: `c_${addressId}`,
+  address_id: addressId,
+  line_items: [{ item_id: itemId, quantity }],
+});
+
+const productRow = (productId, quantity, orderAddressId, rowId = 1) => ({
+  id: rowId, product_id: productId, quantity, order_address_id: orderAddressId,
+});
+
+test("ok when every item assigned once and quantities match", () =&gt; {
+  const consignments = [consignment(101, 2, "addr_1"), consignment(102, 1, "addr_2")];
+  const products = [productRow(101, 2, 10, 1), productRow(102, 1, 11, 2)];
+  const drift = findConsignmentDrift(consignments, products);
+  assert.ok(drift.every((d) =&gt; d.status === "ok"));
+});
+
+test("unassigned when order_address_id is zero", () =&gt; {
+  const consignments = [consignment(101, 3, "addr_1")];
+  const products = [productRow(101, 3, 0, 1)];
+  const drift = findConsignmentDrift(consignments, products);
+  const record = drift.find((d) =&gt; d.product_id === 101);
+  assert.equal(record.status, "unassigned");
+  assert.equal(record.unassigned_qty, 3);
+});
+
+test("unassigned when order_address_id is null", () =&gt; {
+  const consignments = [consignment(101, 1, "addr_1")];
+  const products = [productRow(101, 1, null, 1)];
+  const drift = findConsignmentDrift(consignments, products);
+  const record = drift.find((d) =&gt; d.product_id === 101);
+  assert.equal(record.status, "unassigned");
+});
+
+test("duplicated when actual quantity exceeds expected", () =&gt; {
+  const consignments = [consignment(101, 1, "addr_1")];
+  const products = [productRow(101, 1, 10, 1), productRow(101, 1, 11, 2)];
+  const drift = findConsignmentDrift(consignments, products);
+  const record = drift.find((d) =&gt; d.product_id === 101);
+  assert.equal(record.status, "duplicated");
+  assert.equal(record.expected_qty, 1);
+  assert.equal(record.actual_qty, 2);
+  assert.equal(record.duplicated_qty, 1);
+});
+
+test("ok when no consignments and no products", () =&gt; {
+  assert.deepEqual(findConsignmentDrift([], []), []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Gift-split order</span>
+      <h4>The customer who split a cart across four addresses for the holidays</h4>
+      <p>A shopper bought gifts for four different family members and used multi-address checkout to send each item to a different house. Weeks later, one recipient reported never receiving their item, while another had gotten two of the same thing. Support had no way to tell whether this was a warehouse pick error or a checkout problem, because the order looked completely normal in the admin.</p>
+      <p>Running the reconciliation job against that order showed one product_id with unassigned_qty of 1 and another with duplicated_qty of 1, both consistent with a client that had not re-fetched checkout state between two address assignments. Support now had the exact product_id and quantity to reconcile manually instead of guessing.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Headless storefront</span>
+      <h4>The custom checkout that batched consignment writes</h4>
+      <p>A merchant's headless storefront queued up all of a shopper's address assignments client-side and sent them in a burst right before submitting the order, instead of one call per address as the shopper worked through the UI. Under load, a handful of those burst requests raced against the checkout's version field and silently lost, leaving a small percentage of multi-address orders with unassigned line items.</p>
+      <p>Because the job pulls both the pre-conversion consignments and the post-conversion order products, it caught exactly the orders affected by the race and flagged the still-open ones for manual verification, without ever guessing at which address should have gotten the missing item.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, every multi-address order with a mismatch between its consignments and its final order_address_id groupings gets caught with the exact product_id, expected and actual quantity, and whether the problem is unassigned or duplicated stock. Orders still open reach a human queue before they ship. Nothing gets auto-reassigned, because only the customer or a merchant actually knows which address an item was meant for.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a BigCommerce multi-address order end up with items on the wrong address, or no address at all?</summary>
+      <p>Multi-address checkout represents each destination as its own consignment object holding its own line items, and the storefront or headless client must call assignItemsToAddress or unassignItemsToAddress once per address as the shopper works through the flow. These are sequential, independent calls against a mutable checkout resource with optimistic-concurrency version checks. A slow network, a retried request, or a client that does not re-fetch the checkout state between calls can leave an item counted in two consignments or in none by the time the checkout converts to an order, and that drift becomes permanent once conversion stamps each order line item with a single order_address_id.</p>
+    </details>
+    <details>
+      <summary>Can a script safely reassign the drifted items to the right address after the order is placed?</summary>
+      <p>No. Line-item-to-address assignment reflects which physical address the customer wanted a given item shipped to, and a script cannot safely infer that intent after the fact. The safe pattern is to detect and report the drift, and for orders still Incomplete or Pending, surface the order_id, product_id, and unassigned or duplicated quantity to a human queue. Consignments only exist pre-conversion on the checkout object, so any real fix requires cancelling and refunding the order for a re-checkout, or a manual merchant-initiated edit in the control panel.</p>
+    </details>
+    <details>
+      <summary>How do I detect consignment drift after an order has already converted?</summary>
+      <p>Pull GET /v2/orders/{order_id}/products and GET /v2/orders/{order_id}/shipping_addresses, then cross-tab by order_address_id. Every shipping address should have at least one line item whose order_address_id equals it, and the summed quantity per order_address_id for a product_id should equal that product_id's total quantity on the order. Rows with order_address_id 0 or null on a physical line item are unassigned, and any product_id whose summed quantity across all order_address_id groups exceeds the quantity ordered is duplicated.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: the Checkout Consignments guide. <a href="https://developer.bigcommerce.com/docs/storefront/cart-checkout/guide/consignments" rel="noopener">developer.bigcommerce.com checkout consignments guide</a></li>
+      <li>BigCommerce Support Community: associating items with multiple shipping addresses during order creation. <a href="https://support.bigcommerce.com/s/question/0D51B00005LziVnSAJ/associating-items-with-multiple-shipping-addresses-during-order-creation?language=en_US" rel="noopener">support.bigcommerce.com associating items with multiple shipping addresses</a></li>
+      <li>checkout-sdk-js: the Consignment interface and ConsignmentService, including assignItemsToAddress and unassignItemsToAddress. <a href="https://github.com/bigcommerce/checkout-sdk-js/blob/master/docs/interfaces/Consignment.md" rel="noopener">github.com bigcommerce/checkout-sdk-js Consignment interface</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Checkout Consignments in the REST Management API. <a href="https://developer.bigcommerce.com/docs/rest-management/checkouts/checkout-consignments" rel="noopener">developer.bigcommerce.com REST Management checkout consignments</a></li>
+      <li>BigCommerce Docs: List Order Products, the V2 API endpoint behind order_address_id. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/order-products/get-order-products" rel="noopener">docs.bigcommerce.com list order products</a></li>
+      <li>BigCommerce Developer Center: Order Shipping Addresses. <a href="https://developer.bigcommerce.com/docs/rest-management/orders/order-shipping-addresses" rel="noopener">developer.bigcommerce.com order shipping addresses</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a multi-address order?</h3>
+    <p>If this saved you a support ticket or caught a silent mapping problem before it shipped wrong, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

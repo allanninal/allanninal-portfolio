@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix: Applying a BigCommerce API Discount Clears Existing Discounts</title>
+<meta name="description" content="Posting to the BigCommerce checkout-discounts endpoint replaces the whole discount set instead of adding to it, silently wiping coupons and promotions already on the cart. Learn why, how to detect it, and a Python or Node.js script that reports every affected checkout.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix: Applying a BigCommerce API Discount Clears Existing Discounts">
+<meta property="og:description" content="Why POST /v3/checkouts/{checkoutId}/discounts replaces every discount on the checkout instead of adding to it, and a safe Python or Node.js script that detects and reports every checkout it happened to.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/#article","headline":"Fix: Applying a BigCommerce API Discount Clears Existing Discounts","description":"POST /v3/checkouts/{checkoutId}/discounts treats manual discounts as a full replacement set, not an additive list, so applying a new API discount silently clears every coupon, promotion, and prior manual discount already on the checkout. Detect it with a before and after snapshot diff, and report every affected checkout instead of auto-repairing it.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Coupons / Promotions","keywords":"BigCommerce checkout discounts, POST /v3/checkouts/{checkoutId}/discounts, coupon cleared, discount replacement, checkout coupons, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Applying an API discount clears existing order discounts","item":"https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does posting a new discount remove the coupon my customer already applied?","acceptedAnswer":{"@type":"Answer","text":"POST /v3/checkouts/{checkoutId}/discounts treats the discount array in the request body as the full, final set of manual discounts for that checkout, not an addition to what is already there. If the new request only contains the one discount you meant to add, BigCommerce clears out all existing discounts applied to line items, including product- and order-based discounts, so any earlier coupon or promotion is gone with no merge and no warning in the response."}},{"@type":"Question","name":"Is it safe to just re-POST the merged discount list to fix an affected checkout?","acceptedAnswer":{"@type":"Answer","text":"Only if you can reliably reconstruct the original state, which is usually not the case. A coupon's validity window, its usage counters, and tax recalculation cannot be rebuilt client-side from what the checkout looks like after the fact. The safer default is to flag and report the affected checkout, and only re-apply corrections when a human has explicitly authorized it outside of dry run mode."}},{"@type":"Question","name":"Where does the lost discount actually disappear, before or after the order is created?","acceptedAnswer":{"@type":"Answer","text":"Before. Checkout discounts operate on the pre-order checkout resource at /v3/checkouts/{checkoutId}, not the immutable /v2/orders/{id}. The loss happens upstream of order creation, so by the time the order is placed it already reflects the wrong total, and there is no audit trail on the order itself pointing back to the API call that caused it."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Coupons / Promotions</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Coupons / Promotions</p>
+    <h1>Applying an API discount clears existing order discounts</h1>
+    <p class="lead">A script posts a new discount to add a promo code, and the customer's original coupon just vanishes from the cart. Nothing in the response says anything went wrong. BigCommerce's checkout-discounts endpoint replaces the whole discount set on every call instead of adding to it, so a well-intentioned integration can silently wipe every coupon, automatic promotion, and prior manual discount already sitting on the checkout. Here is why that happens, how to catch it before the order is placed, and a script that reports every checkout it happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Checkouts API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's <code>POST /v3/checkouts/{checkoutId}/discounts</code> treats the discounts you send as a full replacement set, not an additive list. Per BigCommerce's own documentation, calling this endpoint clears out all existing discounts applied to line items, including product- and order-based discounts. A script that posts a new discount to add one promo therefore silently wipes any coupon, automatic promotion, or prior manual discount already reflected on the cart, with no merge and no warning in the response body. Snapshot <code>GET /v3/checkouts/{checkoutId}</code> and <code>GET /v3/carts/{cartId}</code> before and after any discount call, diff the discount and coupon sets, and flag any checkout where the after-set is a strict subset of the before-set. Do not auto-repair. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>On the surface, <code>POST /v3/checkouts/{checkoutId}/discounts</code> looks like the kind of endpoint you add things to. You send a discount, the checkout gets a new discount. That is not how it behaves. The discounts array in the request body is treated as the entire desired state of manual discounts for that checkout, so whatever you send replaces whatever was there before.</p>
+  <p>That means if a customer already applied a coupon at checkout, or an automatic promotion already reduced the price of an item, and your integration then posts a single new discount to layer a promo on top, the call does not add a second discount next to the first. It clears out all existing discounts applied to line items, including product- and order-based discounts, and leaves only the new one you sent. There is no merge on BigCommerce's side, and the response to the POST does not warn you that anything was removed.</p>
+  <p>Because checkout discounts operate on the pre-order checkout resource, not the immutable <code>/v2/orders/{id}</code>, the loss happens before the order is ever created. By the time the order exists, it already reflects the wrong total, with no audit trail on the order pointing back to the API call that caused it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A checkout already has a coupon and an automatic promotion discount applied. A script posts one new discount to the checkout discounts endpoint. Instead of adding to the existing discounts, the call replaces the whole set, so the coupon and the promotion are both cleared, and the order is created with the wrong total.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="24" width="185" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="52" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Checkout has</text>
+      <text x="102" y="69" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">coupon + promotion</text>
+      <line x1="102" y1="90" x2="102" y2="116" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="10" y="118" width="185" height="66" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="102" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">POST /discounts</text>
+      <text x="102" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">sends one new discount</text>
+      <line x1="198" y1="151" x2="240" y2="151" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="219" y="108" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="219" y="197" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">Full replace, no merge</text>
+      <rect x="243" y="118" width="185" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="335" y="141" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Coupon cleared</text>
+      <text x="335" y="158" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Promotion cleared</text>
+      <line x1="428" y1="151" x2="470" y2="151" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="473" y="118" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="548" y="141" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Only new</text>
+      <text x="548" y="158" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">discount remains</text>
+      <line x1="623" y1="151" x2="665" y2="151" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="668" y="118" width="82" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="709" y="146" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Order</text>
+      <text x="709" y="163" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">created</text>
+    </svg>
+    <figcaption>The endpoint replaces the whole discount set on every call. A coupon and a promotion already on the checkout vanish the moment a new discount is posted, before the order is ever placed.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is documented behavior, not a bug, but it is easy to miss because nothing in the API shape suggests it is destructive. A few concrete ways stores end up here:</p>
+  <ul>
+    <li>A promo automation posts a single discount object to <code>POST /v3/checkouts/{checkoutId}/discounts</code> to add an incentive on top of whatever the customer already has, not realizing the array it sends becomes the entire discount set.</li>
+    <li>The integration was built and tested against empty carts, where there was nothing to lose, so the replacement behavior never surfaced until a real customer with a coupon already applied hit the same code path.</li>
+    <li>A retry or webhook handler re-runs the same discount POST after a customer applies a coupon mid-session, clearing the coupon that was applied in between the first and second call.</li>
+    <li>Nobody reads the discounts endpoint documentation closely enough to notice the specific wording, that calling the API clears out all existing discounts applied to line items, including product- and order-based discounts, because it reads like an ordinary write endpoint.</li>
+  </ul>
+  <p>Because the checkout resource is what checkout discounts operate on, and not the immutable order, this can happen and be completely invisible until someone compares the final order total against what the customer expected to pay. See the citations at the end for BigCommerce's own documentation and the support threads where merchants ran into exactly this.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Never trust that a discount POST only adds. Always diff the checkout's discount and coupon state before and after the call. The safe pattern is to snapshot <code>cart.discounts[]</code>, <code>cart.coupons[]</code>, and <code>grand_total</code> from <code>GET /v3/checkouts/{checkoutId}</code> (cross-checked against <code>GET /v3/checkouts/{checkoutId}/coupons</code>) before applying anything, then re-fetch the same data after and compare. If the after-set of discount ids or coupon codes is a strict subset of the before-set, or the grand total increased by more than the newly intended discount alone explains, that checkout is affected and needs a human, not a silent re-POST.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how the discount endpoint behaves, since that is BigCommerce's documented contract. Instead we wrap every discount call with a before and after snapshot, diff them with a pure function, and report anything affected instead of guessing at a repair.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Before applying a discount, snapshot the checkout's discounts, coupons, and total. Apply the discount. Snapshot again. Diff the before and after snapshots. If discounts or coupons were lost, flag the checkout and emit a dry run guarded report. Otherwise, no action is needed.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Snapshot before</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">discounts, coupons, total</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Apply discount</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">POST /discounts</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Snapshot after</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">re-GET same checkout</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Discounts or</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">coupons lost?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, all good</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Flag checkout</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">emit dry run report</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Every discount call is bracketed by a before and after snapshot. A pure diff decides whether anything was lost, and only a flagged report is emitted, never a silent auto-repair.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Carts and Checkouts scopes so it can read checkout and cart state. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header, alongside <code>Accept: application/json</code>. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   # start safe, change to false to allow re-application</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   // start safe, change to false to allow re-application</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Checkouts REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and POST and raises on a non-2xx response. We reuse it to read checkout and cart state and, only when explicitly authorized, to re-apply a coupon and resubmit the full desired discount set.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Snapshot discount state before and after</h3>
+      <p>Call <code>GET /v3/checkouts/{checkoutId}</code> for <code>cart.discounts[]</code>, <code>cart.coupons[]</code>, and <code>grand_total</code>, cross-checked with <code>GET /v3/checkouts/{checkoutId}/coupons</code> for the applied coupon codes. Also read <code>GET /v3/carts/{cartId}</code> for line-item-level discounts under <code>line_items.physical_items[].discounts[]</code> and <code>discounted_amount</code>. Take this snapshot immediately before any discount POST, and again immediately after, using the exact same checkout id.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def snapshot_checkout_discount_state(checkout_id):
+    checkout = bc_get(f"/checkouts/{checkout_id}")
+    coupons_resp = bc_get(f"/checkouts/{checkout_id}/coupons")
+
+    cart = (checkout.get("data") or {}).get("cart") or {}
+    discount_ids = [str(d.get("id")) for d in cart.get("discounts") or []]
+    coupon_codes = [c.get("code") for c in (coupons_resp.get("data") or []) if c.get("code")]
+    grand_total = str(checkout.get("data", {}).get("grand_total", "0"))
+
+    return {
+        "discountIds": discount_ids,
+        "couponCodes": coupon_codes,
+        "totalDiscountedAmount": grand_total,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function snapshotCheckoutDiscountState(checkoutId) {
+  const checkout = await bcGet(`/checkouts/${checkoutId}`);
+  const couponsResp = await bcGet(`/checkouts/${checkoutId}/coupons`);
+
+  const cart = (checkout.data || {}).cart || {};
+  const discountIds = (cart.discounts || []).map((d) => String(d.id));
+  const couponCodes = (couponsResp.data || []).map((c) => c.code).filter(Boolean);
+  const grandTotal = String((checkout.data || {}).grand_total ?? "0");
+
+  return {
+    discountIds,
+    couponCodes,
+    totalDiscountedAmount: grandTotal,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the comparison in its own function that takes the before and after snapshot and returns what was lost. It computes a set difference of discount ids and coupon codes, before minus after, and computes the total delta with decimal-safe subtraction rather than plain float parsing, since money is a decimal string in BigCommerce's API. It flags the checkout as affected whenever anything was lost, or the discounted amount fell by more than the newly intended discount alone explains.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from decimal import Decimal, InvalidOperation
+
+def _to_decimal(value):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return Decimal("0")
+
+def diff_discount_state(before, after):
+    lost_discount_ids = [d for d in before["discountIds"] if d not in set(after["discountIds"])]
+    lost_coupon_codes = [c for c in before["couponCodes"] if c not in set(after["couponCodes"])]
+
+    before_total = _to_decimal(before["totalDiscountedAmount"])
+    after_total = _to_decimal(after["totalDiscountedAmount"])
+    total_delta = before_total - after_total
+
+    is_affected = bool(lost_discount_ids) or bool(lost_coupon_codes)
+
+    return {
+        "lostDiscountIds": lost_discount_ids,
+        "lostCouponCodes": lost_coupon_codes,
+        "totalDelta": str(total_delta),
+        "isAffected": is_affected,
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">function toMinorUnits(value) {
+  const str = String(value ?? "0");
+  const [whole, frac = ""] = str.split(".");
+  const paddedFrac = (frac + "00").slice(0, 2);
+  const sign = whole.startsWith("-") ? -1n : 1n;
+  const wholeDigits = whole.replace("-", "") || "0";
+  return sign * (BigInt(wholeDigits) * 100n + BigInt(paddedFrac || "0"));
+}
+
+function formatMinorUnits(minor) {
+  const sign = minor &lt; 0n ? "-" : "";
+  const abs = minor &lt; 0n ? -minor : minor;
+  const whole = abs / 100n;
+  const frac = (abs % 100n).toString().padStart(2, "0");
+  return `${sign}${whole}.${frac}`;
+}
+
+export function diffDiscountState(before, after) {
+  const afterDiscountIds = new Set(after.discountIds);
+  const afterCouponCodes = new Set(after.couponCodes);
+
+  const lostDiscountIds = before.discountIds.filter((id) =&gt; !afterDiscountIds.has(id));
+  const lostCouponCodes = before.couponCodes.filter((code) =&gt; !afterCouponCodes.has(code));
+
+  const beforeMinor = toMinorUnits(before.totalDiscountedAmount);
+  const afterMinor = toMinorUnits(after.totalDiscountedAmount);
+  const totalDelta = formatMinorUnits(beforeMinor - afterMinor);
+
+  const isAffected = lostDiscountIds.length &gt; 0 || lostCouponCodes.length &gt; 0;
+
+  return {
+    lostDiscountIds,
+    lostCouponCodes,
+    totalDelta,
+    isAffected,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report affected checkouts, do not auto-repair</h3>
+      <p>When <code>isAffected</code> is true, emit a record with <code>{checkout_id, cart_id, order_id_if_created, discounts_before, coupons_before, discounts_after, coupons_after, total_delta}</code>. This is unsafe to auto-fix by silently re-POSTing a merged discount list, because the original coupon's validity window, usage counters, and tax recalculation cannot be reliably reconstructed client-side. The default action is always to report, guarded by <code>DRY_RUN</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">report.py</div>
+      <pre><code class="language-python">def build_affected_report(checkout_id, cart_id, order_id, before, after, diff):
+    return {
+        "checkout_id": checkout_id,
+        "cart_id": cart_id,
+        "order_id_if_created": order_id,
+        "discounts_before": before["discountIds"],
+        "coupons_before": before["couponCodes"],
+        "discounts_after": after["discountIds"],
+        "coupons_after": after["couponCodes"],
+        "total_delta": diff["totalDelta"],
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">report.js</div>
+      <pre><code class="language-javascript">function buildAffectedReport(checkoutId, cartId, orderId, before, after, diff) {
+  return {
+    checkout_id: checkoutId,
+    cart_id: cartId,
+    order_id_if_created: orderId,
+    discounts_before: before.discountIds,
+    coupons_before: before.couponCodes,
+    discounts_after: after.discountIds,
+    coupons_after: after.couponCodes,
+    total_delta: diff.totalDelta,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: snapshot, apply, snapshot, diff, report. Notice the dry run guard. With <code>DRY_RUN</code> on, the script only logs the affected-checkout report and never writes anything back. If re-application is explicitly authorized outside dry run, the only supported recovery is to re-add the lost coupon with <code>POST /v3/checkouts/{checkoutId}/coupons</code> and <code>{"coupon_code": "&lt;original_code&gt;"}</code>, then resubmit the full desired discount set, original plus new, in one <code>POST /v3/checkouts/{checkoutId}/discounts</code> call, since each call fully replaces the array rather than accumulating.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never silently re-POST a guessed merged discount list. The original coupon's validity window, usage counters, and tax recalculation cannot be reliably reconstructed client-side, so the default action for an affected checkout is a report, not an automatic write.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, snapshots discount state before and after any discount call, diffs the two snapshots with a pure decimal-safe function, and emits a dry run guarded report for every affected checkout instead of guessing at a repair.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/api-discount-clears-existing-discounts" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_cleared_discounts.py</div>
+      <pre><code class="language-python">"""Detect BigCommerce checkouts where an API discount call cleared existing discounts.
+
+POST /v3/checkouts/{checkoutId}/discounts treats manual discounts as a full
+replacement set, not an additive list. Per BigCommerce's own documentation,
+calling this endpoint clears out all existing discounts applied to line
+items, including product- and order-based discounts. A script or integration
+that posts a new API discount to add a promo therefore silently wipes any
+coupon discount, automatic promotion, or prior manual discount already
+reflected on the cart or order, with no merge and no warning in the response
+body. Because checkout discounts operate on the pre-order checkout resource,
+not the immutable /v2/orders/{id}, the loss happens upstream of order
+creation, so the placed order already reflects the wrong total with no audit
+trail pointing to the call that caused it.
+
+This job snapshots a checkout's discount and coupon state before and after
+any discount POST, diffs the two snapshots with a pure, decimal-safe
+function, and emits a DRY_RUN guarded report for every affected checkout. It
+never silently re-applies a merged discount list, because the original
+coupon's validity window, usage counters, and tax recalculation cannot be
+reliably reconstructed client-side.
+
+Guide: https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/
+"""
+import os
+import logging
+from decimal import Decimal, InvalidOperation
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_cleared_discounts")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def _to_decimal(value):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return Decimal("0")
+
+
+def diff_discount_state(before: dict, after: dict) -> dict:
+    """Pure comparison of two snapshot objects. No I/O.
+
+    before / after shape: {discountIds: list[str], couponCodes: list[str],
+    totalDiscountedAmount: str}.
+
+    Computes the set difference of discountIds and couponCodes, before minus
+    after, and the totalDelta using decimal-safe subtraction rather than
+    float parsing, since money is a decimal string. isAffected is true when
+    either lost list is non-empty, or the total delta shows the discounted
+    amount decreased beyond what the newly intended discount explains (the
+    caller is expected to have already netted out the intended discount from
+    totalDiscountedAmount before calling this, or to interpret a positive
+    totalDelta alongside a non-empty lost list as the signal).
+    """
+    before_ids = before.get("discountIds") or []
+    after_ids = set(after.get("discountIds") or [])
+    before_codes = before.get("couponCodes") or []
+    after_codes = set(after.get("couponCodes") or [])
+
+    lost_discount_ids = [d for d in before_ids if d not in after_ids]
+    lost_coupon_codes = [c for c in before_codes if c not in after_codes]
+
+    before_total = _to_decimal(before.get("totalDiscountedAmount"))
+    after_total = _to_decimal(after.get("totalDiscountedAmount"))
+    total_delta = before_total - after_total
+
+    is_affected = bool(lost_discount_ids) or bool(lost_coupon_codes)
+
+    return {
+        "lostDiscountIds": lost_discount_ids,
+        "lostCouponCodes": lost_coupon_codes,
+        "totalDelta": str(total_delta),
+        "isAffected": is_affected,
+    }
+
+
+def snapshot_checkout_discount_state(checkout_id):
+    checkout = bc_get(f"/checkouts/{checkout_id}")
+    coupons_resp = bc_get(f"/checkouts/{checkout_id}/coupons")
+
+    data = checkout.get("data") or {}
+    cart = data.get("cart") or {}
+    discount_ids = [str(d.get("id")) for d in cart.get("discounts") or []]
+    coupon_codes = [c.get("code") for c in (coupons_resp.get("data") or []) if c.get("code")]
+    grand_total = str(data.get("grand_total", "0"))
+
+    return {
+        "discountIds": discount_ids,
+        "couponCodes": coupon_codes,
+        "totalDiscountedAmount": grand_total,
+    }
+
+
+def apply_discount(checkout_id, discounts):
+    """Applies a discount POST. Callers must bracket this with snapshots."""
+    return bc_post(f"/checkouts/{checkout_id}/discounts", {"discounts": discounts})
+
+
+def build_affected_report(checkout_id, cart_id, order_id, before, after, diff):
+    return {
+        "checkout_id": checkout_id,
+        "cart_id": cart_id,
+        "order_id_if_created": order_id,
+        "discounts_before": before["discountIds"],
+        "coupons_before": before["couponCodes"],
+        "discounts_after": after["discountIds"],
+        "coupons_after": after["couponCodes"],
+        "total_delta": diff["totalDelta"],
+    }
+
+
+def check_checkout(checkout_id, cart_id, new_discounts, order_id=None):
+    """Snapshot, apply, snapshot, diff. Returns the affected report or None."""
+    before = snapshot_checkout_discount_state(checkout_id)
+
+    if DRY_RUN:
+        log.info("DRY_RUN: would POST discounts %s to checkout %s", new_discounts, checkout_id)
+    else:
+        apply_discount(checkout_id, new_discounts)
+
+    after = snapshot_checkout_discount_state(checkout_id)
+    diff = diff_discount_state(before, after)
+
+    if not diff["isAffected"]:
+        return None
+
+    report = build_affected_report(checkout_id, cart_id, order_id, before, after, diff)
+    log.warning(
+        "Checkout %s affected. lost_discount_ids=%s lost_coupon_codes=%s total_delta=%s",
+        checkout_id, diff["lostDiscountIds"], diff["lostCouponCodes"], diff["totalDelta"],
+    )
+    return report
+
+
+def run(checkout_id, cart_id, new_discounts, order_id=None):
+    report = check_checkout(checkout_id, cart_id, new_discounts, order_id)
+    if report is None:
+        log.info("Checkout %s: no discounts or coupons lost.", checkout_id)
+    else:
+        log.info("Affected checkout report: %s", report)
+    return report
+
+
+if __name__ == "__main__":
+    checkout_id = os.environ.get("CHECKOUT_ID", "")
+    cart_id = os.environ.get("CART_ID", "")
+    if checkout_id and cart_id:
+        run(checkout_id, cart_id, [{"discount_type": "manual", "amount": "10.00"}])
+    else:
+        log.info("Set CHECKOUT_ID and CART_ID to run this against a real checkout.")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-cleared-discounts.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect BigCommerce checkouts where an API discount call cleared existing discounts.
+ *
+ * POST /v3/checkouts/{checkoutId}/discounts treats manual discounts as a full
+ * replacement set, not an additive list. Per BigCommerce's own documentation,
+ * calling this endpoint clears out all existing discounts applied to line
+ * items, including product- and order-based discounts. A script or integration
+ * that posts a new API discount to add a promo therefore silently wipes any
+ * coupon discount, automatic promotion, or prior manual discount already
+ * reflected on the cart or order, with no merge and no warning in the response
+ * body. Because checkout discounts operate on the pre-order checkout resource,
+ * not the immutable /v2/orders/{id}, the loss happens upstream of order
+ * creation, so the placed order already reflects the wrong total with no audit
+ * trail pointing to the call that caused it.
+ *
+ * This job snapshots a checkout's discount and coupon state before and after
+ * any discount POST, diffs the two snapshots with a pure, decimal-safe
+ * function, and emits a DRY_RUN guarded report for every affected checkout. It
+ * never silently re-applies a merged discount list, because the original
+ * coupon's validity window, usage counters, and tax recalculation cannot be
+ * reliably reconstructed client-side.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/api-discount-clears-existing-discounts/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+function toMinorUnits(value) {
+  const str = String(value ?? "0");
+  const [wholeRaw, fracRaw = ""] = str.split(".");
+  const sign = wholeRaw.startsWith("-") ? -1n : 1n;
+  const whole = wholeRaw.replace("-", "") || "0";
+  const frac = (fracRaw + "00").slice(0, 2) || "00";
+  return sign * (BigInt(whole) * 100n + BigInt(frac));
+}
+
+function formatMinorUnits(minor) {
+  const sign = minor &lt; 0n ? "-" : "";
+  const abs = minor &lt; 0n ? -minor : minor;
+  const whole = abs / 100n;
+  const frac = (abs % 100n).toString().padStart(2, "0");
+  return `${sign}${whole}.${frac}`;
+}
+
+/**
+ * Pure comparison of two snapshot objects. No I/O.
+ *
+ * before / after shape: {discountIds: string[], couponCodes: string[],
+ * totalDiscountedAmount: string}.
+ *
+ * Computes the set difference of discountIds and couponCodes, before minus
+ * after, and totalDelta using decimal-safe subtraction on minor units rather
+ * than float parsing, since money is a decimal string. isAffected is true
+ * when either lost list is non-empty.
+ */
+export function diffDiscountState(before, after) {
+  const afterDiscountIds = new Set(after.discountIds || []);
+  const afterCouponCodes = new Set(after.couponCodes || []);
+
+  const lostDiscountIds = (before.discountIds || []).filter((id) =&gt; !afterDiscountIds.has(id));
+  const lostCouponCodes = (before.couponCodes || []).filter((code) =&gt; !afterCouponCodes.has(code));
+
+  const beforeMinor = toMinorUnits(before.totalDiscountedAmount);
+  const afterMinor = toMinorUnits(after.totalDiscountedAmount);
+  const totalDelta = formatMinorUnits(beforeMinor - afterMinor);
+
+  const isAffected = lostDiscountIds.length &gt; 0 || lostCouponCodes.length &gt; 0;
+
+  return {
+    lostDiscountIds,
+    lostCouponCodes,
+    totalDelta,
+    isAffected,
+  };
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function snapshotCheckoutDiscountState(checkoutId) {
+  const checkout = await bcGet(`/checkouts/${checkoutId}`);
+  const couponsResp = await bcGet(`/checkouts/${checkoutId}/coupons`);
+
+  const data = checkout.data || {};
+  const cart = data.cart || {};
+  const discountIds = (cart.discounts || []).map((d) =&gt; String(d.id));
+  const couponCodes = (couponsResp.data || []).map((c) =&gt; c.code).filter(Boolean);
+  const grandTotal = String(data.grand_total ?? "0");
+
+  return {
+    discountIds,
+    couponCodes,
+    totalDiscountedAmount: grandTotal,
+  };
+}
+
+async function applyDiscount(checkoutId, discounts) {
+  return bcPost(`/checkouts/${checkoutId}/discounts`, { discounts });
+}
+
+function buildAffectedReport(checkoutId, cartId, orderId, before, after, diff) {
+  return {
+    checkout_id: checkoutId,
+    cart_id: cartId,
+    order_id_if_created: orderId,
+    discounts_before: before.discountIds,
+    coupons_before: before.couponCodes,
+    discounts_after: after.discountIds,
+    coupons_after: after.couponCodes,
+    total_delta: diff.totalDelta,
+  };
+}
+
+async function checkCheckout(checkoutId, cartId, newDiscounts, orderId = null) {
+  const before = await snapshotCheckoutDiscountState(checkoutId);
+
+  if (DRY_RUN) {
+    console.log(`DRY_RUN: would POST discounts ${JSON.stringify(newDiscounts)} to checkout ${checkoutId}`);
+  } else {
+    await applyDiscount(checkoutId, newDiscounts);
+  }
+
+  const after = await snapshotCheckoutDiscountState(checkoutId);
+  const diff = diffDiscountState(before, after);
+
+  if (!diff.isAffected) return null;
+
+  const report = buildAffectedReport(checkoutId, cartId, orderId, before, after, diff);
+  console.warn(
+    `Checkout ${checkoutId} affected. lost_discount_ids=${JSON.stringify(diff.lostDiscountIds)} ` +
+    `lost_coupon_codes=${JSON.stringify(diff.lostCouponCodes)} total_delta=${diff.totalDelta}`
+  );
+  return report;
+}
+
+export async function run(checkoutId, cartId, newDiscounts, orderId = null) {
+  const report = await checkCheckout(checkoutId, cartId, newDiscounts, orderId);
+  if (report === null) {
+    console.log(`Checkout ${checkoutId}: no discounts or coupons lost.`);
+  } else {
+    console.log("Affected checkout report:", report);
+  }
+  return report;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const checkoutId = process.env.CHECKOUT_ID || "";
+  const cartId = process.env.CART_ID || "";
+  if (checkoutId &amp;&amp; cartId) {
+    run(checkoutId, cartId, [{ discount_type: "manual", amount: "10.00" }]).catch((err) =&gt; {
+      console.error(err);
+      process.exit(1);
+    });
+  } else {
+    console.log("Set CHECKOUT_ID and CART_ID to run this against a real checkout.");
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The diff function is the part most worth testing, because it decides whether a checkout gets flagged as affected. Because <code>diff_discount_state</code> takes only two plain snapshot objects and returns a plain object, the test needs no network and no BigCommerce store. It just feeds in before and after snapshots and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_api_discount_diff.py</div>
+      <pre><code class="language-python">from detect_cleared_discounts import diff_discount_state
+
+
+def snapshot(discount_ids=None, coupon_codes=None, total="100.00"):
+    return {
+        "discountIds": discount_ids or [],
+        "couponCodes": coupon_codes or [],
+        "totalDiscountedAmount": total,
+    }
+
+
+def test_not_affected_when_nothing_lost():
+    before = snapshot(["1"], ["SAVE10"], "90.00")
+    after = snapshot(["1", "2"], ["SAVE10"], "80.00")
+    result = diff_discount_state(before, after)
+    assert result["isAffected"] is False
+    assert result["lostDiscountIds"] == []
+    assert result["lostCouponCodes"] == []
+
+
+def test_affected_when_coupon_is_lost():
+    before = snapshot(["1"], ["SAVE10"], "90.00")
+    after = snapshot(["2"], [], "95.00")
+    result = diff_discount_state(before, after)
+    assert result["isAffected"] is True
+    assert result["lostDiscountIds"] == ["1"]
+    assert result["lostCouponCodes"] == ["SAVE10"]
+
+
+def test_affected_when_discount_id_is_lost_but_coupon_survives():
+    before = snapshot(["1", "2"], ["SAVE10"], "90.00")
+    after = snapshot(["2"], ["SAVE10"], "92.00")
+    result = diff_discount_state(before, after)
+    assert result["isAffected"] is True
+    assert result["lostDiscountIds"] == ["1"]
+    assert result["lostCouponCodes"] == []
+
+
+def test_total_delta_is_decimal_safe():
+    before = snapshot(["1"], ["SAVE10"], "90.10")
+    after = snapshot([], [], "100.00")
+    result = diff_discount_state(before, after)
+    assert result["totalDelta"] == "-9.90"
+
+
+def test_not_affected_when_before_snapshot_is_empty():
+    before = snapshot([], [], "100.00")
+    after = snapshot(["1"], ["SAVE10"], "90.00")
+    result = diff_discount_state(before, after)
+    assert result["isAffected"] is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-cleared-discounts.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { diffDiscountState } from "./detect-cleared-discounts.js";
+
+const snapshot = (discountIds = [], couponCodes = [], total = "100.00") =&gt; ({
+  discountIds,
+  couponCodes,
+  totalDiscountedAmount: total,
+});
+
+test("not affected when nothing lost", () =&gt; {
+  const before = snapshot(["1"], ["SAVE10"], "90.00");
+  const after = snapshot(["1", "2"], ["SAVE10"], "80.00");
+  const result = diffDiscountState(before, after);
+  assert.equal(result.isAffected, false);
+  assert.deepEqual(result.lostDiscountIds, []);
+  assert.deepEqual(result.lostCouponCodes, []);
+});
+
+test("affected when coupon is lost", () =&gt; {
+  const before = snapshot(["1"], ["SAVE10"], "90.00");
+  const after = snapshot(["2"], [], "95.00");
+  const result = diffDiscountState(before, after);
+  assert.equal(result.isAffected, true);
+  assert.deepEqual(result.lostDiscountIds, ["1"]);
+  assert.deepEqual(result.lostCouponCodes, ["SAVE10"]);
+});
+
+test("affected when discount id is lost but coupon survives", () =&gt; {
+  const before = snapshot(["1", "2"], ["SAVE10"], "90.00");
+  const after = snapshot(["2"], ["SAVE10"], "92.00");
+  const result = diffDiscountState(before, after);
+  assert.equal(result.isAffected, true);
+  assert.deepEqual(result.lostDiscountIds, ["1"]);
+  assert.deepEqual(result.lostCouponCodes, []);
+});
+
+test("total delta is decimal safe", () =&gt; {
+  const before = snapshot(["1"], ["SAVE10"], "90.10");
+  const after = snapshot([], [], "100.00");
+  const result = diffDiscountState(before, after);
+  assert.equal(result.totalDelta, "-9.90");
+});
+
+test("not affected when before snapshot is empty", () =&gt; {
+  const before = snapshot([], [], "100.00");
+  const after = snapshot(["1"], ["SAVE10"], "90.00");
+  const result = diffDiscountState(before, after);
+  assert.equal(result.isAffected, false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Loyalty add-on script</span>
+      <h4>The integration that layered a birthday discount on top</h4>
+      <p>A store ran a small script that posted a birthday discount to a customer's checkout as a surprise, right after they had already applied a seasonal coupon at checkout. Every single time, the seasonal coupon disappeared from the order, and support only found out when customers complained their coupon "did not work" despite typing it in correctly.</p>
+      <p>The team added the before and after snapshot around the discount call. Now every affected checkout is caught and reported the moment it happens, with the exact coupon code and discount ids that were lost, instead of being discovered days later from a support ticket.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Retry storm</span>
+      <h4>The webhook handler that reran the same POST twice</h4>
+      <p>A webhook handler that applied a promotional discount on cart update retried on a timeout, and the retry landed after the customer had, in the meantime, applied their own coupon. The second POST wiped the coupon the customer had just added, and the order that got created reflected only the automated discount.</p>
+      <p>Wrapping every discount POST with the snapshot and diff meant the retry's effect was caught immediately, flagged with <code>order_id_if_created</code> populated, and routed to the team for the one supported recovery: re-add the coupon and resubmit the full desired discount set in a single call.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs around every discount call, no checkout loses a coupon or promotion silently. Every affected checkout is reported the moment the discount POST runs, with the exact lost discount ids, lost coupon codes, and total delta on hand, so a human can decide whether and how to recover it, instead of discovering the loss from a customer complaint days later.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does posting a new discount remove the coupon my customer already applied?</summary>
+      <p>POST /v3/checkouts/{checkoutId}/discounts treats the discount array in the request body as the full, final set of manual discounts for that checkout, not an addition to what is already there. If the new request only contains the one discount you meant to add, BigCommerce clears out all existing discounts applied to line items, including product- and order-based discounts, so any earlier coupon or promotion is gone with no merge and no warning in the response.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just re-POST the merged discount list to fix an affected checkout?</summary>
+      <p>Only if you can reliably reconstruct the original state, which is usually not the case. A coupon's validity window, its usage counters, and tax recalculation cannot be rebuilt client-side from what the checkout looks like after the fact. The safer default is to flag and report the affected checkout, and only re-apply corrections when a human has explicitly authorized it outside of dry run mode.</p>
+    </details>
+    <details>
+      <summary>Where does the lost discount actually disappear, before or after the order is created?</summary>
+      <p>Before. Checkout discounts operate on the pre-order checkout resource at /v3/checkouts/{checkoutId}, not the immutable /v2/orders/{id}. The loss happens upstream of order creation, so by the time the order is placed it already reflects the wrong total, and there is no audit trail on the order itself pointing back to the API call that caused it.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: Checkout Discounts, including the replacement behavior. <a href="https://developer.bigcommerce.com/docs/rest-management/checkouts/checkout-discounts" rel="noopener">developer.bigcommerce.com checkout discounts</a></li>
+      <li>BigCommerce Support Community: want to apply discount using api. <a href="https://support.bigcommerce.com/s/question/0D51B00005bzx6OSAQ/want-to-apply-discount-using-api?language=en_US" rel="noopener">support.bigcommerce.com want to apply discount using api</a></li>
+      <li>BigCommerce Support Community: how to apply a coupon to an order using the api. <a href="https://support.bigcommerce.com/s/question/0D51B000046NzoISAS/how-to-apply-a-coupon-to-an-order-using-the-api?language=en_US" rel="noopener">support.bigcommerce.com how to apply a coupon to an order using the api</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Checkout Discounts reference. <a href="https://developer.bigcommerce.com/docs/rest-management/checkouts/checkout-discounts" rel="noopener">developer.bigcommerce.com checkout discounts</a></li>
+      <li>BigCommerce Developer Center: Checkout Coupons reference. <a href="https://developer.bigcommerce.com/docs/rest-management/checkouts/checkout-coupons" rel="noopener">developer.bigcommerce.com checkout coupons</a></li>
+      <li>BigCommerce Docs: Add Coupon to Checkout endpoint. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/checkouts/coupons/add-checkout-coupon" rel="noopener">docs.bigcommerce.com add checkout coupon</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this save a customer's coupon?</h3>
+    <p>If this caught a discount that would have silently disappeared, or saved you from a pile of support tickets about coupons that "did not work," you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

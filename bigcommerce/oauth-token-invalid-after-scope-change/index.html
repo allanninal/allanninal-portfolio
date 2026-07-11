@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce OAuth Token Silently Failing After Scope Change</title>
+<meta name="description" content="A BigCommerce app's stored OAuth access token starts returning a plain 401 Unauthorized after the app's scopes change in the Developer Portal. Learn why the old token is invalidated silently, how to tell scope drift apart from revocation, and build a Python or Node.js script that flags affected stores without ever trying to mint a new token itself.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce OAuth Token Silently Failing After Scope Change">
+<meta property="og:description" content="Why a BigCommerce app's stored OAuth token turns into a plain 401 after the app's scopes change, and a safe Python or Node.js script that tells scope drift apart from revocation and flags stores for re-consent instead of guessing.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/#article","headline":"Fix BigCommerce OAuth Token Silently Failing After Scope Change","description":"Why a BigCommerce app's stored OAuth access token starts returning a plain 401 Unauthorized after the app's declared scopes change, and a safe Python or Node.js script that tells scope drift apart from plain revocation or expiry and flags the store for re-consent instead of guessing.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/","image":"https://www.allanninal.dev/og-image.png","articleSection":"API Fundamentals","keywords":"BigCommerce OAuth, scope change, 401 Unauthorized, access token, X-Auth-Token, re-consent, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"OAuth token silently stops working after app scopes change","item":"https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why did my BigCommerce access token suddenly stop working?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce invalidates a stored OAuth access token whenever the app's declared scopes change in the app or Developer Portal profile. The token is only actually replaced the next time the merchant reopens the app and re-consents through the auth callback, which returns a fresh access_token and the new scope string. Any script still holding the old token gets a generic 401 Unauthorized on every call afterward, with no distinct error code that says the scopes changed."}},{"@type":"Question","name":"How do I tell scope drift apart from a plain revoked or expired token?","acceptedAnswer":{"@type":"Answer","text":"Compare the scope string you captured at the last successful OAuth token exchange against the scopes your app currently requires. If the stored token is missing a scope the app now needs, that is scope drift. If the scopes still match but you still get a 401 after one retry, treat it as a plain revocation or expiry. Both look identical as a bare 401, so the comparison is the only reliable way to tell them apart."}},{"@type":"Question","name":"Can a script automatically fix a BigCommerce token that went stale from a scope change?","acceptedAnswer":{"@type":"Answer","text":"No. A scope change can only be resolved by the merchant reopening the app and re-consenting through the auth callback, so the correct behavior is to flag the store_hash and stop retrying it, not to silently try to mint a new token. The script should log the missing scopes and, if not in dry run, emit the re-auth URL so an admin can send it to the store owner."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / API Fundamentals</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> API Fundamentals</p>
+    <h1>OAuth token silently stops working after app scopes change</h1>
+    <p class="lead">Everything was fine yesterday. Today every call your script makes to the BigCommerce API returns a plain 401 Unauthorized, nothing else changed in your code, and the token has not been touched. What actually happened is upstream: someone edited the app's declared scopes in the Developer Portal, and BigCommerce quietly invalidated the access token you have been holding onto. There is no distinct error for this. It looks exactly like a revoked or expired token unless you go looking for the difference.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce OAuth / Auth Callback</span>
+      <span class="chip">Flag only, no silent token minting</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce invalidates a stored OAuth access token whenever the app's declared scopes are changed in the app or Developer Portal profile. The token is only actually replaced the next time the merchant reopens the app and re-consents through the <code>/auth</code> callback, which returns a fresh <code>access_token</code> plus the new <code>scope</code> string. Until that happens, any script still holding the old token gets a generic 401 Unauthorized on every call, with no distinct "scope changed" error code. Call a lightweight endpoint like <code>GET /v3/catalog/products?limit=1</code> as a canary, and on a 401 compare the scopes you minted the token with against the scopes the app currently requires. A mismatch means scope drift, a match after one retry means the token was revoked or expired. Either way, this is not auto-fixable. The fix is to flag the store_hash and, if not in dry run, hand the merchant a re-auth link. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A BigCommerce single-click app gets an access token once, at install time, through the OAuth flow: the merchant is redirected to <code>https://login.bigcommerce.com/oauth2/authorize</code>, consents to the scopes the app declares, and BigCommerce calls the app's auth callback with a code that gets exchanged at <code>POST https://login.bigcommerce.com/oauth2/token</code> for an <code>access_token</code> and a <code>scope</code> string describing exactly what that token can touch. Most integrations store that token once and use it for months.</p>
+  <p>The part that catches people off guard is that the token is not permanently tied to the app's code. It is tied to the scopes the app declared at the moment the merchant consented. If a developer later edits the app's profile in the Developer Portal, for example adding <code>store_v2_customers</code> because a new feature needs it, BigCommerce treats every existing installation as needing fresh consent. It invalidates the tokens those stores were issued under the old scope set. The store still has the app installed. Nothing in the merchant's world visibly changed. But the token your script has cached in a <code>.env</code> file or a token-store record is now dead weight, and the next call it makes comes back 401 Unauthorized, the same status code you would get from a token that was simply revoked or left to expire.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. The app owner changes the declared scopes in the developer portal, BigCommerce invalidates the stored access token for every installed store, and a script still holding the old token gets a plain 401 Unauthorized with no distinct error for what actually happened.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="75" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Scopes edited</text>
+      <text x="90" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">in Developer Portal</text>
+      <line x1="173" y1="108" x2="215" y2="108" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="75" width="170" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="303" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Old token</text>
+      <text x="303" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">invalidated by BigCommerce</text>
+      <line x1="391" y1="108" x2="450" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="420" y="65" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="420" y="135" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Script keeps using it</text>
+      <rect x="453" y="75" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">401</text>
+      <text x="528" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">Unauthorized</text>
+      <rect x="628" y="75" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Looks just like</text>
+      <text x="689" y="117" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">revoked or expired</text>
+      <line x1="606" y1="108" x2="625" y2="108" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Nothing about the 401 tells you the scopes changed. It reads exactly like a revoked or expired token unless you compare scopes yourself.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce ties an installation's access token to the exact scope set the merchant consented to at auth time, not to the app's identity alone. A few ways this actually bites in production:</p>
+  <ul>
+    <li>A developer adds a new required scope, for example <code>store_v2_orders</code> or <code>store_v2_customers</code>, to support a new feature, and every store that installed the app under the older, narrower scope set gets its token invalidated the moment that change is saved in the Developer Portal.</li>
+    <li>The merchant never sees a prompt to re-consent until they reopen the app in their BigCommerce admin. If nobody opens the app, the store's token can sit invalid indefinitely while a background script keeps hammering it with the old credential.</li>
+    <li>A background job, cron script, or webhook handler holds only the <code>access_token</code> in its config and never persisted the <code>scope</code> string it was issued with, so there is nothing to compare against when the 401s start, and the failure gets misdiagnosed as a network blip or a revoked token.</li>
+    <li>There is no dedicated BigCommerce error code for this. The response is a standard 401 Unauthorized, the same code returned for an expired token, a fully revoked token, or a typo in the <code>X-Auth-Token</code> header, so scope drift is invisible unless the caller specifically checks for it.</li>
+  </ul>
+  <p>This is documented behavior of the OAuth flow itself, not a bug: BigCommerce's auth guide is explicit that scope changes require the merchant to go through the auth callback again. See the citations at the end for the exact docs and support threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A 401 by itself tells you nothing about why. The only way to tell scope drift apart from plain revocation or expiry is to compare the scopes the token was minted with against the scopes the app currently requires. If the required set has anything the stored set is missing, that is scope drift, force re-auth immediately. If the scopes still match, allow exactly one retry to rule out a transient blip, and only then call it revoked or expired. Either outcome ends the same way: this cannot be repaired by minting a new token in the background, because BigCommerce will not issue one without the merchant re-consenting through <code>/auth</code>.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not attempt to silently refresh or mint a token. We add a canary call, classify the failure with a small pure function, and only ever produce a report plus, if enabled, a re-auth link for a human to send.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A canary call hits a lightweight endpoint, on a 401 the script compares stored scopes against required scopes, classifies the failure as scope drift or revoked or expired, and either way flags the store and reports a re-auth link instead of minting a new token.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Canary call</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">GET /v3/catalog/products</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">401 received?</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">no: status is OK</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Compare scopes</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">stored vs required</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Missing a</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">required scope?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="565" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, retry once then flag</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="600" y="185" width="150" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="675" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag store_hash</text>
+      <text x="675" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">report re-auth URL</text>
+      <path d="M690,138 C712,138 675,150 675,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Scope drift or plain revocation both end at the same place: flag the store and report a re-auth link. The script never tries to mint a new token itself.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash, an access token, and your app's required scopes</h3>
+      <p>You need the store hash and the access token your app was issued, sent as the <code>X-Auth-Token</code> header on every call. You also need the scope string your app currently requires, which lives in the Developer Portal app profile, and ideally the scope string you captured the last time this store completed the OAuth token exchange. Keep all of it in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export BIGCOMMERCE_STORED_SCOPES="store_v2_orders store_v2_products"
+export BIGCOMMERCE_REQUIRED_SCOPES="store_v2_orders store_v2_products store_v2_customers"
+export BIGCOMMERCE_CLIENT_ID="..."
+export DRY_RUN="true"   # start safe, change to false to emit the re-auth URL</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export BIGCOMMERCE_STORED_SCOPES="store_v2_orders store_v2_products"
+export BIGCOMMERCE_REQUIRED_SCOPES="store_v2_orders store_v2_products store_v2_customers"
+export BIGCOMMERCE_CLIENT_ID="..."
+export DRY_RUN="true"   // start safe, change to false to emit the re-auth URL</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Call a lightweight canary endpoint</h3>
+      <p>Any cheap authenticated V3 call works. <code>GET /v3/catalog/products?limit=1</code> or <code>GET /v3/customers?limit=1</code> are good choices because they are fast and return a small payload. Send <code>X-Auth-Token</code> and <code>Accept: application/json</code>, and capture the status code, do not raise on 401, since that status is exactly the signal we are trying to classify.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Accept": "application/json",
+}
+
+def canary_status_code():
+    r = requests.get(f"{API_BASE}/catalog/products", headers=HEADERS, params={"limit": 1}, timeout=30)
+    return r.status_code</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  Accept: "application/json",
+};
+
+async function canaryStatusCode() {
+  const url = new URL(`${API_BASE}/catalog/products`);
+  url.searchParams.set("limit", "1");
+  const res = await fetch(url, { headers: HEADERS });
+  return res.status;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Load the stored scopes and the required scopes</h3>
+      <p>The stored scope string is whatever your token-store record captured at the last successful <code>POST https://login.bigcommerce.com/oauth2/token</code> exchange, the API returns it in the response body's <code>scope</code> field. The required scope string is the app's current scope manifest, the same thing the Developer Portal shows on the app profile. Both are space-separated lists, so turn them into sets before comparing.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def scope_set(scope_string):
+    return {s for s in (scope_string or "").split() if s}
+
+stored_scopes = scope_set(os.environ.get("BIGCOMMERCE_STORED_SCOPES", ""))
+required_scopes = scope_set(os.environ.get("BIGCOMMERCE_REQUIRED_SCOPES", ""))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">function scopeSet(scopeString) {
+  return new Set((scopeString || "").split(/\s+/).filter(Boolean));
+}
+
+const storedScopes = scopeSet(process.env.BIGCOMMERCE_STORED_SCOPES || "");
+const requiredScopes = scopeSet(process.env.BIGCOMMERCE_REQUIRED_SCOPES || "");</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Classify the failure with one pure function</h3>
+      <p>Keep the decision in its own function that takes the status code, the stored scopes, the required scopes, and a retry count, and returns one of four outcomes. Scope drift always wins over a plain retry, because there is no point retrying a call that is missing a scope it will never have without re-consent. A clean 401 gets exactly one retry before it is called revoked or expired.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">classify.py</div>
+      <pre><code class="language-python">def classify_auth_failure(status_code, stored_scopes, required_scopes, retry_count):
+    if status_code != 401:
+        return "OK"
+
+    if required_scopes - stored_scopes:
+        return "SCOPE_DRIFT"
+
+    if retry_count == 0:
+        return "TRANSIENT_RETRY"
+
+    return "TOKEN_REVOKED_OR_EXPIRED"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify.js</div>
+      <pre><code class="language-javascript">function classifyAuthFailure(statusCode, storedScopes, requiredScopes, retryCount) {
+  if (statusCode !== 401) return "OK";
+
+  const missing = [...requiredScopes].some((scope) =&gt; !storedScopes.has(scope));
+  if (missing) return "SCOPE_DRIFT";
+
+  if (retryCount === 0) return "TRANSIENT_RETRY";
+
+  return "TOKEN_REVOKED_OR_EXPIRED";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report, never repair, and stop retrying that store</h3>
+      <p>Whatever the classification lands on, other than OK, log the store_hash, the last known scope, the required scope, and the 401 timestamp and count. Do not call the OAuth token endpoint to try to mint a replacement, BigCommerce will refuse it without merchant consent, and quietly retrying forever just burns your rate limit against a store that cannot succeed until a human acts.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def reauth_url(client_id, store_hash):
+    return (
+        "https://login.bigcommerce.com/oauth2/authorize"
+        f"?client_id={client_id}&amp;context=stores/{store_hash}"
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">function reauthUrl(clientId, storeHash) {
+  return (
+    "https://login.bigcommerce.com/oauth2/authorize" +
+    `?client_id=${clientId}&amp;context=stores/${storeHash}`
+  );
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: call the canary, classify the result, and on <code>SCOPE_DRIFT</code> or <code>TOKEN_REVOKED_OR_EXPIRED</code>, log the store_hash and, only if <code>DRY_RUN</code> is false, print the merchant-facing re-auth URL so an admin can send it along. On <code>TRANSIENT_RETRY</code> the loop calls the canary exactly one more time before re-classifying. It never loops forever on the same store_hash within a single run.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never let this script attempt to silently mint a replacement token, BigCommerce requires the merchant to re-consent through <code>/auth</code>, and any workaround that tries to bypass that is fighting the platform's own security model. Once a store is flagged, stop calling it until a fresh <code>access_token</code> and <code>scope</code> pair is recorded from a new auth callback.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, calls the canary endpoint, classifies the result with the pure function above, and only ever reports, logging the store_hash and missing scopes and, when not in dry run, the re-auth URL for a human to use.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/oauth-token-invalid-after-scope-change" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">check_oauth_scope_drift.py</div>
+      <pre><code class="language-python">"""Flag BigCommerce stores whose OAuth token silently died from a scope change.
+
+BigCommerce invalidates a stored OAuth access token whenever the app's declared
+scopes change in the app or Developer Portal profile. The token is only actually
+replaced the next time the merchant reopens the app and re-consents through the
+/auth callback, which returns a fresh access_token plus the new scope string. Any
+script still holding the old token gets a generic 401 Unauthorized on every call
+afterward, and there is no distinct "scope changed" error code, so scope drift and
+plain revocation or expiry look identical unless the caller compares the scopes it
+minted the token with against what the app currently requires.
+
+This script calls a lightweight canary endpoint, classifies a 401 as SCOPE_DRIFT,
+TRANSIENT_RETRY, or TOKEN_REVOKED_OR_EXPIRED with a pure function, and only ever
+reports. It never tries to mint a replacement token itself, because BigCommerce
+will not issue one without the merchant re-consenting. Safe to run again and
+again, and safe by default with DRY_RUN.
+
+Guide: https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("check_oauth_scope_drift")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+CLIENT_ID = os.environ.get("BIGCOMMERCE_CLIENT_ID", "")
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Accept": "application/json",
+}
+
+
+def scope_set(scope_string):
+    return {s for s in (scope_string or "").split() if s}
+
+
+def classify_auth_failure(
+    status_code: int, stored_scopes: set, required_scopes: set, retry_count: int
+) -> str:
+    """Pure decision logic, no I/O.
+
+    Returns one of: 'OK', 'SCOPE_DRIFT', 'TOKEN_REVOKED_OR_EXPIRED', 'TRANSIENT_RETRY'.
+    - If status_code != 401: 'OK'.
+    - If 401 and required_scopes - stored_scopes is non-empty: 'SCOPE_DRIFT' (force
+      re-auth, no retry).
+    - If 401, scopes match, and retry_count == 0: 'TRANSIENT_RETRY' (allow exactly
+      one retry).
+    - If 401, scopes match, and retry_count >= 1: 'TOKEN_REVOKED_OR_EXPIRED' (force
+      re-auth, no further retry).
+    """
+    if status_code != 401:
+        return "OK"
+
+    if required_scopes - stored_scopes:
+        return "SCOPE_DRIFT"
+
+    if retry_count == 0:
+        return "TRANSIENT_RETRY"
+
+    return "TOKEN_REVOKED_OR_EXPIRED"
+
+
+def canary_status_code():
+    r = requests.get(
+        f"{API_BASE}/catalog/products", headers=HEADERS, params={"limit": 1}, timeout=30
+    )
+    return r.status_code
+
+
+def reauth_url(client_id, store_hash):
+    return (
+        "https://login.bigcommerce.com/oauth2/authorize"
+        f"?client_id={client_id}&amp;context=stores/{store_hash}"
+    )
+
+
+def run():
+    stored_scopes = scope_set(os.environ.get("BIGCOMMERCE_STORED_SCOPES", ""))
+    required_scopes = scope_set(os.environ.get("BIGCOMMERCE_REQUIRED_SCOPES", ""))
+
+    retry_count = 0
+    status_code = canary_status_code()
+    outcome = classify_auth_failure(status_code, stored_scopes, required_scopes, retry_count)
+
+    if outcome == "TRANSIENT_RETRY":
+        retry_count = 1
+        status_code = canary_status_code()
+        outcome = classify_auth_failure(status_code, stored_scopes, required_scopes, retry_count)
+
+    if outcome == "OK":
+        log.info("store_hash=%s status=OK canary_status=%s", STORE_HASH, status_code)
+        return
+
+    missing_scopes = sorted(required_scopes - stored_scopes)
+    log.warning(
+        "store_hash=%s classification=%s last_known_scope=%s required_scope=%s "
+        "missing_scopes=%s canary_status=%s retry_count=%s",
+        STORE_HASH, outcome, sorted(stored_scopes), sorted(required_scopes),
+        missing_scopes, status_code, retry_count,
+    )
+
+    if not DRY_RUN:
+        log.warning(
+            "store_hash=%s re_auth_url=%s",
+            STORE_HASH, reauth_url(CLIENT_ID, STORE_HASH),
+        )
+
+    log.info("Done. store_hash=%s stopping retries until a new access_token/scope pair is recorded.", STORE_HASH)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">check-oauth-scope-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag BigCommerce stores whose OAuth token silently died from a scope change.
+ *
+ * BigCommerce invalidates a stored OAuth access token whenever the app's declared
+ * scopes change in the app or Developer Portal profile. The token is only actually
+ * replaced the next time the merchant reopens the app and re-consents through the
+ * /auth callback, which returns a fresh access_token plus the new scope string. Any
+ * script still holding the old token gets a generic 401 Unauthorized on every call
+ * afterward, and there is no distinct "scope changed" error code, so scope drift and
+ * plain revocation or expiry look identical unless the caller compares the scopes it
+ * minted the token with against what the app currently requires.
+ *
+ * This script calls a lightweight canary endpoint, classifies a 401 as SCOPE_DRIFT,
+ * TRANSIENT_RETRY, or TOKEN_REVOKED_OR_EXPIRED with a pure function, and only ever
+ * reports. It never tries to mint a replacement token itself, because BigCommerce
+ * will not issue one without the merchant re-consenting. Safe to run again and
+ * again, and safe by default with DRY_RUN.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/oauth-token-invalid-after-scope-change/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const CLIENT_ID = process.env.BIGCOMMERCE_CLIENT_ID || "";
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  Accept: "application/json",
+};
+
+export function scopeSet(scopeString) {
+  return new Set((scopeString || "").split(/\s+/).filter(Boolean));
+}
+
+/**
+ * Pure decision logic, no I/O.
+ *
+ * Returns one of: 'OK', 'SCOPE_DRIFT', 'TOKEN_REVOKED_OR_EXPIRED', 'TRANSIENT_RETRY'.
+ * - If statusCode !== 401: 'OK'.
+ * - If 401 and requiredScopes has anything storedScopes lacks: 'SCOPE_DRIFT' (force
+ *   re-auth, no retry).
+ * - If 401, scopes match, and retryCount === 0: 'TRANSIENT_RETRY' (allow exactly
+ *   one retry).
+ * - If 401, scopes match, and retryCount &gt;= 1: 'TOKEN_REVOKED_OR_EXPIRED' (force
+ *   re-auth, no further retry).
+ */
+export function classifyAuthFailure(statusCode, storedScopes, requiredScopes, retryCount) {
+  if (statusCode !== 401) return "OK";
+
+  const missing = [...requiredScopes].some((scope) =&gt; !storedScopes.has(scope));
+  if (missing) return "SCOPE_DRIFT";
+
+  if (retryCount === 0) return "TRANSIENT_RETRY";
+
+  return "TOKEN_REVOKED_OR_EXPIRED";
+}
+
+async function canaryStatusCode() {
+  const url = new URL(`${API_BASE}/catalog/products`);
+  url.searchParams.set("limit", "1");
+  const res = await fetch(url, { headers: HEADERS });
+  return res.status;
+}
+
+function reauthUrl(clientId, storeHash) {
+  return (
+    "https://login.bigcommerce.com/oauth2/authorize" +
+    `?client_id=${clientId}&amp;context=stores/${storeHash}`
+  );
+}
+
+export async function run() {
+  const storedScopes = scopeSet(process.env.BIGCOMMERCE_STORED_SCOPES || "");
+  const requiredScopes = scopeSet(process.env.BIGCOMMERCE_REQUIRED_SCOPES || "");
+
+  let retryCount = 0;
+  let statusCode = await canaryStatusCode();
+  let outcome = classifyAuthFailure(statusCode, storedScopes, requiredScopes, retryCount);
+
+  if (outcome === "TRANSIENT_RETRY") {
+    retryCount = 1;
+    statusCode = await canaryStatusCode();
+    outcome = classifyAuthFailure(statusCode, storedScopes, requiredScopes, retryCount);
+  }
+
+  if (outcome === "OK") {
+    console.log(`store_hash=${STORE_HASH} status=OK canary_status=${statusCode}`);
+    return;
+  }
+
+  const missingScopes = [...requiredScopes].filter((s) =&gt; !storedScopes.has(s)).sort();
+  console.warn(
+    `store_hash=${STORE_HASH} classification=${outcome} ` +
+    `last_known_scope=${[...storedScopes].sort()} required_scope=${[...requiredScopes].sort()} ` +
+    `missing_scopes=${missingScopes} canary_status=${statusCode} retry_count=${retryCount}`
+  );
+
+  if (!DRY_RUN) {
+    console.warn(`store_hash=${STORE_HASH} re_auth_url=${reauthUrl(CLIENT_ID, STORE_HASH)}`);
+  }
+
+  console.log(`Done. store_hash=${STORE_HASH} stopping retries until a new access_token/scope pair is recorded.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classification rule is the part most worth testing, because it decides whether a script keeps hammering a dead token or correctly hands the problem to a human. Because <code>classify_auth_failure</code> takes only plain values and returns a plain string, the test needs no network and no BigCommerce store. It just feeds in plain values and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_oauth_classify_failure.py</div>
+      <pre><code class="language-python">from check_oauth_scope_drift import classify_auth_failure
+
+
+def test_ok_when_status_is_not_401():
+    assert classify_auth_failure(200, {"store_v2_orders"}, {"store_v2_orders"}, 0) == "OK"
+
+
+def test_scope_drift_when_required_scope_is_missing():
+    stored = {"store_v2_orders"}
+    required = {"store_v2_orders", "store_v2_customers"}
+    assert classify_auth_failure(401, stored, required, 0) == "SCOPE_DRIFT"
+
+
+def test_scope_drift_wins_even_on_first_attempt():
+    stored = {"store_v2_products"}
+    required = {"store_v2_products", "store_v2_orders"}
+    assert classify_auth_failure(401, stored, required, 0) == "SCOPE_DRIFT"
+
+
+def test_transient_retry_when_scopes_match_and_first_attempt():
+    scopes = {"store_v2_orders", "store_v2_products"}
+    assert classify_auth_failure(401, scopes, scopes, 0) == "TRANSIENT_RETRY"
+
+
+def test_revoked_or_expired_when_scopes_match_after_retry():
+    scopes = {"store_v2_orders", "store_v2_products"}
+    assert classify_auth_failure(401, scopes, scopes, 1) == "TOKEN_REVOKED_OR_EXPIRED"
+
+
+def test_revoked_or_expired_stays_final_on_further_retries():
+    scopes = {"store_v2_orders"}
+    assert classify_auth_failure(401, scopes, scopes, 3) == "TOKEN_REVOKED_OR_EXPIRED"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">check-oauth-scope-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyAuthFailure } from "./check-oauth-scope-drift.js";
+
+test("OK when status is not 401", () =&gt; {
+  const scopes = new Set(["store_v2_orders"]);
+  assert.equal(classifyAuthFailure(200, scopes, scopes, 0), "OK");
+});
+
+test("SCOPE_DRIFT when required scope is missing", () =&gt; {
+  const stored = new Set(["store_v2_orders"]);
+  const required = new Set(["store_v2_orders", "store_v2_customers"]);
+  assert.equal(classifyAuthFailure(401, stored, required, 0), "SCOPE_DRIFT");
+});
+
+test("SCOPE_DRIFT wins even on first attempt", () =&gt; {
+  const stored = new Set(["store_v2_products"]);
+  const required = new Set(["store_v2_products", "store_v2_orders"]);
+  assert.equal(classifyAuthFailure(401, stored, required, 0), "SCOPE_DRIFT");
+});
+
+test("TRANSIENT_RETRY when scopes match and first attempt", () =&gt; {
+  const scopes = new Set(["store_v2_orders", "store_v2_products"]);
+  assert.equal(classifyAuthFailure(401, scopes, scopes, 0), "TRANSIENT_RETRY");
+});
+
+test("TOKEN_REVOKED_OR_EXPIRED when scopes match after retry", () =&gt; {
+  const scopes = new Set(["store_v2_orders", "store_v2_products"]);
+  assert.equal(classifyAuthFailure(401, scopes, scopes, 1), "TOKEN_REVOKED_OR_EXPIRED");
+});
+
+test("TOKEN_REVOKED_OR_EXPIRED stays final on further retries", () =&gt; {
+  const scopes = new Set(["store_v2_orders"]);
+  assert.equal(classifyAuthFailure(401, scopes, scopes, 3), "TOKEN_REVOKED_OR_EXPIRED");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">New feature, new scope</span>
+      <h4>The integration that broke for every store overnight</h4>
+      <p>A developer shipped a new feature that needed <code>store_v2_customers</code> and updated the app's scope manifest in the Developer Portal to match. Within minutes, every background sync job across every installed store started failing with 401 Unauthorized. The on-call engineer's first instinct was to check the API status page, then suspect a network issue, because nothing in their own code or credentials had changed.</p>
+      <p>Running the canary check against a handful of affected stores showed the same pattern every time: the stored scope was missing <code>store_v2_customers</code>, the exact scope that had just been added. Once the classification pointed at SCOPE_DRIFT instead of a generic outage, the team stopped burning time on the wrong theory and started emailing merchants a re-auth link instead.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Revoked, not drifted</span>
+      <h4>The store that had genuinely uninstalled and reinstalled</h4>
+      <p>One flagged store looked identical to the scope-drift cases at first glance, a plain 401 on every call. But the scope comparison came back clean, the stored scopes matched the required scopes exactly. A single retry a few seconds later still came back 401.</p>
+      <p>That combination told the real story: the merchant had genuinely removed the app from their store, which revokes the token outright, and then reinstalled it under a different internal record the team's token store had not picked up yet. Because the script only reports and never retries a store past that point, no calls were wasted hammering a token that was never coming back on its own, and the re-auth link pointed the team at the correct fix.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs as a canary check, a 401 is never a mystery. It is either a clean OK, a clearly labeled SCOPE_DRIFT with the exact missing scopes named, or a TOKEN_REVOKED_OR_EXPIRED after a single confirming retry, and in every non-OK case the store_hash stops being retried and a human gets a direct re-auth link instead of a vague error report.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why did my BigCommerce access token suddenly stop working?</summary>
+      <p>BigCommerce invalidates a stored OAuth access token whenever the app's declared scopes change in the app or Developer Portal profile. The token is only actually replaced the next time the merchant reopens the app and re-consents through the auth callback, which returns a fresh access_token and the new scope string. Any script still holding the old token gets a generic 401 Unauthorized on every call afterward, with no distinct error code that says the scopes changed.</p>
+    </details>
+    <details>
+      <summary>How do I tell scope drift apart from a plain revoked or expired token?</summary>
+      <p>Compare the scope string you captured at the last successful OAuth token exchange against the scopes your app currently requires. If the stored token is missing a scope the app now needs, that is scope drift. If the scopes still match but you still get a 401 after one retry, treat it as a plain revocation or expiry. Both look identical as a bare 401, so the comparison is the only reliable way to tell them apart.</p>
+    </details>
+    <details>
+      <summary>Can a script automatically fix a BigCommerce token that went stale from a scope change?</summary>
+      <p>No. A scope change can only be resolved by the merchant reopening the app and re-consenting through the auth callback, so the correct behavior is to flag the store_hash and stop retrying it, not to silently try to mint a new token. The script should log the missing scopes and, if not in dry run, emit the re-auth URL so an admin can send it to the store owner.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Docs: implementing OAuth and the auth callback flow. <a href="https://docs.bigcommerce.com/developer/docs/integrations/apps/guide/auth" rel="noopener">docs.bigcommerce.com implementing OAuth</a></li>
+      <li>BigCommerce Support Community: OAuth scopes. <a href="https://support.bigcommerce.com/s/topic/0TO1B000000HYriWAG/oauth-scopes?language=en_US" rel="noopener">support.bigcommerce.com OAuth scopes</a></li>
+      <li>BigCommerce Support Community: 401 Unauthorized? <a href="https://support.bigcommerce.com/s/question/0D51B00004ReUGHSA3/401-unauthorized?language=en_US" rel="noopener">support.bigcommerce.com 401 unauthorized</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: single-click app OAuth flow. <a href="https://developer.bigcommerce.com/docs/integrations/apps/guide/auth" rel="noopener">developer.bigcommerce.com single-click app OAuth flow</a></li>
+      <li>BigCommerce Developer Center: API status codes. <a href="https://developer.bigcommerce.com/docs/start/about/status-codes" rel="noopener">developer.bigcommerce.com API status codes</a></li>
+      <li>BigCommerce Docs: API accounts. <a href="https://docs.bigcommerce.com/developer/docs/overview/api-fundamentals/api-accounts" rel="noopener">docs.bigcommerce.com API accounts</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop a wasted afternoon of debugging?</h3>
+    <p>If this saved you from chasing a phantom network issue or a "revoked" token that was really just scope drift, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

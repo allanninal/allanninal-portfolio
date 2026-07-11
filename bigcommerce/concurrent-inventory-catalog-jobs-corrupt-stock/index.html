@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Concurrent Inventory and Catalog Jobs Corrupting Stock</title>
+<meta name="description" content="Running BigCommerce Inventory API bulk jobs at the same time as Catalog or Orders API bulk jobs can silently corrupt stock totals. Learn why the two race on the same counter and build a Python or Node.js script that detects and repairs the drift.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Concurrent Inventory and Catalog Jobs Corrupting Stock">
+<meta property="og:description" content="Why running Inventory API bulk jobs alongside Catalog or Orders API bulk jobs races on the same stock counter, and a safe Python or Node.js script that detects and reconciles the drift.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/#article","headline":"Fix BigCommerce Concurrent Inventory and Catalog Jobs Corrupting Stock","description":"BigCommerce's Inventory API warns that running inventory adjustment bulk jobs in parallel with Catalog or Orders API bulk jobs may cause unpredictable, incorrect calculation results. A safe Python or Node.js script that detects and reconciles the resulting stock drift.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory","keywords":"BigCommerce Inventory API, concurrent bulk jobs, stock corruption, total_inventory_onhand, inventory adjustments, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Concurrent inventory and catalog jobs corrupt stock totals","item":"https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why do stock totals get corrupted when I run inventory and catalog jobs at the same time?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce's Inventory API processes adjustments asynchronously with its own internal queue, and the documentation explicitly warns that running Inventory API bulk operations in parallel with Catalog API or Orders API bulk operations may cause unpredictable, incorrect calculation results. Relative adjustments read the current stored value before writing a new one, so if a catalog bulk edit or an order job touches the same SKU and location in that window, the two writes race on the same counter and one can silently clobber or double-apply the other."}},{"@type":"Question","name":"Is it safe to auto-write a correction the moment I detect drift?","acceptedAnswer":{"@type":"Answer","text":"No. Correction should be a serialize-then-reconcile flow, not a blind auto-write, because concurrent absolute and relative adjustments can race in either order and a naive re-apply could double-correct a SKU that has already settled. Recompute the expected on-hand from your own adjustment ledger, push a single absolute adjustment, then re-verify the value before marking the SKU reconciled."}},{"@type":"Question","name":"Does BigCommerce expose an audit trail I can use to reconstruct what happened?","acceptedAnswer":{"@type":"Answer","text":"No. BigCommerce does not expose a public adjustment audit-trail endpoint, so you cannot ask the platform what sequence of writes produced a given total_inventory_onhand value. You have to keep your own ledger of every relative and absolute adjustment your integration issues, and diff each SKU and location's actual on-hand against that ledger to find drift."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Inventory</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Inventory</p>
+    <h1>Concurrent inventory and catalog or order bulk jobs corrupt stock totals</h1>
+    <p class="lead">Two bulk jobs, one SKU, one location, the same window of time. An inventory adjustment job and a catalog or order bulk job both touch the same underlying stock counter, and BigCommerce's own documentation warns this can produce unpredictable, incorrect results. The two writes race, one silently clobbers or double-applies the other, and total_inventory_onhand quietly drifts from what your store actually has. Here is why the race happens and a script that detects the drift against your own adjustment ledger and repairs it safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Inventory API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's Inventory API processes absolute and relative adjustments asynchronously through its own internal queue, and its documentation explicitly warns that running Inventory API bulk operations in parallel with Catalog API or Orders API bulk operations "may cause unpredictable, incorrect calculation results." Relative adjustments do a read-modify-write against the current stored value, so a catalog bulk edit that also touches inventory_level, or an order bulk job decrementing stock, can race an inventory adjustment job on the same SKU and location and clobber it. Serialize the jobs with a per-store lock going forward, then reconcile the damage already done: rebuild each SKU and location's expected on-hand from your own adjustment ledger, compare it against <code>GET /v3/inventory/locations/{location_id}/items</code>, and push a corrective <code>PUT /v3/inventory/adjustments/absolute</code> only where the two disagree beyond a tolerance. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce keeps one number per SKU and location, total_inventory_onhand, and every inventory adjustment call is really a write against that single counter. Absolute adjustments overwrite it outright. Relative adjustments have to read the current value, add or subtract the delta, and write the result back, all inside BigCommerce's own asynchronous queue.</p>
+  <p>That queue does not know, and does not care, whether something else is also writing to the same SKU right now. A catalog bulk job that edits products or variants and happens to touch inventory_level along the way, or an order bulk job that is decrementing stock for a batch of fulfillments, can land a write on the exact same SKU and location in the exact same window as an inventory adjustment job. Both jobs believe they are the only one updating that counter. One of them wins, the other's change is silently lost or double-applied, and nobody gets an error for it. There is also a documented propagation delay between an adjustment call returning 200 and the new value being reliably readable via GET, which widens the window and lets a second job read stale data mid-race.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An inventory adjustment job and a catalog or order bulk job both write to the same SKU and location counter at the same time, they race on BigCommerce's internal queue, and total_inventory_onhand ends up wrong for one of the two writes.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="18" width="200" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="110" y="44" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Inventory adjustment job</text>
+      <text x="110" y="61" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">relative, SKU-123 @ loc 1</text>
+      <rect x="10" y="140" width="200" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="110" y="166" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Catalog or order bulk job</text>
+      <text x="110" y="183" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">also writes SKU-123 @ loc 1</text>
+      <line x1="213" y1="48" x2="330" y2="95" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="213" y1="170" x2="330" y2="115" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="333" y="75" width="185" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="425" y="101" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Same counter, same</text>
+      <text x="425" y="118" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">window, internal queue</text>
+      <line x1="521" y1="105" x2="590" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="555" y="62" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="555" y="132" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Race, one write wins</text>
+      <rect x="593" y="75" width="157" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="671" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">total_inventory_onhand</text>
+      <text x="671" y="117" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">wrong for one write</text>
+    </svg>
+    <figcaption>Two bulk jobs write the same SKU and location counter in the same window. BigCommerce's own docs warn the results are unpredictable when this happens.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce's documentation is direct about this: Inventory API bulk operations run in parallel with Catalog API or Orders API bulk operations "may cause unpredictable, incorrect calculation results." A few concrete ways this plays out on real stores:</p>
+  <ul>
+    <li>A nightly inventory sync issuing relative adjustments for order-driven decrements overlaps with a product import or bulk catalog edit that also updates inventory_level on the same SKUs.</li>
+    <li>A relative adjustment's read-modify-write cycle reads the current total_inventory_onhand, computes a new value, and writes it back, but a second job's write lands in between the read and the write, so the second job's change is silently overwritten.</li>
+    <li>An order bulk job decrementing stock for a batch of orders runs at the same time as a separate inventory reconciliation job correcting stock for the same SKUs, and the two disagree about which value is current.</li>
+    <li>There is a documented propagation delay between an adjustment call returning 200 and the new value being consistently readable via GET, so a second job that reads mid-window sees stale data and computes its own adjustment from the wrong baseline.</li>
+  </ul>
+  <p>None of this raises an error. Both jobs get a 200. The drift only shows up later, as a mismatch between what the store thinks it has and what a human counts on a shelf. See the citations at the end for BigCommerce's own concurrency warning and the underlying adjustments reference.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>total_inventory_onhand is not a ledger, it is a single number that the last write happened to leave behind. The only reliable ledger is the one you keep yourself: every relative and absolute adjustment your own integration issues, with a timestamp and a SKU and location. BigCommerce does not expose a public adjustment audit-trail endpoint, so you cannot ask the platform what sequence of writes produced the current value. You have to reconstruct the expected on-hand from your own log and compare it against what BigCommerce actually reports, then treat any mismatch beyond a small tolerance as corrupted.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live checkout or catalog editing flow. We add a job that first serializes future runs behind a per-store lock so this stops happening, then walks every SKU and location touched during the overlapping window, diffs the actual total against the expected total from our own ledger, and pushes a single corrective absolute adjustment only where the two disagree.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A reconciliation job lists recently touched SKUs and locations, reads the actual on-hand from the inventory items endpoint, compares it to the expected on-hand from the integration's own ledger, and if they differ beyond a tolerance it pushes an absolute adjustment and re-verifies, otherwise it takes no action.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Reconciliation job</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs after the overlap</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List touched SKUs</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">products, variants, locations</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="270" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="362" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Read actual on-hand</text>
+      <text x="362" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">inventory items endpoint</text>
+      <line x1="455" y1="138" x2="497" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,106 675,138 590,170 505,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="590" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Differs from</text>
+      <text x="590" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">ledger total?</text>
+      <text x="678" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="675" y1="138" x2="702" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="597" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, already correct</text>
+      <line x1="590" y1="170" x2="590" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="630" y="185" width="120" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="690" y="206" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Absolute</text>
+      <text x="690" y="222" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#4c9a2a">adjustment</text>
+      <text x="690" y="236" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#55607a">then re-verify</text>
+      <path d="M702,138 C720,138 690,150 690,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job only writes a correction where the actual on-hand disagrees with our own ledger's expected total, and it re-verifies the write before marking the SKU reconciled.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Inventory (modify) and Products (read) scope so it can read inventory items and push corrective adjustments. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export STOCK_TOLERANCE="0"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export STOCK_TOLERANCE="0"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Inventory and Catalog REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and PUT and raises on a non-2xx response. We reuse it to list recently touched products and variants, read current inventory items, and write the corrective absolute adjustment.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Find the SKUs touched during the overlap window and read their actual on-hand</h3>
+      <p>Call <code>GET /v3/catalog/products?include=variants&amp;date_modified:min={job_start_ts}</code>, paginated, to find products and variants touched since the overlapping jobs started. For each SKU and location pair, call <code>GET /v3/inventory/locations/{location_id}/items?sku__in={skus}</code> to read the current <code>total_inventory_onhand</code> and <code>available_to_sell</code> straight from BigCommerce.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def touched_products(job_start_ts):
+    page = 1
+    while True:
+        resp = bc_get("/catalog/products", {
+            "include": "variants",
+            "date_modified:min": job_start_ts,
+            "page": page,
+            "limit": 250,
+        })
+        rows = resp.get("data", [])
+        if not rows:
+            return
+        for product in rows:
+            yield product
+        page += 1
+
+def actual_inventory_items(location_id, skus):
+    resp = bc_get(f"/inventory/locations/{location_id}/items", {"sku__in": ",".join(skus)})
+    return resp.get("data", [])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* touchedProducts(jobStartTs) {
+  let page = 1;
+  while (true) {
+    const resp = await bcGet("/catalog/products", {
+      include: "variants",
+      "date_modified:min": jobStartTs,
+      page,
+      limit: 250,
+    });
+    const rows = resp.data || [];
+    if (!rows.length) return;
+    for (const product of rows) yield product;
+    page += 1;
+  }
+}
+
+async function actualInventoryItems(locationId, skus) {
+  const resp = await bcGet(`/inventory/locations/${locationId}/items`, { sku__in: skus.join(",") });
+  return resp.data || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the corruption decision in its own function that takes the actual on-hand BigCommerce reports, the expected on-hand from your own adjustment ledger, and a tolerance, and returns a plain boolean. Anything beyond the tolerance gets flagged for repair. This is the only place the "is it corrupted" judgment lives, so it can be tested with plain numbers and no store.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def is_inventory_corrupted(actual_on_hand: int, expected_on_hand: int, tolerance: int = 0) -&gt; bool:
+    return abs(actual_on_hand - expected_on_hand) &gt; tolerance</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function isInventoryCorrupted(actualOnHand, expectedOnHand, tolerance = 0) {
+  return Math.abs(actualOnHand - expectedOnHand) &gt; tolerance;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Build the correction payload, then write it and re-verify</h3>
+      <p>When a SKU and location are flagged, build the exact item dict the absolute-adjustment endpoint expects with a second pure helper, no network involved. Under <code>DRY_RUN=true</code>, only log that payload. Under <code>DRY_RUN=false</code>, call <code>PUT /v3/inventory/adjustments/absolute</code> with reason <code>reconciliation-after-concurrent-jobs</code>, batched up to 2,000 items per BigCommerce's documented limit, then immediately re-read the same SKUs and confirm total_inventory_onhand equals the pushed quantity before marking anything reconciled.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def build_correction_payload(sku: str, location_id: int, expected_on_hand: int) -&gt; dict:
+    return {"location_id": location_id, "sku": sku, "quantity": expected_on_hand}
+
+def push_absolute_adjustment(items):
+    body = {"reason": "reconciliation-after-concurrent-jobs", "items": items}
+    return bc_put("/inventory/adjustments/absolute", body)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">export function buildCorrectionPayload(sku, locationId, expectedOnHand) {
+  return { location_id: locationId, sku, quantity: expectedOnHand };
+}
+
+async function pushAbsoluteAdjustment(items) {
+  const body = { reason: "reconciliation-after-concurrent-jobs", items };
+  return bcPut("/inventory/adjustments/absolute", body);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard and a store-wide mutex</h3>
+      <p>The loop ties every piece together, batching corrections up to 2,000 items per call. Notice the dry run guard: on the first run, leave <code>DRY_RUN</code> on so the script only logs the {sku, location_id, actual_on_hand, expected_on_hand, corrective_quantity} tuple for every flagged SKU. Read the output, agree with it, then switch it off. Just as important, gate every future inventory-adjustment job and catalog or order bulk job behind a single per-store_hash mutex, a Redis or DB lock, so they never overlap again after this cleanup.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and always re-verify a write with a fresh GET before marking a SKU reconciled. A naive re-apply without re-verification can double-correct a SKU that a concurrent job has already settled, because absolute and relative adjustments can still race in either order until the mutex is in place.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only writes a correction where the actual on-hand disagrees with your own ledger's expected total beyond the tolerance, and it re-verifies every write before calling a SKU reconciled.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/concurrent-inventory-catalog-jobs-corrupt-stock" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_concurrent_inventory_drift.py</div>
+      <pre><code class="language-python">"""Detect and repair BigCommerce stock corrupted by concurrent bulk jobs.
+
+BigCommerce's Inventory API processes absolute and relative adjustments
+asynchronously through its own internal queue, and its documentation warns
+that running Inventory API bulk operations in parallel with Catalog API or
+Orders API bulk operations "may cause unpredictable, incorrect calculation
+results." Relative adjustments do a read-modify-write against the current
+stored total_inventory_onhand, so a catalog bulk edit that also touches
+inventory_level, or an order bulk job decrementing stock, can race an
+inventory adjustment job on the same SKU and location and silently clobber
+or double-apply it. There is also a documented propagation delay between an
+adjustment call returning 200 and the new value being reliably readable via
+GET, which widens the race window.
+
+BigCommerce does not expose a public adjustment audit-trail endpoint, so
+this job reconstructs the expected on-hand for each SKU and location from
+the integration's own adjustment ledger, compares it against the actual
+total_inventory_onhand BigCommerce reports, and pushes a corrective
+absolute adjustment only where the two disagree beyond a tolerance. Every
+write is re-verified with a fresh GET before the SKU is marked reconciled.
+Run once after any window where inventory and catalog or order bulk jobs
+overlapped, then gate all future jobs behind a per-store_hash mutex so this
+does not happen again.
+
+Guide: https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_concurrent_inventory_drift")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+STOCK_TOLERANCE = int(os.environ.get("STOCK_TOLERANCE", "0"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+MAX_ITEMS_PER_ADJUSTMENT_CALL = 2000
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def is_inventory_corrupted(actual_on_hand: int, expected_on_hand: int, tolerance: int = 0) -&gt; bool:
+    """Pure decision. No network, no side effects.
+
+    Returns True (flag for repair) when the actual on-hand BigCommerce
+    reports differs from the expected on-hand reconstructed from our own
+    adjustment ledger by more than tolerance. Returns False otherwise.
+    """
+    return abs(actual_on_hand - expected_on_hand) &gt; tolerance
+
+
+def build_correction_payload(sku: str, location_id: int, expected_on_hand: int) -&gt; dict:
+    """Pure payload builder. No network, no side effects.
+
+    Returns the exact item dict the absolute-adjustment request body
+    expects for one SKU and location.
+    """
+    return {"location_id": location_id, "sku": sku, "quantity": expected_on_hand}
+
+
+def touched_products(job_start_ts):
+    """Page through products and variants modified since job_start_ts."""
+    page = 1
+    while True:
+        resp = bc_get(
+            "/catalog/products",
+            {
+                "include": "variants",
+                "date_modified:min": job_start_ts,
+                "page": page,
+                "limit": 250,
+            },
+        )
+        rows = resp.get("data", [])
+        if not rows:
+            return
+        for product in rows:
+            yield product
+        page += 1
+
+
+def actual_inventory_items(location_id, skus):
+    """Read current total_inventory_onhand for a batch of SKUs at a location."""
+    if not skus:
+        return []
+    resp = bc_get(f"/inventory/locations/{location_id}/items", {"sku__in": ",".join(skus)})
+    return resp.get("data", [])
+
+
+def expected_on_hand_from_ledger(sku, location_id, ledger):
+    """Reconstruct expected on-hand from our own adjustment log.
+
+    ledger maps (sku, location_id) -&gt; expected on-hand, built from a
+    baseline plus every relative or absolute adjustment this integration
+    issued during the overlapping window. BigCommerce does not expose a
+    public adjustment audit-trail endpoint, so this ledger has to be kept
+    by the integration itself.
+    """
+    return ledger.get((sku, location_id))
+
+
+def push_absolute_adjustment(items):
+    body = {"reason": "reconciliation-after-concurrent-jobs", "items": items}
+    return bc_put("/inventory/adjustments/absolute", body)
+
+
+def batched(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def run(job_start_ts, ledger):
+    """ledger: dict mapping (sku, location_id) -&gt; expected on-hand int.
+
+    In production this is built from the integration's own persisted
+    adjustment history, not passed in by hand.
+    """
+    flagged = []
+
+    for product in touched_products(job_start_ts):
+        variants = product.get("variants") or [{
+            "sku": product.get("sku"),
+            "inventory_level": product.get("inventory_level"),
+        }]
+        for variant in variants:
+            sku = variant.get("sku")
+            if not sku:
+                continue
+            for location_id in sorted({loc for (s, loc) in ledger if s == sku}):
+                items = actual_inventory_items(location_id, [sku])
+                for item in items:
+                    actual = item.get("total_inventory_onhand")
+                    expected = expected_on_hand_from_ledger(sku, location_id, ledger)
+                    if actual is None or expected is None:
+                        continue
+                    if is_inventory_corrupted(actual, expected, STOCK_TOLERANCE):
+                        flagged.append((sku, location_id, actual, expected))
+
+    log.info("Found %d SKU/location pair(s) with drift beyond tolerance %d.", len(flagged), STOCK_TOLERANCE)
+
+    corrected = 0
+    for batch in batched(flagged, MAX_ITEMS_PER_ADJUSTMENT_CALL):
+        payload_items = [
+            build_correction_payload(sku, location_id, expected)
+            for (sku, location_id, actual, expected) in batch
+        ]
+        for (sku, location_id, actual, expected) in batch:
+            log.info(
+                "sku=%s location_id=%s actual_on_hand=%s expected_on_hand=%s (%s)",
+                sku, location_id, actual, expected,
+                "dry run" if DRY_RUN else "correcting",
+            )
+        if DRY_RUN:
+            continue
+
+        push_absolute_adjustment(payload_items)
+
+        skus_in_batch = [sku for (sku, _loc, _a, _e) in batch]
+        by_location = {}
+        for (sku, location_id, _actual, expected) in batch:
+            by_location.setdefault(location_id, []).append((sku, expected))
+
+        for location_id, sku_expected in by_location.items():
+            skus = [sku for (sku, _e) in sku_expected]
+            verify_items = actual_inventory_items(location_id, skus)
+            verify_by_sku = {i.get("sku"): i.get("total_inventory_onhand") for i in verify_items}
+            for sku, expected in sku_expected:
+                if verify_by_sku.get(sku) == expected:
+                    corrected += 1
+                else:
+                    log.warning(
+                        "Re-verify failed for sku=%s location_id=%s expected=%s got=%s",
+                        sku, location_id, expected, verify_by_sku.get(sku),
+                    )
+
+    log.info(
+        "Done. %d SKU/location pair(s) %s.",
+        len(flagged), "would be corrected" if DRY_RUN else f"corrected ({corrected} re-verified)",
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        "This script needs job_start_ts and a persisted adjustment ledger from your own "
+        "integration. Import run(job_start_ts, ledger) and call it from your scheduler."
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-concurrent-inventory-drift.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect and repair BigCommerce stock corrupted by concurrent bulk jobs.
+ *
+ * BigCommerce's Inventory API processes absolute and relative adjustments
+ * asynchronously through its own internal queue, and its documentation warns
+ * that running Inventory API bulk operations in parallel with Catalog API or
+ * Orders API bulk operations "may cause unpredictable, incorrect calculation
+ * results." Relative adjustments do a read-modify-write against the current
+ * stored total_inventory_onhand, so a catalog bulk edit that also touches
+ * inventory_level, or an order bulk job decrementing stock, can race an
+ * inventory adjustment job on the same SKU and location and silently clobber
+ * or double-apply it. There is also a documented propagation delay between an
+ * adjustment call returning 200 and the new value being reliably readable via
+ * GET, which widens the race window.
+ *
+ * BigCommerce does not expose a public adjustment audit-trail endpoint, so
+ * this job reconstructs the expected on-hand for each SKU and location from
+ * the integration's own adjustment ledger, compares it against the actual
+ * total_inventory_onhand BigCommerce reports, and pushes a corrective
+ * absolute adjustment only where the two disagree beyond a tolerance. Every
+ * write is re-verified with a fresh GET before the SKU is marked reconciled.
+ * Gate all future inventory and catalog or order bulk jobs behind a single
+ * per-store_hash mutex so this does not happen again.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/concurrent-inventory-catalog-jobs-corrupt-stock/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const STOCK_TOLERANCE = Number(process.env.STOCK_TOLERANCE || 0);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const MAX_ITEMS_PER_ADJUSTMENT_CALL = 2000;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * Returns true (flag for repair) when the actual on-hand BigCommerce
+ * reports differs from the expected on-hand reconstructed from our own
+ * adjustment ledger by more than tolerance. Returns false otherwise.
+ */
+export function isInventoryCorrupted(actualOnHand, expectedOnHand, tolerance = 0) {
+  return Math.abs(actualOnHand - expectedOnHand) &gt; tolerance;
+}
+
+/**
+ * Pure payload builder. No network, no side effects.
+ *
+ * Returns the exact item object the absolute-adjustment request body
+ * expects for one SKU and location.
+ */
+export function buildCorrectionPayload(sku, locationId, expectedOnHand) {
+  return { location_id: locationId, sku, quantity: expectedOnHand };
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function* touchedProducts(jobStartTs) {
+  let page = 1;
+  while (true) {
+    const resp = await bcGet("/catalog/products", {
+      include: "variants",
+      "date_modified:min": jobStartTs,
+      page,
+      limit: 250,
+    });
+    const rows = resp.data || [];
+    if (!rows.length) return;
+    for (const product of rows) yield product;
+    page += 1;
+  }
+}
+
+async function actualInventoryItems(locationId, skus) {
+  if (!skus.length) return [];
+  const resp = await bcGet(`/inventory/locations/${locationId}/items`, { sku__in: skus.join(",") });
+  return resp.data || [];
+}
+
+/**
+ * Reconstruct expected on-hand from our own adjustment log.
+ *
+ * ledger maps a "sku|locationId" key to the expected on-hand, built from a
+ * baseline plus every relative or absolute adjustment this integration
+ * issued during the overlapping window. BigCommerce does not expose a
+ * public adjustment audit-trail endpoint, so this ledger has to be kept by
+ * the integration itself.
+ */
+function expectedOnHandFromLedger(sku, locationId, ledger) {
+  return ledger.get(`${sku}|${locationId}`);
+}
+
+async function pushAbsoluteAdjustment(items) {
+  const body = { reason: "reconciliation-after-concurrent-jobs", items };
+  return bcPut("/inventory/adjustments/absolute", body);
+}
+
+function* batched(seq, size) {
+  for (let i = 0; i &lt; seq.length; i += size) yield seq.slice(i, i + size);
+}
+
+/**
+ * ledger: Map of "sku|locationId" -&gt; expected on-hand number.
+ *
+ * In production this is built from the integration's own persisted
+ * adjustment history, not passed in by hand.
+ */
+export async function run(jobStartTs, ledger) {
+  const flagged = [];
+  const locationIdsBySku = new Map();
+  for (const key of ledger.keys()) {
+    const [sku, locationIdStr] = key.split("|");
+    const locationId = Number(locationIdStr);
+    if (!locationIdsBySku.has(sku)) locationIdsBySku.set(sku, []);
+    locationIdsBySku.get(sku).push(locationId);
+  }
+
+  for await (const product of touchedProducts(jobStartTs)) {
+    const variants = product.variants &amp;&amp; product.variants.length
+      ? product.variants
+      : [{ sku: product.sku, inventory_level: product.inventory_level }];
+
+    for (const variant of variants) {
+      const sku = variant.sku;
+      if (!sku) continue;
+      const locationIds = locationIdsBySku.get(sku) || [];
+      for (const locationId of locationIds) {
+        const items = await actualInventoryItems(locationId, [sku]);
+        for (const item of items) {
+          const actual = item.total_inventory_onhand;
+          const expected = expectedOnHandFromLedger(sku, locationId, ledger);
+          if (actual == null || expected == null) continue;
+          if (isInventoryCorrupted(actual, expected, STOCK_TOLERANCE)) {
+            flagged.push({ sku, locationId, actual, expected });
+          }
+        }
+      }
+    }
+  }
+
+  console.log(`Found ${flagged.length} SKU/location pair(s) with drift beyond tolerance ${STOCK_TOLERANCE}.`);
+
+  let corrected = 0;
+  for (const batch of batched(flagged, MAX_ITEMS_PER_ADJUSTMENT_CALL)) {
+    const payloadItems = batch.map((f) =&gt; buildCorrectionPayload(f.sku, f.locationId, f.expected));
+
+    for (const f of batch) {
+      console.log(
+        `sku=${f.sku} location_id=${f.locationId} actual_on_hand=${f.actual} expected_on_hand=${f.expected} ` +
+        `(${DRY_RUN ? "dry run" : "correcting"})`
+      );
+    }
+    if (DRY_RUN) continue;
+
+    await pushAbsoluteAdjustment(payloadItems);
+
+    const byLocation = new Map();
+    for (const f of batch) {
+      if (!byLocation.has(f.locationId)) byLocation.set(f.locationId, []);
+      byLocation.get(f.locationId).push(f);
+    }
+
+    for (const [locationId, entries] of byLocation) {
+      const skus = entries.map((e) =&gt; e.sku);
+      const verifyItems = await actualInventoryItems(locationId, skus);
+      const verifyBySku = new Map(verifyItems.map((i) =&gt; [i.sku, i.total_inventory_onhand]));
+      for (const e of entries) {
+        if (verifyBySku.get(e.sku) === e.expected) {
+          corrected += 1;
+        } else {
+          console.warn(
+            `Re-verify failed for sku=${e.sku} location_id=${locationId} expected=${e.expected} got=${verifyBySku.get(e.sku)}`
+          );
+        }
+      }
+    }
+  }
+
+  console.log(
+    `Done. ${flagged.length} SKU/location pair(s) ${DRY_RUN ? "would be corrected" : `corrected (${corrected} re-verified)`}.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The corruption decision and the payload shape are the two parts most worth testing, because together they decide whether a real inventory count gets overwritten. Both <code>is_inventory_corrupted</code> and <code>build_correction_payload</code> take only plain values and return plain values, so the tests need no network and no BigCommerce store.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_concurrent_stock_drift.py</div>
+      <pre><code class="language-python">from reconcile_concurrent_inventory_drift import (
+    is_inventory_corrupted,
+    build_correction_payload,
+)
+
+
+def test_not_corrupted_when_actual_matches_expected():
+    assert is_inventory_corrupted(50, 50) is False
+
+
+def test_not_corrupted_within_tolerance():
+    assert is_inventory_corrupted(48, 50, tolerance=2) is False
+
+
+def test_corrupted_when_actual_drifts_above_tolerance():
+    assert is_inventory_corrupted(45, 50, tolerance=2) is True
+
+
+def test_corrupted_when_actual_is_higher_than_expected():
+    assert is_inventory_corrupted(70, 50) is True
+
+
+def test_correction_payload_has_exact_shape():
+    payload = build_correction_payload("SKU-123", 7, 50)
+    assert payload == {"location_id": 7, "sku": "SKU-123", "quantity": 50}
+
+
+def test_correction_payload_uses_expected_on_hand_as_quantity():
+    payload = build_correction_payload("SKU-999", 1, 0)
+    assert payload["quantity"] == 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-concurrent-inventory-drift.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isInventoryCorrupted, buildCorrectionPayload } from "./reconcile-concurrent-inventory-drift.js";
+
+test("not corrupted when actual matches expected", () =&gt; {
+  assert.equal(isInventoryCorrupted(50, 50), false);
+});
+
+test("not corrupted within tolerance", () =&gt; {
+  assert.equal(isInventoryCorrupted(48, 50, 2), false);
+});
+
+test("corrupted when actual drifts above tolerance", () =&gt; {
+  assert.equal(isInventoryCorrupted(45, 50, 2), true);
+});
+
+test("corrupted when actual is higher than expected", () =&gt; {
+  assert.equal(isInventoryCorrupted(70, 50), true);
+});
+
+test("correction payload has exact shape", () =&gt; {
+  const payload = buildCorrectionPayload("SKU-123", 7, 50);
+  assert.deepEqual(payload, { location_id: 7, sku: "SKU-123", quantity: 50 });
+});
+
+test("correction payload uses expected on hand as quantity", () =&gt; {
+  const payload = buildCorrectionPayload("SKU-999", 1, 0);
+  assert.equal(payload.quantity, 0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Nightly import overlap</span>
+      <h4>The store whose nightly product import fought its own inventory sync</h4>
+      <p>A mid-size store ran a nightly catalog import to update pricing and descriptions, and a separate order-driven inventory sync that decremented stock as orders came in. Both jobs happened to overlap for about twenty minutes every night, and both touched inventory_level on the same variants. Staff kept finding SKUs that showed more or less stock than a warehouse count agreed with, with no error anywhere in either job's logs.</p>
+      <p>The reconciliation job ran once against the affected window, rebuilt expected on-hand from the sync's own adjustment log, and found the drift on about three percent of touched SKUs. After pushing the corrections and re-verifying each one, the two jobs were put behind a shared per-store_hash lock so the import always waits for the sync to finish, and the drift never came back.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Bulk order fulfillment</span>
+      <h4>The fulfillment batch that raced a bulk variant relaunch</h4>
+      <p>A merchant relaunched a whole product line's variants in one bulk catalog operation on the same afternoon a large batch of backordered items shipped and decremented stock through the Orders API. Several SKUs ended up showing available_to_sell numbers that did not match what the warehouse had just counted, right on the variants the relaunch had touched.</p>
+      <p>Because the store already logged every adjustment it issued, the reconciliation job could reconstruct the correct expected total for each affected SKU without guessing. It flagged the mismatches, corrected them with a single batched absolute adjustment, and confirmed every one with a fresh GET before calling it done.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After the reconciliation job runs, every SKU and location touched during the overlap window has an actual total_inventory_onhand that matches your own ledger's expected total within tolerance, and every correction that was written has been re-verified with a fresh GET before being marked done. Going forward, the per-store_hash mutex means inventory adjustment jobs and catalog or order bulk jobs simply never run at the same time again, so the race that caused the drift cannot recur.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why do stock totals get corrupted when I run inventory and catalog jobs at the same time?</summary>
+      <p>BigCommerce's Inventory API processes adjustments asynchronously with its own internal queue, and the documentation explicitly warns that running Inventory API bulk operations in parallel with Catalog API or Orders API bulk operations may cause unpredictable, incorrect calculation results. Relative adjustments read the current stored value before writing a new one, so if a catalog bulk edit or an order job touches the same SKU and location in that window, the two writes race on the same counter and one can silently clobber or double-apply the other.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-write a correction the moment I detect drift?</summary>
+      <p>No. Correction should be a serialize-then-reconcile flow, not a blind auto-write, because concurrent absolute and relative adjustments can race in either order and a naive re-apply could double-correct a SKU that has already settled. Recompute the expected on-hand from your own adjustment ledger, push a single absolute adjustment, then re-verify the value before marking the SKU reconciled.</p>
+    </details>
+    <details>
+      <summary>Does BigCommerce expose an audit trail I can use to reconstruct what happened?</summary>
+      <p>No. BigCommerce does not expose a public adjustment audit-trail endpoint, so you cannot ask the platform what sequence of writes produced a given total_inventory_onhand value. You have to keep your own ledger of every relative and absolute adjustment your integration issues, and diff each SKU and location's actual on-hand against that ledger to find drift.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce orders whose transactions total does not match</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: Adjustments (inventory API overview, concurrency caveat). <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments</a></li>
+      <li>BigCommerce Docs: Inventory adjustments (store-operations guide). <a href="https://developer.bigcommerce.com/docs/store-operations/catalog/inventory-adjustments" rel="noopener">developer.bigcommerce.com store-operations inventory adjustments</a></li>
+      <li>BigCommerce Support Community: API to update Inventory. <a href="https://support.bigcommerce.com/s/question/0D54O00007VQ2BNSA1/api-to-update-inventory?language=en_US" rel="noopener">support.bigcommerce.com api to update inventory</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Adjustments (absolute vs relative endpoints, batching, sequencing guidance). <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments</a></li>
+      <li>BigCommerce Developer Center: Inventory (GET locations/{location_id}/items, total_inventory_onhand, available_to_sell fields). <a href="https://developer.bigcommerce.com/buy-online-pick-up-in-store/rest-management/inventory" rel="noopener">developer.bigcommerce.com inventory (BOPIS)</a></li>
+      <li>BigCommerce Docs: Inventory (REST admin management inventory reference). <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/inventory" rel="noopener">docs.bigcommerce.com inventory reference</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop your stock from drifting?</h3>
+    <p>If this caught corrupted counts you would have otherwise found by hand or on a shelf, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

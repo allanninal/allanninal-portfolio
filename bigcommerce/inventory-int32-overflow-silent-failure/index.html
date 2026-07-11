@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Variant Inventory That Silently Fails to Save Past Int32 Max</title>
+<meta name="description" content="BigCommerce's Catalog API stores inventory_level as a 32-bit signed integer and caps the product's summed variant inventory at 2147483647. Past that ceiling, a write returns 200 but never persists. Learn why and build a Python or Node.js check that catches it before the API silently drops it.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Variant Inventory That Silently Fails to Save Past Int32 Max">
+<meta property="og:description" content="Why a BigCommerce inventory_level write past 2147483647 returns 200 but never persists, and a safe Python or Node.js check that predicts and reports the silent failure before it happens.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/#article","headline":"Fix BigCommerce Variant Inventory That Silently Fails to Save Past Int32 Max","description":"BigCommerce's Catalog v3 API stores inventory_level as a 32-bit signed integer with a ceiling of 2147483647, enforced against the product's summed variant inventory. A write that would push the sum over that ceiling returns HTTP 200 but never persists. This is why, how to detect it, and a Python or Node.js check that predicts the silent failure before the write.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory","keywords":"BigCommerce inventory_level, int32 overflow, Catalog v3 API, product variants, inventory adjustments, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Variant inventory sum silently fails to save past int32 max","item":"https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does my BigCommerce inventory_level update return 200 but not actually save?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce stores inventory_level as a 32-bit signed integer, with a hard ceiling of 2147483647, and enforces that ceiling against the product's summed variant inventory, not just the single variant you are writing. When your update would push that sum over the ceiling, the Catalog API declines to persist the new value but still returns a 200 success response, so the stored inventory_level is left exactly where it was before your call."}},{"@type":"Question","name":"Is this the same as a normal validation error I can catch with a try/except?","acceptedAnswer":{"@type":"Answer","text":"No. A validation error would come back as a non-2xx status with an error body you could catch and log. This failure mode returns HTTP 200, the same response shape as a successful write, with no error field indicating anything went wrong. The only way to know the write did not take effect is to re-read the variant after the call and compare it to what you attempted to set."}},{"@type":"Question","name":"Should a script auto-correct an inventory_level that overflowed?","acceptedAnswer":{"@type":"Answer","text":"No, not automatically. A number that large could be a data-entry mistake, a bug in an ERP integration producing a garbage delta, or an intentional aggregate SKU the merchant actually wants tracked at that scale. The safe pattern is to report every mismatch with the attempted and currently persisted values and only clamp to an operator-approved ceiling after a human confirms it, never inferred automatically from the overflowed input."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Inventory</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Inventory</p>
+    <h1>BigCommerce variant inventory sum silently fails to save past int32 max</h1>
+    <p class="lead">You PUT a new inventory_level, BigCommerce answers 200, and the number on the variant does not move. Nothing errors. Nothing warns you. The Catalog API stores inventory_level as a 32-bit signed integer with a ceiling of 2147483647, and it checks that ceiling against the product's summed variant inventory, not just the one variant you touched. Once a write would push that sum over the edge, the platform quietly keeps the old value and tells you everything is fine. Here is why that happens and a small check that catches it before you ever trust the response.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce Catalog v3 API</span>
+      <span class="chip">Report only, no auto-write</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's Catalog v3 API stores inventory_level as a 32-bit signed integer, capped at 2147483647, and it enforces that cap against the product's summed variant inventory. A write via <code>PUT /v3/catalog/products/{id}/variants/{variant_id}</code>, the Update Products batch endpoint, or <code>POST /v3/inventory/adjustments/absolute</code> or <code>/relative</code> that would push that sum past the ceiling does not get clamped and does not get rejected with a validation error. It returns HTTP 200 and simply does not persist the new value. Detect this by re-reading the variant after every write and comparing it to what you attempted to set, and by summing all of a product's variant.inventory_level values and comparing against the parent product's own inventory_level before you ever issue the write. Full code and a pure predicate function are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A 32-bit signed integer maxes out at 2147483647. That is the ceiling BigCommerce's Catalog v3 API uses for inventory_level, on both the product and every one of its variants. Most stores never get near that number on a single SKU. But the cap is not just per variant. BigCommerce also checks the product's summed variant inventory against the same ceiling, so a product with many variants, or one fed by an ERP integration that occasionally emits a garbage-large delta, can hit the wall even when no single variant looks unreasonable on its own.</p>
+  <p>When a write would push that sum over 2147483647, whether it comes through <code>PUT /v3/catalog/products/{product_id}/variants/{variant_id}</code>, the Update Products batch endpoint, or <code>POST /v3/inventory/adjustments/absolute</code> or <code>/relative</code>, the Catalog API does not clamp the value down to the max and does not return a validation error explaining what happened. It returns the same HTTP 200 you would get from a normal successful write, with a response body that looks unremarkable, and the stored inventory_level is left exactly where it was before the call. Nothing in the response tells you the write was dropped.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. An integration sends an inventory update that would push the product's summed variant inventory past 2147483647. BigCommerce returns HTTP 200 but does not persist the new value, so the stored inventory_level stays unchanged and downstream systems believe the write succeeded.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="155" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="87" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Integration sends</text>
+      <text x="87" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">new inventory_level</text>
+      <line x1="168" y1="103" x2="210" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="213" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="293" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Sum exceeds</text>
+      <text x="293" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">2147483647</text>
+      <line x1="376" y1="103" x2="445" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Write dropped</text>
+      <rect x="448" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">HTTP 200</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">value unchanged</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Systems believe</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">it succeeded</text>
+      <line x1="611" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The API replies exactly like a successful write. The stored inventory_level never moved, and nothing in the response says why.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The ceiling is a storage-format limit, not a business rule, and BigCommerce applies it at more than one layer:</p>
+  <ul>
+    <li>inventory_level is stored as a 32-bit signed integer on both the product and each variant, so the theoretical per-field max is 2147483647. Anything at or above that on a single field is already out of range.</li>
+    <li>BigCommerce additionally checks the product's summed variant inventory against the same ceiling, so a product with many variants can hit the limit collectively even when each variant's individual inventory_level looks ordinary.</li>
+    <li>An ERP or PIM integration that miscalculates a delta, for example applying a unit conversion twice or misreading a field as an absolute value instead of a relative adjustment, can generate a single write large enough to push the sum over the edge in one call.</li>
+    <li>The write path matters less than the resulting number. <code>PUT /v3/catalog/products/{product_id}/variants/{variant_id}</code>, the Update Products batch endpoint, and <code>POST /v3/inventory/adjustments/absolute</code> or <code>/relative</code> all funnel into the same stored field and the same ceiling check.</li>
+    <li>Because the response is a normal 200 with no error field, nothing in a typical integration's error handling gets triggered. The failure is invisible unless you go looking for it by re-reading the value.</li>
+  </ul>
+  <p>Merchants asking how to reliably read variant stock levels have run into the gap between what the API reports success on and what actually persisted; see the citations at the end for the exact docs and support threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>HTTP 200 from BigCommerce's Catalog API does not mean your value was saved. It only means the request was well formed. The only proof a write took effect is re-reading the variant afterward and comparing it to what you sent. And because the ceiling applies to the summed variant inventory, not just the field you touched, you can predict the failure before you ever call the API: fetch every other variant's current inventory_level, add the new value you are about to write, and check that sum against 2147483647 first.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how BigCommerce stores or caps inventory_level. We add a pure predicate that runs before every write, using the pre-fetched inventory levels of every other variant on the product, and we verify after every write by re-reading the variant. Anything the predicate flags, or anything the post-write re-read shows unchanged, gets reported. Nothing is auto-corrected.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Before writing, the script sums the other variants' inventory levels plus the proposed new value and checks it against int32 max. If it would overflow, the write is skipped and reported. If it looks safe, the write proceeds and the script re-reads the variant afterward to confirm the value actually changed, reporting anything that still does not match.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List variants</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">GET current levels</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Compute projected sum</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">others + new_level</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="580,106 667,138 580,170 493,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="580" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Sum over</text>
+      <text x="580" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">2147483647?</text>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#cf4b3f" font-weight="700">yes, skip write and report</text>
+      <line x1="580" y1="170" x2="580" y2="205" stroke="#cf4b3f" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="670" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no</text>
+      <line x1="667" y1="138" x2="695" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="623" y="185" width="132" height="45" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="212" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Report mismatch</text>
+      <rect x="90" y="185" width="185" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="182" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Write, then re-GET</text>
+      <text x="182" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">confirm value changed</text>
+      <path d="M695,138 C740,138 740,213 758,213" fill="none" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></path>
+      <path d="M267,138 C260,138 210,150 182,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The predicate runs before the write and needs no network access. The re-read after the write catches anything the predicate could not see coming, like stale list-cache reads.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Products (modify) scope so it can read variants and write inventory_level. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the Catalog v3 REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. V3 responses wrap the payload in <code>{data, meta.pagination}</code>. A small helper handles GET and PUT and raises on a non-2xx response. We reuse it to list variants, read the parent product, and write an inventory_level.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List every variant's current inventory_level</h3>
+      <p>Call <code>GET /v3/catalog/products/{product_id}/variants</code> paginated with <code>limit=250</code> and <code>include_fields=id,sku,inventory_level</code>, so the predicate has the current level of every variant on the product. Separately call <code>GET /v3/catalog/products/{product_id}?include=variants</code> to read the parent's own inventory_level, since a mismatch between the two is itself a signal a past write was silently dropped.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def list_variants(product_id):
+    page = 1
+    variants = []
+    while True:
+        resp = bc_get(f"/catalog/products/{product_id}/variants", {
+            "limit": 250,
+            "page": page,
+            "include_fields": "id,sku,inventory_level",
+        })
+        rows = resp.get("data", [])
+        if not rows:
+            return variants
+        variants.extend(rows)
+        page += 1
+
+def get_product_inventory_level(product_id):
+    resp = bc_get(f"/catalog/products/{product_id}", {"include": "variants"})
+    return resp["data"]["inventory_level"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function listVariants(productId) {
+  const variants = [];
+  let page = 1;
+  while (true) {
+    const resp = await bcGet(`/catalog/products/${productId}/variants`, {
+      limit: 250,
+      page,
+      include_fields: "id,sku,inventory_level",
+    });
+    const rows = resp.data || [];
+    if (!rows.length) return variants;
+    variants.push(...rows);
+    page += 1;
+  }
+}
+
+async function getProductInventoryLevel(productId) {
+  const resp = await bcGet(`/catalog/products/${productId}`, { include: "variants" });
+  return resp.data.inventory_level;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Predict the silent failure with one pure function</h3>
+      <p>Before ever writing, sum every other variant's inventory_level, add the new value you are about to set on the target variant, and compare that projected sum to int32 max. This function takes only plain values, the pre-fetched list of (id, level) tuples, the target variant_id, and the proposed new_level, so it needs no network access and is fully testable on its own.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">predicate.py</div>
+      <pre><code class="language-python">from typing import NamedTuple
+
+INT32_MAX = 2147483647
+
+class VariantLevel(NamedTuple):
+    id: int
+    level: int
+
+def would_overflow_and_be_dropped(
+    current_variant_levels: list, variant_id: int, new_level: int, int32_max: int = INT32_MAX
+):
+    total_excluding_target = sum(
+        v.level for v in current_variant_levels if v.id != variant_id
+    )
+    projected_sum = total_excluding_target + new_level
+    is_unsafe = projected_sum &gt; int32_max or new_level &gt; int32_max
+    return is_unsafe, projected_sum</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">predicate.js</div>
+      <pre><code class="language-javascript">const INT32_MAX = 2147483647;
+
+function wouldOverflowAndBeDropped(currentVariantLevels, variantId, newLevel, int32Max = INT32_MAX) {
+  const totalExcludingTarget = currentVariantLevels
+    .filter((v) =&gt; v.id !== variantId)
+    .reduce((sum, v) =&gt; sum + v.level, 0);
+  const projectedSum = totalExcludingTarget + newLevel;
+  const isUnsafe = projectedSum &gt; int32Max || newLevel &gt; int32Max;
+  return [isUnsafe, projectedSum];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Write, then re-GET to confirm it actually took effect</h3>
+      <p>When the predicate says the write is safe, issue it with <code>PUT /v3/catalog/products/{product_id}/variants/{variant_id}</code> and body <code>{"inventory_level": new_level}</code>, or <code>POST /v3/inventory/adjustments/absolute</code> for a bulk adjustment. Then re-GET the same variant directly, not from a cached list response, and compare. If the stored inventory_level still equals the value from before the call while the API returned 200, the write was silently dropped and belongs in the report, regardless of what the predicate said, since stale list-cache reads can mask the same symptom.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def get_variant(product_id, variant_id):
+    resp = bc_get(f"/catalog/products/{product_id}/variants/{variant_id}")
+    return resp["data"]
+
+def write_variant_inventory_level(product_id, variant_id, new_level):
+    return bc_put(
+        f"/catalog/products/{product_id}/variants/{variant_id}",
+        {"inventory_level": new_level},
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function getVariant(productId, variantId) {
+  const resp = await bcGet(`/catalog/products/${productId}/variants/${variantId}`);
+  return resp.data;
+}
+
+async function writeVariantInventoryLevel(productId, variantId, newLevel) {
+  return bcPut(`/catalog/products/${productId}/variants/${variantId}`, {
+    inventory_level: newLevel,
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard, report only</h3>
+      <p>The loop ties every piece together. On the first few runs, leave <code>DRY_RUN</code> on so the script only reports each <code>{product_id, variant_id, sku, attempted_inventory_level, current_persisted_inventory_level, projected_sum}</code> it would flag, whether the predicate caught it ahead of time or the post-write re-read caught it after. Nothing is auto-corrected, even with DRY_RUN off. A separate, explicit clamp flag exists for a human to invoke on purpose, never inferred automatically from the overflowed input.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and treat every flagged mismatch as a question for the merchant, not an answer to compute yourself. A number large enough to overflow int32 could be a genuine mistake or a deliberate aggregate SKU, and only a human can tell which.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, predicts the overflow before writing whenever possible, verifies with a re-read after every write, and only reports mismatches. It never guesses at a corrected value on its own.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/inventory-int32-overflow-silent-failure" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">check_inventory_overflow.py</div>
+      <pre><code class="language-python">"""Detect BigCommerce variant inventory writes that silently fail past int32 max.
+
+BigCommerce's Catalog v3 API stores inventory_level as a 32-bit signed integer
+with a ceiling of 2147483647, and it enforces that ceiling against the product's
+summed variant inventory, not just the single variant being written. A write via
+PUT /v3/catalog/products/{id}/variants/{variant_id}, the Update Products batch
+endpoint, or POST /v3/inventory/adjustments/absolute|relative that would push that
+sum over the ceiling does not get clamped and does not return a validation error.
+It returns HTTP 200 and the stored inventory_level is left unchanged. This job
+predicts the overflow before writing using only pre-fetched variant levels (no
+network call needed for the decision itself), and after every write it re-reads
+the same variant directly to confirm the value actually changed. Everything it
+finds is reported, nothing is auto-corrected. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/
+"""
+import os
+import logging
+from typing import NamedTuple
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("check_inventory_overflow")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+INT32_MAX = 2147483647
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+class VariantLevel(NamedTuple):
+    id: int
+    level: int
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def would_overflow_and_be_dropped(
+    current_variant_levels: list, variant_id: int, new_level: int, int32_max: int = INT32_MAX
+):
+    """Pure decision. No network, no side effects.
+
+    total_excluding_target = sum of every other variant's inventory_level.
+    projected_sum = total_excluding_target + new_level.
+    is_unsafe when projected_sum exceeds int32_max, or when new_level alone
+    already exceeds int32_max. Returns (is_unsafe, projected_sum) so the caller
+    can log the projected total whether or not it is unsafe.
+    """
+    total_excluding_target = sum(
+        v.level for v in current_variant_levels if v.id != variant_id
+    )
+    projected_sum = total_excluding_target + new_level
+    is_unsafe = projected_sum &gt; int32_max or new_level &gt; int32_max
+    return is_unsafe, projected_sum
+
+
+def list_variants(product_id):
+    page = 1
+    variants = []
+    while True:
+        resp = bc_get(
+            f"/catalog/products/{product_id}/variants",
+            {"limit": 250, "page": page, "include_fields": "id,sku,inventory_level"},
+        )
+        rows = resp.get("data", [])
+        if not rows:
+            return variants
+        variants.extend(rows)
+        page += 1
+
+
+def get_variant(product_id, variant_id):
+    resp = bc_get(f"/catalog/products/{product_id}/variants/{variant_id}")
+    return resp["data"]
+
+
+def write_variant_inventory_level(product_id, variant_id, new_level):
+    return bc_put(
+        f"/catalog/products/{product_id}/variants/{variant_id}",
+        {"inventory_level": new_level},
+    )
+
+
+def check_and_apply(product_id, variant_id, sku, new_level):
+    """Predict, then write if safe, then re-read to confirm. Returns a report dict or None."""
+    variants = list_variants(product_id)
+    levels = [VariantLevel(id=v["id"], level=v.get("inventory_level") or 0) for v in variants]
+
+    before = get_variant(product_id, variant_id)
+    current_persisted = before.get("inventory_level")
+
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id, new_level)
+
+    if is_unsafe:
+        log.warning(
+            "Predicted overflow: product_id=%s variant_id=%s sku=%s "
+            "attempted=%s current=%s projected_sum=%s",
+            product_id, variant_id, sku, new_level, current_persisted, projected_sum,
+        )
+        return {
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "sku": sku,
+            "attempted_inventory_level": new_level,
+            "current_persisted_inventory_level": current_persisted,
+            "projected_sum": projected_sum,
+        }
+
+    if DRY_RUN:
+        log.info(
+            "Dry run, would write: product_id=%s variant_id=%s sku=%s "
+            "attempted=%s current=%s projected_sum=%s",
+            product_id, variant_id, sku, new_level, current_persisted, projected_sum,
+        )
+        return None
+
+    write_variant_inventory_level(product_id, variant_id, new_level)
+    after = get_variant(product_id, variant_id)
+
+    if after.get("inventory_level") == current_persisted and new_level != current_persisted:
+        log.warning(
+            "Silent failure detected: product_id=%s variant_id=%s sku=%s "
+            "attempted=%s current=%s (unchanged after 200 response) projected_sum=%s",
+            product_id, variant_id, sku, new_level, current_persisted, projected_sum,
+        )
+        return {
+            "product_id": product_id,
+            "variant_id": variant_id,
+            "sku": sku,
+            "attempted_inventory_level": new_level,
+            "current_persisted_inventory_level": after.get("inventory_level"),
+            "projected_sum": projected_sum,
+        }
+
+    return None
+
+
+def run(pending_writes):
+    """pending_writes: iterable of (product_id, variant_id, sku, new_level)."""
+    reports = []
+    for product_id, variant_id, sku, new_level in pending_writes:
+        report = check_and_apply(product_id, variant_id, sku, new_level)
+        if report:
+            reports.append(report)
+
+    log.info("Done. %d mismatch(es) reported.", len(reports))
+    return reports
+
+
+if __name__ == "__main__":
+    run([])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">check-inventory-overflow.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect BigCommerce variant inventory writes that silently fail past int32 max.
+ *
+ * BigCommerce's Catalog v3 API stores inventory_level as a 32-bit signed integer
+ * with a ceiling of 2147483647, and it enforces that ceiling against the product's
+ * summed variant inventory, not just the single variant being written. A write via
+ * PUT /v3/catalog/products/{id}/variants/{variant_id}, the Update Products batch
+ * endpoint, or POST /v3/inventory/adjustments/absolute|relative that would push
+ * that sum over the ceiling does not get clamped and does not return a validation
+ * error. It returns HTTP 200 and the stored inventory_level is left unchanged.
+ * This job predicts the overflow before writing using only pre-fetched variant
+ * levels (no network call needed for the decision itself), and after every write
+ * it re-reads the same variant directly to confirm the value actually changed.
+ * Everything it finds is reported, nothing is auto-corrected.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/inventory-int32-overflow-silent-failure/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const INT32_MAX = 2147483647;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * totalExcludingTarget = sum of every other variant's level.
+ * projectedSum = totalExcludingTarget + newLevel.
+ * isUnsafe when projectedSum exceeds int32Max, or when newLevel alone already
+ * exceeds int32Max. Returns [isUnsafe, projectedSum] so the caller can log the
+ * projected total whether or not it is unsafe.
+ */
+export function wouldOverflowAndBeDropped(currentVariantLevels, variantId, newLevel, int32Max = INT32_MAX) {
+  const totalExcludingTarget = currentVariantLevels
+    .filter((v) =&gt; v.id !== variantId)
+    .reduce((sum, v) =&gt; sum + v.level, 0);
+  const projectedSum = totalExcludingTarget + newLevel;
+  const isUnsafe = projectedSum &gt; int32Max || newLevel &gt; int32Max;
+  return [isUnsafe, projectedSum];
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function listVariants(productId) {
+  const variants = [];
+  let page = 1;
+  while (true) {
+    const resp = await bcGet(`/catalog/products/${productId}/variants`, {
+      limit: 250,
+      page,
+      include_fields: "id,sku,inventory_level",
+    });
+    const rows = resp.data || [];
+    if (!rows.length) return variants;
+    variants.push(...rows);
+    page += 1;
+  }
+}
+
+async function getVariant(productId, variantId) {
+  const resp = await bcGet(`/catalog/products/${productId}/variants/${variantId}`);
+  return resp.data;
+}
+
+async function writeVariantInventoryLevel(productId, variantId, newLevel) {
+  return bcPut(`/catalog/products/${productId}/variants/${variantId}`, {
+    inventory_level: newLevel,
+  });
+}
+
+async function checkAndApply(productId, variantId, sku, newLevel) {
+  const variants = await listVariants(productId);
+  const levels = variants.map((v) =&gt; ({ id: v.id, level: v.inventory_level || 0 }));
+
+  const before = await getVariant(productId, variantId);
+  const currentPersisted = before.inventory_level;
+
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, variantId, newLevel);
+
+  if (isUnsafe) {
+    console.warn(
+      `Predicted overflow: product_id=${productId} variant_id=${variantId} sku=${sku} ` +
+      `attempted=${newLevel} current=${currentPersisted} projected_sum=${projectedSum}`
+    );
+    return {
+      product_id: productId,
+      variant_id: variantId,
+      sku,
+      attempted_inventory_level: newLevel,
+      current_persisted_inventory_level: currentPersisted,
+      projected_sum: projectedSum,
+    };
+  }
+
+  if (DRY_RUN) {
+    console.log(
+      `Dry run, would write: product_id=${productId} variant_id=${variantId} sku=${sku} ` +
+      `attempted=${newLevel} current=${currentPersisted} projected_sum=${projectedSum}`
+    );
+    return null;
+  }
+
+  await writeVariantInventoryLevel(productId, variantId, newLevel);
+  const after = await getVariant(productId, variantId);
+
+  if (after.inventory_level === currentPersisted &amp;&amp; newLevel !== currentPersisted) {
+    console.warn(
+      `Silent failure detected: product_id=${productId} variant_id=${variantId} sku=${sku} ` +
+      `attempted=${newLevel} current=${currentPersisted} (unchanged after 200 response) projected_sum=${projectedSum}`
+    );
+    return {
+      product_id: productId,
+      variant_id: variantId,
+      sku,
+      attempted_inventory_level: newLevel,
+      current_persisted_inventory_level: after.inventory_level,
+      projected_sum: projectedSum,
+    };
+  }
+
+  return null;
+}
+
+export async function run(pendingWrites) {
+  const reports = [];
+  for (const [productId, variantId, sku, newLevel] of pendingWrites) {
+    const report = await checkAndApply(productId, variantId, sku, newLevel);
+    if (report) reports.push(report);
+  }
+
+  console.log(`Done. ${reports.length} mismatch(es) reported.`);
+  return reports;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run([]).catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The predicate is the part most worth testing, because it decides whether a write is even attempted. Because <code>would_overflow_and_be_dropped</code> takes only plain values, a list of (id, level) tuples, a target variant_id, and a new_level, the test needs no network and no BigCommerce store. It just feeds in plain values and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_inventory_overflow_predicate.py</div>
+      <pre><code class="language-python">from check_inventory_overflow import would_overflow_and_be_dropped, VariantLevel
+
+INT32_MAX = 2147483647
+
+
+def test_safe_when_sum_is_well_under_max():
+    levels = [VariantLevel(id=1, level=100), VariantLevel(id=2, level=200)]
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id=2, new_level=300)
+    assert is_unsafe is False
+    assert projected_sum == 400
+
+
+def test_unsafe_when_projected_sum_exceeds_int32_max():
+    levels = [VariantLevel(id=1, level=2000000000), VariantLevel(id=2, level=100)]
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id=2, new_level=500000000)
+    assert is_unsafe is True
+    assert projected_sum == 2500000000
+
+
+def test_unsafe_when_new_level_alone_exceeds_int32_max():
+    levels = [VariantLevel(id=1, level=0)]
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id=1, new_level=INT32_MAX + 1)
+    assert is_unsafe is True
+    assert projected_sum == INT32_MAX + 1
+
+
+def test_safe_at_exactly_int32_max():
+    levels = [VariantLevel(id=1, level=0)]
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id=1, new_level=INT32_MAX)
+    assert is_unsafe is False
+    assert projected_sum == INT32_MAX
+
+
+def test_excludes_target_variant_current_level_from_the_sum():
+    levels = [VariantLevel(id=1, level=INT32_MAX), VariantLevel(id=2, level=50)]
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id=1, new_level=10)
+    assert is_unsafe is False
+    assert projected_sum == 60
+
+
+def test_other_variants_pushing_sum_over_max_is_unsafe():
+    levels = [VariantLevel(id=1, level=INT32_MAX - 10), VariantLevel(id=2, level=0)]
+    is_unsafe, projected_sum = would_overflow_and_be_dropped(levels, variant_id=2, new_level=11)
+    assert is_unsafe is True
+    assert projected_sum == INT32_MAX + 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">check-inventory-overflow.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { wouldOverflowAndBeDropped } from "./check-inventory-overflow.js";
+
+const INT32_MAX = 2147483647;
+
+test("safe when sum is well under max", () =&gt; {
+  const levels = [{ id: 1, level: 100 }, { id: 2, level: 200 }];
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, 2, 300);
+  assert.equal(isUnsafe, false);
+  assert.equal(projectedSum, 400);
+});
+
+test("unsafe when projected sum exceeds int32 max", () =&gt; {
+  const levels = [{ id: 1, level: 2000000000 }, { id: 2, level: 100 }];
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, 2, 500000000);
+  assert.equal(isUnsafe, true);
+  assert.equal(projectedSum, 2500000000);
+});
+
+test("unsafe when new level alone exceeds int32 max", () =&gt; {
+  const levels = [{ id: 1, level: 0 }];
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, 1, INT32_MAX + 1);
+  assert.equal(isUnsafe, true);
+  assert.equal(projectedSum, INT32_MAX + 1);
+});
+
+test("safe at exactly int32 max", () =&gt; {
+  const levels = [{ id: 1, level: 0 }];
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, 1, INT32_MAX);
+  assert.equal(isUnsafe, false);
+  assert.equal(projectedSum, INT32_MAX);
+});
+
+test("excludes target variant current level from the sum", () =&gt; {
+  const levels = [{ id: 1, level: INT32_MAX }, { id: 2, level: 50 }];
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, 1, 10);
+  assert.equal(isUnsafe, false);
+  assert.equal(projectedSum, 60);
+});
+
+test("other variants pushing sum over max is unsafe", () =&gt; {
+  const levels = [{ id: 1, level: INT32_MAX - 10 }, { id: 2, level: 0 }];
+  const [isUnsafe, projectedSum] = wouldOverflowAndBeDropped(levels, 2, 11);
+  assert.equal(isUnsafe, true);
+  assert.equal(projectedSum, INT32_MAX + 1);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">ERP double-conversion bug</span>
+      <h4>The integration that applied a unit conversion twice</h4>
+      <p>A store synced inventory from an ERP that tracked stock in individual units but occasionally sent a bulk-pack quantity multiplied by a case size that had already been applied upstream. Most SKUs looked fine. One aggregate warehouse SKU, fed a doubled conversion on a promotional run, produced a write large enough to push its variant sum past 2147483647.</p>
+      <p>The integration's own logs showed a clean 200 response and moved on. The merchant only noticed weeks later when a stock report looked stale. Running the predicate against the ERP's proposed value before the write would have caught it at the source, and the post-write re-read would have caught it even if the predicate had been skipped.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Many-variant product</span>
+      <h4>The product where no single variant looked unusual</h4>
+      <p>A configurable product had several dozen variants, each with an ordinary-looking inventory_level in the low thousands. A batch restock event pushed one variant's count up substantially as part of a larger warehouse consolidation. Individually the number was unremarkable. Summed against every sibling variant on the same product, it crossed the ceiling.</p>
+      <p>Because the check sums every other variant's current level before proposing the write, it caught this even though no one field, taken alone, looked like a problem. The report gave the merchant the exact projected sum, so they could decide whether the consolidation number was correct or needed correcting upstream.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs before and after every inventory write, a write that would silently fail gets caught before it is even attempted, with the exact projected sum in the log. Anything that still slips through gets caught by the post-write re-read instead of surfacing weeks later as a stale stock report. Every flagged mismatch is a question for a human, with the attempted value, the currently persisted value, and the projected sum right there, never a guess an automated script made on its own.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does my BigCommerce inventory_level update return 200 but not actually save?</summary>
+      <p>BigCommerce stores inventory_level as a 32-bit signed integer, with a hard ceiling of 2147483647, and enforces that ceiling against the product's summed variant inventory, not just the single variant you are writing. When your update would push that sum over the ceiling, the Catalog API declines to persist the new value but still returns a 200 success response, so the stored inventory_level is left exactly where it was before your call.</p>
+    </details>
+    <details>
+      <summary>Is this the same as a normal validation error I can catch with a try/except?</summary>
+      <p>No. A validation error would come back as a non-2xx status with an error body you could catch and log. This failure mode returns HTTP 200, the same response shape as a successful write, with no error field indicating anything went wrong. The only way to know the write did not take effect is to re-read the variant after the call and compare it to what you attempted to set.</p>
+    </details>
+    <details>
+      <summary>Should a script auto-correct an inventory_level that overflowed?</summary>
+      <p>No, not automatically. A number that large could be a data-entry mistake, a bug in an ERP integration producing a garbage delta, or an intentional aggregate SKU the merchant actually wants tracked at that scale. The safe pattern is to report every mismatch with the attempted and currently persisted values and only clamp to an operator-approved ceiling after a human confirms it, never inferred automatically from the overflowed input.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: the Product Variants API reference and the inventory_level field. <a href="https://developer.bigcommerce.com/docs/rest-catalog/product-variants" rel="noopener">developer.bigcommerce.com product variants</a></li>
+      <li>bigcommerce/docs on GitHub: the Catalog v3 product-variants YAML schema definition. <a href="https://github.com/bigcommerce/docs/blob/main/reference/catalog/product-variants_catalog.v3.yml" rel="noopener">github.com bigcommerce/docs product-variants_catalog.v3.yml</a></li>
+      <li>BigCommerce Help Center: a merchant asking how to reliably read variant stock levels. <a href="https://support.bigcommerce.com/s/question/0D54O00006Rlk72SAB/is-there-any-way-to-get-variant-stock-level?language=en_US" rel="noopener">support.bigcommerce.com is there any way to get variant stock level</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: the Inventory Adjustments endpoint, absolute and relative. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments</a></li>
+      <li>BigCommerce API Reference: the Inventory management endpoints. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/inventory" rel="noopener">docs.bigcommerce.com inventory</a></li>
+      <li>BigCommerce API Reference: Create Product Variant, the inventory_level field on write. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/catalog/product-variants/create-product-variant" rel="noopener">docs.bigcommerce.com create product variant</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silent inventory failure?</h3>
+    <p>If this saved you from a stock count quietly drifting out of sync, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

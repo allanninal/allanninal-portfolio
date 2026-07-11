@@ -1,0 +1,910 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Brand Update Immediately Before Product Create Returns Empty Reply</title>
+<meta name="description" content="A BigCommerce brand PUT fired right before a product POST sometimes comes back as an empty reply with no status code. Learn why the connection drops and build a Python or Node.js script that reconciles the pair and safely retries only when it is safe.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Brand Update Immediately Before Product Create Returns Empty Reply">
+<meta property="og:description" content="Why a brand update fired right before a product create can come back as an empty reply, and a safe Python or Node.js script that reconciles the pair and only retries the create when it is idempotently safe.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/#article","headline":"Fix BigCommerce Brand Update Immediately Before Product Create Returns Empty Reply","description":"Why a brand PUT fired immediately before a product POST can come back as an empty reply from server with no status code or body, and a safe Python or Node.js script that reconciles the pair against real catalog state and only retries the create when it is idempotently safe.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Catalog / Products","keywords":"BigCommerce empty reply from server, brand update race condition, product create, rate limit, X-Rate-Limit-Requests-Left, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Brand update immediately before product create returns empty reply","item":"https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a brand update right before a product create return an empty reply from server?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce enforces a per-store request quota and a concurrency cap. When a brand PUT is fired immediately before a product POST, the store's connection can close before the response headers or body finish sending, which HTTP clients like cURL surface as a generic empty reply instead of a structured 429 or 500. The underlying mutation may have actually succeeded server-side even though the client never received a parsable response."}},{"@type":"Question","name":"Is it safe to just retry the product create after an empty reply?","acceptedAnswer":{"@type":"Answer","text":"Not blindly. First confirm the brand update actually applied with a GET on the brand, then GET the products endpoint filtered by name and brand_id (or sku) to check whether the product already exists from the failed attempt. Only POST again if it is absent, the brand update is confirmed, and the rate limit has recovered or a backoff has elapsed. Resubmitting without that check risks a duplicate product."}},{"@type":"Question","name":"How do I tell a rate limit problem from a genuine outage?","acceptedAnswer":{"@type":"Answer","text":"Inspect the X-Rate-Limit-Requests-Left and X-Rate-Limit-Time-Reset-Ms headers on the calls immediately before and after the failure. Requests-Left near zero corroborates a rate-limit-adjacent cause. If the quota still had headroom and the empty reply persists, treat it as a possible outage and fall back to the fixed exponential backoff instead of retrying immediately."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Catalog / Products</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Catalog / Products</p>
+    <h1>BigCommerce brand update immediately before product create returns empty reply</h1>
+    <p class="lead">You PUT an update to a brand, then POST a new product against it right away, and the client comes back with nothing. No status code, no JSON, just "Empty reply from server." BigCommerce's rate limit and concurrency cap can close the connection mid-response when the two calls land back to back, and the brand update or the product create may have actually gone through on BigCommerce's side even though your script never saw a usable answer. Here is why that gap opens up and a small script that reconciles the pair against real catalog state instead of guessing.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Catalog API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce enforces a per-store request quota (150 to 450 requests per 30 second OAuth window, depending on plan) and a concurrency cap, normally surfaced as a structured 429 with <code>X-Rate-Limit-Requests-Left</code> and <code>X-Rate-Limit-Time-Reset-Ms</code> headers. But when a brand <code>PUT /v3/catalog/brands/{id}</code> fires immediately before a product <code>POST /v3/catalog/products</code>, the store's connection sometimes closes before the response finishes, and cURL-based HTTP clients report that as a generic empty reply instead of a real error. This is a confirmed, reproduced issue in BigCommerce's own PHP SDK repo. You cannot fix this from the failed response itself, because there is no response. Instead, log every (brand update, product create) pair, then reconcile: GET the brand to confirm the update applied, GET the products list filtered by name and brand_id to check whether the create actually landed, and only retry the create when it is idempotently safe to do so. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce's Management API is not unlimited. Every store on every plan has a request quota inside a rolling 30 second OAuth window, somewhere between 150 and 450 requests depending on plan, plus a cap on how many requests can be in flight at once. Cross that line and BigCommerce is supposed to hand back a 429 with the two headers that tell you exactly how much room is left and how long until the window resets.</p>
+  <p>The trouble shows up in a specific, narrow case. You send a brand update, <code>PUT /v3/catalog/brands/{id}</code>, and immediately after, without any pause, you send a product create, <code>POST /v3/catalog/products</code>, referencing that brand. Fired back to back like that, the store's connection can close before the response headers and body finish being written out. Your HTTP client never gets a structured error to parse. It gets nothing, which cURL and the SDKs built on top of it report as "Empty reply from server." No status code. No JSON body. No signal about which of the two calls, if either, actually succeeded.</p>
+  <p>This is not a hunch. BigCommerce's own engineering team reproduced and confirmed this exact failure in the bigcommerce-api-php SDK's issue tracker: firing those two calls back to back is intermittent, reordering them (create the product first, then update the brand) or adding a short delay between calls avoids it. And critically, the mutation that appeared to fail may have actually completed on BigCommerce's side. Your client just never got told.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A brand update PUT is fired, then a product create POST is fired immediately after with no delay, and the store connection closes before the response finishes, so the client sees an empty reply from server with no status code, while the mutation may have actually succeeded server side.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">PUT brand</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">/v3/catalog/brands/{id}</text>
+      <line x1="163" y1="103" x2="205" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <text x="184" y="90" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#8a93a8">no delay</text>
+      <rect x="208" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="288" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">POST product</text>
+      <text x="288" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">/v3/catalog/products</text>
+      <line x1="371" y1="103" x2="440" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="405" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="405" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Connection closes</text>
+      <rect x="443" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="94" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Empty reply</text>
+      <text x="523" y="112" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">from server</text>
+      <rect x="628" y="70" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Which one</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">succeeded?</text>
+      <line x1="606" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>No status code, no body, just a dropped connection. The brand update, the product create, both, or neither may have actually gone through on BigCommerce's side.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few things stack up to cause this specific failure mode:</p>
+  <ul>
+    <li>BigCommerce's per-store rate limit is a rolling 30 second OAuth window with a fixed request quota (150 to 450 depending on plan) and a separate concurrency cap on simultaneous in-flight requests. Firing two mutating calls back to back can trip either limit.</li>
+    <li>When the limit is tripped in this specific window, the observed failure is not always a clean 429. The connection can close mid-response, which cURL and cURL-based HTTP clients (including many SDKs) surface as "Empty reply from server" rather than any parsable HTTP status.</li>
+    <li>An empty reply carries no <code>X-Rate-Limit-Requests-Left</code> or <code>X-Rate-Limit-Time-Reset-Ms</code> headers, because there is no response to read them from. The only way to correlate the failure with rate limiting is to look at the headers on the calls immediately before and after it.</li>
+    <li>The mutation itself, brand update or product create, is not guaranteed to have failed just because the client got nothing back. BigCommerce engineering confirmed in bigcommerce-api-php issue #138 that this exact pairing is intermittent, and that reordering the calls or adding a delay avoids it, which points at a timing and load issue rather than a hard rejection of the request itself.</li>
+  </ul>
+  <p>Because the failure is transport-level with no body, you cannot inspect the failed response to learn anything. You have to look at the actual catalog state afterward. See the citations at the end for the exact issue thread and API rate limit docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>An empty reply is not proof of failure, and it is not proof of success either. It is proof of nothing. So the safe pattern is not "assume it failed and retry" and not "assume it succeeded and move on." It is "go check." For each (brand update, product create) pair fired within a short window, GET the brand to confirm the update actually applied, then GET the products list filtered by name and brand_id (or sku) to see whether the create landed. Only retry the create when the brand update is confirmed, the product is confirmed absent, and the rate limit has recovered or a backoff has elapsed. Anything murkier gets flagged for a human, never auto-repaired.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live checkout or the catalog write path. We add a reconciler that takes the logged (brand update, product create) pairs, checks real catalog state for each, and only retries the create when every safety condition lines up.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. A reconciler reads a logged pair of brand update and product create calls, confirms whether the brand update applied and whether the product already exists, and only retries the product create when the brand is confirmed, the product is absent, and the rate limit has recovered, otherwise it flags the pair for manual review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Logged pair</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">brand update + product create</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">GET the brand</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">confirm the update applied</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="200" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="360" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">GET products</text>
+      <text x="360" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">by name + brand_id</text>
+      <line x1="460" y1="138" x2="502" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="595,106 682,138 595,170 508,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="595" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Brand ok, product</text>
+      <text x="595" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">missing, quota ok?</text>
+      <text x="685" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="682" y1="138" x2="710" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="600" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, flag for review</text>
+      <line x1="595" y1="170" x2="595" y2="215" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="10" y="200" width="205" height="50" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="112" y="222" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Manual review</text>
+      <text x="112" y="238" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">stale brand or field mismatch</text>
+      <path d="M508,170 C400,215 300,225 218,225" fill="none" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></path>
+      <rect x="638" y="188" width="112" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="694" y="211" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Retry create</text>
+      <text x="694" y="228" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">idempotent, backed off</text>
+      <path d="M710,138 C730,138 704,150 704,186" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The reconciler only retries the create when the brand is confirmed updated, the product is confirmed absent, and the rate limit budget or backoff supports another call. Anything else goes to a human.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Products (modify) scope so it can read and write catalog data. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Catalog REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and POST, reads back the <code>X-Rate-Limit-Requests-Left</code> and <code>X-Rate-Limit-Time-Reset-Ms</code> headers on every response, and raises on a non-2xx status so a real error never gets confused with an empty reply.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    rate_limit_left = int(r.headers.get("X-Rate-Limit-Requests-Left", "1"))
+    return r.json(), rate_limit_left
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const rateLimitLeft = Number(res.headers.get("X-Rate-Limit-Requests-Left") || "1");
+  const body = await res.json();
+  return { body, rateLimitLeft };
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Confirm the brand update and check whether the product exists</h3>
+      <p>For each logged pair, call <code>GET /v3/catalog/brands/{brand_id}</code> and compare the fields you intended to change (name, custom_url, meta_keywords, page_title) against what actually landed. Then call <code>GET /v3/catalog/products?name={intended_name}&amp;brand_id={brand_id}</code> (or filter by <code>sku=</code> if you have one) to see whether <code>data[]</code> already contains the product from the failed attempt.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def confirm_brand_update(brand_id, intended_fields):
+    data, rate_limit_left = bc_get(f"/catalog/brands/{brand_id}")
+    brand = data.get("data", {})
+    matches = all(brand.get(field) == value for field, value in intended_fields.items())
+    return matches, rate_limit_left
+
+def find_existing_product(name, brand_id):
+    data, rate_limit_left = bc_get("/catalog/products", {"name": name, "brand_id": brand_id})
+    products = data.get("data", [])
+    return (products[0] if products else None), rate_limit_left</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function confirmBrandUpdate(brandId, intendedFields) {
+  const { body, rateLimitLeft } = await bcGet(`/catalog/brands/${brandId}`);
+  const brand = body.data || {};
+  const matches = Object.entries(intendedFields).every(([field, value]) =&gt; brand[field] === value);
+  return { matches, rateLimitLeft };
+}
+
+async function findExistingProduct(name, brandId) {
+  const { body, rateLimitLeft } = await bcGet("/catalog/products", { name, brand_id: brandId });
+  const products = body.data || [];
+  return { product: products[0] || null, rateLimitLeft };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes whether the brand update was confirmed, whether the product already exists, the current rate limit budget, and the retry attempt count, and returns one of five outcomes. The rule is strict on purpose: a stale brand update never gets an auto-created product against it, and an exhausted rate limit means a wait, not an immediate hammer.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_action(
+    brand_confirmed: bool,
+    product_exists: bool,
+    rate_limit_left: int,
+    attempt: int,
+    max_attempts: int = 5,
+) -&gt; str:
+    if brand_confirmed and product_exists:
+        return "noop_success"
+    if not brand_confirmed:
+        return "flag_manual_review"
+    if attempt &gt;= max_attempts and not product_exists:
+        return "give_up"
+    if rate_limit_left &lt;= 0:
+        return "wait_and_retry"
+    return "retry_create"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideAction(brandConfirmed, productExists, rateLimitLeft, attempt, maxAttempts = 5) {
+  if (brandConfirmed &amp;&amp; productExists) return "noop_success";
+  if (!brandConfirmed) return "flag_manual_review";
+  if (attempt &gt;= maxAttempts &amp;&amp; !productExists) return "give_up";
+  if (rateLimitLeft &lt;= 0) return "wait_and_retry";
+  return "retry_create";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Retry the create only after the idempotency check</h3>
+      <p>When the decision is <code>retry_create</code>, re-run the existence check one more time immediately before posting, since state can change between the decision and the write. Only then call <code>POST /v3/catalog/products</code>. If the decision is <code>wait_and_retry</code>, sleep with a fixed exponential backoff (1s, 2s, 4s, 8s, up to the max attempts) before looping back to step 3.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def create_product(product_payload):
+    return bc_post("/catalog/products", product_payload)
+
+def backoff_seconds(attempt):
+    return min(2 ** attempt, 8)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function createProduct(productPayload) {
+  return bcPost("/catalog/products", productPayload);
+}
+
+function backoffSeconds(attempt) {
+  return Math.min(2 ** attempt, 8);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only logs what it would do for each pending pair: retry, wait, flag, or confirm a no-op success. Read the output, agree with it, then switch it off. Feed it the pairs your own logging already captured for calls issued within a couple seconds of each other.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never let the job create a product against a brand update that failed to apply. Resubmitting a create without the existence check first can leave you with a duplicate product under the same brand.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only retries a create after confirming the product does not already exist, and only after the brand update itself is confirmed applied.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/brand-update-product-create-race" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_brand_product_race.py</div>
+      <pre><code class="language-python">"""Reconcile a BigCommerce brand update fired immediately before a product create
+that came back as an empty reply from server.
+
+BigCommerce enforces a per-store request quota (150 to 450 requests per 30 second
+OAuth window depending on plan) and a concurrency cap, normally surfaced as a 429
+with X-Rate-Limit-Requests-Left and X-Rate-Limit-Time-Reset-Ms headers. When a
+brand PUT to /v3/catalog/brands/{id} is fired immediately before a product POST to
+/v3/catalog/products, the store's connection sometimes closes before the response
+finishes, which HTTP clients surface as a generic empty reply instead of a
+structured error. The underlying mutation may have actually succeeded server side
+even though the client received nothing parsable. This is a confirmed, reproduced
+issue in BigCommerce's own bigcommerce-api-php SDK repo (issue #138).
+
+This job takes logged (brand_id, intended_fields, product_payload) pairs, confirms
+whether the brand update actually applied, checks whether the product already
+exists from the failed attempt, and only retries the create when it is safe:
+brand confirmed, product confirmed absent, and rate limit budget or backoff
+allows another call. Anything else (a stale brand update, or a same-named product
+whose fields do not match) is flagged for manual review, never auto-repaired.
+
+Guide: https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/
+"""
+import os
+import time
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_brand_product_race")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "5"))
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    rate_limit_left = int(r.headers.get("X-Rate-Limit-Requests-Left", "1"))
+    return r.json(), rate_limit_left
+
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def decide_action(
+    brand_confirmed: bool,
+    product_exists: bool,
+    rate_limit_left: int,
+    attempt: int,
+    max_attempts: int = 5,
+) -&gt; str:
+    """Pure decision logic, no I/O. Returns one of:
+
+    'noop_success'        - brand_confirmed and product_exists: pair actually
+                             succeeded despite empty reply.
+    'retry_create'        - brand_confirmed, not product_exists, rate_limit_left
+                             &gt; 0, attempt &lt; max_attempts: safe to retry create.
+    'wait_and_retry'      - rate_limit_left &lt;= 0 and attempt &lt; max_attempts:
+                             back off before retrying.
+    'flag_manual_review'  - not brand_confirmed (brand update itself never
+                             applied): don't create against a stale brand.
+    'give_up'             - attempt &gt;= max_attempts and not product_exists:
+                             surface for manual review.
+    """
+    if brand_confirmed and product_exists:
+        return "noop_success"
+    if not brand_confirmed:
+        return "flag_manual_review"
+    if attempt &gt;= max_attempts and not product_exists:
+        return "give_up"
+    if rate_limit_left &lt;= 0:
+        return "wait_and_retry"
+    return "retry_create"
+
+
+def confirm_brand_update(brand_id, intended_fields):
+    data, rate_limit_left = bc_get(f"/catalog/brands/{brand_id}")
+    brand = data.get("data", {})
+    matches = all(brand.get(field) == value for field, value in intended_fields.items())
+    return matches, rate_limit_left
+
+
+def find_existing_product(name, brand_id):
+    data, rate_limit_left = bc_get("/catalog/products", {"name": name, "brand_id": brand_id})
+    products = data.get("data", [])
+    return (products[0] if products else None), rate_limit_left
+
+
+def create_product(product_payload):
+    return bc_post("/catalog/products", product_payload)
+
+
+def backoff_seconds(attempt):
+    return min(2 ** attempt, 8)
+
+
+def reconcile_pair(brand_id, intended_fields, product_payload):
+    attempt = 0
+    while True:
+        brand_confirmed, rate_limit_left = confirm_brand_update(brand_id, intended_fields)
+        existing, rate_limit_left = find_existing_product(
+            product_payload.get("name"), brand_id
+        )
+        product_exists = existing is not None
+
+        decision = decide_action(brand_confirmed, product_exists, rate_limit_left, attempt, MAX_ATTEMPTS)
+
+        log.info(
+            "brand_id=%s attempt=%s brand_confirmed=%s product_exists=%s "
+            "rate_limit_left=%s decision=%s",
+            brand_id, attempt, brand_confirmed, product_exists, rate_limit_left, decision,
+        )
+
+        if decision == "noop_success":
+            return "noop_success"
+        if decision == "flag_manual_review":
+            log.warning("Brand %s update not confirmed. Flagging pair for manual review.", brand_id)
+            return "flag_manual_review"
+        if decision == "give_up":
+            log.warning("Brand %s exhausted %s attempts. Flagging for manual review.", brand_id, MAX_ATTEMPTS)
+            return "give_up"
+        if decision == "wait_and_retry":
+            wait_for = backoff_seconds(attempt)
+            log.info("Rate limit exhausted, waiting %ss before retry.", wait_for)
+            if not DRY_RUN:
+                time.sleep(wait_for)
+            attempt += 1
+            continue
+
+        # decision == "retry_create"
+        if DRY_RUN:
+            log.info("Dry run: would create product %s under brand %s.", product_payload.get("name"), brand_id)
+            return "retry_create"
+
+        # Re-check existence immediately before writing, state can change between checks.
+        existing_recheck, _ = find_existing_product(product_payload.get("name"), brand_id)
+        if existing_recheck is not None:
+            log.info("Product appeared before retry. Treating as noop_success.")
+            return "noop_success"
+
+        create_product(product_payload)
+        log.info("Created product %s under brand %s.", product_payload.get("name"), brand_id)
+        return "created"
+
+
+def run(pairs):
+    """pairs: iterable of (brand_id, intended_fields, product_payload)."""
+    results = []
+    for brand_id, intended_fields, product_payload in pairs:
+        results.append(reconcile_pair(brand_id, intended_fields, product_payload))
+    log.info("Done. %d pair(s) processed.", len(results))
+    return results
+
+
+if __name__ == "__main__":
+    run([])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-brand-product-race.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile a BigCommerce brand update fired immediately before a product create
+ * that came back as an empty reply from server.
+ *
+ * BigCommerce enforces a per-store request quota (150 to 450 requests per 30
+ * second OAuth window depending on plan) and a concurrency cap, normally
+ * surfaced as a 429 with X-Rate-Limit-Requests-Left and
+ * X-Rate-Limit-Time-Reset-Ms headers. When a brand PUT to
+ * /v3/catalog/brands/{id} is fired immediately before a product POST to
+ * /v3/catalog/products, the store's connection sometimes closes before the
+ * response finishes, which HTTP clients surface as a generic empty reply
+ * instead of a structured error. The underlying mutation may have actually
+ * succeeded server side even though the client received nothing parsable.
+ * This is a confirmed, reproduced issue in BigCommerce's own bigcommerce-api-php
+ * SDK repo (issue #138).
+ *
+ * This job takes logged {brandId, intendedFields, productPayload} pairs,
+ * confirms whether the brand update actually applied, checks whether the
+ * product already exists from the failed attempt, and only retries the create
+ * when it is safe: brand confirmed, product confirmed absent, and rate limit
+ * budget or backoff allows another call. Anything else is flagged for manual
+ * review, never auto-repaired.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/brand-update-product-create-race/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 5);
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision logic, no I/O. Returns one of:
+ *
+ * "noop_success"        - brandConfirmed and productExists: pair actually
+ *                          succeeded despite empty reply.
+ * "retry_create"        - brandConfirmed, not productExists, rateLimitLeft
+ *                          &gt; 0, attempt &lt; maxAttempts: safe to retry create.
+ * "wait_and_retry"      - rateLimitLeft &lt;= 0 and attempt &lt; maxAttempts:
+ *                          back off before retrying.
+ * "flag_manual_review"  - not brandConfirmed (brand update itself never
+ *                          applied): don't create against a stale brand.
+ * "give_up"             - attempt &gt;= maxAttempts and not productExists:
+ *                          surface for manual review.
+ */
+export function decideAction(brandConfirmed, productExists, rateLimitLeft, attempt, maxAttempts = 5) {
+  if (brandConfirmed &amp;&amp; productExists) return "noop_success";
+  if (!brandConfirmed) return "flag_manual_review";
+  if (attempt &gt;= maxAttempts &amp;&amp; !productExists) return "give_up";
+  if (rateLimitLeft &lt;= 0) return "wait_and_retry";
+  return "retry_create";
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const rateLimitLeft = Number(res.headers.get("X-Rate-Limit-Requests-Left") || "1");
+  const body = await res.json();
+  return { body, rateLimitLeft };
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function confirmBrandUpdate(brandId, intendedFields) {
+  const { body, rateLimitLeft } = await bcGet(`/catalog/brands/${brandId}`);
+  const brand = body.data || {};
+  const matches = Object.entries(intendedFields).every(([field, value]) =&gt; brand[field] === value);
+  return { matches, rateLimitLeft };
+}
+
+async function findExistingProduct(name, brandId) {
+  const { body, rateLimitLeft } = await bcGet("/catalog/products", { name, brand_id: brandId });
+  const products = body.data || [];
+  return { product: products[0] || null, rateLimitLeft };
+}
+
+async function createProduct(productPayload) {
+  return bcPost("/catalog/products", productPayload);
+}
+
+function backoffSeconds(attempt) {
+  return Math.min(2 ** attempt, 8);
+}
+
+function sleep(seconds) {
+  return new Promise((resolve) =&gt; setTimeout(resolve, seconds * 1000));
+}
+
+async function reconcilePair(brandId, intendedFields, productPayload) {
+  let attempt = 0;
+  for (;;) {
+    const { matches: brandConfirmed } = await confirmBrandUpdate(brandId, intendedFields);
+    const { product: existing, rateLimitLeft } = await findExistingProduct(productPayload.name, brandId);
+    const productExists = existing !== null;
+
+    const decision = decideAction(brandConfirmed, productExists, rateLimitLeft, attempt, MAX_ATTEMPTS);
+
+    console.log(
+      `brand_id=${brandId} attempt=${attempt} brand_confirmed=${brandConfirmed} ` +
+      `product_exists=${productExists} rate_limit_left=${rateLimitLeft} decision=${decision}`
+    );
+
+    if (decision === "noop_success") return "noop_success";
+    if (decision === "flag_manual_review") {
+      console.warn(`Brand ${brandId} update not confirmed. Flagging pair for manual review.`);
+      return "flag_manual_review";
+    }
+    if (decision === "give_up") {
+      console.warn(`Brand ${brandId} exhausted ${MAX_ATTEMPTS} attempts. Flagging for manual review.`);
+      return "give_up";
+    }
+    if (decision === "wait_and_retry") {
+      const waitFor = backoffSeconds(attempt);
+      console.log(`Rate limit exhausted, waiting ${waitFor}s before retry.`);
+      if (!DRY_RUN) await sleep(waitFor);
+      attempt += 1;
+      continue;
+    }
+
+    // decision === "retry_create"
+    if (DRY_RUN) {
+      console.log(`Dry run: would create product ${productPayload.name} under brand ${brandId}.`);
+      return "retry_create";
+    }
+
+    const { product: recheck } = await findExistingProduct(productPayload.name, brandId);
+    if (recheck !== null) {
+      console.log("Product appeared before retry. Treating as noop_success.");
+      return "noop_success";
+    }
+
+    await createProduct(productPayload);
+    console.log(`Created product ${productPayload.name} under brand ${brandId}.`);
+    return "created";
+  }
+}
+
+export async function run(pairs = []) {
+  const results = [];
+  for (const { brandId, intendedFields, productPayload } of pairs) {
+    results.push(await reconcilePair(brandId, intendedFields, productPayload));
+  }
+  console.log(`Done. ${results.length} pair(s) processed.`);
+  return results;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run([]).catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a script auto-creates a product or leaves it for a human. Because <code>decide_action</code> takes only plain values and returns a plain string, the test needs no network and no BigCommerce store. It just feeds in plain values and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_brand_race_decision.py</div>
+      <pre><code class="language-python">from reconcile_brand_product_race import decide_action
+
+
+def test_noop_success_when_both_confirmed():
+    assert decide_action(True, True, 50, 0) == "noop_success"
+
+
+def test_retry_create_when_brand_confirmed_and_product_missing():
+    assert decide_action(True, False, 50, 0) == "retry_create"
+
+
+def test_wait_and_retry_when_rate_limit_exhausted():
+    assert decide_action(True, False, 0, 1) == "wait_and_retry"
+
+
+def test_flag_manual_review_when_brand_not_confirmed():
+    assert decide_action(False, False, 50, 0) == "flag_manual_review"
+
+
+def test_flag_manual_review_even_if_product_exists_but_brand_not_confirmed():
+    assert decide_action(False, True, 50, 0) == "flag_manual_review"
+
+
+def test_give_up_after_max_attempts_without_product():
+    assert decide_action(True, False, 50, 5, max_attempts=5) == "give_up"
+
+
+def test_noop_success_takes_priority_over_give_up():
+    assert decide_action(True, True, 0, 5, max_attempts=5) == "noop_success"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-brand-product-race.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideAction } from "./reconcile-brand-product-race.js";
+
+test("noop_success when both confirmed", () =&gt; {
+  assert.equal(decideAction(true, true, 50, 0), "noop_success");
+});
+
+test("retry_create when brand confirmed and product missing", () =&gt; {
+  assert.equal(decideAction(true, false, 50, 0), "retry_create");
+});
+
+test("wait_and_retry when rate limit exhausted", () =&gt; {
+  assert.equal(decideAction(true, false, 0, 1), "wait_and_retry");
+});
+
+test("flag_manual_review when brand not confirmed", () =&gt; {
+  assert.equal(decideAction(false, false, 50, 0), "flag_manual_review");
+});
+
+test("flag_manual_review even if product exists but brand not confirmed", () =&gt; {
+  assert.equal(decideAction(false, true, 50, 0), "flag_manual_review");
+});
+
+test("give_up after max attempts without product", () =&gt; {
+  assert.equal(decideAction(true, false, 50, 5, 5), "give_up");
+});
+
+test("noop_success takes priority over give_up", () =&gt; {
+  assert.equal(decideAction(true, true, 0, 5, 5), "noop_success");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Bulk catalog import</span>
+      <h4>The migration script that renamed brands right before creating each brand's first product</h4>
+      <p>A catalog migration tool normalized brand names and immediately created the first product under each brand, one pair right after another, with no delay. A handful of pairs, always the same ones under load, came back with an empty reply. The import script treated that as a hard failure and stopped the whole batch, even though most of those brand updates and even some of the product creates had actually gone through.</p>
+      <p>Running the reconciler against the logged pairs afterward showed most of them were already fully applied, brand confirmed and product present, a clean noop_success. Only two pairs had a genuinely stale brand update, and those were flagged and fixed by hand instead of being blindly retried.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Duplicate product scare</span>
+      <h4>The retry loop that almost created two of the same product</h4>
+      <p>An earlier version of an internal tool retried the product create immediately on any error, including empty replies, with no existence check first. During a burst of brand updates, one create actually succeeded server side despite the empty reply, and the naive retry created a second, duplicate product under the same brand before anyone noticed.</p>
+      <p>Adding the idempotency check, GET products by name and brand_id immediately before every retry, closed that gap. Now a retry only ever fires when the product is confirmed absent, and the case that used to create a duplicate now resolves as a clean noop_success instead.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs against your logged call pairs, an empty reply from server stops being scary. Every pair either turns out to have actually succeeded, gets a safe idempotent retry once the rate limit and existence check both agree it is fine, or gets flagged for a human when the brand update itself never applied. No pair ever gets a duplicate product, and no pair ever gets silently written off as failed when it actually went through.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a brand update right before a product create return an empty reply from server?</summary>
+      <p>BigCommerce enforces a per-store request quota and a concurrency cap. When a brand PUT is fired immediately before a product POST, the store's connection can close before the response headers or body finish sending, which HTTP clients like cURL surface as a generic empty reply instead of a structured 429 or 500. The underlying mutation may have actually succeeded server-side even though the client never received a parsable response.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just retry the product create after an empty reply?</summary>
+      <p>Not blindly. First confirm the brand update actually applied with a GET on the brand, then GET the products endpoint filtered by name and brand_id (or sku) to check whether the product already exists from the failed attempt. Only POST again if it is absent, the brand update is confirmed, and the rate limit has recovered or a backoff has elapsed. Resubmitting without that check risks a duplicate product.</p>
+    </details>
+    <details>
+      <summary>How do I tell a rate limit problem from a genuine outage?</summary>
+      <p>Inspect the X-Rate-Limit-Requests-Left and X-Rate-Limit-Time-Reset-Ms headers on the calls immediately before and after the failure. Requests-Left near zero corroborates a rate-limit-adjacent cause. If the quota still had headroom and the empty reply persists, treat it as a possible outage and fall back to the fixed exponential backoff instead of retrying immediately.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>bigcommerce-api-php Issue #138: empty reply from server after updating brand followed by immediately creating product. <a href="https://github.com/bigcommerce/bigcommerce-api-php/issues/138" rel="noopener">github.com bigcommerce-api-php issue #138</a></li>
+      <li>BigCommerce Support: response status 207 for creation product or update products (batch), API RESTful. <a href="https://support.bigcommerce.com/s/question/0D54O00007HsIKVSA3/response-status-207-for-creation-product-or-update-products-batch-api-restful?language=en_US" rel="noopener">support.bigcommerce.com response status 207</a></li>
+      <li>BigCommerce Support: getting 500 internal server error with the empty body in the endpoint. <a href="https://support.bigcommerce.com/s/question/0D54O00006q7CZ2SAM/getting-500-internal-server-error-with-the-empty-body-in-the-endpoint?language=en_US" rel="noopener">support.bigcommerce.com 500 with empty body</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: API rate limits, request quota, and rate limit headers. <a href="https://developer.bigcommerce.com/docs/start/best-practices/api-rate-limits" rel="noopener">developer.bigcommerce.com API rate limits</a></li>
+      <li>BigCommerce Developer Center: error handling migration guide. <a href="https://developer.bigcommerce.com/docs/start/migration/error-handling" rel="noopener">developer.bigcommerce.com error handling</a></li>
+      <li>BigCommerce API Reference: Update a Brand. <a href="https://developer.bigcommerce.com/api-reference/b3A6MzU5MDQzNzQ-update-a-brand" rel="noopener">developer.bigcommerce.com update a brand</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or the catalog that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this save you from a duplicate product?</h3>
+    <p>If this saved you a pile of manual cleanup or caught a race you would have otherwise missed, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
