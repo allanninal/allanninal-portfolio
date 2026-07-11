@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Webhooks That Keep Firing After the App or Token Is Removed</title>
+<meta name="description" content="A BigCommerce app was uninstalled or its token was revoked, but its webhook is still firing. Learn why GET /v3/hooks cannot see across client_ids and build a Python or Node.js reconciler that safely flags and deletes orphaned webhooks.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Webhooks That Keep Firing After the App or Token Is Removed">
+<meta property="og:description" content="Why an orphaned BigCommerce webhook can keep firing long after its app or token is gone, and a safe Python or Node.js reconciler that flags and deletes only confirmed orphans.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/#article","headline":"Fix BigCommerce Webhooks That Keep Firing After the App or Token Is Removed","description":"Why an orphaned BigCommerce webhook can keep firing long after its owning app was uninstalled or its token was revoked, and a safe Python or Node.js reconciler that flags every orphan for review and deletes only the ones confirmed both unowned and already deactivated.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Webhooks","keywords":"BigCommerce webhooks, GET /v3/hooks, client_id, orphaned webhook, DELETE /v3/hooks, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Webhook keeps firing after its owning app or token is removed","item":"https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a BigCommerce webhook keep firing after I removed the app?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce only cascades a clean delete of a client_id's webhooks when the app is uninstalled through the Marketplace flow, or when its API account is deleted in the control panel. If the app lost access some other way, an ad-hoc token revocation, a legacy store-level token, or an app that never received the store/app/uninstall event, its webhooks are left fully intact and keep firing normally."}},{"@type":"Question","name":"Why can I not just list every webhook my store has and see the orphans right away?","acceptedAnswer":{"@type":"Answer","text":"GET /v3/hooks only returns hooks tied to the client_id of the credential making the call. There is no public v3 endpoint that lists every client_id a store has ever issued alongside its webhooks, so a single store-level token can only ever see its own slice. Full coverage means running the reconciler once per API account or app credential the store has ever had, and comparing what it sees against the merchant's own record of currently installed apps."}},{"@type":"Question","name":"Is it safe to auto-delete every webhook whose client_id I do not recognize?","acceptedAnswer":{"@type":"Answer","text":"No. An unrecognized client_id that is still active should be flagged for a human to confirm, not deleted automatically, because is_active alone can be misleading and a currently-firing hook might still belong to an app you simply forgot to record. Only delete automatically when the hook is both unowned (client_id not in the known set) and already deactivated by BigCommerce for a long stretch, which is the safest, most corroborated signal that it is a true orphan."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Webhooks</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Webhooks</p>
+    <h1>Webhook keeps firing after its owning app or token is removed</h1>
+    <p class="lead">The app is gone. The token was revoked weeks ago. But the destination endpoint keeps getting POSTed to on every order and cart event, and nobody can figure out from the BigCommerce admin why. Uninstalling an app through the Marketplace, or deleting an API account in the control panel, is supposed to cascade-delete its webhooks. Anything outside that clean path leaves them behind, still firing, still eating into the ten-webhook-per-client_id quota. Here is why the orphan slips through and a small reconciler that finds and safely clears it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Webhooks API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce only cleans up a client_id's webhooks when an app is uninstalled through the App Marketplace flow, or when its API account is deleted in the control panel. Anything outside that path, a legacy store-level token, an app removed by ad-hoc token revocation, or an app that never got the <code>store/app/uninstall</code> event, leaves its webhooks fully intact and firing. Worse, <code>GET /v3/hooks</code> only returns hooks tied to the client_id of the credential making the call, so no single request shows you every webhook the store has ever registered. Run a small Python or Node.js reconciler that lists hooks per known credential, diffs each hook's client_id against your known-good set of currently installed apps, and only auto-deletes the ones that are both unowned and already deactivated. Everything else that looks orphaned but is still active gets flagged for a human. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce webhooks are scoped to the client_id that created them. Delete the app cleanly, through the Marketplace uninstall flow, or delete its API account from Settings, API in the control panel, and BigCommerce cascades that removal down to every webhook that client_id ever registered. That is the documented, supported path, and it works.</p>
+  <p>The trouble starts when an app or token disappears some other way. A legacy store-level API account gets revoked by hand instead of properly deleted. An app is pulled from a store's connected apps list without ever firing the <code>store/app/uninstall</code> event its own uninstall handler was relying on. A developer rotates credentials and simply stops using the old client_id, without ever calling anything to clean it up. In every one of these cases, BigCommerce has no signal that tells it "this app is gone, clear its hooks." The webhook rows sit exactly where they were created, <code>is_active</code> still true, still matching every event they were scoped to, still POSTing to a destination that may not even resolve anymore.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. An app's token is revoked or the app is removed outside the Marketplace uninstall flow, so BigCommerce never learns to cascade-delete its webhooks, and the webhook keeps firing to a destination that no longer belongs to any known app.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="75" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Token revoked</text>
+      <text x="90" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">or app removed ad hoc</text>
+      <line x1="173" y1="108" x2="215" y2="108" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="75" width="165" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="300" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">No uninstall event</text>
+      <text x="300" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">store/app/uninstall skipped</text>
+      <line x1="386" y1="108" x2="450" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="418" y="65" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="418" y="135" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">No cascade delete</text>
+      <rect x="453" y="75" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Webhook row</text>
+      <text x="528" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">is_active still true</text>
+      <rect x="633" y="75" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="99" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Dead endpoint</text>
+      <text x="691" y="117" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">still POSTed</text>
+      <line x1="606" y1="108" x2="630" y2="108" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Only a Marketplace uninstall or a control panel API account delete cascades to the webhooks. Every other way an app disappears leaves its hooks firing, unowned and unnoticed.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few concrete ways stores end up with orphaned webhooks that keep firing:</p>
+  <ul>
+    <li>An app is disconnected by revoking or deleting its token directly, instead of going through the Marketplace's own uninstall flow, so the <code>store/app/uninstall</code> webhook that would normally trigger cleanup never fires.</li>
+    <li>A legacy store-level API account was used to register webhooks years ago, was later abandoned in favor of a proper app installation, but was never explicitly deleted from Settings, API in the control panel.</li>
+    <li>An app loses marketplace access or its listing is pulled, but the store's existing installation and its client_id's webhooks are untouched, because that removal path does not run the same cleanup as a merchant-initiated uninstall.</li>
+    <li><code>GET /v3/hooks</code> only returns hooks scoped to the client_id of the credential making the call, so a store-level token reconciling its own hooks will never see a stray hook that belongs to some other, possibly removed, client_id, unless that credential is used to check too. Nobody has a single view across every client_id a store has ever issued.</li>
+    <li>Because BigCommerce caps webhooks at ten per store_id, client_id, and scope combination, an orphaned hook quietly consumes one of those ten slots, and a legitimate reinstall of the same integration can fail to register its own webhook until the quota is freed.</li>
+  </ul>
+  <p>This is a recurring point of confusion in BigCommerce's own support channel: merchants ask whether uninstalling an app removes its webhooks, and whether there is any way to be notified when it does not. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A webhook's own fields, <code>is_active</code> especially, do not tell you whether it is orphaned. BigCommerce auto-deactivates hooks after repeated delivery failures or 90 days of inactivity, so <code>is_active=false</code> can just as easily mean a perfectly legitimate, still-owned integration hit a rough patch. The only reliable signal is whether the hook's <code>client_id</code> is still in your known set of currently installed apps or trusted store-level credentials. Even then, an unrecognized client_id that is still actively firing needs a human to confirm before it gets deleted. We only auto-delete when a hook is both unowned and already deactivated for a long stretch, the two signals corroborating each other.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch live webhook creation. We add a reconciler that lists hooks visible to each API credential you run it with, compares every hook's client_id against the set of client_ids you currently trust, and classifies each one before ever deleting anything.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A reconciler lists webhooks per known credential, checks each hook's client_id against the known-good set, and if unrecognized and already deactivated for a long stretch it deletes the hook, if unrecognized and still active it flags for review, otherwise it keeps the hook.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Reconciler job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a schedule</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List GET /v3/hooks</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">per known credential</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Diff client_id</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">vs known installed apps</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="126" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">Unowned and</text>
+      <text x="575" y="141" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">stale inactive</text>
+      <text x="575" y="156" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">90+ days?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="558" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, keep or flag</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">DELETE /v3/hooks</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">confirmed orphan</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Only a hook with an unrecognized client_id that BigCommerce has already deactivated for 90 or more days gets auto-deleted. A still-active unrecognized hook is flagged for a human first.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Use a store-level API account (or, for full coverage, one token per app credential the store has ever issued) with Webhooks read and write scope. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export KNOWN_CLIENT_IDS="client_abc,client_def"
+export STALE_AFTER_DAYS="90"
+export DRY_RUN="true"   # start safe, change to false to delete</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export KNOWN_CLIENT_IDS="client_abc,client_def"
+export STALE_AFTER_DAYS="90"
+export DRY_RUN="true"   // start safe, change to false to delete</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Webhooks REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/hooks</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and DELETE and raises on a non-2xx response. V3 wraps list responses in <code>{data, meta.pagination}</code>, so we page through <code>meta.pagination.links.next</code> until it runs out.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def bc_delete(path):
+    r = requests.delete(f"{API_BASE}{path}", headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcDelete(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "DELETE", headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List every hook the credential can see</h3>
+      <p>Call <code>GET /v3/hooks</code>, paginated via <code>meta.pagination.links.next</code>. Each item carries <code>id</code>, <code>client_id</code>, <code>scope</code>, <code>destination</code>, <code>is_active</code>, <code>created_at</code>, and <code>updated_at</code>. Remember this only shows hooks tied to the client_id of the token you are calling with, so run this once per credential the store has ever issued for full coverage.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def list_hooks():
+    page = 1
+    while True:
+        payload = bc_get("/hooks", {"page": page, "limit": 50})
+        items = payload.get("data") or []
+        if not items:
+            return
+        for hook in items:
+            yield hook
+        next_link = (payload.get("meta") or {}).get("pagination", {}).get("links", {}).get("next")
+        if not next_link:
+            return
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* listHooks() {
+  let page = 1;
+  while (true) {
+    const payload = await bcGet("/hooks", { page, limit: 50 });
+    const items = payload.data || [];
+    if (!items.length) return;
+    for (const hook of items) yield hook;
+    const nextLink = payload.meta?.pagination?.links?.next;
+    if (!nextLink) return;
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the hook, the set of known client_ids, and the current time, and returns one of four outcomes. A recognized client_id is always kept. An unrecognized one is only cleared for deletion when BigCommerce itself has already marked it inactive for a long stretch, the corroborating second signal. A still-active unrecognized hook is flagged, never deleted automatically.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">classify.py</div>
+      <pre><code class="language-python">from typing import Literal
+
+STALE_AFTER_DAYS_DEFAULT = 90
+
+def classify_hook(
+    hook: dict, known_client_ids: set, now_epoch: int, stale_after_days: int = STALE_AFTER_DAYS_DEFAULT
+) -&gt; Literal["keep", "orphan_delete", "orphan_flag_only", "stale_inactive"]:
+    if hook.get("client_id") in known_client_ids:
+        return "keep"
+
+    is_active = bool(hook.get("is_active"))
+    updated_at = hook.get("updated_at") or 0
+    age_seconds = now_epoch - updated_at
+    is_stale = age_seconds &gt; stale_after_days * 86400
+
+    if not is_active and is_stale:
+        return "orphan_delete"
+    if is_active:
+        return "orphan_flag_only"
+    return "stale_inactive"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">classify.js</div>
+      <pre><code class="language-javascript">const STALE_AFTER_DAYS_DEFAULT = 90;
+
+export function classifyHook(hook, knownClientIds, nowEpoch, staleAfterDays = STALE_AFTER_DAYS_DEFAULT) {
+  if (knownClientIds.has(hook.client_id)) return "keep";
+
+  const isActive = Boolean(hook.is_active);
+  const updatedAt = hook.updated_at || 0;
+  const ageSeconds = nowEpoch - updatedAt;
+  const isStale = ageSeconds &gt; staleAfterDays * 86400;
+
+  if (!isActive &amp;&amp; isStale) return "orphan_delete";
+  if (isActive) return "orphan_flag_only";
+  return "stale_inactive";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Delete only the confirmed orphans</h3>
+      <p>When the classification is <code>orphan_delete</code>, call <code>DELETE /v3/hooks/{webhook_id}</code>, which returns the deleted hook as <code>200 OK</code>. Anything flagged is logged with enough detail, id, client_id, scope, destination, is_active, created_at, for a human to look it up in the control panel or cross-check the destination host against a known app domain before deciding anything.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def delete_hook(hook_id):
+    return bc_delete(f"/hooks/{hook_id}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function deleteHook(hookId) {
+  return bcDelete(`/hooks/${hookId}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script only logs the {id, client_id, scope, destination, is_active, created_at} tuple for each hook it would delete, and each hook it would flag. Read the output, agree with it, then switch it off. Run it on a schedule, weekly is plenty, since orphaned hooks accumulate slowly.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never let the job delete a hook on <code>is_active=false</code> alone. That flag can just mean BigCommerce's own 48-hour-retry or 90-day-inactivity auto-deactivation kicked in on a hook that is still legitimately owned. Require the client_id-not-in-known-apps condition first, corroborated by the staleness window, before anything gets deleted automatically.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and only deletes hooks that are both unowned and already deactivated for a long stretch, flagging every other unrecognized client_id for a human instead.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/orphaned-webhooks-after-token-removal" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_orphaned_webhooks.py</div>
+      <pre><code class="language-python">"""Find and safely clear BigCommerce webhooks orphaned by app or token removal.
+
+Uninstalling an app through the App Marketplace flow, or deleting an API account
+through the control panel, cascades to delete that client_id's webhooks. Every
+other way an app or token disappears, an ad-hoc token revocation, a legacy
+store-level credential, or an app that never received the store/app/uninstall
+event, leaves its webhooks fully intact and still firing. GET /v3/hooks only
+returns hooks tied to the client_id of the credential making the call, so no
+single request shows every webhook a store has ever registered. This job lists
+hooks visible to the configured credential, diffs each hook's client_id against
+a known-good set of currently installed apps, and only deletes a hook when it is
+both unowned and already deactivated by BigCommerce for a long stretch. A still
+active, unrecognized hook is flagged for a human, never deleted automatically.
+Run on a schedule. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/
+"""
+import os
+import time
+import logging
+from typing import Literal
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_orphaned_webhooks")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+KNOWN_CLIENT_IDS = {
+    c.strip() for c in os.environ.get("KNOWN_CLIENT_IDS", "").split(",") if c.strip()
+}
+STALE_AFTER_DAYS = int(os.environ.get("STALE_AFTER_DAYS", "90"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def bc_delete(path):
+    r = requests.delete(f"{API_BASE}{path}", headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def classify_hook(
+    hook: dict, known_client_ids: set, now_epoch: int, stale_after_days: int = 90
+) -&gt; Literal["keep", "orphan_delete", "orphan_flag_only", "stale_inactive"]:
+    """Pure decision. No network, no side effects.
+
+    hook: {id, client_id, scope, destination, is_active, created_at, updated_at}
+    known_client_ids: set of client_id strings for currently installed/authorized
+      apps (or the single store-level client_id set the operator trusts).
+
+    1. If hook['client_id'] in known_client_ids -&gt; 'keep'.
+    2. Else (client_id not recognized):
+         a. If hook['is_active'] is False and (now_epoch - hook['updated_at'])
+              &gt; stale_after_days*86400 -&gt; 'orphan_delete' (safe: already
+              deactivated by BigCommerce AND unowned).
+         b. Elif hook['is_active'] is True -&gt; 'orphan_flag_only' (still firing
+              for an unrecognized owner; needs human confirm before delete).
+         c. Else -&gt; 'stale_inactive' (recently deactivated, unrecognized owner,
+              but not old enough to auto-clear).
+    """
+    if hook.get("client_id") in known_client_ids:
+        return "keep"
+
+    is_active = bool(hook.get("is_active"))
+    updated_at = hook.get("updated_at") or 0
+    age_seconds = now_epoch - updated_at
+    is_stale = age_seconds &gt; stale_after_days * 86400
+
+    if not is_active and is_stale:
+        return "orphan_delete"
+    if is_active:
+        return "orphan_flag_only"
+    return "stale_inactive"
+
+
+def list_hooks():
+    """Page through every hook visible to the configured credential."""
+    page = 1
+    while True:
+        payload = bc_get("/hooks", {"page": page, "limit": 50})
+        items = payload.get("data") or []
+        if not items:
+            return
+        for hook in items:
+            yield hook
+        next_link = (payload.get("meta") or {}).get("pagination", {}).get("links", {}).get("next")
+        if not next_link:
+            return
+        page += 1
+
+
+def delete_hook(hook_id):
+    return bc_delete(f"/hooks/{hook_id}")
+
+
+def run():
+    deleted = 0
+    flagged = 0
+    stale = 0
+    now_epoch = int(time.time())
+
+    for hook in list_hooks():
+        decision = classify_hook(hook, KNOWN_CLIENT_IDS, now_epoch, STALE_AFTER_DAYS)
+
+        if decision == "keep":
+            continue
+
+        if decision == "stale_inactive":
+            log.info(
+                "Hook %s (client_id=%s) is recently inactive but not old enough to clear yet.",
+                hook.get("id"), hook.get("client_id"),
+            )
+            stale += 1
+            continue
+
+        if decision == "orphan_flag_only":
+            log.warning(
+                "Hook %s flagged for review. client_id=%s scope=%s destination=%s "
+                "is_active=%s created_at=%s",
+                hook.get("id"), hook.get("client_id"), hook.get("scope"),
+                hook.get("destination"), hook.get("is_active"), hook.get("created_at"),
+            )
+            flagged += 1
+            continue
+
+        log.info(
+            "id=%s client_id=%s scope=%s destination=%s is_active=%s created_at=%s (%s)",
+            hook.get("id"), hook.get("client_id"), hook.get("scope"),
+            hook.get("destination"), hook.get("is_active"), hook.get("created_at"),
+            "dry run" if DRY_RUN else "deleting",
+        )
+        if not DRY_RUN:
+            delete_hook(hook.get("id"))
+        deleted += 1
+
+    log.info(
+        "Done. %d hook(s) %s, %d hook(s) flagged for review, %d hook(s) stale but not yet clearable.",
+        deleted, "to delete" if DRY_RUN else "deleted", flagged, stale,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-orphaned-webhooks.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and safely clear BigCommerce webhooks orphaned by app or token removal.
+ *
+ * Uninstalling an app through the App Marketplace flow, or deleting an API
+ * account through the control panel, cascades to delete that client_id's
+ * webhooks. Every other way an app or token disappears, an ad-hoc token
+ * revocation, a legacy store-level credential, or an app that never received
+ * the store/app/uninstall event, leaves its webhooks fully intact and still
+ * firing. GET /v3/hooks only returns hooks tied to the client_id of the
+ * credential making the call, so no single request shows every webhook a
+ * store has ever registered. This job lists hooks visible to the configured
+ * credential, diffs each hook's client_id against a known-good set of
+ * currently installed apps, and only deletes a hook when it is both unowned
+ * and already deactivated by BigCommerce for a long stretch. A still active,
+ * unrecognized hook is flagged for a human, never deleted automatically.
+ * Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/orphaned-webhooks-after-token-removal/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const KNOWN_CLIENT_IDS = new Set(
+  (process.env.KNOWN_CLIENT_IDS || "")
+    .split(",")
+    .map((c) =&gt; c.trim())
+    .filter(Boolean)
+);
+const STALE_AFTER_DAYS = Number(process.env.STALE_AFTER_DAYS || 90);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * hook: {id, client_id, scope, destination, is_active, created_at, updated_at}
+ * knownClientIds: Set of client_id strings for currently installed/authorized
+ *   apps (or the single store-level client_id set the operator trusts).
+ *
+ * 1. If hook.client_id is in knownClientIds -&gt; "keep".
+ * 2. Else (client_id not recognized):
+ *      a. If hook.is_active is false and (nowEpoch - hook.updated_at)
+ *           &gt; staleAfterDays*86400 -&gt; "orphan_delete" (safe: already
+ *           deactivated by BigCommerce AND unowned).
+ *      b. Else if hook.is_active is true -&gt; "orphan_flag_only" (still firing
+ *           for an unrecognized owner; needs human confirm before delete).
+ *      c. Else -&gt; "stale_inactive" (recently deactivated, unrecognized owner,
+ *           but not old enough to auto-clear).
+ */
+export function classifyHook(hook, knownClientIds, nowEpoch, staleAfterDays = 90) {
+  if (knownClientIds.has(hook.client_id)) return "keep";
+
+  const isActive = Boolean(hook.is_active);
+  const updatedAt = hook.updated_at || 0;
+  const ageSeconds = nowEpoch - updatedAt;
+  const isStale = ageSeconds &gt; staleAfterDays * 86400;
+
+  if (!isActive &amp;&amp; isStale) return "orphan_delete";
+  if (isActive) return "orphan_flag_only";
+  return "stale_inactive";
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcDelete(path) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "DELETE", headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function* listHooks() {
+  let page = 1;
+  while (true) {
+    const payload = await bcGet("/hooks", { page, limit: 50 });
+    const items = payload.data || [];
+    if (!items.length) return;
+    for (const hook of items) yield hook;
+    const nextLink = payload.meta?.pagination?.links?.next;
+    if (!nextLink) return;
+    page += 1;
+  }
+}
+
+async function deleteHook(hookId) {
+  return bcDelete(`/hooks/${hookId}`);
+}
+
+export async function run() {
+  let deleted = 0;
+  let flagged = 0;
+  let stale = 0;
+  const nowEpoch = Math.floor(Date.now() / 1000);
+
+  for await (const hook of listHooks()) {
+    const decision = classifyHook(hook, KNOWN_CLIENT_IDS, nowEpoch, STALE_AFTER_DAYS);
+
+    if (decision === "keep") continue;
+
+    if (decision === "stale_inactive") {
+      console.log(
+        `Hook ${hook.id} (client_id=${hook.client_id}) is recently inactive but not old enough to clear yet.`
+      );
+      stale += 1;
+      continue;
+    }
+
+    if (decision === "orphan_flag_only") {
+      console.warn(
+        `Hook ${hook.id} flagged for review. client_id=${hook.client_id} scope=${hook.scope} ` +
+        `destination=${hook.destination} is_active=${hook.is_active} created_at=${hook.created_at}`
+      );
+      flagged += 1;
+      continue;
+    }
+
+    console.log(
+      `id=${hook.id} client_id=${hook.client_id} scope=${hook.scope} destination=${hook.destination} ` +
+      `is_active=${hook.is_active} created_at=${hook.created_at} (${DRY_RUN ? "dry run" : "deleting"})`
+    );
+    if (!DRY_RUN) await deleteHook(hook.id);
+    deleted += 1;
+  }
+
+  console.log(
+    `Done. ${deleted} hook(s) ${DRY_RUN ? "to delete" : "deleted"}, ${flagged} hook(s) flagged for review, ` +
+    `${stale} hook(s) stale but not yet clearable.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classification rule is the part most worth testing, because it decides whether a real webhook gets deleted. Because <code>classify_hook</code> takes only plain values and returns a plain string, the test needs no network and no BigCommerce store. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_orphaned_hook_classification.py</div>
+      <pre><code class="language-python">from reconcile_orphaned_webhooks import classify_hook
+
+NOW = 1_800_000_000
+DAY = 86400
+
+
+def make_hook(client_id="client_unknown", is_active=False, updated_at=NOW):
+    return {
+        "id": 1,
+        "client_id": client_id,
+        "scope": "store/order/*",
+        "destination": "https://example.com/hooks",
+        "is_active": is_active,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+    }
+
+
+def test_keep_when_client_id_is_known():
+    hook = make_hook(client_id="client_known")
+    assert classify_hook(hook, {"client_known"}, NOW) == "keep"
+
+
+def test_orphan_delete_when_unowned_and_stale_inactive():
+    hook = make_hook(is_active=False, updated_at=NOW - 91 * DAY)
+    assert classify_hook(hook, {"client_known"}, NOW) == "orphan_delete"
+
+
+def test_orphan_flag_only_when_unowned_and_still_active():
+    hook = make_hook(is_active=True, updated_at=NOW - 200 * DAY)
+    assert classify_hook(hook, {"client_known"}, NOW) == "orphan_flag_only"
+
+
+def test_stale_inactive_when_unowned_but_recently_deactivated():
+    hook = make_hook(is_active=False, updated_at=NOW - 10 * DAY)
+    assert classify_hook(hook, {"client_known"}, NOW) == "stale_inactive"
+
+
+def test_orphan_delete_respects_custom_stale_after_days():
+    hook = make_hook(is_active=False, updated_at=NOW - 31 * DAY)
+    assert classify_hook(hook, {"client_known"}, NOW, stale_after_days=30) == "orphan_delete"
+
+
+def test_keep_wins_even_if_hook_would_otherwise_look_orphaned():
+    hook = make_hook(client_id="client_known", is_active=False, updated_at=NOW - 500 * DAY)
+    assert classify_hook(hook, {"client_known"}, NOW) == "keep"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-orphaned-webhooks.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyHook } from "./reconcile-orphaned-webhooks.js";
+
+const NOW = 1_800_000_000;
+const DAY = 86400;
+
+const makeHook = ({ clientId = "client_unknown", isActive = false, updatedAt = NOW } = {}) =&gt; ({
+  id: 1,
+  client_id: clientId,
+  scope: "store/order/*",
+  destination: "https://example.com/hooks",
+  is_active: isActive,
+  created_at: updatedAt,
+  updated_at: updatedAt,
+});
+
+test("keep when client_id is known", () =&gt; {
+  const hook = makeHook({ clientId: "client_known" });
+  assert.equal(classifyHook(hook, new Set(["client_known"]), NOW), "keep");
+});
+
+test("orphan_delete when unowned and stale inactive", () =&gt; {
+  const hook = makeHook({ isActive: false, updatedAt: NOW - 91 * DAY });
+  assert.equal(classifyHook(hook, new Set(["client_known"]), NOW), "orphan_delete");
+});
+
+test("orphan_flag_only when unowned and still active", () =&gt; {
+  const hook = makeHook({ isActive: true, updatedAt: NOW - 200 * DAY });
+  assert.equal(classifyHook(hook, new Set(["client_known"]), NOW), "orphan_flag_only");
+});
+
+test("stale_inactive when unowned but recently deactivated", () =&gt; {
+  const hook = makeHook({ isActive: false, updatedAt: NOW - 10 * DAY });
+  assert.equal(classifyHook(hook, new Set(["client_known"]), NOW), "stale_inactive");
+});
+
+test("orphan_delete respects custom staleAfterDays", () =&gt; {
+  const hook = makeHook({ isActive: false, updatedAt: NOW - 31 * DAY });
+  assert.equal(classifyHook(hook, new Set(["client_known"]), NOW, 30), "orphan_delete");
+});
+
+test("keep wins even if hook would otherwise look orphaned", () =&gt; {
+  const hook = makeHook({ clientId: "client_known", isActive: false, updatedAt: NOW - 500 * DAY });
+  assert.equal(classifyHook(hook, new Set(["client_known"]), NOW), "keep");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Ad hoc token revocation</span>
+      <h4>The store that revoked a token instead of deleting the API account</h4>
+      <p>A merchant's IT team rotated an integration's credentials by revoking the old token from a password manager entry, without ever visiting Settings, API in the BigCommerce control panel to delete the API account itself. Months later, order and cart webhooks kept hitting a decommissioned server, filling up its error logs and quietly holding two of the ten webhook slots for a client_id nobody could even find in the current app list.</p>
+      <p>The reconciler, run with the store's current known-good client_ids, flagged both hooks immediately as unowned. Because they were still <code>is_active=true</code>, they were held for review rather than auto-deleted. Once a human confirmed the client_id belonged to the retired integration, the flagged list gave them exactly the hook ids to remove.</p>
+    </div>
+    <div class="case">
+      <span class="tag">App pulled outside the uninstall flow</span>
+      <h4>The app that lost marketplace access without an uninstall event</h4>
+      <p>A third-party app's listing was pulled from the BigCommerce Marketplace after a policy issue on the vendor's side. The store's existing installation was never explicitly uninstalled through the normal flow, so its webhooks kept running for weeks, firing to a destination that had already gone dark on the vendor's end.</p>
+      <p>Because those hooks had gone quiet and BigCommerce's own 90-day inactivity auto-deactivation had already kicked in by the time anyone investigated, the reconciler classified them as <code>orphan_delete</code>: unowned by any currently known client_id, and already deactivated for well over the stale window. They were the only hooks removed automatically; everything still active was left for a human.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, every hook whose client_id you no longer recognize gets seen, whether it is quietly firing to a dead endpoint or sitting deactivated and forgotten. Only the ones BigCommerce itself has already stopped delivering to, and that belong to nobody you currently trust, get cleared automatically. Anything still active but unrecognized stays exactly where it is, flagged for a human, so a legitimate integration you simply forgot to record never gets deleted by mistake, and your ten-webhook-per-client_id quota stops leaking to hooks nobody owns anymore.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a BigCommerce webhook keep firing after I removed the app?</summary>
+      <p>BigCommerce only cascades a clean delete of a client_id's webhooks when the app is uninstalled through the Marketplace flow, or when its API account is deleted in the control panel. If the app lost access some other way, an ad-hoc token revocation, a legacy store-level token, or an app that never received the store/app/uninstall event, its webhooks are left fully intact and keep firing normally.</p>
+    </details>
+    <details>
+      <summary>Why can I not just list every webhook my store has and see the orphans right away?</summary>
+      <p>GET /v3/hooks only returns hooks tied to the client_id of the credential making the call. There is no public v3 endpoint that lists every client_id a store has ever issued alongside its webhooks, so a single store-level token can only ever see its own slice. Full coverage means running the reconciler once per API account or app credential the store has ever had, and comparing what it sees against the merchant's own record of currently installed apps.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-delete every webhook whose client_id I do not recognize?</summary>
+      <p>No. An unrecognized client_id that is still active should be flagged for a human to confirm, not deleted automatically, because is_active alone can be misleading and a currently-firing hook might still belong to an app you simply forgot to record. Only delete automatically when the hook is both unowned (client_id not in the known set) and already deactivated by BigCommerce for a long stretch, which is the safest, most corroborated signal that it is a true orphan.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Support: is there a way to delete webhooks on app uninstall. <a href="https://support.bigcommerce.com/s/question/0D54O00007ad0BZSAY/is-there-a-way-to-delete-webhooks-on-app-uninstall?language=en_US" rel="noopener">support.bigcommerce.com is there a way to delete webhooks on app uninstall</a></li>
+      <li>BigCommerce Support: during app uninstall from a client will I be able to remove the webhooks. <a href="https://support.bigcommerce.com/s/question/0D54O00006NjAgMSAV/during-app-uninstall-from-a-client-will-i-be-able-to-remove-the-webhooks?language=en_US" rel="noopener">support.bigcommerce.com during app uninstall will I be able to remove the webhooks</a></li>
+      <li>BigCommerce Support: how to avoid webhooks deactivation, it happens periodically. <a href="https://support.bigcommerce.com/s/question/0D54O00006SyE1pSAF/how-to-avoid-webhooks-deactivation-it-happens-periodically?language=en_US" rel="noopener">support.bigcommerce.com how to avoid webhooks deactivation</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Docs: Webhooks Overview, retry mechanism, is_active, post app uninstall actions. <a href="https://docs.bigcommerce.com/developer/docs/integrations/webhooks/overview" rel="noopener">docs.bigcommerce.com webhooks overview</a></li>
+      <li>BigCommerce API Reference: List Webhooks, GET /v3/hooks. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/integrations/webhooks/get-webhooks" rel="noopener">docs.bigcommerce.com list webhooks</a></li>
+      <li>BigCommerce API Reference: Delete Webhook, DELETE /v3/hooks/{webhook_id}. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/integrations/webhooks/delete-webhook" rel="noopener">docs.bigcommerce.com delete webhook</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear your orphaned webhooks?</h3>
+    <p>If this saved you a mystery-endpoint hunt or freed up a webhook quota you thought was maxed out for good, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
