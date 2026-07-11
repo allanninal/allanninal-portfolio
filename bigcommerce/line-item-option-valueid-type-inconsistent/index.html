@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Line Item Option valueId Type Inconsistency</title>
+<meta name="description" content="BigCommerce line item option.valueId is a numeric id for choice-based options, null for free-input options, and sometimes a string. Learn why forwarding it straight into the v2 Orders API product_options array breaks, and build a Python or Node.js normalizer that resolves the real catalog id first.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Line Item Option valueId Type Inconsistency">
+<meta property="og:description" content="Why checkout.cart line item option.valueId is numeric for choice options, null for free-input options, and sometimes a string, and a safe Python or Node.js normalizer that resolves the real catalog option-value id before it ever reaches the Orders API.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/#article","headline":"Fix BigCommerce Line Item Option valueId Type Inconsistency","description":"BigCommerce product options split into choice-based types with a numeric catalog option_value id and free-input types with no option_values at all. LineItemOption.valueId reflects that split literally: numeric for choice options, null for free-input options, and sometimes a string. Forwarding it straight into the v2 Orders API product_options array breaks. Build a pure normalizer that resolves the authoritative catalog id first.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Checkout / Carts","keywords":"BigCommerce LineItemOption, valueId, product_options, Checkout SDK, order-value id, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Line item option valueId type is inconsistent across product option types","item":"https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why is BigCommerce line item option.valueId sometimes a number, sometimes null, and sometimes a string?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce product options fall into two families. Choice-based types like dropdown, radio, swatch, checkbox, and rectangles resolve to a catalog option_value record with a numeric id, so valueId carries that number. Free-input types like text, multi_line_text, numbers_only_text, date, and file have no option_values array at all, so valueId is null. Across SDK and API versions that numeric id is also sometimes serialized as a string, which is why a script that blindly forwards valueId sees three different shapes for what looks like one field."}},{"@type":"Question","name":"Why does forwarding checkout.cart line item option.valueId straight into POST /v2/orders break order creation?","acceptedAnswer":{"@type":"Answer","text":"The v2 Orders API product_options array expects {id, value} where value is either the numeric catalog option-value id for choice-based options or the raw literal text for free-input options. A script that forwards option.valueId directly sends null or an omitted value for free-input options that actually need the literal text, and sends a string-typed id for choice options that fails strict type validation on the order endpoint, both of which surface as The options of one or more products are invalid."}},{"@type":"Question","name":"Is it safe to guess the numeric option-value id when a captured cart is missing one?","acceptedAnswer":{"@type":"Answer","text":"No. Do not auto-write orders from a mismatched or missing valueId. Flag the cart, product, and option combination for a reconciliation report instead, and only resolve the id going forward by cross-referencing GET /v3/catalog/products/{id}/options or /modifiers for the authoritative option_values list, matching by id first and falling back to a label match on option.value."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Checkout / Carts</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Checkout / Carts</p>
+    <h1>BigCommerce line item option valueId type is inconsistent across product option types</h1>
+    <p class="lead">A script reads checkout.cart.lineItems, grabs each option's valueId, and forwards it straight into the order product_options array. For a dropdown it works. For a text field it sends null. For some carts the very same numeric id shows up as a string. The v2 Orders API rejects the mismatched shapes with a single vague error: the options of one or more products are invalid. Here is why valueId has three different shapes depending on the option type, and a normalizer that resolves the real catalog id before it ever reaches the order.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 Orders + V3 Catalog Options</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce product options split into two families. Choice-based types (dropdown, radio, swatch, checkbox, rectangles/product list) resolve to a catalog <code>option_value</code> record with a numeric id. Free-input types (text, multi_line_text, numbers_only_text, date, file) have no <code>option_values</code> array at all. The Checkout SDK's <code>LineItemOption.valueId</code> reflects that split literally: numeric for choice options, <code>null</code> for free-input options, and across SDK/API versions that numeric id is sometimes serialized as a string. A script that forwards <code>option.valueId</code> straight into the <code>POST /v2/orders</code> <code>product_options</code> array (which expects <code>{id, value}</code>) breaks on both edges: null valueIds get sent as null or omitted, and string-typed ids fail strict type validation, producing <em>"The options of one or more products are invalid."</em> Do not guess a numeric id when one is missing. Instead, cross-reference <code>GET /v3/catalog/products/{id}/options</code> (or <code>/modifiers</code>) for the authoritative <code>option_values[].id</code> list, and run the normalizer below before you ever build the order payload. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A BigCommerce product option is not one thing. Under the hood it is one of two very different shapes. A dropdown, radio button set, swatch, checkbox, or rectangles/product-list option is choice-based: BigCommerce stores a fixed list of <code>option_values</code>, each with its own numeric <code>id</code>, and the shopper's selection resolves to one of those ids. A text field, multi-line text field, numbers-only field, date picker, or file upload is free-input: there is no <code>option_values</code> array at all, because the shopper typed or uploaded something that was never a fixed choice.</p>
+  <p>The Checkout SDK's <code>LineItemOption</code>, which mirrors what the storefront checkout endpoint returns under <code>cart.lineItems.*.options</code>, exposes this split honestly through its <code>valueId</code> field. For a choice-based option, <code>valueId</code> is the numeric catalog id of the chosen option value. For a free-input option, <code>valueId</code> is <code>null</code>, because there was never a catalog id to point to. Across different SDK and API versions, that same numeric id also sometimes comes back serialized as a string instead of a number.</p>
+  <p>A script that reads <code>checkout.cart.lineItems</code> and copies <code>option.valueId</code> straight into the <code>product_options</code> array of a <code>POST /v2/orders</code> call sees all three shapes and treats them as one. It sends <code>null</code> where the order API needed literal text, and it sends a stringified id where the order API's strict validation wanted an integer. Both cases collapse into the same unhelpful response: <em>"The options of one or more products are invalid."</em> bigcommerce/checkout-sdk-js issue #474 documents the same root complaint from the other direction: the exposed <code>value_id</code> is not even guaranteed to be in the id-space the order API expects for choice options, which compounds the null/string inconsistency.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A cart line item has two kinds of options: choice-based options with a numeric valueId, and free-input options with a null valueId. A script blindly forwards option.valueId into the v2 orders product_options array, sending null or a mismatched string type, and the order API rejects it with the options of one or more products are invalid.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="15" width="185" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="41" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Dropdown / radio</text>
+      <text x="102" y="58" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">valueId: 42 (numeric)</text>
+      <rect x="10" y="150" width="185" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="176" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Text / date / file</text>
+      <text x="102" y="193" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">valueId: null</text>
+      <line x1="195" y1="45" x2="255" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="195" y1="180" x2="255" y2="118" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="258" y="80" width="175" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="345" y="106" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Script forwards</text>
+      <text x="345" y="123" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">option.valueId as-is</text>
+      <line x1="433" y1="110" x2="495" y2="110" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="464" y="90" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <rect x="498" y="80" width="150" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="573" y="103" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">POST /v2/orders</text>
+      <text x="573" y="121" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">product_options[]</text>
+      <line x1="648" y1="110" x2="690" y2="110" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="693" y="80" width="57" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="721" y="103" text-anchor="middle" font-family="sans-serif" font-size="19" font-weight="800" fill="#cf4b3f">400</text>
+      <text x="721" y="121" text-anchor="middle" font-family="sans-serif" font-size="9.5" fill="#cf4b3f">invalid</text>
+    </svg>
+    <figcaption>Choice-based options carry a numeric catalog id. Free-input options never had one. Forwarding valueId as-is mixes both into one payload and the order API rejects it.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The inconsistency is not a bug in one endpoint, it is two different data models colliding at the point a script assumes they are the same field:</p>
+  <ul>
+    <li>Choice-based option types (dropdown, radio_buttons, rectangles, swatch, product_list, checkbox) are backed by a real <code>option_values</code> catalog record, each with its own numeric <code>id</code>. That id is what <code>valueId</code> carries.</li>
+    <li>Free-input option types (text, multi_line_text, numbers_only_text, date, file) have no <code>option_values</code> array at all, because the shopper supplied arbitrary text or a file rather than picking from a fixed list, so <code>valueId</code> is always <code>null</code> for these.</li>
+    <li>Across BigCommerce Checkout SDK and API versions, the numeric id for choice-based options is sometimes serialized as a JSON number and sometimes as a string, so <code>typeof</code> alone is not a reliable signal of validity.</li>
+    <li>The v2 Orders API's <code>product_options</code> array expects <code>{id, value}</code>, where <code>value</code> means two different things depending on option type: the numeric catalog option-value id for choice types, or the raw literal string for free-input types. A script that does not branch on <code>option.type</code> cannot tell which meaning applies.</li>
+    <li>bigcommerce/checkout-sdk-js issue #474 independently confirms the exposed <code>value_id</code> is not guaranteed to be in the same id-space the order API expects for choice options, so even a numeric-looking valueId is not safe to trust without cross-referencing the catalog.</li>
+  </ul>
+  <p>See the citations at the end for the exact issue thread and BigCommerce support case this is drawn from.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A line item option's <code>valueId</code> is not proof of anything by itself. The product's own <code>option_values</code> catalog is. So the safe pattern is not "forward whatever valueId the cart gives you." It is "look at <code>option.type</code> first: free-input types never need a numeric id at all, and choice-based types need their id resolved against <code>GET /v3/catalog/products/{id}/options</code> or <code>/modifiers</code>, matching by id first and by label as a fallback, never guessed."</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout or the storefront cart. We add a normalizer that runs right before the order payload is built, branches on the option's type, and only ever emits an <code>{id, value}</code> pair the v2 Orders API will actually accept.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. For each cart line item option, check the option type. Free-input types or a null valueId pass the literal text value straight through. Choice-based types coerce valueId to a number and look it up in the product's catalog option values, falling back to a label match, before building the order payload.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="95" width="150" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="121" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Cart line item</text>
+      <text x="85" y="138" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">option + valueId</text>
+      <line x1="160" y1="125" x2="202" y2="125" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="295,93 382,125 295,157 208,125" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="295" y="120" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Free-input type</text>
+      <text x="295" y="135" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">or valueId null?</text>
+      <text x="385" y="88" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="382" y1="125" x2="382" y2="60" stroke="#3466e0" stroke-width="2"></line>
+      <line x1="382" y1="60" x2="440" y2="60" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="443" y="30" width="165" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="525" y="56" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Pass literal text</text>
+      <text x="525" y="73" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">value: String(option.value)</text>
+      <text x="392" y="180" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, choice-based</text>
+      <line x1="382" y1="125" x2="382" y2="190" stroke="#8a93a8" stroke-width="2"></line>
+      <line x1="382" y1="190" x2="440" y2="190" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="443" y="160" width="165" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="525" y="184" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Resolve real id</text>
+      <text x="525" y="201" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">match catalog option_values</text>
+      <line x1="608" y1="60" x2="660" y2="60" stroke="#3466e0" stroke-width="2"></line>
+      <line x1="608" y1="190" x2="660" y2="190" stroke="#3466e0" stroke-width="2"></line>
+      <line x1="660" y1="60" x2="660" y2="125" stroke="#3466e0" stroke-width="2"></line>
+      <line x1="660" y1="190" x2="660" y2="125" stroke="#3466e0" stroke-width="2"></line>
+      <line x1="660" y1="125" x2="700" y2="125" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="700" y="95" width="52" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="726" y="119" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#4c9a2a">order</text>
+      <text x="726" y="136" text-anchor="middle" font-family="sans-serif" font-size="10.5" font-weight="700" fill="#4c9a2a">payload</text>
+    </svg>
+    <figcaption>The normalizer branches on option type before it ever touches the order payload. Free-input options pass their literal text through untouched. Choice-based options always resolve against the catalog, never the raw valueId alone.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Products (read-only) scope to read catalog options and modifiers, and Orders (modify) scope if this feeds an order-creation flow. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Catalog and V2 Orders REST APIs</h3>
+      <p>Catalog options and modifiers live under <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code>. Order creation lives under the <code>v2/</code> base. Both share the same <code>X-Auth-Token</code> header. A small helper handles GET and raises on a non-2xx response, and unwraps the v3 <code>{data, meta}</code> envelope.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get_v3(path, params=None):
+    r = requests.get(f"{API_BASE_V3}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    return body.get("data", [])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGetV3(path, params = {}) {
+  const url = new URL(`${API_BASE_V3}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return body.data || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Fetch the authoritative option values for a product</h3>
+      <p>Before you can trust any <code>valueId</code>, you need the product's own list of choices. Call <code>GET /v3/catalog/products/{product_id}/options</code> and <code>GET /v3/catalog/products/{product_id}/modifiers</code>, and for each choice-based option collect its <code>option_values[]</code> as <code>{id, label}</code> pairs. Free-input options in this response will have no <code>option_values</code> at all, which itself confirms the type.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def product_option_values(product_id):
+    """Map every choice-based option's id to its list of {id, label} option_values."""
+    by_option_id = {}
+    for endpoint in ("options", "modifiers"):
+        for option in bc_get_v3(f"/catalog/products/{product_id}/{endpoint}"):
+            values = option.get("option_values") or []
+            by_option_id[option["id"]] = [
+                {"id": v["id"], "label": v.get("label", "")} for v in values
+            ]
+    return by_option_id</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function productOptionValues(productId) {
+  // Map every choice-based option's id to its list of {id, label} option_values.
+  const byOptionId = {};
+  for (const endpoint of ["options", "modifiers"]) {
+    const options = await bcGetV3(`/catalog/products/${productId}/${endpoint}`);
+    for (const option of options) {
+      const values = option.option_values || [];
+      byOptionId[option.id] = values.map((v) => ({ id: v.id, label: v.label || "" }));
+    }
+  }
+  return byOptionId;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Normalize, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the raw line item option and the product's catalog option values, and returns the <code>{id, value}</code> pair the order API actually wants. Free-input types, and any option with a <code>null</code> valueId, pass the literal text straight through since there was never a numeric id to resolve. Choice-based types coerce the valueId to a number, confirm it exists in the catalog list, and fall back to a label match on <code>option.value</code> if the numeric id does not resolve. If nothing matches, the function flags the option rather than guessing.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">normalize.py</div>
+      <pre><code class="language-python">FREE_INPUT_TYPES = {"text", "multi_line_text", "numbers_only_text", "date", "file"}
+
+class OptionValueUnresolvedError(ValueError):
+    pass
+
+def normalize_line_item_option_value(option, catalog_option_values):
+    """option: {type, value, valueId, optionId, nameId}
+    catalog_option_values: list of {id, label} for this option's choices.
+    Returns {"id": int, "value": str|int}.
+    """
+    is_free_input = option.get("type") in FREE_INPUT_TYPES
+    value_id = option.get("valueId")
+
+    if is_free_input or value_id is None:
+        return {
+            "id": option.get("optionId") if option.get("optionId") is not None else option.get("nameId"),
+            "value": str(option.get("value")),
+        }
+
+    try:
+        numeric_id = int(value_id)
+    except (TypeError, ValueError):
+        numeric_id = None
+
+    if numeric_id is not None:
+        for entry in catalog_option_values:
+            if entry["id"] == numeric_id:
+                return {"id": numeric_id, "value": option.get("value")}
+
+    label = option.get("value")
+    for entry in catalog_option_values:
+        if entry.get("label") == label:
+            return {"id": entry["id"], "value": option.get("value")}
+
+    raise OptionValueUnresolvedError(
+        f"Could not resolve option value id for valueId={value_id!r} value={label!r}"
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">normalize.js</div>
+      <pre><code class="language-javascript">const FREE_INPUT_TYPES = new Set(["text", "multi_line_text", "numbers_only_text", "date", "file"]);
+
+export class OptionValueUnresolvedError extends Error {}
+
+export function normalizeLineItemOptionValue(option, catalogOptionValues) {
+  const isFreeInput = FREE_INPUT_TYPES.has(option.type);
+  const valueId = option.valueId;
+
+  if (isFreeInput || valueId === null || valueId === undefined) {
+    return {
+      id: option.optionId ?? option.nameId,
+      value: String(option.value),
+    };
+  }
+
+  const numericId = Number(valueId);
+  if (!Number.isNaN(numericId)) {
+    const byId = catalogOptionValues.find((entry) => entry.id === numericId);
+    if (byId) return { id: numericId, value: option.value };
+  }
+
+  const byLabel = catalogOptionValues.find((entry) => entry.label === option.value);
+  if (byLabel) return { id: byLabel.id, value: option.value };
+
+  throw new OptionValueUnresolvedError(
+    `Could not resolve option value id for valueId=${JSON.stringify(valueId)} value=${JSON.stringify(option.value)}`
+  );
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Reconcile existing carts before you touch order creation</h3>
+      <p>Do not backfill orders from mismatched data by guessing a numeric id. Instead, walk open and abandoned carts with <code>GET /v3/carts/{cart_id}?include=line_items.physical_items.options,line_items.digital_items.options</code>, cross-reference each option against the product's <code>option_values</code>, and log any mismatch: a choice-based type with a null, empty, or non-numeric valueId, or a free-input type where the script previously treated literal text as a numeric id.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile.py</div>
+      <pre><code class="language-python">CHOICE_TYPES = {"dropdown", "radio_buttons", "rectangles", "swatch", "product_list", "checkbox"}
+
+def find_mismatches(cart_id, line_items, option_types_by_product):
+    mismatches = []
+    for item in line_items:
+        product_id = item["product_id"]
+        option_types = option_types_by_product.get(product_id, {})
+        for option in item.get("options", []):
+            option_type = option_types.get(option.get("nameId"), option.get("type"))
+            value_id = option.get("valueId")
+            is_choice = option_type in CHOICE_TYPES
+            looks_numeric = isinstance(value_id, int) or (
+                isinstance(value_id, str) and value_id.isdigit()
+            )
+            if is_choice and not looks_numeric:
+                mismatches.append({
+                    "cart_id": cart_id,
+                    "product_id": product_id,
+                    "option_id": option.get("nameId") or option.get("optionId"),
+                    "option_type": option_type,
+                    "raw_value_id_typeof": type(value_id).__name__,
+                })
+    return mismatches</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile.js</div>
+      <pre><code class="language-javascript">const CHOICE_TYPES = new Set(["dropdown", "radio_buttons", "rectangles", "swatch", "product_list", "checkbox"]);
+
+export function findMismatches(cartId, lineItems, optionTypesByProduct) {
+  const mismatches = [];
+  for (const item of lineItems) {
+    const productId = item.product_id;
+    const optionTypes = optionTypesByProduct[productId] || {};
+    for (const option of item.options || []) {
+      const optionType = optionTypes[option.nameId] || option.type;
+      const valueId = option.valueId;
+      const isChoice = CHOICE_TYPES.has(optionType);
+      const looksNumeric =
+        typeof valueId === "number" || (typeof valueId === "string" &amp;&amp; /^\d+$/.test(valueId));
+      if (isChoice &amp;&amp; !looksNumeric) {
+        mismatches.push({
+          cart_id: cartId,
+          product_id: productId,
+          option_id: option.nameId || option.optionId,
+          option_type: optionType,
+          raw_value_id_typeof: valueId === null ? "null" : typeof valueId,
+        });
+      }
+    }
+  }
+  return mismatches;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: pull candidate carts, resolve each product's catalog option values once and cache them, run the normalizer per option, and log every <code>{cart_id, option_id, before, after}</code> diff. Leave <code>DRY_RUN</code> on so nothing is ever written to <code>POST /v2/orders</code> until you have read the diff log and agreed with it.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never guess a numeric option-value id for a mismatched or missing valueId. Flag the cart, product, and option combination for a human, and only build an order payload from an id the normalizer resolved against the product's real <code>option_values</code> catalog. Always start with <code>DRY_RUN=true</code>.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and never writes an order from an option value id it could not confirm against the product's own catalog.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/line-item-option-valueid-type-inconsistent" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">normalize_line_item_options.py</div>
+      <pre><code class="language-python">"""Normalize BigCommerce line item option valueId before building an order payload.
+
+BigCommerce product options split into two families. Choice-based types
+(dropdown, radio_buttons, rectangles, swatch, product_list, checkbox) resolve to
+a catalog option_value record with a numeric id. Free-input types (text,
+multi_line_text, numbers_only_text, date, file) have no option_values array at
+all. The Checkout SDK's LineItemOption.valueId reflects that split literally:
+numeric for choice options, null for free-input options, and across SDK/API
+versions that numeric id is sometimes serialized as a string. A script that
+forwards option.valueId straight into the v2 POST /v2/orders product_options
+array (which expects {id, value}) breaks: null valueIds get sent as null or
+omitted, and string-typed ids fail strict type validation, producing
+"The options of one or more products are invalid." This script cross-references
+each product's real option_values catalog via GET /v3/catalog/products/{id}/options
+and /modifiers, walks open and abandoned carts, and reports every mismatch. It
+never guesses a numeric id; anything unresolved is flagged, never auto-written.
+
+Guide: https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("normalize_line_item_options")
+
+STORE_HASH = os.environ.get("BIGCOMMERCE_STORE_HASH", "example_hash")
+ACCESS_TOKEN = os.environ.get("BIGCOMMERCE_ACCESS_TOKEN", "bc_dummy")
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+FREE_INPUT_TYPES = {"text", "multi_line_text", "numbers_only_text", "date", "file"}
+CHOICE_TYPES = {"dropdown", "radio_buttons", "rectangles", "swatch", "product_list", "checkbox"}
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+class OptionValueUnresolvedError(ValueError):
+    pass
+
+
+def bc_get_v3(path, params=None):
+    r = requests.get(f"{API_BASE_V3}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    return body.get("data", [])
+
+
+def product_option_values(product_id):
+    """Map every choice-based option's id to its list of {id, label} option_values."""
+    by_option_id = {}
+    for endpoint in ("options", "modifiers"):
+        for option in bc_get_v3(f"/catalog/products/{product_id}/{endpoint}"):
+            values = option.get("option_values") or []
+            by_option_id[option["id"]] = [
+                {"id": v["id"], "label": v.get("label", "")} for v in values
+            ]
+    return by_option_id
+
+
+def normalize_line_item_option_value(option, catalog_option_values):
+    """Pure decision. No network, no side effects.
+
+    option: {type, value, valueId, optionId, nameId}
+    catalog_option_values: list of {id, label} for this option's choices.
+
+    If option.type is free-input, or valueId is None, return the literal text
+    passthrough: {id: option.optionId or option.nameId, value: str(option.value)}.
+    Otherwise coerce valueId to a number and confirm it exists in
+    catalog_option_values. If that fails, fall back to a label match on
+    option.value. If nothing matches, raise OptionValueUnresolvedError rather
+    than silently sending a bad id.
+    """
+    is_free_input = option.get("type") in FREE_INPUT_TYPES
+    value_id = option.get("valueId")
+
+    if is_free_input or value_id is None:
+        return {
+            "id": option.get("optionId") if option.get("optionId") is not None else option.get("nameId"),
+            "value": str(option.get("value")),
+        }
+
+    try:
+        numeric_id = int(value_id)
+    except (TypeError, ValueError):
+        numeric_id = None
+
+    if numeric_id is not None:
+        for entry in catalog_option_values:
+            if entry["id"] == numeric_id:
+                return {"id": numeric_id, "value": option.get("value")}
+
+    label = option.get("value")
+    for entry in catalog_option_values:
+        if entry.get("label") == label:
+            return {"id": entry["id"], "value": option.get("value")}
+
+    raise OptionValueUnresolvedError(
+        f"Could not resolve option value id for valueId={value_id!r} value={label!r}"
+    )
+
+
+def find_mismatches(cart_id, line_items, option_types_by_product):
+    """Flag choice-based options whose valueId is null, empty, or non-numeric."""
+    mismatches = []
+    for item in line_items:
+        product_id = item["product_id"]
+        option_types = option_types_by_product.get(product_id, {})
+        for option in item.get("options", []):
+            option_type = option_types.get(option.get("nameId"), option.get("type"))
+            value_id = option.get("valueId")
+            is_choice = option_type in CHOICE_TYPES
+            looks_numeric = isinstance(value_id, int) or (
+                isinstance(value_id, str) and value_id.isdigit()
+            )
+            if is_choice and not looks_numeric:
+                mismatches.append({
+                    "cart_id": cart_id,
+                    "product_id": product_id,
+                    "option_id": option.get("nameId") or option.get("optionId"),
+                    "option_type": option_type,
+                    "raw_value_id_typeof": type(value_id).__name__,
+                })
+    return mismatches
+
+
+def candidate_carts():
+    """Page through open and abandoned carts."""
+    page = 1
+    while True:
+        carts = bc_get_v3(
+            "/carts",
+            {"page": page, "limit": 50, "include": "line_items.physical_items.options,line_items.digital_items.options"},
+        )
+        if not carts:
+            return
+        for cart in carts:
+            yield cart
+        page += 1
+
+
+def run():
+    reported = 0
+    resolved = 0
+    unresolved = 0
+    option_values_cache = {}
+
+    for cart in candidate_carts():
+        cart_id = cart["id"]
+        line_items = (cart.get("line_items", {}).get("physical_items", []) or []) + (
+            cart.get("line_items", {}).get("digital_items", []) or []
+        )
+
+        option_types_by_product = {}
+        for item in line_items:
+            product_id = item["product_id"]
+            if product_id not in option_values_cache:
+                option_values_cache[product_id] = product_option_values(product_id)
+            option_types_by_product[product_id] = {
+                oid: [] for oid in option_values_cache[product_id]
+            }
+
+        mismatches = find_mismatches(cart_id, line_items, option_types_by_product)
+        for mismatch in mismatches:
+            log.warning("Mismatch found: %s", mismatch)
+            reported += 1
+
+        for item in line_items:
+            product_id = item["product_id"]
+            catalog = option_values_cache.get(product_id, {})
+            for option in item.get("options", []):
+                option_id = option.get("nameId") or option.get("optionId")
+                values_for_option = catalog.get(option_id, [])
+                try:
+                    normalized = normalize_line_item_option_value(option, values_for_option)
+                    log.info(
+                        "cart_id=%s option_id=%s before=%s after=%s (%s)",
+                        cart_id, option_id, option.get("valueId"), normalized,
+                        "dry run" if DRY_RUN else "resolved",
+                    )
+                    resolved += 1
+                except OptionValueUnresolvedError as exc:
+                    log.warning("cart_id=%s option_id=%s unresolved: %s", cart_id, option_id, exc)
+                    unresolved += 1
+
+    log.info(
+        "Done. %d mismatch(es) reported, %d option(s) resolved, %d option(s) unresolved.",
+        reported, resolved, unresolved,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">normalize-line-item-options.js</div>
+      <pre><code class="language-javascript">/**
+ * Normalize BigCommerce line item option valueId before building an order payload.
+ *
+ * BigCommerce product options split into two families. Choice-based types
+ * (dropdown, radio_buttons, rectangles, swatch, product_list, checkbox) resolve to
+ * a catalog option_value record with a numeric id. Free-input types (text,
+ * multi_line_text, numbers_only_text, date, file) have no option_values array at
+ * all. The Checkout SDK's LineItemOption.valueId reflects that split literally:
+ * numeric for choice options, null for free-input options, and across SDK/API
+ * versions that numeric id is sometimes serialized as a string. A script that
+ * forwards option.valueId straight into the v2 POST /v2/orders product_options
+ * array (which expects {id, value}) breaks: null valueIds get sent as null or
+ * omitted, and string-typed ids fail strict type validation, producing
+ * "The options of one or more products are invalid." This script cross-references
+ * each product's real option_values catalog via GET /v3/catalog/products/{id}/options
+ * and /modifiers, walks open and abandoned carts, and reports every mismatch. It
+ * never guesses a numeric id; anything unresolved is flagged, never auto-written.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/line-item-option-valueid-type-inconsistent/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const FREE_INPUT_TYPES = new Set(["text", "multi_line_text", "numbers_only_text", "date", "file"]);
+const CHOICE_TYPES = new Set(["dropdown", "radio_buttons", "rectangles", "swatch", "product_list", "checkbox"]);
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+export class OptionValueUnresolvedError extends Error {}
+
+async function bcGetV3(path, params = {}) {
+  const url = new URL(`${API_BASE_V3}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return body.data || [];
+}
+
+async function productOptionValues(productId) {
+  // Map every choice-based option's id to its list of {id, label} option_values.
+  const byOptionId = {};
+  for (const endpoint of ["options", "modifiers"]) {
+    const options = await bcGetV3(`/catalog/products/${productId}/${endpoint}`);
+    for (const option of options) {
+      const values = option.option_values || [];
+      byOptionId[option.id] = values.map((v) => ({ id: v.id, label: v.label || "" }));
+    }
+  }
+  return byOptionId;
+}
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * option: {type, value, valueId, optionId, nameId}
+ * catalogOptionValues: list of {id, label} for this option's choices.
+ *
+ * If option.type is free-input, or valueId is null/undefined, return the
+ * literal text passthrough: {id: option.optionId ?? option.nameId, value: String(option.value)}.
+ * Otherwise coerce valueId to a number and confirm it exists in
+ * catalogOptionValues. If that fails, fall back to a label match on
+ * option.value. If nothing matches, throw OptionValueUnresolvedError rather
+ * than silently sending a bad id.
+ */
+export function normalizeLineItemOptionValue(option, catalogOptionValues) {
+  const isFreeInput = FREE_INPUT_TYPES.has(option.type);
+  const valueId = option.valueId;
+
+  if (isFreeInput || valueId === null || valueId === undefined) {
+    return {
+      id: option.optionId ?? option.nameId,
+      value: String(option.value),
+    };
+  }
+
+  const numericId = Number(valueId);
+  if (!Number.isNaN(numericId)) {
+    const byId = catalogOptionValues.find((entry) => entry.id === numericId);
+    if (byId) return { id: numericId, value: option.value };
+  }
+
+  const byLabel = catalogOptionValues.find((entry) => entry.label === option.value);
+  if (byLabel) return { id: byLabel.id, value: option.value };
+
+  throw new OptionValueUnresolvedError(
+    `Could not resolve option value id for valueId=${JSON.stringify(valueId)} value=${JSON.stringify(option.value)}`
+  );
+}
+
+export function findMismatches(cartId, lineItems, optionTypesByProduct) {
+  // Flag choice-based options whose valueId is null, empty, or non-numeric.
+  const mismatches = [];
+  for (const item of lineItems) {
+    const productId = item.product_id;
+    const optionTypes = optionTypesByProduct[productId] || {};
+    for (const option of item.options || []) {
+      const optionType = optionTypes[option.nameId] || option.type;
+      const valueId = option.valueId;
+      const isChoice = CHOICE_TYPES.has(optionType);
+      const looksNumeric =
+        typeof valueId === "number" || (typeof valueId === "string" &amp;&amp; /^\d+$/.test(valueId));
+      if (isChoice &amp;&amp; !looksNumeric) {
+        mismatches.push({
+          cart_id: cartId,
+          product_id: productId,
+          option_id: option.nameId || option.optionId,
+          option_type: optionType,
+          raw_value_id_typeof: valueId === null ? "null" : typeof valueId,
+        });
+      }
+    }
+  }
+  return mismatches;
+}
+
+async function* candidateCarts() {
+  let page = 1;
+  while (true) {
+    const carts = await bcGetV3("/carts", {
+      page,
+      limit: 50,
+      include: "line_items.physical_items.options,line_items.digital_items.options",
+    });
+    if (!carts.length) return;
+    for (const cart of carts) yield cart;
+    page += 1;
+  }
+}
+
+export async function run() {
+  let reported = 0;
+  let resolved = 0;
+  let unresolved = 0;
+  const optionValuesCache = {};
+
+  for await (const cart of candidateCarts()) {
+    const cartId = cart.id;
+    const lineItems = [
+      ...((cart.line_items &amp;&amp; cart.line_items.physical_items) || []),
+      ...((cart.line_items &amp;&amp; cart.line_items.digital_items) || []),
+    ];
+
+    const optionTypesByProduct = {};
+    for (const item of lineItems) {
+      const productId = item.product_id;
+      if (!optionValuesCache[productId]) {
+        optionValuesCache[productId] = await productOptionValues(productId);
+      }
+      optionTypesByProduct[productId] = Object.fromEntries(
+        Object.keys(optionValuesCache[productId]).map((oid) => [oid, []])
+      );
+    }
+
+    const mismatches = findMismatches(cartId, lineItems, optionTypesByProduct);
+    for (const mismatch of mismatches) {
+      console.warn("Mismatch found:", mismatch);
+      reported += 1;
+    }
+
+    for (const item of lineItems) {
+      const productId = item.product_id;
+      const catalog = optionValuesCache[productId] || {};
+      for (const option of item.options || []) {
+        const optionId = option.nameId || option.optionId;
+        const valuesForOption = catalog[optionId] || [];
+        try {
+          const normalized = normalizeLineItemOptionValue(option, valuesForOption);
+          console.log(
+            `cart_id=${cartId} option_id=${optionId} before=${JSON.stringify(option.valueId)} ` +
+            `after=${JSON.stringify(normalized)} (${DRY_RUN ? "dry run" : "resolved"})`
+          );
+          resolved += 1;
+        } catch (err) {
+          if (err instanceof OptionValueUnresolvedError) {
+            console.warn(`cart_id=${cartId} option_id=${optionId} unresolved: ${err.message}`);
+            unresolved += 1;
+          } else {
+            throw err;
+          }
+        }
+      }
+    }
+  }
+
+  console.log(
+    `Done. ${reported} mismatch(es) reported, ${resolved} option(s) resolved, ${unresolved} option(s) unresolved.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The normalizer is the part most worth testing, because it decides what id ends up in an order payload. Because <code>normalize_line_item_option_value</code> takes only plain values and returns a plain object, the test needs no network and no BigCommerce store. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_valueid_normalizer.py</div>
+      <pre><code class="language-python">import pytest
+
+from normalize_line_item_options import (
+    normalize_line_item_option_value,
+    OptionValueUnresolvedError,
+)
+
+CATALOG = [{"id": 42, "label": "Red"}, {"id": 43, "label": "Blue"}]
+
+
+def test_free_input_type_passes_literal_text_through():
+    option = {"type": "text", "value": "Engrave: Happy Birthday", "valueId": None, "optionId": 9}
+    assert normalize_line_item_option_value(option, []) == {
+        "id": 9,
+        "value": "Engrave: Happy Birthday",
+    }
+
+
+def test_null_valueid_passes_literal_text_through_even_for_choice_type():
+    option = {"type": "dropdown", "value": "Red", "valueId": None, "nameId": 5}
+    assert normalize_line_item_option_value(option, CATALOG) == {"id": 5, "value": "Red"}
+
+
+def test_numeric_valueid_resolves_directly():
+    option = {"type": "dropdown", "value": "Red", "valueId": 42}
+    assert normalize_line_item_option_value(option, CATALOG) == {"id": 42, "value": "Red"}
+
+
+def test_string_valueid_coerces_and_resolves():
+    option = {"type": "swatch", "value": "Blue", "valueId": "43"}
+    assert normalize_line_item_option_value(option, CATALOG) == {"id": 43, "value": "Blue"}
+
+
+def test_stale_numeric_id_falls_back_to_label_match():
+    option = {"type": "dropdown", "value": "Red", "valueId": 999}
+    assert normalize_line_item_option_value(option, CATALOG) == {"id": 42, "value": "Red"}
+
+
+def test_unresolved_id_and_label_raises():
+    option = {"type": "dropdown", "value": "Green", "valueId": "not-an-id"}
+    with pytest.raises(OptionValueUnresolvedError):
+        normalize_line_item_option_value(option, CATALOG)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">normalize-line-item-options.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  normalizeLineItemOptionValue,
+  OptionValueUnresolvedError,
+} from "./normalize-line-item-options.js";
+
+const CATALOG = [{ id: 42, label: "Red" }, { id: 43, label: "Blue" }];
+
+test("free-input type passes literal text through", () =&gt; {
+  const option = { type: "text", value: "Engrave: Happy Birthday", valueId: null, optionId: 9 };
+  assert.deepEqual(normalizeLineItemOptionValue(option, []), {
+    id: 9,
+    value: "Engrave: Happy Birthday",
+  });
+});
+
+test("null valueId passes literal text through even for choice type", () =&gt; {
+  const option = { type: "dropdown", value: "Red", valueId: null, nameId: 5 };
+  assert.deepEqual(normalizeLineItemOptionValue(option, CATALOG), { id: 5, value: "Red" });
+});
+
+test("numeric valueId resolves directly", () =&gt; {
+  const option = { type: "dropdown", value: "Red", valueId: 42 };
+  assert.deepEqual(normalizeLineItemOptionValue(option, CATALOG), { id: 42, value: "Red" });
+});
+
+test("string valueId coerces and resolves", () =&gt; {
+  const option = { type: "swatch", value: "Blue", valueId: "43" };
+  assert.deepEqual(normalizeLineItemOptionValue(option, CATALOG), { id: 43, value: "Blue" });
+});
+
+test("stale numeric id falls back to label match", () =&gt; {
+  const option = { type: "dropdown", value: "Red", valueId: 999 };
+  assert.deepEqual(normalizeLineItemOptionValue(option, CATALOG), { id: 42, value: "Red" });
+});
+
+test("unresolved id and label throws", () =&gt; {
+  const option = { type: "dropdown", value: "Green", valueId: "not-an-id" };
+  assert.throws(() =&gt; normalizeLineItemOptionValue(option, CATALOG), OptionValueUnresolvedError);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Custom engraving text field</span>
+      <h4>The store that sent null into product_options for a personalization field</h4>
+      <p>A store selling personalized jewelry had a free-input text option for an engraving message. A checkout automation copied every line item option's valueId straight into the v2 Orders API payload for a back-office reorder flow. For the metal-finish dropdown it worked fine. For the engraving text field it sent <code>{"id": 9, "value": null}</code>, because valueId is always null for text options, and the order rejected with the options of one or more products are invalid.</p>
+      <p>Switching to the normalizer fixed it immediately: free-input types now pass <code>String(option.value)</code>, the actual engraving text, instead of the null valueId, and the choice-based finish option resolves through the catalog exactly as before.</p>
+    </div>
+    <div class="case">
+      <span class="tag">String-typed id from an older SDK build</span>
+      <h4>The integration that failed only on one storefront theme</h4>
+      <p>A multi-storefront merchant had one theme running an older Checkout SDK build. Every dropdown option value came through as a string, like <code>"42"</code> instead of <code>42</code>, while every other theme's cart returned numbers. The order API's strict type validation rejected the string form outright, and the failure only ever showed up from that one theme, which made it look storefront-specific instead of type-specific.</p>
+      <p>The normalizer's <code>Number(valueId)</code> coercion step resolved it for every theme at once, since it treats a numeric string and a real number identically as long as the resulting id exists in the product's catalog option_values.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After the normalizer sits in front of order creation, valueId's three shapes stop mattering. Free-input options always contribute their literal text. Choice-based options always resolve against the product's real option_values catalog, whether the incoming id was a number, a numeric string, or missing entirely because it fell back to a label match. Anything that cannot be resolved is raised as <code>OptionValueUnresolvedError</code> and flagged for a human, never silently guessed into an order.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why is BigCommerce line item option.valueId sometimes a number, sometimes null, and sometimes a string?</summary>
+      <p>BigCommerce product options fall into two families. Choice-based types like dropdown, radio, swatch, checkbox, and rectangles resolve to a catalog option_value record with a numeric id, so valueId carries that number. Free-input types like text, multi_line_text, numbers_only_text, date, and file have no option_values array at all, so valueId is null. Across SDK and API versions that numeric id is also sometimes serialized as a string, which is why a script that blindly forwards valueId sees three different shapes for what looks like one field.</p>
+    </details>
+    <details>
+      <summary>Why does forwarding checkout.cart line item option.valueId straight into POST /v2/orders break order creation?</summary>
+      <p>The v2 Orders API product_options array expects {id, value} where value is either the numeric catalog option-value id for choice-based options or the raw literal text for free-input options. A script that forwards option.valueId directly sends null or an omitted value for free-input options that actually need the literal text, and sends a string-typed id for choice options that fails strict type validation on the order endpoint, both of which surface as The options of one or more products are invalid.</p>
+    </details>
+    <details>
+      <summary>Is it safe to guess the numeric option-value id when a captured cart is missing one?</summary>
+      <p>No. Do not auto-write orders from a mismatched or missing valueId. Flag the cart, product, and option combination for a reconciliation report instead, and only resolve the id going forward by cross-referencing GET /v3/catalog/products/{id}/options or /modifiers for the authoritative option_values list, matching by id first and falling back to a label match on option.value.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">Orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">Transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>bigcommerce/checkout-sdk-js Issue #474: LineItemOption does not expose the ID needed for the POST order API call. <a href="https://github.com/bigcommerce/checkout-sdk-js/issues/474" rel="noopener">github.com bigcommerce/checkout-sdk-js issue #474</a></li>
+      <li>BigCommerce Support: creating an order using Orders API v2 with product variant options using custom text values. <a href="https://support.bigcommerce.com/s/question/0D54O00006XF9sRSAT/creating-an-order-using-orders-api-v2-with-product-variant-options-using-custom-text-values?language=en_US" rel="noopener">support.bigcommerce.com creating an order using Orders API v2 with custom text values</a></li>
+      <li>BigCommerce Developer Center: Checkout Cart Items. <a href="https://developer.bigcommerce.com/docs/rest-storefront/checkouts/checkout-cart-items" rel="noopener">developer.bigcommerce.com checkout cart items</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Help Center: Product Options (v3). <a href="https://support.bigcommerce.com/s/article/Product-Options-v3?language=en_US" rel="noopener">support.bigcommerce.com product options (v3)</a></li>
+      <li>BigCommerce Developer Center: Product Modifiers. <a href="https://developer.bigcommerce.com/docs/rest-catalog/product-modifiers" rel="noopener">developer.bigcommerce.com product modifiers</a></li>
+      <li>BigCommerce Developer Center: Orders Overview. <a href="https://developer.bigcommerce.com/docs/store-operations/orders" rel="noopener">developer.bigcommerce.com orders overview</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a broken order payload?</h3>
+    <p>If this saved you from guessing option-value ids or chasing a vague invalid-options error, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

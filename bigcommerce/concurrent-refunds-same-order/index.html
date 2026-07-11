@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Concurrent Refund Requests Corrupting a BigCommerce Order</title>
+<meta name="description" content="Two refund requests racing on the same BigCommerce order can both get accepted and leave payment_status corrupted. Learn why BigCommerce has no per-order refund lock, how to detect a corrupted order, and build a Python or Node.js script that serializes future refunds and flags what already broke.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Concurrent Refund Requests Corrupting a BigCommerce Order">
+<meta property="og:description" content="Why two refund requests racing on the same order both get accepted, why payment_status ends up wrong, and a safe way to serialize refunds and flag orders that already corrupted.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/#article","headline":"Fix Concurrent Refund Requests Corrupting a BigCommerce Order","description":"Why two refund requests racing on the same BigCommerce order can both get accepted by the API, why the order's payment_status and status_id end up corrupted, and how to serialize future refunds with a per-order lock while flagging orders that are already broken for manual reconciliation.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Payments and refunds","keywords":"BigCommerce concurrent refunds, refund_quotes, payment_actions/refund, payment_status, status_id 14 Partially Refunded, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Concurrent refund requests on one order corrupt payment status","item":"https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does BigCommerce let two refund requests corrupt the same order?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce's refund workflow is two sequential calls per order, a refund_quotes call to compute the refundable amount and then a refund call that spends that quote, and refund settlement against the gateway is asynchronous. BigCommerce's own documentation states that processing multiple concurrent refunds on the same order is not yet supported, because there is no per-order idempotency lock at the API layer. When two refund requests race, both can read the same pre-refund quote and both get accepted, leaving payment_status mismatched against the real sum of refund transactions."}},{"@type":"Question","name":"Can I safely auto-fix an order once I detect a corrupted refund state?","acceptedAnswer":{"@type":"Answer","text":"No. Refunds that were double-submitted to the gateway may already be irreversible money movement, so the safe action is to flag and report the discrepancy, not to write a blind correction. BigCommerce has no undo-refund endpoint, and issuing another programmatic refund on a corrupted order risks a second real charge reversal. A human should reconcile the flagged order against the payment gateway's own dashboard before any compensating action is taken."}},{"@type":"Question","name":"How do I stop this from happening to new refunds going forward?","acceptedAnswer":{"@type":"Answer","text":"Serialize refunds per order_id with a lock, for example a Redis SETNX keyed as order_refund_lock:{order_id} or an in-process mutex keyed by order_id, acquired before calling refund_quotes and refund, and released only after the refund response or a timeout. That forces a second concurrent request for the same order to wait or fail fast instead of racing against the first one for the same quote."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Payments / Refunds</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Payments / Refunds</p>
+    <h1>Concurrent refund requests on one order corrupt payment status</h1>
+    <p class="lead">A support agent double-clicks Refund while an automation script fires the same request. Both calls get accepted. Now the order's payment_status is stuck at Partially Refunded, or over-refunded, and nobody can tell from the admin screen alone what actually happened at the gateway. BigCommerce's refund flow has no per-order lock, so two requests racing on the same order_id can both read the same pre-refund quote and both go through. Here is why that gap exists and a small script that serializes future refunds and flags the orders already caught in the race.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Payment Actions API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce refunds an order in two sequential calls, <code>POST /v3/orders/{id}/payment_actions/refund_quotes</code> to compute the refundable amount and eligible payment methods, then <code>POST /v3/orders/{id}/payment_actions/refund</code> using that quote. Settlement against the gateway is asynchronous, so payment_status and status_id update after the API accepts the request, not atomically with it. BigCommerce's own documentation says plainly that processing multiple concurrent refunds on the same order is not yet supported, because there is no per-order idempotency lock. When two refund requests race for the same order_id, both can read the same quote and both get accepted, leaving the order mismatched. Run a small Python or Node.js script that acquires a per-order lock before every future refund call, and that scans existing orders for a mismatch between total_refunded and the sum of refund transactions so a human can reconcile anything already broken. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>A refund on a BigCommerce order is not one call, it is two. First you ask for a quote, <code>POST /v3/orders/{id}/payment_actions/refund_quotes</code>, which tells you the refundable amount and which payment methods are eligible to receive it. Then you spend that quote with <code>POST /v3/orders/{id}/payment_actions/refund</code>. Nothing about that second call is atomic with the order's own state. The gateway settles the refund out of band, and the order's payment_status (Refunded, status_id 4, or Partially Refunded, status_id 14) is only updated once BigCommerce hears back, not the instant the refund API accepts the request.</p>
+  <p>That gap is exactly where two requests can collide. A support agent double-clicks the Refund button in the admin while a Zapier automation, a retried webhook handler, or a second browser tab fires the same refund for the same order_id. Both requests call refund_quotes first, and because nothing has settled yet, both can read the same pre-refund refundable amount and the same eligible refund_methods. Both then get accepted by the refund endpoint. The order ends up stuck at Partially Refunded when it should read Refunded, over-refunded past the order total, or throwing "invalid split payment" 422 errors on the next legitimate refund attempt, because BigCommerce's API has no per-order lock to make the second request wait for the first.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 240" role="img" aria-label="Diagram of the problem. Two refund requests for the same order_id both call refund_quotes and read the same refundable amount, both then call refund and are accepted, and the order's payment_status ends up corrupted because there is no per-order lock.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="15" width="185" height="50" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="45" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Agent clicks Refund</text>
+      <rect x="10" y="130" width="185" height="50" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="160" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Automation fires refund</text>
+      <line x1="195" y1="40" x2="245" y2="80" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="195" y1="155" x2="245" y2="95" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="248" y="65" width="185" height="55" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="340" y="88" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Both read same</text>
+      <text x="340" y="105" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">refund_quotes result</text>
+      <line x1="433" y1="92" x2="480" y2="92" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="457" y="60" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="457" y="120" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">No per-order lock</text>
+      <rect x="483" y="60" width="150" height="65" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="558" y="84" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Both refund calls</text>
+      <text x="558" y="101" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">accepted</text>
+      <text x="558" y="115" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55607a">async settlement</text>
+      <line x1="633" y1="92" x2="670" y2="92" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="605" y="150" width="145" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="677" y="174" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">payment_status</text>
+      <text x="677" y="191" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">Partially Refunded</text>
+      <text x="677" y="206" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">or over-refunded</text>
+      <line x1="670" y1="92" x2="677" y2="145" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Two refund requests for the same order_id both read the same pre-refund quote and both get accepted, because BigCommerce has no per-order refund lock at the API layer.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few common paths lead to the same collision on the same order_id:</p>
+  <ul>
+    <li>A support agent double-clicks the Refund button in the BigCommerce admin, or opens the order in two browser tabs and submits a refund in each.</li>
+    <li>A Zapier or custom automation script fires a refund at the same time a human agent processes the same request manually, because neither system knows about the other's in-flight call.</li>
+    <li>A webhook handler retries a refund after a timeout, not realizing the original request already succeeded, and issues a second refund for the same order_id.</li>
+    <li>Two support requests for a partial refund on the same order are worked in parallel by different team members without either checking whether a refund is already in flight.</li>
+  </ul>
+  <p>In every case, both requests call <code>refund_quotes</code> before either one settles, so both see the same refundable amount and the same eligible refund_methods. BigCommerce's own developer documentation states plainly that processing multiple concurrent refunds on the same order is not yet supported, and BigCommerce's support community has threads describing the resulting "invalid split payment" 422 error on subsequent refund attempts against an order already left in this state. See the citations at the end for the exact docs and support threads.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The order's status_id and payment_status are not proof that only one refund happened. The transaction record is. Because BigCommerce accepts the request before settlement completes, the fix is not "retry until the status looks right." It is "never let two refund requests for the same order_id be in flight at the same time," which means acquiring a lock keyed by order_id before either <code>refund_quotes</code> or <code>refund</code> is called, and reconciling total_refunded against the sum of refund transactions for anything that already happened before the lock existed.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the refund UI or the gateway. We add a lock in front of the refund call so a second request for the same order_id waits instead of racing, and a separate read-only scan that flags any order already corrupted so a human can reconcile it against the gateway's dashboard.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A refund request acquires a per-order lock before calling refund_quotes and refund, releasing it after the response, so a second concurrent request for the same order waits. A separate scan reads transactions and order totals and reconciles them, flagging any mismatch or duplicate for manual review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="175" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="97" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Refund request</text>
+      <text x="97" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">for order_id</text>
+      <line x1="185" y1="50" x2="222" y2="50" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="225" y="20" width="175" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="312" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Acquire lock</text>
+      <text x="312" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">order_refund_lock:{id}</text>
+      <line x1="400" y1="50" x2="437" y2="50" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="440" y="20" width="175" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="527" y="40" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">refund_quotes then</text>
+      <text x="527" y="57" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">refund</text>
+      <text x="527" y="72" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55607a">serialized, one at a time</text>
+      <line x1="527" y1="80" x2="527" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="440" y="108" width="175" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="527" y="131" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Release lock</text>
+      <text x="527" y="148" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">after response or timeout</text>
+      <text x="200" y="105" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">second request waits here</text>
+      <line x1="312" y1="80" x2="312" y2="118" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="10" y="188" width="205" height="55" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="112" y="211" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Reconcile scan</text>
+      <text x="112" y="228" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">total_refunded vs transactions</text>
+      <line x1="215" y1="215" x2="257" y2="215" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="188" width="145" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="332" y="211" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Flag report</text>
+      <text x="332" y="228" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">human reconciles, never auto-fix</text>
+    </svg>
+    <figcaption>Future refunds serialize on a per-order lock so requests queue instead of racing. Orders already corrupted before the lock existed are only ever flagged, never auto-repaired.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (modify) scope so it can read transactions, read order totals, and call the payment_actions refund endpoints. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export REFUND_LOCK_TIMEOUT_SECONDS="30"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export REFUND_LOCK_TIMEOUT_SECONDS="30"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 and V3 Orders APIs</h3>
+      <p>Order totals and the transaction list come from the V2 endpoints, <code>GET /v2/orders/{id}</code> and <code>GET /v2/orders/{id}/transactions</code>. The refund call itself is V3, <code>POST /v3/orders/{id}/payment_actions/refund_quotes</code> and <code>POST /v3/orders/{id}/payment_actions/refund</code>. A small helper handles GET and POST against either base and raises on a non-2xx response.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V2 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_post(base, path, body):
+    r = requests.post(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE_V2 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPost(base, path, body) {
+  const res = await fetch(`${base}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Acquire a per-order lock before every refund call</h3>
+      <p>Before calling <code>refund_quotes</code> or <code>refund</code> for a given order_id, acquire a lock keyed by that order_id. A Redis <code>SETNX order_refund_lock:{order_id}</code> with a TTL works across multiple processes. A single-process deployment can use a local mutex keyed by order_id instead. Either way, release the lock only after the refund response comes back or a timeout elapses, so a second request for the same order_id queues behind the first instead of racing it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import threading
+
+_order_locks = {}
+_registry_lock = threading.Lock()
+
+def lock_for_order(order_id):
+    with _registry_lock:
+        if order_id not in _order_locks:
+            _order_locks[order_id] = threading.Lock()
+        return _order_locks[order_id]
+
+def refund_order_serialized(order_id, refund_body, timeout_seconds=30):
+    lock = lock_for_order(order_id)
+    acquired = lock.acquire(timeout=timeout_seconds)
+    if not acquired:
+        raise TimeoutError(f"order {order_id} refund already in flight")
+    try:
+        quote = bc_post(API_BASE_V3, f"/orders/{order_id}/payment_actions/refund_quotes", {})
+        return bc_post(API_BASE_V3, f"/orders/{order_id}/payment_actions/refund", refund_body)
+    finally:
+        lock.release()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const orderLocks = new Map();
+
+function lockForOrder(orderId) {
+  if (!orderLocks.has(orderId)) orderLocks.set(orderId, Promise.resolve());
+  return orderLocks;
+}
+
+async function refundOrderSerialized(orderId, refundBody) {
+  const prior = orderLocks.get(orderId) || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) =&gt; { release = resolve; });
+  orderLocks.set(orderId, prior.then(() =&gt; next));
+  await prior;
+  try {
+    await bcPost(API_BASE_V3, `/orders/${orderId}/payment_actions/refund_quotes`, {});
+    return await bcPost(API_BASE_V3, `/orders/${orderId}/payment_actions/refund`, refundBody);
+  } finally {
+    release();
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Reconciliation is the part worth getting exactly right, because it decides whether an order is quietly fine or needs a human before anyone touches it again. Keep it as a pure function that takes the order's total_inc_tax, its reported total_refunded, and the list of refund transactions, and returns one of three outcomes. Group transactions by gateway_transaction_id, or by amount and date_created within a small window, to catch a duplicate submission. Compare the reported total_refunded against the actual sum of refund transaction amounts to catch a mismatch.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+
+MISMATCH_EPSILON = Decimal("0.01")
+DUPLICATE_WINDOW_SECONDS = 1.0
+
+def reconcile_refund_state(order_total_inc_tax, order_total_refunded, refund_transactions):
+    total_refund_amount = sum((t["amount"] for t in refund_transactions), Decimal("0"))
+    discrepancy = order_total_refunded - total_refund_amount
+
+    duplicate_ids = find_duplicate_ids(refund_transactions)
+    if duplicate_ids:
+        return {"status": "flag_duplicate", "discrepancy": discrepancy, "duplicate_ids": duplicate_ids}
+
+    if abs(discrepancy) &gt; MISMATCH_EPSILON:
+        return {"status": "flag_mismatch", "discrepancy": discrepancy, "duplicate_ids": []}
+
+    return {"status": "ok", "discrepancy": discrepancy, "duplicate_ids": []}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const MISMATCH_EPSILON = 0.01;
+const DUPLICATE_WINDOW_SECONDS = 1.0;
+
+export function reconcileRefundState(orderTotalIncTax, orderTotalRefunded, refundTransactions) {
+  const totalRefundAmount = refundTransactions.reduce((sum, t) =&gt; sum + t.amount, 0);
+  const discrepancy = orderTotalRefunded - totalRefundAmount;
+
+  const duplicateIds = findDuplicateIds(refundTransactions);
+  if (duplicateIds.length &gt; 0) {
+    return { status: "flag_duplicate", discrepancy, duplicateIds };
+  }
+
+  if (Math.abs(discrepancy) &gt; MISMATCH_EPSILON) {
+    return { status: "flag_mismatch", discrepancy, duplicateIds: [] };
+  }
+
+  return { status: "ok", discrepancy, duplicateIds: [] };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Read the real state before deciding anything</h3>
+      <p>Call <code>GET /v2/orders/{id}</code> for total_inc_tax and total_refunded, and <code>GET /v3/orders/{id}/payment_actions/transactions</code> (the v2 <code>/v2/orders/{id}/transactions</code> list also works) to enumerate every transaction of type refund, capturing id, amount, gateway_transaction_id, and date_created for each. Feed all three into the pure function above.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def order_refund_transactions(order_id):
+    txns = bc_get(API_BASE_V2, f"/orders/{order_id}/transactions")
+    return [t for t in txns if (t.get("type") or "").lower() == "refund"]
+
+def order_summary(order_id):
+    return bc_get(API_BASE_V2, f"/orders/{order_id}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function orderRefundTransactions(orderId) {
+  const txns = await bcGet(API_BASE_V2, `/orders/${orderId}/transactions`);
+  return txns.filter((t) =&gt; (t.type || "").toLowerCase() === "refund");
+}
+
+async function orderSummary(orderId) {
+  return bcGet(API_BASE_V2, `/orders/${orderId}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop scans orders sitting at status_id 4 (Refunded) or 14 (Partially Refunded), pulls each one's summary and refund transactions, and runs the reconcile function. Anything that comes back <code>ok</code> is left alone. Anything <code>flag_duplicate</code> or <code>flag_mismatch</code> is only ever logged, with the order_id, expected total_refunded, actual sum, and discrepancy, for a human to check against the gateway's dashboard. <code>DRY_RUN</code> gates the refund-locking code path too, so on the first few runs nothing new is written, only logged.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never write a compensating refund or credit automatically. BigCommerce has no undo-refund endpoint, and a second programmatic refund against an order that already double-refunded risks a real second charge reversal. Flag it, and let a human reconcile it against the gateway's own dashboard first.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, respects the dry run flag, serializes future refund calls per order_id, and only ever reports, never auto-repairs, orders that are already corrupted.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/concurrent-refunds-same-order" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_refund_state.py</div>
+      <pre><code class="language-python">"""Serialize BigCommerce refunds per order and flag orders already corrupted by a race.
+
+BigCommerce's refund workflow is two sequential calls per order,
+POST /v3/orders/{id}/payment_actions/refund_quotes to compute the refundable
+amount and eligible payment methods, then POST /v3/orders/{id}/payment_actions/refund
+using that quote. Refund settlement against the gateway is asynchronous, so the
+order's payment_status/status_id (Refunded=4, Partially Refunded=14) updates after
+the API accepts the request, not atomically with it. BigCommerce's own docs state
+that processing multiple concurrent refunds on the same order is not yet supported,
+because there is no per-order idempotency lock at the API layer. When two refund
+requests race for the same order_id, both can read the same pre-refund quote and
+both get accepted, leaving the order mismatched.
+
+This script does two things. First, it wraps future refund calls in a per-order
+lock so a second request for the same order_id queues instead of racing. Second,
+it scans orders already at status_id 4 or 14 and reconciles total_refunded against
+the actual sum of refund transactions, flagging any duplicate or mismatch for a
+human. It never writes a compensating refund or credit automatically, because
+BigCommerce has no undo-refund endpoint and a second programmatic refund on an
+already-corrupted order risks a real second charge reversal.
+
+Guide: https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/
+"""
+import os
+import logging
+import threading
+from decimal import Decimal, InvalidOperation
+from typing import TypedDict
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_refund_state")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE_V2 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+API_BASE_V3 = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+REFUND_LOCK_TIMEOUT_SECONDS = float(os.environ.get("REFUND_LOCK_TIMEOUT_SECONDS", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+REFUNDED = 4
+PARTIALLY_REFUNDED = 14
+RECONCILE_STATUS_IDS = {REFUNDED, PARTIALLY_REFUNDED}
+
+MISMATCH_EPSILON = Decimal("0.01")
+DUPLICATE_WINDOW_SECONDS = 1.0
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_post(base, path, body):
+    r = requests.post(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return {}
+    return r.json()
+
+
+class RefundTransaction(TypedDict):
+    id: str
+    amount: Decimal
+    gateway_transaction_id: str
+    date_created: str
+
+
+def _parse_timestamp(date_created):
+    """Best-effort parse of a date_created string to a comparable float. Returns None on failure."""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(date_created)
+        return dt.timestamp() if dt else None
+    except (TypeError, ValueError):
+        return None
+
+
+def find_duplicate_ids(refund_transactions):
+    """Group transactions by gateway_transaction_id, or by amount plus a close
+    date_created, and return the ids of any transaction that shares a group
+    with another transaction (a likely double submission)."""
+    duplicate_ids = []
+
+    by_gateway_id = {}
+    for txn in refund_transactions:
+        gw_id = txn.get("gateway_transaction_id")
+        if not gw_id:
+            continue
+        by_gateway_id.setdefault(gw_id, []).append(txn)
+    for group in by_gateway_id.values():
+        if len(group) &gt; 1:
+            duplicate_ids.extend(t["id"] for t in group)
+
+    already_flagged = set(duplicate_ids)
+    remaining = [t for t in refund_transactions if t["id"] not in already_flagged]
+    for i, a in enumerate(remaining):
+        a_ts = _parse_timestamp(a.get("date_created"))
+        if a_ts is None:
+            continue
+        for b in remaining[i + 1:]:
+            b_ts = _parse_timestamp(b.get("date_created"))
+            if b_ts is None:
+                continue
+            same_amount = a["amount"] == b["amount"]
+            close_in_time = abs(a_ts - b_ts) &lt;= DUPLICATE_WINDOW_SECONDS
+            if same_amount and close_in_time:
+                duplicate_ids.extend([a["id"], b["id"]])
+
+    return sorted(set(duplicate_ids))
+
+
+def reconcile_refund_state(
+    order_total_inc_tax: Decimal,
+    order_total_refunded: Decimal,
+    refund_transactions: list,
+) -&gt; dict:
+    """Pure decision. No network, no side effects.
+
+    Sums refund_transactions amounts, groups them by gateway_transaction_id or
+    by amount plus a close date_created to detect a duplicate submission, and
+    compares order_total_refunded against the sum to detect a mismatch.
+    Returns one of "ok", "flag_duplicate", or "flag_mismatch".
+    order_total_inc_tax is accepted for context and future use but is not
+    required to make this decision.
+    """
+    total_refund_amount = sum((t["amount"] for t in refund_transactions), Decimal("0"))
+    discrepancy = order_total_refunded - total_refund_amount
+
+    duplicate_ids = find_duplicate_ids(refund_transactions)
+    if duplicate_ids:
+        return {"status": "flag_duplicate", "discrepancy": discrepancy, "duplicate_ids": duplicate_ids}
+
+    if abs(discrepancy) &gt; MISMATCH_EPSILON:
+        return {"status": "flag_mismatch", "discrepancy": discrepancy, "duplicate_ids": []}
+
+    return {"status": "ok", "discrepancy": discrepancy, "duplicate_ids": []}
+
+
+_order_locks: dict = {}
+_registry_lock = threading.Lock()
+
+
+def lock_for_order(order_id):
+    with _registry_lock:
+        if order_id not in _order_locks:
+            _order_locks[order_id] = threading.Lock()
+        return _order_locks[order_id]
+
+
+def refund_order_serialized(order_id, refund_body):
+    """Acquire a per-order lock, then call refund_quotes and refund. Releases
+    the lock after the response or the configured timeout, so a second
+    concurrent call for the same order_id waits instead of racing."""
+    lock = lock_for_order(order_id)
+    acquired = lock.acquire(timeout=REFUND_LOCK_TIMEOUT_SECONDS)
+    if not acquired:
+        raise TimeoutError(f"order {order_id} refund already in flight")
+    try:
+        if DRY_RUN:
+            log.info("DRY_RUN: would call refund_quotes and refund for order %s", order_id)
+            return {"dry_run": True, "order_id": order_id}
+        bc_post(API_BASE_V3, f"/orders/{order_id}/payment_actions/refund_quotes", {})
+        return bc_post(API_BASE_V3, f"/orders/{order_id}/payment_actions/refund", refund_body)
+    finally:
+        lock.release()
+
+
+def orders_to_reconcile():
+    """Page through orders currently at status_id 4 (Refunded) or 14 (Partially Refunded)."""
+    for status_id in RECONCILE_STATUS_IDS:
+        page = 1
+        while True:
+            orders = bc_get(
+                API_BASE_V2,
+                "/orders",
+                {"status_id": status_id, "page": page, "limit": 50},
+            )
+            if not orders:
+                break
+            for order in orders:
+                yield order
+            page += 1
+
+
+def order_refund_transactions(order_id):
+    txns = bc_get(API_BASE_V2, f"/orders/{order_id}/transactions")
+    parsed = []
+    for t in txns or []:
+        if (t.get("type") or "").lower() != "refund":
+            continue
+        try:
+            amount = Decimal(str(t.get("amount")))
+        except (InvalidOperation, TypeError):
+            continue
+        parsed.append({
+            "id": str(t.get("id")),
+            "amount": amount,
+            "gateway_transaction_id": t.get("gateway_transaction_id") or "",
+            "date_created": t.get("date_created") or "",
+        })
+    return parsed
+
+
+def run():
+    checked = 0
+    flagged = 0
+    for order in orders_to_reconcile():
+        checked += 1
+        order_id = order["id"]
+        try:
+            total_inc_tax = Decimal(str(order.get("total_inc_tax") or "0"))
+            total_refunded = Decimal(str(order.get("total_refunded") or order.get("refunded_amount") or "0"))
+        except InvalidOperation:
+            log.warning("order %s has an unparsable total, skipping", order_id)
+            continue
+
+        refund_transactions = order_refund_transactions(order_id)
+        result = reconcile_refund_state(total_inc_tax, total_refunded, refund_transactions)
+
+        if result["status"] == "ok":
+            continue
+
+        flagged += 1
+        log.warning(
+            "order_id=%s status=%s discrepancy=%s duplicate_ids=%s total_refunded=%s total_inc_tax=%s",
+            order_id, result["status"], result["discrepancy"], result["duplicate_ids"],
+            total_refunded, total_inc_tax,
+        )
+
+    log.info("Done. %d order(s) checked, %d order(s) flagged for manual reconciliation.", checked, flagged)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-refund-state.js</div>
+      <pre><code class="language-javascript">/**
+ * Serialize BigCommerce refunds per order and flag orders already corrupted by a race.
+ *
+ * BigCommerce's refund workflow is two sequential calls per order,
+ * POST /v3/orders/{id}/payment_actions/refund_quotes to compute the refundable
+ * amount and eligible payment methods, then POST /v3/orders/{id}/payment_actions/refund
+ * using that quote. Refund settlement against the gateway is asynchronous, so the
+ * order's payment_status/status_id (Refunded=4, Partially Refunded=14) updates after
+ * the API accepts the request, not atomically with it. BigCommerce's own docs state
+ * that processing multiple concurrent refunds on the same order is not yet supported,
+ * because there is no per-order idempotency lock at the API layer. When two refund
+ * requests race for the same order_id, both can read the same pre-refund quote and
+ * both get accepted, leaving the order mismatched.
+ *
+ * This script does two things. First, it wraps future refund calls in a per-order
+ * lock (a promise chain keyed by order_id) so a second request for the same
+ * order_id queues instead of racing. Second, it scans orders already at status_id
+ * 4 or 14 and reconciles total_refunded against the actual sum of refund
+ * transactions, flagging any duplicate or mismatch for a human. It never writes a
+ * compensating refund or credit automatically, because BigCommerce has no
+ * undo-refund endpoint and a second programmatic refund on an already-corrupted
+ * order risks a real second charge reversal.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/concurrent-refunds-same-order/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE_V2 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const API_BASE_V3 = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const REFUNDED = 4;
+const PARTIALLY_REFUNDED = 14;
+const RECONCILE_STATUS_IDS = [REFUNDED, PARTIALLY_REFUNDED];
+
+const MISMATCH_EPSILON = 0.01;
+const DUPLICATE_WINDOW_SECONDS = 1.0;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+function parseTimestamp(dateCreated) {
+  const ms = Date.parse(dateCreated);
+  return Number.isNaN(ms) ? null : ms / 1000;
+}
+
+/**
+ * Group transactions by gateway_transaction_id, or by amount plus a close
+ * date_created, and return the ids of any transaction that shares a group
+ * with another transaction (a likely double submission).
+ */
+export function findDuplicateIds(refundTransactions) {
+  const duplicateIds = new Set();
+
+  const byGatewayId = new Map();
+  for (const txn of refundTransactions) {
+    const gwId = txn.gateway_transaction_id;
+    if (!gwId) continue;
+    if (!byGatewayId.has(gwId)) byGatewayId.set(gwId, []);
+    byGatewayId.get(gwId).push(txn);
+  }
+  for (const group of byGatewayId.values()) {
+    if (group.length &gt; 1) group.forEach((t) =&gt; duplicateIds.add(t.id));
+  }
+
+  const remaining = refundTransactions.filter((t) =&gt; !duplicateIds.has(t.id));
+  for (let i = 0; i &lt; remaining.length; i += 1) {
+    const a = remaining[i];
+    const aTs = parseTimestamp(a.date_created);
+    if (aTs === null) continue;
+    for (let j = i + 1; j &lt; remaining.length; j += 1) {
+      const b = remaining[j];
+      const bTs = parseTimestamp(b.date_created);
+      if (bTs === null) continue;
+      const sameAmount = a.amount === b.amount;
+      const closeInTime = Math.abs(aTs - bTs) &lt;= DUPLICATE_WINDOW_SECONDS;
+      if (sameAmount &amp;&amp; closeInTime) {
+        duplicateIds.add(a.id);
+        duplicateIds.add(b.id);
+      }
+    }
+  }
+
+  return [...duplicateIds].sort();
+}
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * Sums refundTransactions amounts, groups them by gateway_transaction_id or
+ * by amount plus a close date_created to detect a duplicate submission, and
+ * compares orderTotalRefunded against the sum to detect a mismatch.
+ * Returns one of "ok", "flag_duplicate", or "flag_mismatch".
+ * orderTotalIncTax is accepted for context and future use but is not
+ * required to make this decision.
+ */
+export function reconcileRefundState(orderTotalIncTax, orderTotalRefunded, refundTransactions) {
+  const totalRefundAmount = refundTransactions.reduce((sum, t) =&gt; sum + t.amount, 0);
+  const discrepancy = orderTotalRefunded - totalRefundAmount;
+
+  const duplicateIds = findDuplicateIds(refundTransactions);
+  if (duplicateIds.length &gt; 0) {
+    return { status: "flag_duplicate", discrepancy, duplicateIds };
+  }
+
+  if (Math.abs(discrepancy) &gt; MISMATCH_EPSILON) {
+    return { status: "flag_mismatch", discrepancy, duplicateIds: [] };
+  }
+
+  return { status: "ok", discrepancy, duplicateIds: [] };
+}
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPost(base, path, body) {
+  const res = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+const orderLocks = new Map();
+
+/**
+ * Acquire a per-order lock (a promise chain keyed by order_id), then call
+ * refund_quotes and refund. The lock is released after the response, so a
+ * second concurrent call for the same order_id waits instead of racing.
+ */
+export async function refundOrderSerialized(orderId, refundBody) {
+  const prior = orderLocks.get(orderId) || Promise.resolve();
+  let release;
+  const next = new Promise((resolve) =&gt; { release = resolve; });
+  orderLocks.set(orderId, prior.then(() =&gt; next));
+  await prior;
+  try {
+    if (DRY_RUN) {
+      console.log(`DRY_RUN: would call refund_quotes and refund for order ${orderId}`);
+      return { dryRun: true, orderId };
+    }
+    await bcPost(API_BASE_V3, `/orders/${orderId}/payment_actions/refund_quotes`, {});
+    return await bcPost(API_BASE_V3, `/orders/${orderId}/payment_actions/refund`, refundBody);
+  } finally {
+    release();
+  }
+}
+
+async function* ordersToReconcile() {
+  for (const statusId of RECONCILE_STATUS_IDS) {
+    let page = 1;
+    while (true) {
+      const orders = await bcGet(API_BASE_V2, "/orders", { status_id: statusId, page, limit: 50 });
+      if (!orders.length) break;
+      for (const order of orders) yield order;
+      page += 1;
+    }
+  }
+}
+
+async function orderRefundTransactions(orderId) {
+  const txns = await bcGet(API_BASE_V2, `/orders/${orderId}/transactions`);
+  const parsed = [];
+  for (const t of txns || []) {
+    if ((t.type || "").toLowerCase() !== "refund") continue;
+    const amount = Number.parseFloat(t.amount);
+    if (!Number.isFinite(amount)) continue;
+    parsed.push({
+      id: String(t.id),
+      amount,
+      gateway_transaction_id: t.gateway_transaction_id || "",
+      date_created: t.date_created || "",
+    });
+  }
+  return parsed;
+}
+
+export async function run() {
+  let checked = 0;
+  let flagged = 0;
+
+  for await (const order of ordersToReconcile()) {
+    checked += 1;
+    const orderId = order.id;
+    const totalIncTax = Number.parseFloat(order.total_inc_tax || "0");
+    const totalRefunded = Number.parseFloat(order.total_refunded ?? order.refunded_amount ?? "0");
+    if (!Number.isFinite(totalIncTax) || !Number.isFinite(totalRefunded)) {
+      console.warn(`order ${orderId} has an unparsable total, skipping`);
+      continue;
+    }
+
+    const refundTransactions = await orderRefundTransactions(orderId);
+    const result = reconcileRefundState(totalIncTax, totalRefunded, refundTransactions);
+
+    if (result.status === "ok") continue;
+
+    flagged += 1;
+    console.warn(
+      `order_id=${orderId} status=${result.status} discrepancy=${result.discrepancy} ` +
+      `duplicate_ids=${JSON.stringify(result.duplicateIds)} total_refunded=${totalRefunded} total_inc_tax=${totalIncTax}`
+    );
+  }
+
+  console.log(`Done. ${checked} order(s) checked, ${flagged} order(s) flagged for manual reconciliation.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The reconcile function is the part most worth testing, because it decides whether an order is quietly fine or gets flagged for a human. Because <code>reconcile_refund_state</code> takes only plain values and returns a plain object, the test needs no network and no BigCommerce store. It just feeds in synthetic transaction lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_concurrent_refund_reconcile.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+
+from reconcile_refund_state import reconcile_refund_state
+
+
+def refund_txn(id_="1", amount="25.00", gateway_transaction_id="gw_1", date_created="Wed, 01 Jul 2026 10:00:00 +0000"):
+    return {
+        "id": id_,
+        "amount": Decimal(amount),
+        "gateway_transaction_id": gateway_transaction_id,
+        "date_created": date_created,
+    }
+
+
+def test_ok_when_totals_match_and_no_duplicates():
+    txns = [refund_txn(id_="1", amount="25.00", gateway_transaction_id="gw_1")]
+    result = reconcile_refund_state(Decimal("100.00"), Decimal("25.00"), txns)
+    assert result["status"] == "ok"
+    assert result["discrepancy"] == Decimal("0.00")
+    assert result["duplicate_ids"] == []
+
+
+def test_flag_duplicate_when_same_gateway_transaction_id_appears_twice():
+    txns = [
+        refund_txn(id_="1", amount="25.00", gateway_transaction_id="gw_1"),
+        refund_txn(id_="2", amount="25.00", gateway_transaction_id="gw_1"),
+    ]
+    result = reconcile_refund_state(Decimal("100.00"), Decimal("50.00"), txns)
+    assert result["status"] == "flag_duplicate"
+    assert set(result["duplicate_ids"]) == {"1", "2"}
+
+
+def test_flag_duplicate_when_same_amount_and_overlapping_timestamp():
+    txns = [
+        refund_txn(id_="1", amount="25.00", gateway_transaction_id="gw_1", date_created="Wed, 01 Jul 2026 10:00:00 +0000"),
+        refund_txn(id_="2", amount="25.00", gateway_transaction_id="gw_2", date_created="Wed, 01 Jul 2026 10:00:00 +0000"),
+    ]
+    result = reconcile_refund_state(Decimal("100.00"), Decimal("50.00"), txns)
+    assert result["status"] == "flag_duplicate"
+    assert set(result["duplicate_ids"]) == {"1", "2"}
+
+
+def test_flag_mismatch_when_total_refunded_does_not_match_transaction_sum():
+    txns = [refund_txn(id_="1", amount="25.00", gateway_transaction_id="gw_1")]
+    result = reconcile_refund_state(Decimal("100.00"), Decimal("40.00"), txns)
+    assert result["status"] == "flag_mismatch"
+    assert result["discrepancy"] == Decimal("15.00")
+
+
+def test_ok_when_two_distinct_partial_refunds_sum_correctly():
+    txns = [
+        refund_txn(id_="1", amount="20.00", gateway_transaction_id="gw_1", date_created="Wed, 01 Jul 2026 09:00:00 +0000"),
+        refund_txn(id_="2", amount="30.00", gateway_transaction_id="gw_2", date_created="Wed, 01 Jul 2026 11:00:00 +0000"),
+    ]
+    result = reconcile_refund_state(Decimal("100.00"), Decimal("50.00"), txns)
+    assert result["status"] == "ok"
+    assert result["duplicate_ids"] == []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-refund-state.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { reconcileRefundState } from "./reconcile-refund-state.js";
+
+const refundTxn = ({
+  id = "1", amount = 25.0, gateway_transaction_id = "gw_1",
+  date_created = "2026-07-01T10:00:00Z",
+} = {}) =&gt; ({ id, amount, gateway_transaction_id, date_created });
+
+test("ok when totals match and no duplicates", () =&gt; {
+  const txns = [refundTxn({ id: "1", amount: 25.0, gateway_transaction_id: "gw_1" })];
+  const result = reconcileRefundState(100.0, 25.0, txns);
+  assert.equal(result.status, "ok");
+  assert.equal(result.discrepancy, 0);
+  assert.deepEqual(result.duplicateIds, []);
+});
+
+test("flag_duplicate when same gateway_transaction_id appears twice", () =&gt; {
+  const txns = [
+    refundTxn({ id: "1", amount: 25.0, gateway_transaction_id: "gw_1" }),
+    refundTxn({ id: "2", amount: 25.0, gateway_transaction_id: "gw_1" }),
+  ];
+  const result = reconcileRefundState(100.0, 50.0, txns);
+  assert.equal(result.status, "flag_duplicate");
+  assert.deepEqual(result.duplicateIds.sort(), ["1", "2"]);
+});
+
+test("flag_duplicate when same amount and overlapping timestamp", () =&gt; {
+  const txns = [
+    refundTxn({ id: "1", amount: 25.0, gateway_transaction_id: "gw_1", date_created: "2026-07-01T10:00:00Z" }),
+    refundTxn({ id: "2", amount: 25.0, gateway_transaction_id: "gw_2", date_created: "2026-07-01T10:00:00Z" }),
+  ];
+  const result = reconcileRefundState(100.0, 50.0, txns);
+  assert.equal(result.status, "flag_duplicate");
+  assert.deepEqual(result.duplicateIds.sort(), ["1", "2"]);
+});
+
+test("flag_mismatch when total_refunded does not match transaction sum", () =&gt; {
+  const txns = [refundTxn({ id: "1", amount: 25.0, gateway_transaction_id: "gw_1" })];
+  const result = reconcileRefundState(100.0, 40.0, txns);
+  assert.equal(result.status, "flag_mismatch");
+  assert.equal(result.discrepancy, 15.0);
+});
+
+test("ok when two distinct partial refunds sum correctly", () =&gt; {
+  const txns = [
+    refundTxn({ id: "1", amount: 20.0, gateway_transaction_id: "gw_1", date_created: "2026-07-01T09:00:00Z" }),
+    refundTxn({ id: "2", amount: 30.0, gateway_transaction_id: "gw_2", date_created: "2026-07-01T11:00:00Z" }),
+  ];
+  const result = reconcileRefundState(100.0, 50.0, txns);
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.duplicateIds, []);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Double-click in the admin</span>
+      <h4>The store where a slow admin page trained agents to click twice</h4>
+      <p>A mid-size store's admin refund button took a couple of seconds to respond on a slow connection, and support agents got into the habit of clicking Refund a second time when nothing seemed to happen. Most of the time the first click had already gone through, and the second click landed on the same order_id while the first refund was still settling.</p>
+      <p>The result was a slow drip of orders stuck at Partially Refunded with a total_refunded that did not match a single transaction. Once refunds were serialized behind a per-order lock, the second click either waited for the first to finish and saw the order already refunded, or failed fast with a clear error, instead of quietly duplicating the refund.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Automation plus manual override</span>
+      <h4>The store running a Zapier refund automation alongside manual support</h4>
+      <p>A store used a Zapier workflow to auto-refund orders matching a return-approved tag, while support staff also processed refunds manually for edge cases. On days with a backlog, the automation and a support agent occasionally picked up the same order within seconds of each other, both unaware of the other's in-flight request.</p>
+      <p>The reconcile scan caught the resulting orders by comparing total_refunded against the sum of refund transactions and by grouping transactions with the same gateway_transaction_id. Every flagged order was a genuine double-submission, confirmed against the gateway dashboard, and none needed an automatic write, only a manual credit adjustment where the gateway confirmed a real overpayment refund.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After the lock is in place, a second refund request for the same order_id waits behind the first instead of reading the same stale quote, so payment_status only ever reflects one settled refund action at a time. The reconcile scan runs separately and only ever produces a report, order_id, expected total_refunded, actual sum of transactions, discrepancy, for a human to check against the gateway dashboard. Nothing gets auto-corrected, because BigCommerce has no undo-refund endpoint and a wrong guess here is real money.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does BigCommerce let two refund requests corrupt the same order?</summary>
+      <p>BigCommerce's refund workflow is two sequential calls per order, a refund_quotes call to compute the refundable amount and then a refund call that spends that quote, and refund settlement against the gateway is asynchronous. BigCommerce's own documentation states that processing multiple concurrent refunds on the same order is not yet supported, because there is no per-order idempotency lock at the API layer. When two refund requests race, both can read the same pre-refund quote and both get accepted, leaving payment_status mismatched against the real sum of refund transactions.</p>
+    </details>
+    <details>
+      <summary>Can I safely auto-fix an order once I detect a corrupted refund state?</summary>
+      <p>No. Refunds that were double-submitted to the gateway may already be irreversible money movement, so the safe action is to flag and report the discrepancy, not to write a blind correction. BigCommerce has no undo-refund endpoint, and issuing another programmatic refund on a corrupted order risks a second real charge reversal. A human should reconcile the flagged order against the payment gateway's own dashboard before any compensating action is taken.</p>
+    </details>
+    <details>
+      <summary>How do I stop this from happening to new refunds going forward?</summary>
+      <p>Serialize refunds per order_id with a lock, for example a Redis SETNX keyed as order_refund_lock:{order_id} or an in-process mutex keyed by order_id, acquired before calling refund_quotes and refund, and released only after the refund response or a timeout. That forces a second concurrent request for the same order to wait or fail fast instead of racing against the first one for the same quote.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: Order Refunds, including the note that concurrent refunds on the same order are not yet supported. <a href="https://developer.bigcommerce.com/docs/store-operations/orders/refunds" rel="noopener">developer.bigcommerce.com order refunds</a></li>
+      <li>BigCommerce Support Community: "The requested refund had invalid split payment" error when refunding via the API. <a href="https://support.bigcommerce.com/s/question/0D54O00006ZTMr5SAH/error-trying-to-refund-order-from-api-the-requested-refund-had-invalid-split-payment?language=en_US" rel="noopener">support.bigcommerce.com invalid split payment</a></li>
+      <li>BigCommerce Support Community: API endpoints to retrieve refund information on an order. <a href="https://support.bigcommerce.com/s/question/0D51B00004qD08uSAC/api-endpoints-to-retrieve-data-relating-to-refund-information?language=en_US" rel="noopener">support.bigcommerce.com refund information endpoints</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce API Reference: Create Refund, POST /v3/orders/{id}/payment_actions/refund. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/order-transactions/payment-actions/create-order-refund" rel="noopener">docs.bigcommerce.com create refund</a></li>
+      <li>BigCommerce API Reference: Create Refund Quote, POST /v3/orders/{id}/payment_actions/refund_quotes. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/order-transactions/payment-actions/create-order-refund-quotes" rel="noopener">docs.bigcommerce.com create refund quote</a></li>
+      <li>BigCommerce Developer Center: the Transactions API for enumerating refund transactions on an order. <a href="https://developer.bigcommerce.com/docs/store-operations/payments/transactions-api" rel="noopener">developer.bigcommerce.com transactions API</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this untangle a corrupted refund?</h3>
+    <p>If this saved you from a messy reconciliation or stopped the next race before it happened, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

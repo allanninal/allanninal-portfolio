@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce SKUs Endpoint Truncating at 50 Records</title>
+<meta name="description" content="BigCommerce's product SKU and variant sub-resource endpoints silently default limit to 50 per page and cap at 250, so a single unpaginated call returns a truncated list for any product with more than 50 SKUs. Learn why and build a Python or Node.js reconciler that fully paginates and reports the true count.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce SKUs Endpoint Truncating at 50 Records">
+<meta property="og:description" content="Why GET /v2/products/{id}/skus and GET /v3/catalog/products/{id}/variants quietly return only 50 records without pagination, and a safe Python or Node.js reconciler that finds every product with a truncated fetch and re-syncs it with the complete list.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/#article","headline":"Fix BigCommerce SKUs Endpoint Truncating at 50 Records","description":"BigCommerce's catalog SKU and variant sub-resource endpoints, GET /v2/products/{id}/skus and its V3 successor GET /v3/catalog/products/{id}/variants, silently default the limit query parameter to 50 per page when omitted, with a documented maximum of 250. A single unpaginated call returns only the first 50 records for any product with more, and the API never warns the caller. A Python or Node.js reconciler detects the truncation signature and re-fetches the complete, correctly paginated SKU or variant list.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Catalog / Products","keywords":"BigCommerce SKUs endpoint, v2 products skus, v3 catalog variants, pagination limit, meta.pagination, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"SKUs endpoint truncates at 50 records without paginating","item":"https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does the BigCommerce SKUs or variants endpoint only return 50 records?","acceptedAnswer":{"@type":"Answer","text":"GET /v2/products/{id}/skus and GET /v3/catalog/products/{id}/variants are paginated collection endpoints. When the limit query parameter is omitted, BigCommerce silently defaults it to 50 per page, with a documented maximum of 250. A client that calls the endpoint once without limit or page, or without reading meta.pagination.total_pages, only ever sees the first 50 records for any product that has more."}},{"@type":"Question","name":"How do I know a product's SKU or variant list was actually truncated?","acceptedAnswer":{"@type":"Answer","text":"Compare the number of records a single unpaginated call returned against meta.pagination.total from that same response. If the call returned exactly 50 records and meta.pagination.total is greater than 50, that combination is the truncation signature. The safest permanent check is to always read meta.pagination.total_pages and loop until every page has been fetched, regardless of how many records came back on the first page."}},{"@type":"Question","name":"Should the fix rewrite or delete the SKU records that were missed?","acceptedAnswer":{"@type":"Answer","text":"No. Truncation is a read-path defect, not a data-integrity problem, so there is nothing on the BigCommerce side to repair. The correct fix is to always paginate fully using limit=250 and looping until page is greater than or equal to meta.pagination.total_pages. If a downstream system, such as a mirrored SKU table, was populated from the truncated call, re-sync only the affected product_ids using the complete, fully paginated result set, guarded by a DRY_RUN flag before writing anything."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Catalog / Products</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Catalog / Products</p>
+    <h1>BigCommerce SKUs endpoint truncates at 50 records without paginating</h1>
+    <p class="lead">A product has 80 variants. A script calls the SKUs endpoint once, gets a tidy array back, and moves on. That array has exactly 50 rows in it. Nothing in the call itself says anything is missing. BigCommerce's catalog SKU and variant sub-resource endpoints are paginated collections where the limit query parameter silently defaults to 50 per page when you leave it out, capped at 250, and the API never auto-paginates or warns you. Here is why that gap opens up and a small reconciler that finds every product where it happened and re-fetches the complete list.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 / V3 Catalog API</span>
+      <span class="chip">Report first, re-sync guarded by dry run</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>Both <code>GET /v2/products/{id}/skus</code> and its V3 successor <code>GET /v3/catalog/products/{id}/variants</code> are paginated collection endpoints. When you omit the <code>limit</code> query parameter, BigCommerce silently applies a default of 50 records per page, with a documented maximum of 250. If your code calls the endpoint once, without passing <code>limit</code>/<code>page</code> and without reading <code>meta.pagination.total_pages</code>, you get back exactly the first 50 SKUs or variants for any product that has more, and the response never flags that anything was cut off. This is a well known integration pitfall documented in BigCommerce's own SDK issue trackers, not a platform bug. The fix is to always paginate fully: request <code>limit=250</code>, loop while <code>page &lt; meta.pagination.total_pages</code>, and treat a single-page call that returned exactly 50 records while <code>meta.pagination.total</code> is greater than 50 as the truncation signature. Full code, tests, and a reconciliation report are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>The V2 endpoint <code>GET /v2/products/{id}/skus</code>, and the V3 endpoint that replaces it for most new integrations, <code>GET /v3/catalog/products/{id}/variants</code>, both return a collection, not a single object. Like every other BigCommerce collection endpoint, they accept <code>limit</code> and <code>page</code> query parameters. What is easy to miss is what happens when you do not pass them: BigCommerce does not return everything, and it does not error. It quietly applies its own default page size of 50 and hands back exactly that many rows, even if the product actually has 80, 200, or 500 SKUs.</p>
+  <p>A product with 30 variants looks completely fine under this pattern, because 30 is under the default page size and the single call happens to return all of them. The bug only shows up on products that cross the 50-record line, which is exactly the kind of thing that slips past manual testing on a handful of sample SKUs and then surfaces in production against a real catalog with large variant matrices. Nothing about the shape of the response signals the problem. It is still a <code>data</code> array, still valid JSON, still exactly what the calling code expected to see, just short.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A product has 80 SKUs. A client calls the SKUs or variants endpoint once with no limit parameter. BigCommerce silently defaults limit to 50 and returns only the first 50 records, with no warning that 30 more exist, and the client treats the 50 it got as the complete list.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="165" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="92" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Product has</text>
+      <text x="92" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">80 SKUs / variants</text>
+      <line x1="178" y1="103" x2="215" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="185" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="310" y="92" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">GET .../skus</text>
+      <text x="310" y="108" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">or .../variants</text>
+      <text x="310" y="124" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">no limit, no page</text>
+      <line x1="406" y1="103" x2="450" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="428" y="60" text-anchor="middle" font-family="sans-serif" font-size="20" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="428" y="130" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">limit defaults to 50</text>
+      <rect x="453" y="70" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">50 records</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">returned, no warning</text>
+      <rect x="628" y="70" width="122" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="689" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">30 SKUs</text>
+      <text x="689" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">silently lost</text>
+      <line x1="603" y1="103" x2="625" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The response is valid, complete-looking JSON. It is still missing 30 of the product's 80 SKUs, and nothing about the shape of the array says so.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>This is a documented, well known integration pitfall, not a platform defect. A few concrete ways it reaches production code:</p>
+  <ul>
+    <li>Code written and tested against a handful of sample products, none of which happen to cross the 50-SKU line, so the bug never triggers during development.</li>
+    <li>A client that reads <code>data</code> from the response and never looks at <code>meta.pagination</code> at all, so there is no signal in the code path that would ever notice a mismatch between records fetched and records that exist.</li>
+    <li>Confusing the SKU/variant sub-resource with the parent product record. <code>GET /v3/catalog/products/{id}?include=variants</code> can behave differently from the dedicated variants collection endpoint, and teams sometimes trust whichever one they tested first without reconciling the two.</li>
+    <li>Legacy V2 client libraries and generated SDKs that expose a single "get SKUs for product" call with no obvious pagination affordance, which is exactly the shape of bug reported against the BigCommerce PHP and Python API client libraries.</li>
+  </ul>
+  <p>The endpoint is not lying or broken. It is doing precisely what a paginated collection endpoint is supposed to do: return one page, and describe the rest of the pages in <code>meta.pagination</code>, for the caller to act on. See the citations at the end for the exact SDK issues and API docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A single unpaginated call is never proof that you have every SKU or variant for a product. The proof is <code>meta.pagination.total</code>, or equivalently <code>meta.pagination.total_pages</code>, compared against how many records you actually retrieved across every page you fetched. The reconciler's job is not to guess whether a product was affected. It is to read that field on every call and treat <code>records_fetched == 50 and meta_pagination_total &gt; 50</code>, on a call made without an explicit <code>limit</code>, as the unambiguous truncation signature, then re-fetch that product's full list before anything downstream trusts it.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We never mutate a SKU or variant record. The reconciler pages through the product catalog, calls the variants (and, for cross-checking, the legacy SKUs) endpoint for each product, and compares what a naive single-page call would have returned against the true total from <code>meta.pagination</code>. Anything truncated gets a corrected, fully-paginated fetch and a line in the report.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A reconciler pages through all products, and for each product calls the variants endpoint once without a limit, reads meta.pagination.total, and checks whether records fetched equals 50 while the total is greater than 50. If so it is truncated, so the reconciler fully paginates with limit 250 and records the corrected count in a report. If not it moves to the next product.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="180" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="100" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Page all products</text>
+      <text x="100" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">/v3/catalog/products</text>
+      <line x1="100" y1="80" x2="100" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="220" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="120" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Call variants once</text>
+      <text x="120" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">no limit, read meta.pagination</text>
+      <line x1="230" y1="138" x2="272" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="365,106 452,138 365,170 278,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="365" y="133" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">fetched==50 and</text>
+      <text x="365" y="148" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">total&gt;50?</text>
+      <text x="455" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes, truncated</text>
+      <line x1="452" y1="138" x2="497" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="378" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, complete already</text>
+      <line x1="365" y1="170" x2="365" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="500" y="108" width="230" height="60" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="615" y="130" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Re-fetch fully paginated</text>
+      <text x="615" y="147" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">limit=250, loop to total_pages</text>
+      <path d="M365,205 C365,225 500,225 500,178" fill="none" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ah2)"></path>
+      <rect x="595" y="185" width="140" height="45" rx="9" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="665" y="203" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">Next product</text>
+      <text x="665" y="217" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55607a">report line either way</text>
+    </svg>
+    <figcaption>The reconciler only re-syncs a product once it has proven, from meta.pagination, that a single-page call would have truncated the list. Everything else is a passthrough with a clean report line.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Products (read-only) scope is enough for detection and the corrected re-fetch, since this reconciler is a read path. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   # this reconciler only ever reports and re-fetches, never writes</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   // this reconciler only ever reports and re-fetches, never writes</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Catalog REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and raises on a non-2xx response, and returns both the <code>data</code> array and the <code>meta</code> object, since <code>meta.pagination</code> is what the whole detection depends on.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    return body.get("data", []), body.get("meta", {})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return { data: body.data || [], meta: body.meta || {} };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List every product, and probe each one's variants with a single unpaginated call</h3>
+      <p>Page through <code>GET /v3/catalog/products?limit=250&amp;page=N</code>, following <code>meta.pagination.total_pages</code>, to enumerate every product_id. For each product, make the exact call a naive integration would make, <code>GET /v3/catalog/products/{product_id}/variants</code> with no <code>limit</code> or <code>page</code> at all, and keep both the record count returned and <code>meta.pagination.total</code> from that response. That single probe call is what feeds the decision function.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def all_product_ids():
+    page = 1
+    while True:
+        products, meta = bc_get("/catalog/products", {"limit": 250, "page": page})
+        if not products:
+            return
+        for product in products:
+            yield product["id"]
+        pagination = meta.get("pagination", {})
+        if page >= pagination.get("total_pages", page):
+            return
+        page += 1
+
+def probe_variants_unpaginated(product_id):
+    """The exact call a naive integration makes: no limit, no page."""
+    records, meta = bc_get(f"/catalog/products/{product_id}/variants")
+    total = meta.get("pagination", {}).get("total", len(records))
+    return len(records), total</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* allProductIds() {
+  let page = 1;
+  while (true) {
+    const { data: products, meta } = await bcGet("/catalog/products", { limit: 250, page });
+    if (!products.length) return;
+    for (const product of products) yield product.id;
+    const pagination = meta.pagination || {};
+    if (page >= (pagination.total_pages || page)) return;
+    page += 1;
+  }
+}
+
+async function probeVariantsUnpaginated(productId) {
+  // The exact call a naive integration makes: no limit, no page.
+  const { data: records, meta } = await bcGet(`/catalog/products/${productId}/variants`);
+  const total = (meta.pagination || {}).total ?? records.length;
+  return { recordsFetched: records.length, total };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the truncation decision in its own function that takes only plain values, how many records a call actually returned, whether a <code>limit</code> was explicitly requested, and what <code>meta.pagination.total</code> reported, and returns a plain boolean. If no limit was passed, BigCommerce applied its implicit default of 50, so the call is truncated exactly when it returned 50 records and the true total is greater than 50. If a limit was passed, truncation means the records actually fetched fall short of the smaller of the requested limit and the true total.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from typing import Optional
+
+IMPLICIT_DEFAULT_LIMIT = 50
+
+def is_truncated(
+    records_fetched: int, page_limit_requested: Optional[int], meta_pagination_total: int
+) -&gt; bool:
+    if page_limit_requested is None:
+        return records_fetched == IMPLICIT_DEFAULT_LIMIT and meta_pagination_total &gt; IMPLICIT_DEFAULT_LIMIT
+    expected = min(page_limit_requested, meta_pagination_total)
+    return records_fetched &lt; expected</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const IMPLICIT_DEFAULT_LIMIT = 50;
+
+export function isTruncated(recordsFetched, pageLimitRequested, metaPaginationTotal) {
+  if (pageLimitRequested === null || pageLimitRequested === undefined) {
+    return recordsFetched === IMPLICIT_DEFAULT_LIMIT &amp;&amp; metaPaginationTotal &gt; IMPLICIT_DEFAULT_LIMIT;
+  }
+  const expected = Math.min(pageLimitRequested, metaPaginationTotal);
+  return recordsFetched &lt; expected;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Re-fetch the complete list for anything flagged</h3>
+      <p>When <code>is_truncated</code> is true for a product_id, do not trust the 50 records already in hand. Re-run the fetch fully paginated, <code>limit=250</code>, looping while <code>page &lt; meta.pagination.total_pages</code>, and use that complete list as the corrected record set. This is the same shape of call whether you are re-populating a local mirror table or just producing the report a human will read.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def fetch_all_variants(product_id):
+    """Fully paginated. Always returns the complete list, never truncated."""
+    all_records = []
+    page = 1
+    while True:
+        records, meta = bc_get(f"/catalog/products/{product_id}/variants", {"limit": 250, "page": page})
+        all_records.extend(records)
+        pagination = meta.get("pagination", {})
+        if not records or page >= pagination.get("total_pages", page):
+            return all_records
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function fetchAllVariants(productId) {
+  // Fully paginated. Always returns the complete list, never truncated.
+  const allRecords = [];
+  let page = 1;
+  while (true) {
+    const { data: records, meta } = await bcGet(`/catalog/products/${productId}/variants`, { limit: 250, page });
+    allRecords.push(...records);
+    const pagination = meta.pagination || {};
+    if (!records.length || page >= (pagination.total_pages || page)) return allRecords;
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop enumerates every product, probes each one with the naive unpaginated call, and only pays the cost of a full paginated re-fetch for the products where <code>is_truncated</code> comes back true. It emits one report line per affected product_id with <code>expected_total</code> (from <code>meta.pagination.total</code>) versus <code>records_fetched_without_pagination</code> (capped at 50) versus the corrected count. If you also mirror SKUs into a downstream table, gate the actual write to that table behind <code>DRY_RUN</code>, exactly like every other reconciler here: log first, write only once you have reviewed the list.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Report, then repair the read, never the record</div>
+    <p>There is nothing wrong with the SKU or variant data on BigCommerce's side to fix. The defect is entirely in the unpaginated call. Never delete or overwrite anything based on the 50-record fetch. The only thing this job does with a positive detection is re-fetch fully paginated and, if you keep a downstream mirror table, guard that specific re-sync with <code>DRY_RUN=true</code> until you have reviewed the corrected counts.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, pages through the full product catalog, probes each product's variants exactly the way a naive integration would, flags any product where the truncation signature shows up, and re-fetches the complete list for every one it flags.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/sku-endpoint-truncates-at-50" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_truncated_skus.py</div>
+      <pre><code class="language-python">"""Find and re-fetch BigCommerce SKU / variant lists truncated at 50 records.
+
+GET /v2/products/{id}/skus and its V3 successor GET /v3/catalog/products/{id}/
+variants are paginated collection endpoints. When the limit query parameter is
+omitted, BigCommerce silently defaults it to 50 per page, with a documented
+maximum of 250. A client that calls the endpoint once, without limit/page and
+without reading meta.pagination.total_pages, only ever sees the first 50 SKUs
+or variants for any product that has more, and the response never signals
+anything was cut off. This is a well known integration pitfall documented in
+BigCommerce's own SDK issue trackers, not a platform bug. This job pages
+through the full product catalog, probes each product's variants with the
+exact unpaginated call a naive integration would make, flags every product_id
+where records_fetched == 50 and meta.pagination.total &gt; 50 (the truncation
+signature), and re-fetches the complete, fully paginated list for each one it
+flags. It never deletes or rewrites a SKU record; it only corrects the read.
+
+Guide: https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/
+"""
+import os
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_truncated_skus")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+IMPLICIT_DEFAULT_LIMIT = 50
+PAGE_LIMIT = 250
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    return body.get("data", []), body.get("meta", {})
+
+
+def is_truncated(
+    records_fetched: int, page_limit_requested: Optional[int], meta_pagination_total: int
+) -&gt; bool:
+    """Pure decision. No network, no side effects.
+
+    If page_limit_requested is None, BigCommerce applied the implicit default
+    of 50, so the call is truncated when records_fetched == 50 and the true
+    total is greater than 50. If page_limit_requested is not None, truncation
+    means records_fetched is less than the smaller of the requested limit and
+    the true total, after exhausting every page implied by that total.
+    """
+    if page_limit_requested is None:
+        return records_fetched == IMPLICIT_DEFAULT_LIMIT and meta_pagination_total &gt; IMPLICIT_DEFAULT_LIMIT
+    expected = min(page_limit_requested, meta_pagination_total)
+    return records_fetched &lt; expected
+
+
+@dataclass
+class ReconciliationRow:
+    product_id: int
+    expected_total: int
+    records_fetched_without_pagination: int
+    records_fetched_after_repair: int
+
+
+def all_product_ids():
+    page = 1
+    while True:
+        products, meta = bc_get("/catalog/products", {"limit": PAGE_LIMIT, "page": page})
+        if not products:
+            return
+        for product in products:
+            yield product["id"]
+        pagination = meta.get("pagination", {})
+        if page &gt;= pagination.get("total_pages", page):
+            return
+        page += 1
+
+
+def probe_variants_unpaginated(product_id):
+    """The exact call a naive integration makes: no limit, no page."""
+    records, meta = bc_get(f"/catalog/products/{product_id}/variants")
+    total = meta.get("pagination", {}).get("total", len(records))
+    return len(records), total
+
+
+def fetch_all_variants(product_id):
+    """Fully paginated. Always returns the complete list, never truncated."""
+    all_records = []
+    page = 1
+    while True:
+        records, meta = bc_get(
+            f"/catalog/products/{product_id}/variants", {"limit": PAGE_LIMIT, "page": page}
+        )
+        all_records.extend(records)
+        pagination = meta.get("pagination", {})
+        if not records or page &gt;= pagination.get("total_pages", page):
+            return all_records
+        page += 1
+
+
+def run():
+    affected: list[ReconciliationRow] = []
+    scanned = 0
+
+    for product_id in all_product_ids():
+        scanned += 1
+        records_fetched, expected_total = probe_variants_unpaginated(product_id)
+
+        if not is_truncated(records_fetched, None, expected_total):
+            continue
+
+        log.warning(
+            "product_id=%s truncated: records_fetched_without_pagination=%s expected_total=%s",
+            product_id, records_fetched, expected_total,
+        )
+
+        corrected = fetch_all_variants(product_id)
+        affected.append(
+            ReconciliationRow(
+                product_id=product_id,
+                expected_total=expected_total,
+                records_fetched_without_pagination=records_fetched,
+                records_fetched_after_repair=len(corrected),
+            )
+        )
+
+        if not DRY_RUN:
+            # Re-sync only this product_id's mirrored SKU rows here, using `corrected`.
+            log.info("product_id=%s re-synced with %s records.", product_id, len(corrected))
+        else:
+            log.info(
+                "product_id=%s would re-sync %s records (DRY_RUN=true, no write performed).",
+                product_id, len(corrected),
+            )
+
+    log.info(
+        "Done. Scanned %d product(s). %d product(s) were truncated at the implicit 50-record default.",
+        scanned, len(affected),
+    )
+    for row in affected:
+        log.info(
+            "REPORT product_id=%s expected_total=%s records_fetched_without_pagination=%s "
+            "records_fetched_after_repair=%s",
+            row.product_id, row.expected_total,
+            row.records_fetched_without_pagination, row.records_fetched_after_repair,
+        )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-truncated-skus.js</div>
+      <pre><code class="language-javascript">/**
+ * Find and re-fetch BigCommerce SKU / variant lists truncated at 50 records.
+ *
+ * GET /v2/products/{id}/skus and its V3 successor GET /v3/catalog/products/{id}/
+ * variants are paginated collection endpoints. When the limit query parameter is
+ * omitted, BigCommerce silently defaults it to 50 per page, with a documented
+ * maximum of 250. A client that calls the endpoint once, without limit/page and
+ * without reading meta.pagination.total_pages, only ever sees the first 50 SKUs
+ * or variants for any product that has more, and the response never signals
+ * anything was cut off. This is a well known integration pitfall documented in
+ * BigCommerce's own SDK issue trackers, not a platform bug. This job pages
+ * through the full product catalog, probes each product's variants with the
+ * exact unpaginated call a naive integration would make, flags every productId
+ * where recordsFetched === 50 and meta.pagination.total &gt; 50 (the truncation
+ * signature), and re-fetches the complete, fully paginated list for each one it
+ * flags. It never deletes or rewrites a SKU record; it only corrects the read.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/sku-endpoint-truncates-at-50/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const IMPLICIT_DEFAULT_LIMIT = 50;
+const PAGE_LIMIT = 250;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * If pageLimitRequested is null/undefined, BigCommerce applied the implicit
+ * default of 50, so the call is truncated when recordsFetched === 50 and the
+ * true total is greater than 50. If pageLimitRequested is set, truncation
+ * means recordsFetched is less than the smaller of the requested limit and
+ * the true total, after exhausting every page implied by that total.
+ */
+export function isTruncated(recordsFetched, pageLimitRequested, metaPaginationTotal) {
+  if (pageLimitRequested === null || pageLimitRequested === undefined) {
+    return recordsFetched === IMPLICIT_DEFAULT_LIMIT &amp;&amp; metaPaginationTotal &gt; IMPLICIT_DEFAULT_LIMIT;
+  }
+  const expected = Math.min(pageLimitRequested, metaPaginationTotal);
+  return recordsFetched &lt; expected;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return { data: body.data || [], meta: body.meta || {} };
+}
+
+async function* allProductIds() {
+  let page = 1;
+  while (true) {
+    const { data: products, meta } = await bcGet("/catalog/products", { limit: PAGE_LIMIT, page });
+    if (!products.length) return;
+    for (const product of products) yield product.id;
+    const pagination = meta.pagination || {};
+    if (page &gt;= (pagination.total_pages || page)) return;
+    page += 1;
+  }
+}
+
+async function probeVariantsUnpaginated(productId) {
+  // The exact call a naive integration makes: no limit, no page.
+  const { data: records, meta } = await bcGet(`/catalog/products/${productId}/variants`);
+  const total = (meta.pagination || {}).total ?? records.length;
+  return { recordsFetched: records.length, total };
+}
+
+async function fetchAllVariants(productId) {
+  // Fully paginated. Always returns the complete list, never truncated.
+  const allRecords = [];
+  let page = 1;
+  while (true) {
+    const { data: records, meta } = await bcGet(`/catalog/products/${productId}/variants`, {
+      limit: PAGE_LIMIT,
+      page,
+    });
+    allRecords.push(...records);
+    const pagination = meta.pagination || {};
+    if (!records.length || page &gt;= (pagination.total_pages || page)) return allRecords;
+    page += 1;
+  }
+}
+
+export async function run() {
+  const affected = [];
+  let scanned = 0;
+
+  for await (const productId of allProductIds()) {
+    scanned += 1;
+    const { recordsFetched, total: expectedTotal } = await probeVariantsUnpaginated(productId);
+
+    if (!isTruncated(recordsFetched, null, expectedTotal)) continue;
+
+    console.warn(
+      `product_id=${productId} truncated: records_fetched_without_pagination=${recordsFetched} expected_total=${expectedTotal}`
+    );
+
+    const corrected = await fetchAllVariants(productId);
+    affected.push({
+      productId,
+      expectedTotal,
+      recordsFetchedWithoutPagination: recordsFetched,
+      recordsFetchedAfterRepair: corrected.length,
+    });
+
+    if (!DRY_RUN) {
+      // Re-sync only this product's mirrored SKU rows here, using `corrected`.
+      console.log(`product_id=${productId} re-synced with ${corrected.length} records.`);
+    } else {
+      console.log(
+        `product_id=${productId} would re-sync ${corrected.length} records (DRY_RUN=true, no write performed).`
+      );
+    }
+  }
+
+  console.log(
+    `Done. Scanned ${scanned} product(s). ${affected.length} product(s) were truncated at the implicit 50-record default.`
+  );
+  for (const row of affected) {
+    console.log(
+      `REPORT product_id=${row.productId} expected_total=${row.expectedTotal} ` +
+      `records_fetched_without_pagination=${row.recordsFetchedWithoutPagination} ` +
+      `records_fetched_after_repair=${row.recordsFetchedAfterRepair}`
+    );
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides whether a product's SKU list gets treated as trustworthy or gets a full paginated re-fetch. Because <code>is_truncated</code> takes only plain values and returns a plain boolean, the test needs no network and no BigCommerce store. It just feeds in a few record counts and totals and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_sku_truncation.py</div>
+      <pre><code class="language-python">from reconcile_truncated_skus import is_truncated
+
+
+def test_no_limit_requested_and_records_equal_default_and_total_exceeds_it():
+    assert is_truncated(50, None, 80) is True
+
+
+def test_no_limit_requested_and_total_equals_records_fetched():
+    assert is_truncated(50, None, 50) is False
+
+
+def test_no_limit_requested_and_records_fetched_under_default():
+    assert is_truncated(30, None, 30) is False
+
+
+def test_explicit_limit_requested_and_records_fall_short_of_true_total():
+    assert is_truncated(200, 250, 260) is True
+
+
+def test_explicit_limit_requested_and_records_match_the_smaller_of_limit_and_total():
+    assert is_truncated(100, 250, 100) is False
+
+
+def test_explicit_limit_requested_and_records_match_the_limit_itself():
+    assert is_truncated(250, 250, 250) is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-truncated-skus.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isTruncated } from "./reconcile-truncated-skus.js";
+
+test("no limit requested and records equal the default while total exceeds it", () =&gt; {
+  assert.equal(isTruncated(50, null, 80), true);
+});
+
+test("no limit requested and total equals records fetched", () =&gt; {
+  assert.equal(isTruncated(50, null, 50), false);
+});
+
+test("no limit requested and records fetched under the default", () =&gt; {
+  assert.equal(isTruncated(30, null, 30), false);
+});
+
+test("explicit limit requested and records fall short of the true total", () =&gt; {
+  assert.equal(isTruncated(200, 250, 260), true);
+});
+
+test("explicit limit requested and records match the smaller of limit and total", () =&gt; {
+  assert.equal(isTruncated(100, 250, 100), false);
+});
+
+test("explicit limit requested and records match the limit itself", () =&gt; {
+  assert.equal(isTruncated(250, 250, 250), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Legacy SDK</span>
+      <h4>The migration script that silently dropped 30 SKUs per bulk product</h4>
+      <p>A merchant migrating from another platform ran a one-time script against a legacy BigCommerce API client library to pull every SKU for every product into a new pricing engine. The client library's <code>getSkus(productId)</code> helper made one call and returned whatever came back. Products with under 50 variants imported perfectly. Every bulk-configured product, size and color matrices well past 50 combinations, quietly imported only its first 50 SKUs, and the pricing engine ran for weeks with incomplete variant coverage before anyone noticed prices missing on specific combinations.</p>
+      <p>Running the reconciler against the full catalog found the exact product_ids where the naive call had returned exactly 50 records against a much larger <code>meta.pagination.total</code>, then re-fetched each one fully paginated. The pricing engine was re-synced only for those flagged product_ids, using the corrected list.</p>
+    </div>
+    <div class="case">
+      <span class="tag">V2 to V3 migration</span>
+      <h4>The team that trusted the wrong endpoint during a version upgrade</h4>
+      <p>A store migrating integration code from <code>GET /v2/products/{id}/skus</code> to <code>GET /v3/catalog/products/{id}/variants</code> tested the new endpoint against a small set of simple products and confirmed the shape of the response matched what the old code expected. The team shipped the change without re-testing against the store's largest configurable products, which carried well over 50 variants each.</p>
+      <p>The reconciler caught it on the first scheduled run after deploy, before a downstream inventory sync job ever picked up the incomplete variant lists. Every affected product_id was flagged with its expected total and its truncated count, and the corrected fetch ran automatically once the report had been reviewed.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no product's SKU or variant count is trusted from a single unpaginated call. Every product is probed the same way a naive integration would probe it, any product where the truncation signature shows up gets a full, correctly paginated re-fetch, and the report shows exactly which product_ids were affected, what the true total was, and how many records the corrected fetch actually returned, so nothing downstream ever silently works off a 50-record slice of a larger list again.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does the BigCommerce SKUs or variants endpoint only return 50 records?</summary>
+      <p>GET /v2/products/{id}/skus and GET /v3/catalog/products/{id}/variants are paginated collection endpoints. When the limit query parameter is omitted, BigCommerce silently defaults it to 50 per page, with a documented maximum of 250. A client that calls the endpoint once without limit or page, or without reading meta.pagination.total_pages, only ever sees the first 50 records for any product that has more.</p>
+    </details>
+    <details>
+      <summary>How do I know a product's SKU or variant list was actually truncated?</summary>
+      <p>Compare the number of records a single unpaginated call returned against meta.pagination.total from that same response. If the call returned exactly 50 records and meta.pagination.total is greater than 50, that combination is the truncation signature. The safest permanent check is to always read meta.pagination.total_pages and loop until every page has been fetched, regardless of how many records came back on the first page.</p>
+    </details>
+    <details>
+      <summary>Should the fix rewrite or delete the SKU records that were missed?</summary>
+      <p>No. Truncation is a read-path defect, not a data-integrity problem, so there is nothing on the BigCommerce side to repair. The correct fix is to always paginate fully using limit=250 and looping until page is greater than or equal to meta.pagination.total_pages. If a downstream system, such as a mirrored SKU table, was populated from the truncated call, re-sync only the affected product_ids using the complete, fully paginated result set, guarded by a DRY_RUN flag before writing anything.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">Orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">Transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>Issue with products with more than 50 Skus, bigcommerce-api-php. <a href="https://github.com/bigcommerce/bigcommerce-api-php/issues/187" rel="noopener">github.com bigcommerce-api-php issue #187</a></li>
+      <li>Pagination on a subresource, bigcommerce-api-python. <a href="https://github.com/bigcommerce/bigcommerce-api-python/issues/18" rel="noopener">github.com bigcommerce-api-python issue #18</a></li>
+      <li>BigCommerce Developer Center: Product SKU (V2 legacy reference). <a href="https://developer.bigcommerce.com/legacy/v2-catalog-products/v2-product-sku" rel="noopener">developer.bigcommerce.com v2 product sku</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Product Variants (V3). <a href="https://developer.bigcommerce.com/docs/rest-catalog/product-variants" rel="noopener">developer.bigcommerce.com product variants</a></li>
+      <li>BigCommerce Docs: List Products, pagination params (limit, page, meta.pagination). <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/catalog/products/get-products" rel="noopener">docs.bigcommerce.com list products</a></li>
+      <li>BigCommerce Support: Platform Limits. <a href="https://support.bigcommerce.com/s/article/Platform-Limits?language=en_US" rel="noopener">support.bigcommerce.com platform limits</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silently truncated SKU list?</h3>
+    <p>If this saved you from a pricing or inventory job quietly working off half a product's variants, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Manual Refunded Status Without a Transaction</title>
+<meta name="description" content="A BigCommerce order shows status_id 4, Refunded, but the transactions endpoint has no refund entry and no money ever moved. Learn why status and money are decoupled, and build a Python or Node.js reconciler that flags every orphaned Refunded status and prepares, but never submits, the real refund.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Manual Refunded Status Without a Transaction">
+<meta property="og:description" content="Why a BigCommerce order can show Refunded or Partially Refunded with zero matching refund transactions, and a safe Python or Node.js reconciler that flags the mismatch instead of guessing.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/#article","headline":"Fix BigCommerce Manual Refunded Status Without a Transaction","description":"BigCommerce lets status_id be set to 4 (Refunded) or 14 (Partially Refunded) with a plain PUT to the order, with no side effect and no money movement. Here is why status and money are decoupled, and a safe Python or Node.js reconciler that flags every order marked Refunded with no matching refund transaction.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders","keywords":"BigCommerce Refunded status, status_id 4, status_id 14, Payment Actions, refund_quotes, order transactions, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Manual status change to Refunded does not move any money","item":"https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a BigCommerce order show Refunded when no money was actually returned?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce treats order status and money movement as two separate systems. The status_id field is just a label on the order record, and PUT /v2/orders/{id} will accept status_id 4 (Refunded) or 14 (Partially Refunded) with no side effect at all. Only the dedicated Payment Actions endpoints, refund_quotes then refunds, actually call the gateway and move money, then write a transaction and update the status as a result. If staff use the Edit status dropdown instead of the Refund action, or a script PUTs status_id 4 directly, BigCommerce shows Refunded with zero refund transactions behind it."}},{"@type":"Question","name":"Can I safely auto-fix an order that is stuck showing Refunded with no transaction?","acceptedAnswer":{"@type":"Answer","text":"No, not automatically. There is no BigCommerce API to retroactively attach a real gateway refund to an order after the fact, and whether the customer was already refunded through some other channel, like the processor's own dashboard, requires a human to check. The safe pattern is to flag the mismatch, and optionally fetch a refund quote to show an operator the exact request they would need to confirm, but never auto-submit the refund itself since that moves real money."}},{"@type":"Question","name":"How do I detect these orphaned Refunded statuses across a whole store?","acceptedAnswer":{"@type":"Answer","text":"Query GET /v2/orders with status_id=4 and again with status_id=14 for your lookback window, then call GET /v2/orders/{id}/transactions for each order and look for a refund-type entry whose summed amount is greater than zero. Cross-check against GET /v3/orders/{order_id}/payment_actions/refunds. Any order marked Refunded or Partially Refunded with no matching refund transaction, or a refunded_amount that is still 0.00, is an orphaned status change with no money behind it."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Orders</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Orders</p>
+    <h1>Manual status change to Refunded does not move any money</h1>
+    <p class="lead">An order sits at status_id 4, Refunded, or 14, Partially Refunded. The customer is asking where their money is. You check the transactions endpoint and there is nothing there, no refund entry, no amount, no gateway call. BigCommerce let someone set that status directly, with zero side effects, because order status and money movement are two completely separate systems. Here is why that gap opens up and a reconciler that flags every orphaned Refunded status instead of quietly trusting the label.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 Orders and Payment Actions</span>
+      <span class="chip">Report only, never auto-refunds</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's status_id field is just a label stored on the order record. A plain <code>PUT /v2/orders/{id}</code> with <code>{"status_id": 4}</code> or <code>14</code> is accepted with no side effect, no gateway call, and no transaction written. Real refunds only happen through the Payment Actions workflow, <code>POST .../payment_actions/refund_quotes</code> then <code>POST .../payment_actions/refunds</code>, which calls the original gateway and, only on success, writes a transaction and updates status_id as a result. When staff use the admin's Edit status dropdown instead of the Refund action, or an integration PUTs status_id 4 directly to mirror an external refund, the order shows Refunded while <code>GET /v2/orders/{id}/transactions</code> stays empty. Run a small Python or Node.js script that lists orders at status_id 4 and 14, checks each one's transactions for an actual refund entry, and reports every mismatch, optionally fetching a refund quote to show an operator exactly what to submit, but never auto-submitting a refund itself. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In BigCommerce, an order's status_id and the money that has actually moved through the payment gateway are not the same fact, and nothing forces them to agree. The status field is metadata. It is written the same way whether you type it into the Edit status dropdown in the admin, or send a script that calls <code>PUT /v2/orders/{id}</code> with a raw status_id. BigCommerce accepts either one without checking whether a refund actually happened.</p>
+  <p>Actually moving money back to a customer is a different, dedicated workflow: the Payment Actions API. It calls the original payment gateway, waits for a real result, and only on success writes a transaction record and updates the order's status as a side effect of that success. If a staff member instead reaches for the general status editor, or an external system mirrors a refund it processed somewhere else by writing status_id 4 straight onto the order, BigCommerce happily shows Refunded. The transactions endpoint for that order stays empty. The customer, and the next person looking at the order, both believe the money went back. It did not.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Staff use the Edit status dropdown or a script PUTs status_id 4 directly to the order. BigCommerce accepts the write with no side effect. The order shows Refunded but the transactions endpoint has no refund entry and no money moved.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="80" width="170" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="108" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Edit status dropdown</text>
+      <text x="95" y="126" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">or PUT status_id=4</text>
+      <line x1="183" y1="113" x2="225" y2="113" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="228" y="80" width="170" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="313" y="108" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">BigCommerce accepts</text>
+      <text x="313" y="126" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">no side effect fired</text>
+      <line x1="398" y1="113" x2="450" y2="113" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="424" y="70" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="424" y="140" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">No gateway call</text>
+      <rect x="453" y="80" width="150" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="108" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">status_id 4</text>
+      <text x="528" y="126" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">shows Refunded</text>
+      <rect x="633" y="80" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="104" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Transactions</text>
+      <text x="691" y="122" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">empty</text>
+      <line x1="606" y1="113" x2="630" y2="113" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The status label changes instantly. No gateway call happens, and the transactions endpoint for that order never shows a refund.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce splits "what the order record says" from "what actually happened to the money" into two systems that only agree when the correct workflow is used. A few common ways stores end up with orphaned Refunded statuses:</p>
+  <ul>
+    <li>A staff member opens the order, reaches for the general Edit status dropdown out of habit, and picks Refunded or Partially Refunded, instead of using the dedicated Refund action in the Order Actions menu.</li>
+    <li>A third-party integration, like a returns app or an ERP sync, processes a refund somewhere else entirely and then blindly writes <code>status_id=4</code> to BigCommerce through <code>PUT /v2/orders/{id}</code> to keep the two systems visually in sync, without ever calling BigCommerce's own Payment Actions endpoints.</li>
+    <li>A script written against the V2 Orders API sets status_id directly because it is the simplest call available, not realizing that the write has no relationship to the payment gateway at all.</li>
+    <li>An earlier real refund attempt through Payment Actions failed partway (the gateway declined the refund_quotes call, for example), but a retry loop or a manual cleanup step still forced the status forward to Refunded on the order record.</li>
+  </ul>
+  <p>This is a recurring point of confusion in BigCommerce's own support channels: merchants report refunds that "are not going through" or fail with an error, while the order itself may still end up marked Refunded through some other path, leaving staff with no reliable way to tell, just by looking at the order status, whether the customer actually got their money. See the citations at the end for the exact support threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>An order's status_id is not proof that money moved. The transactions record is. So the safe pattern is not "trust any order marked Refunded." It is "treat status_id 4 or 14 as a claim, and verify that claim against <code>GET /v2/orders/{id}/transactions</code> for a refund-type entry with a non-zero amount, cross-checked against <code>GET /v3/orders/{order_id}/payment_actions/refunds</code>." Anything marked Refunded or Partially Refunded with no matching refund transaction is flagged, never silently repaired, because only a human can know whether the customer was actually paid back through some other channel.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the live Edit status flow or the Payment Actions endpoints in normal operation. We add a reconciler job that lists orders recently marked Refunded or Partially Refunded, checks each one's transaction history for real refund evidence, and reports every mismatch for a human to resolve, optionally preparing (but never submitting) the exact refund request an operator would need to confirm.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A scheduled job lists orders at status_id 4 or 14, reads each order's transactions and payment action refunds, and if no refund transaction exists it writes the order to a report and, only if DRY_RUN is false, fetches a refund quote to print the exact refund request an operator must confirm, never submitting it automatically.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List status_id 4/14</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">Refunded orders</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Read transactions</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">+ payment_actions/refunds</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Refund txn</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">found?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">yes, skip</text>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, orphaned</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#4c9a2a" stroke-width="1.6"></line>
+      <rect x="500" y="185" width="150" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="575" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Report + optional</text>
+      <text x="575" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">refund_quotes preview</text>
+      <line x1="662" y1="138" x2="700" y2="138" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <text x="710" y="143" font-family="sans-serif" font-size="10.5" fill="#8a93a8">no action taken</text>
+    </svg>
+    <figcaption>The reconciler only ever reports and, at most, prepares a refund quote for a human. It never calls the real refunds endpoint itself.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (modify) and Payments scope so it can read transactions, read payment_actions, and, later, fetch refund quotes. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="30"
+export DRY_RUN="true"   # start safe, change to false only to preview a refund quote</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="30"
+export DRY_RUN="true"   // start safe, change to false only to preview a refund quote</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 Orders and V3 Payment Actions APIs</h3>
+      <p>Order status and transactions live under <code>https://api.bigcommerce.com/stores/{store_hash}/v2/</code>. Payment Actions, refund_quotes and refunds, live under the V3 base, <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code>, and wrap responses in <code>{data, meta}</code>. Both use the same <code>X-Auth-Token</code> header. A small helper handles GET and POST and raises on a non-2xx response.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+V2_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+V3_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_post(base, path, body):
+    r = requests.post(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const V2_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const V3_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPost(base, path, body) {
+  const res = await fetch(`${base}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List the candidate orders and read their transactions</h3>
+      <p>Call <code>GET /v2/orders?status_id=4&amp;min_date_modified=...</code>, paginated, and repeat with <code>status_id=14</code>, to get every order recently marked Refunded or Partially Refunded within your lookback window. For each one, call <code>GET /v2/orders/{id}/transactions</code> for the raw transaction list, and <code>GET /v3/orders/{order_id}/payment_actions/refunds</code> to cross-check BigCommerce's own recorded refund history for that order.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">REFUNDED = 4
+PARTIALLY_REFUNDED = 14
+
+def candidate_orders(status_id, lookback_days):
+    page = 1
+    while True:
+        orders = bc_get(V2_BASE, "/orders", {
+            "status_id": status_id,
+            "min_date_modified": f"-{lookback_days} days",
+            "page": page,
+            "limit": 50,
+        })
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+def order_transactions(order_id):
+    return bc_get(V2_BASE, f"/orders/{order_id}/transactions")
+
+def order_payment_action_refunds(order_id):
+    result = bc_get(V3_BASE, f"/orders/{order_id}/payment_actions/refunds")
+    return result.get("data", []) if isinstance(result, dict) else []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const REFUNDED = 4;
+const PARTIALLY_REFUNDED = 14;
+
+async function* candidateOrders(statusId, lookbackDays) {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet(V2_BASE, "/orders", {
+      status_id: statusId,
+      min_date_modified: `-${lookbackDays} days`,
+      page,
+      limit: 50,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderTransactions(orderId) {
+  return bcGet(V2_BASE, `/orders/${orderId}/transactions`);
+}
+
+async function orderPaymentActionRefunds(orderId) {
+  const result = await bcGet(V3_BASE, `/orders/${orderId}/payment_actions/refunds`);
+  return (result &amp;&amp; result.data) || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the order's status_id, its transaction list, its refunded_amount, and its total_inc_tax, and returns a plain true or false. The rule is deliberately narrow: only status_id 4 or 14 count, and the order is only orphaned when there is no refund-type transaction and the refunded_amount does not reflect any actual refund. Anything else is left alone.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">REFUND_STATUS_IDS = {4, 14}
+AMOUNT_EPSILON = 0.01
+
+def is_orphaned_refund_status(
+    status_id: int, transactions: list, refunded_amount: str, total_inc_tax: str
+) -&gt; bool:
+    if status_id not in REFUND_STATUS_IDS:
+        return False
+
+    has_refund_txn = False
+    refund_txn_total = 0.0
+    for txn in transactions or []:
+        kind = (txn.get("type") or txn.get("event") or "").lower()
+        if kind != "refund":
+            continue
+        try:
+            amount = float(txn.get("amount"))
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount &gt; 0:
+            has_refund_txn = True
+            refund_txn_total += amount
+
+    try:
+        recorded_refund = float(refunded_amount)
+    except (TypeError, ValueError):
+        recorded_refund = 0.0
+
+    no_recorded_refund = recorded_refund &lt; AMOUNT_EPSILON
+
+    return (not has_refund_txn) and no_recorded_refund and refund_txn_total &lt; AMOUNT_EPSILON</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const REFUND_STATUS_IDS = new Set([4, 14]);
+const AMOUNT_EPSILON = 0.01;
+
+export function isOrphanedRefundStatus(statusId, transactions, refundedAmount, totalIncTax) {
+  if (!REFUND_STATUS_IDS.has(statusId)) return false;
+
+  let hasRefundTxn = false;
+  let refundTxnTotal = 0;
+  for (const txn of transactions || []) {
+    const kind = (txn.type || txn.event || "").toLowerCase();
+    if (kind !== "refund") continue;
+    const amount = Number.parseFloat(txn.amount);
+    if (Number.isFinite(amount) &amp;&amp; amount &gt; 0) {
+      hasRefundTxn = true;
+      refundTxnTotal += amount;
+    }
+  }
+
+  const recordedRefund = Number.parseFloat(refundedAmount);
+  const noRecordedRefund = !Number.isFinite(recordedRefund) || recordedRefund &lt; AMOUNT_EPSILON;
+
+  return !hasRefundTxn &amp;&amp; noRecordedRefund &amp;&amp; refundTxnTotal &lt; AMOUNT_EPSILON;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Report the mismatch, never auto-refund</h3>
+      <p>When an order is orphaned, write its order_id, current status_id, total_inc_tax, and a summary of its transactions to a report. There is no BigCommerce endpoint to retroactively attach a real refund to an order after the fact, and only a human can know whether the customer was already refunded through some other channel, like the processor's own dashboard. So the job stops there by default.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">report.py</div>
+      <pre><code class="language-python">def build_report_row(order, transactions):
+    return {
+        "order_id": order["id"],
+        "status_id": order.get("status_id"),
+        "total_inc_tax": order.get("total_inc_tax"),
+        "refunded_amount": order.get("refunded_amount"),
+        "transaction_count": len(transactions or []),
+    }</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">report.js</div>
+      <pre><code class="language-javascript">function buildReportRow(order, transactions) {
+  return {
+    order_id: order.id,
+    status_id: order.status_id,
+    total_inc_tax: order.total_inc_tax,
+    refunded_amount: order.refunded_amount,
+    transaction_count: (transactions || []).length,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard, optional refund quote preview</h3>
+      <p>The loop ties every piece together. With <code>DRY_RUN=true</code> (the default), the job only writes the report. If an operator sets <code>DRY_RUN=false</code>, the job additionally calls <code>POST /v3/orders/{order_id}/payment_actions/refund_quotes</code> for each orphaned order to fetch a valid quote, then prints the exact <code>POST /v3/orders/{order_id}/payment_actions/refunds</code> body an operator would need to review and submit by hand. The job itself never calls the real refunds endpoint. That call always requires a human to run it.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This job never moves money. Even with <code>DRY_RUN=false</code>, it only fetches a refund quote and prints the exact request an operator would need to confirm. Submitting the real <code>payment_actions/refunds</code> call is a decision only a human should make, after checking whether the customer was already paid back some other way.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and only ever reports or previews, because there is no safe way to auto-repair an order that claims to be refunded with no money behind it.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/manual-refunded-status-without-transaction" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">find_orphaned_refund_statuses.py</div>
+      <pre><code class="language-python">"""Find BigCommerce orders marked Refunded or Partially Refunded with no real refund behind them.
+
+BigCommerce treats order status and money movement as two decoupled systems. The
+status_id field is just a label on the order record, and PUT /v2/orders/{id} will
+accept status_id 4 (Refunded) or 14 (Partially Refunded) with no side effect at all.
+Real refunds only happen through the Payment Actions workflow, refund_quotes then
+refunds, which calls the gateway and, only on success, writes a transaction and
+updates status as a result. Staff using the Edit status dropdown instead of the
+Refund action, or an integration that PUTs status_id 4 directly to mirror an
+external refund, both leave the order showing Refunded with zero refund
+transactions behind it. This job lists candidate orders at status_id 4 and 14,
+reads each order's transactions, and reports every order where no refund-type
+transaction exists and refunded_amount is still 0.00. There is no API to
+retroactively attach a real refund to an order, so this never auto-repairs.
+With DRY_RUN=false it additionally fetches a refund quote and prints the exact
+refund request an operator would need to review and submit by hand. It never
+calls the real refunds endpoint itself. Run on a schedule. Safe to run again
+and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("find_orphaned_refund_statuses")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+V2_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+V3_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "30"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+REFUNDED = 4
+PARTIALLY_REFUNDED = 14
+REFUND_STATUS_IDS = {REFUNDED, PARTIALLY_REFUNDED}
+AMOUNT_EPSILON = 0.01
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(base, path, params=None):
+    r = requests.get(f"{base}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_post(base, path, body):
+    r = requests.post(f"{base}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return {}
+    return r.json()
+
+
+def is_orphaned_refund_status(
+    status_id: int, transactions: list, refunded_amount: str, total_inc_tax: str
+) -&gt; bool:
+    """Pure decision. No network, no side effects.
+
+    status_id from the BigCommerce order (4=Refunded, 14=Partially Refunded).
+    transactions is the list from GET /v2/orders/{id}/transactions, each a dict
+    with a 'type' (or 'event') key. refunded_amount and total_inc_tax are decimal
+    strings from the order resource. Returns True only when status_id is 4 or 14,
+    there is no refund-type transaction with a positive amount, and refunded_amount
+    is still effectively 0.00, meaning the status was changed with no money moved.
+    """
+    if status_id not in REFUND_STATUS_IDS:
+        return False
+
+    has_refund_txn = False
+    refund_txn_total = 0.0
+    for txn in transactions or []:
+        kind = (txn.get("type") or txn.get("event") or "").lower()
+        if kind != "refund":
+            continue
+        try:
+            amount = float(txn.get("amount"))
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount &gt; 0:
+            has_refund_txn = True
+            refund_txn_total += amount
+
+    try:
+        recorded_refund = float(refunded_amount)
+    except (TypeError, ValueError):
+        recorded_refund = 0.0
+
+    no_recorded_refund = recorded_refund &lt; AMOUNT_EPSILON
+
+    return (not has_refund_txn) and no_recorded_refund and refund_txn_total &lt; AMOUNT_EPSILON
+
+
+def candidate_orders(status_id):
+    """Page through orders currently at the given refund-ish status_id."""
+    page = 1
+    while True:
+        orders = bc_get(
+            V2_BASE,
+            "/orders",
+            {
+                "status_id": status_id,
+                "min_date_modified": f"-{LOOKBACK_DAYS} days",
+                "page": page,
+                "limit": 50,
+            },
+        )
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+
+def order_transactions(order_id):
+    return bc_get(V2_BASE, f"/orders/{order_id}/transactions")
+
+
+def order_payment_action_refunds(order_id):
+    result = bc_get(V3_BASE, f"/orders/{order_id}/payment_actions/refunds")
+    return result.get("data", []) if isinstance(result, dict) else []
+
+
+def fetch_refund_quote(order_id):
+    """Fetch a refund quote from BigCommerce. Never submits the refund itself."""
+    return bc_post(V3_BASE, f"/orders/{order_id}/payment_actions/refund_quotes", {})
+
+
+def build_report_row(order, transactions):
+    return {
+        "order_id": order["id"],
+        "status_id": order.get("status_id"),
+        "total_inc_tax": order.get("total_inc_tax"),
+        "refunded_amount": order.get("refunded_amount"),
+        "transaction_count": len(transactions or []),
+    }
+
+
+def run():
+    orphaned = 0
+    for status_id in (REFUNDED, PARTIALLY_REFUNDED):
+        for order in candidate_orders(status_id):
+            order_id = order["id"]
+            transactions = order_transactions(order_id)
+            payment_action_refunds = order_payment_action_refunds(order_id)
+
+            orphaned_flag = is_orphaned_refund_status(
+                order.get("status_id"),
+                transactions,
+                order.get("refunded_amount"),
+                order.get("total_inc_tax"),
+            )
+            if not orphaned_flag:
+                continue
+            if payment_action_refunds:
+                # BigCommerce's own Payment Actions history disagrees with the
+                # transactions read; still worth a human look, but log distinctly.
+                log.warning(
+                    "Order %s has payment_actions/refunds history but no matching "
+                    "transaction entry, needs manual review.", order_id,
+                )
+
+            row = build_report_row(order, transactions)
+            log.warning(
+                "ORPHANED REFUND STATUS order_id=%s status_id=%s total_inc_tax=%s "
+                "refunded_amount=%s transaction_count=%s",
+                row["order_id"], row["status_id"], row["total_inc_tax"],
+                row["refunded_amount"], row["transaction_count"],
+            )
+            orphaned += 1
+
+            if not DRY_RUN:
+                quote = fetch_refund_quote(order_id)
+                log.info(
+                    "Refund quote fetched for order_id=%s. To submit, an operator "
+                    "must POST %s/orders/%s/payment_actions/refunds with body: %s",
+                    order_id, V3_BASE, order_id, quote,
+                )
+
+    log.info("Done. %d order(s) flagged as orphaned Refunded status.", orphaned)
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-orphaned-refund-statuses.js</div>
+      <pre><code class="language-javascript">/**
+ * Find BigCommerce orders marked Refunded or Partially Refunded with no real refund behind them.
+ *
+ * BigCommerce treats order status and money movement as two decoupled systems. The
+ * status_id field is just a label on the order record, and PUT /v2/orders/{id} will
+ * accept status_id 4 (Refunded) or 14 (Partially Refunded) with no side effect at all.
+ * Real refunds only happen through the Payment Actions workflow, refund_quotes then
+ * refunds, which calls the gateway and, only on success, writes a transaction and
+ * updates status as a result. Staff using the Edit status dropdown instead of the
+ * Refund action, or an integration that PUTs status_id 4 directly to mirror an
+ * external refund, both leave the order showing Refunded with zero refund
+ * transactions behind it. This job lists candidate orders at status_id 4 and 14,
+ * reads each order's transactions, and reports every order where no refund-type
+ * transaction exists and refunded_amount is still 0.00. There is no API to
+ * retroactively attach a real refund to an order, so this never auto-repairs.
+ * With DRY_RUN=false it additionally fetches a refund quote and prints the exact
+ * refund request an operator would need to review and submit by hand. It never
+ * calls the real refunds endpoint itself. Run on a schedule.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/manual-refunded-status-without-transaction/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const V2_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const V3_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 30);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const REFUNDED = 4;
+const PARTIALLY_REFUNDED = 14;
+const REFUND_STATUS_IDS = new Set([REFUNDED, PARTIALLY_REFUNDED]);
+const AMOUNT_EPSILON = 0.01;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * statusId from the BigCommerce order (4=Refunded, 14=Partially Refunded).
+ * transactions is the list from GET /v2/orders/{id}/transactions, each an object
+ * with a 'type' (or 'event') key. refundedAmount and totalIncTax are decimal
+ * strings from the order resource. Returns true only when statusId is 4 or 14,
+ * there is no refund-type transaction with a positive amount, and refundedAmount
+ * is still effectively 0.00, meaning the status was changed with no money moved.
+ */
+export function isOrphanedRefundStatus(statusId, transactions, refundedAmount, totalIncTax) {
+  if (!REFUND_STATUS_IDS.has(statusId)) return false;
+
+  let hasRefundTxn = false;
+  let refundTxnTotal = 0;
+  for (const txn of transactions || []) {
+    const kind = (txn.type || txn.event || "").toLowerCase();
+    if (kind !== "refund") continue;
+    const amount = Number.parseFloat(txn.amount);
+    if (Number.isFinite(amount) &amp;&amp; amount &gt; 0) {
+      hasRefundTxn = true;
+      refundTxnTotal += amount;
+    }
+  }
+
+  const recordedRefund = Number.parseFloat(refundedAmount);
+  const noRecordedRefund = !Number.isFinite(recordedRefund) || recordedRefund &lt; AMOUNT_EPSILON;
+
+  return !hasRefundTxn &amp;&amp; noRecordedRefund &amp;&amp; refundTxnTotal &lt; AMOUNT_EPSILON;
+}
+
+async function bcGet(base, path, params = {}) {
+  const url = new URL(`${base}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPost(base, path, body) {
+  const res = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function* candidateOrders(statusId) {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet(V2_BASE, "/orders", {
+      status_id: statusId,
+      min_date_modified: `-${LOOKBACK_DAYS} days`,
+      page,
+      limit: 50,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderTransactions(orderId) {
+  return bcGet(V2_BASE, `/orders/${orderId}/transactions`);
+}
+
+async function orderPaymentActionRefunds(orderId) {
+  const result = await bcGet(V3_BASE, `/orders/${orderId}/payment_actions/refunds`);
+  return (result &amp;&amp; result.data) || [];
+}
+
+async function fetchRefundQuote(orderId) {
+  return bcPost(V3_BASE, `/orders/${orderId}/payment_actions/refund_quotes`, {});
+}
+
+function buildReportRow(order, transactions) {
+  return {
+    order_id: order.id,
+    status_id: order.status_id,
+    total_inc_tax: order.total_inc_tax,
+    refunded_amount: order.refunded_amount,
+    transaction_count: (transactions || []).length,
+  };
+}
+
+export async function run() {
+  let orphaned = 0;
+
+  for (const statusId of [REFUNDED, PARTIALLY_REFUNDED]) {
+    for await (const order of candidateOrders(statusId)) {
+      const orderId = order.id;
+      const transactions = await orderTransactions(orderId);
+      const paymentActionRefunds = await orderPaymentActionRefunds(orderId);
+
+      const orphanedFlag = isOrphanedRefundStatus(
+        order.status_id,
+        transactions,
+        order.refunded_amount,
+        order.total_inc_tax,
+      );
+      if (!orphanedFlag) continue;
+
+      if (paymentActionRefunds.length) {
+        console.warn(
+          `Order ${orderId} has payment_actions/refunds history but no matching transaction entry, needs manual review.`
+        );
+      }
+
+      const row = buildReportRow(order, transactions);
+      console.warn(
+        `ORPHANED REFUND STATUS order_id=${row.order_id} status_id=${row.status_id} ` +
+        `total_inc_tax=${row.total_inc_tax} refunded_amount=${row.refunded_amount} ` +
+        `transaction_count=${row.transaction_count}`
+      );
+      orphaned += 1;
+
+      if (!DRY_RUN) {
+        const quote = await fetchRefundQuote(orderId);
+        console.log(
+          `Refund quote fetched for order_id=${orderId}. To submit, an operator must ` +
+          `POST ${V3_BASE}/orders/${orderId}/payment_actions/refunds with body: ${JSON.stringify(quote)}`
+        );
+      }
+    }
+  }
+
+  console.log(`Done. ${orphaned} order(s) flagged as orphaned Refunded status.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides which orders get flagged as misleading. Because <code>is_orphaned_refund_status</code> takes only plain values and returns a plain boolean, the test needs no network and no BigCommerce store. It just feeds in plain objects and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_manual_refund_repair.py</div>
+      <pre><code class="language-python">from find_orphaned_refund_statuses import is_orphaned_refund_status
+
+
+def refund_txn(amount="50.00", type_="refund"):
+    return {"type": type_, "amount": amount}
+
+
+def test_false_when_status_is_not_refund_related():
+    assert is_orphaned_refund_status(10, [], "0.00", "50.00") is False
+
+
+def test_true_when_refunded_status_with_no_transactions_at_all():
+    assert is_orphaned_refund_status(4, [], "0.00", "50.00") is True
+
+
+def test_false_when_refunded_status_has_a_real_refund_transaction():
+    txns = [refund_txn(amount="50.00")]
+    assert is_orphaned_refund_status(4, txns, "50.00", "50.00") is False
+
+
+def test_true_when_partially_refunded_with_only_non_refund_transactions():
+    txns = [{"type": "capture", "amount": "50.00"}]
+    assert is_orphaned_refund_status(14, txns, "0.00", "50.00") is True
+
+
+def test_false_when_refunded_amount_is_recorded_even_without_a_txn_row():
+    assert is_orphaned_refund_status(4, [], "50.00", "50.00") is False
+
+
+def test_true_when_refund_transaction_amount_is_zero():
+    txns = [refund_txn(amount="0.00")]
+    assert is_orphaned_refund_status(4, txns, "0.00", "50.00") is True</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">find-orphaned-refund-statuses.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isOrphanedRefundStatus } from "./find-orphaned-refund-statuses.js";
+
+const refundTxn = ({ amount = "50.00", type = "refund" } = {}) =&gt; ({ type, amount });
+
+test("false when status is not refund related", () =&gt; {
+  assert.equal(isOrphanedRefundStatus(10, [], "0.00", "50.00"), false);
+});
+
+test("true when refunded status with no transactions at all", () =&gt; {
+  assert.equal(isOrphanedRefundStatus(4, [], "0.00", "50.00"), true);
+});
+
+test("false when refunded status has a real refund transaction", () =&gt; {
+  const txns = [refundTxn({ amount: "50.00" })];
+  assert.equal(isOrphanedRefundStatus(4, txns, "50.00", "50.00"), false);
+});
+
+test("true when partially refunded with only non-refund transactions", () =&gt; {
+  const txns = [{ type: "capture", amount: "50.00" }];
+  assert.equal(isOrphanedRefundStatus(14, txns, "0.00", "50.00"), true);
+});
+
+test("false when refunded amount is recorded even without a txn row", () =&gt; {
+  assert.equal(isOrphanedRefundStatus(4, [], "50.00", "50.00"), false);
+});
+
+test("true when refund transaction amount is zero", () =&gt; {
+  const txns = [refundTxn({ amount: "0.00" })];
+  assert.equal(isOrphanedRefundStatus(4, txns, "0.00", "50.00"), true);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Edit status habit</span>
+      <h4>The support team that always used the wrong dropdown</h4>
+      <p>A small support team had one veteran rep who had learned BigCommerce years ago through the general Edit status control, and never switched to the dedicated Refund action once it existed. Every refund that rep handled looked done from the order list, Refunded, right there in the status column, but the transactions endpoint for every one of those orders was empty.</p>
+      <p>The reconciler caught the whole backlog on its first run: dozens of orders marked Refunded going back months, refunded_amount still at 0.00. Once the team saw the report, they retrained on the Refund action and used the flagged list to work out, order by order, which customers still genuinely needed their money back.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Sync script mirroring an external refund</span>
+      <h4>The integration that copied refund status from a legacy system</h4>
+      <p>A store migrating off an older platform ran a sync script that mirrored refund decisions from the legacy system by writing status_id 4 straight onto the matching BigCommerce order, on the assumption the legacy system's refund had already happened wherever the real payment lived. For most orders that was true. For a batch where the legacy refund itself had silently failed, it was not.</p>
+      <p>Because the reconciler checks the transaction record instead of trusting the status label, it flagged exactly the batch where the legacy refund had failed, letting the team go back and process real refunds for the customers who were still owed money, without re-checking every order the sync had touched.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no order can sit marked Refunded or Partially Refunded for long without someone knowing whether real money actually moved. The report gives a human everything needed to act, the order id, the status, the total, and the transaction summary, and the optional refund quote preview saves them from re-deriving the exact request by hand. The one thing that never happens automatically is the refund itself, because that decision needs a person who can check whether the customer was already paid back some other way.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a BigCommerce order show Refunded when no money was actually returned?</summary>
+      <p>BigCommerce treats order status and money movement as two separate systems. The status_id field is just a label on the order record, and PUT /v2/orders/{id} will accept status_id 4 (Refunded) or 14 (Partially Refunded) with no side effect at all. Only the dedicated Payment Actions endpoints, refund_quotes then refunds, actually call the gateway and move money, then write a transaction and update the status as a result. If staff use the Edit status dropdown instead of the Refund action, or a script PUTs status_id 4 directly, BigCommerce shows Refunded with zero refund transactions behind it.</p>
+    </details>
+    <details>
+      <summary>Can I safely auto-fix an order that is stuck showing Refunded with no transaction?</summary>
+      <p>No, not automatically. There is no BigCommerce API to retroactively attach a real gateway refund to an order after the fact, and whether the customer was already refunded through some other channel, like the processor's own dashboard, requires a human to check. The safe pattern is to flag the mismatch, and optionally fetch a refund quote to show an operator the exact request they would need to confirm, but never auto-submit the refund itself since that moves real money.</p>
+    </details>
+    <details>
+      <summary>How do I detect these orphaned Refunded statuses across a whole store?</summary>
+      <p>Query GET /v2/orders with status_id=4 and again with status_id=14 for your lookback window, then call GET /v2/orders/{id}/transactions for each order and look for a refund-type entry whose summed amount is greater than zero. Cross-check against GET /v3/orders/{order_id}/payment_actions/refunds. Any order marked Refunded or Partially Refunded with no matching refund transaction, or a refunded_amount that is still 0.00, is an orphaned status change with no money behind it.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Help Center: Order Actions, manually changing status vs. using the Refund action. <a href="https://support.bigcommerce.com/s/article/Using-Order-Actions?language=en_US" rel="noopener">support.bigcommerce.com using order actions</a></li>
+      <li>BigCommerce Support Community: refunds not working correctly. <a href="https://support.bigcommerce.com/s/question/0D54O00006TkKikSAF/refunds-not-working-correctly-ever-since-late-2019-id-say-every-time-we-process-a-refund-we-are-getting-a-refund-failed-error-message-from-bigcommerce-yet-before-this-refunds-were-working-fine?language=en_US" rel="noopener">support.bigcommerce.com refunds not working correctly</a></li>
+      <li>BigCommerce Support Community: refunds not going through, issue with all refund processing. <a href="https://bigcommerce.my.site.com/s/question/0D54O000063bjB1SAI/the-refunds-are-not-going-through-there-is-an-issue-with-all-the-refund-processing-through-big-commerce?language=en_US" rel="noopener">bigcommerce.my.site.com refund processing issue</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Order Refunds overview and the Payment Actions workflow. <a href="https://developer.bigcommerce.com/docs/store-operations/orders/refunds" rel="noopener">developer.bigcommerce.com order refunds</a></li>
+      <li>BigCommerce API Reference: Create Refund (payment_actions/refunds). <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/order-operations/payment-actions/create-order-refund" rel="noopener">docs.bigcommerce.com create order refund</a></li>
+      <li>BigCommerce Developer Center: the order transactions endpoint. <a href="https://developer.bigcommerce.com/docs/rest-management/transactions" rel="noopener">developer.bigcommerce.com transactions</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up a mystery refund?</h3>
+    <p>If this saved you from mistaking a status label for money in the bank, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

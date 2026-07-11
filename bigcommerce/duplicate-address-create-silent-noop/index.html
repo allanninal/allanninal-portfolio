@@ -1,0 +1,1034 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Customer Address Create That Silently No-ops on a Duplicate</title>
+<meta name="description" content="POST /v3/customers/addresses returns a 200 but creates nothing when the new address matches an existing one on every uniqueness field. Learn why BigCommerce dedupes silently and build a Python or Node.js script that detects the no-op with a before and after snapshot diff.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Customer Address Create That Silently No-ops on a Duplicate">
+<meta property="og:description" content="Why POST /v3/customers/addresses returns 200/207 with no new address id when the payload matches an existing address on every uniqueness field, and a safe Python or Node.js script that detects the silent no-op with a snapshot diff instead of trusting the status code.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/#article","headline":"Fix BigCommerce Customer Address Create That Silently No-ops on a Duplicate","description":"POST /v3/customers/addresses treats first_name, last_name, company, phone, address_type, address1, address2, city, country_code, state_or_province, and postal_code as a uniqueness key per customer. When a new address matches an existing one on all of these fields, BigCommerce dedupes silently, returning a 200/207 with no new address id in data. Detect it with a before and after GET snapshot diff, and report it, since there is nothing to auto-repair.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Customers","keywords":"BigCommerce customer addresses, POST v3 customers addresses, duplicate address, silent no-op, address uniqueness key, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Customer address create no-ops on an exact duplicate with a 200 response","item":"https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does POST /v3/customers/addresses return 200 but not create a new address?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce treats a set of core fields, first_name, last_name, company, phone, address_type, address1, address2, city, country_code, state_or_province, and postal_code, as a uniqueness key per customer. When a new address submission matches an existing address on all of these fields, BigCommerce intentionally dedupes rather than erroring. It makes no change to the existing record and returns a 200 or 207 success, but the address is omitted from the response body's data, so no new address id is ever returned."}},{"@type":"Question","name":"How do I tell a silent no-op apart from a real address create?","acceptedAnswer":{"@type":"Answer","text":"Snapshot the customer's addresses with GET /v3/customers/addresses?customer_id:in={customer_id} before the POST, indexed by a normalized uniqueness key. After the POST, check whether the response status is 2xx with an empty or id-less data, then re-GET the same endpoint and diff meta.pagination.total and the set of address ids against the pre-write snapshot. If the total is unchanged and no new id appears despite the 200, that is the confirmed silent no-op signature."}},{"@type":"Question","name":"Should I retry the POST or try to force the duplicate address to save?","acceptedAnswer":{"@type":"Answer","text":"No. The POST already succeeded from BigCommerce's perspective, since deduping by design is not an error condition, so there is nothing to correct with a retry. Do not attempt a PUT to force a duplicate either, BigCommerce has no mechanism for that and the uniqueness fields are effectively immutable for this check. Flag the (customer_id, attempted fields) pair with the matched existing address id and surface it for human review instead."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Customers</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Customers</p>
+    <h1>Customer address create no-ops on an exact duplicate with a 200 response</h1>
+    <p class="lead">A sync job, an import, or a checkout retry posts a new customer address with <code>POST /v3/customers/addresses</code>, and BigCommerce answers with a clean 200. Everything about the response looks like success. Except the address you meant to add was never created, because it already existed, matched field for field, and BigCommerce quietly deduped it instead of erroring or telling you. No id comes back. Nothing in the payload says "no-op." Here is why that gap opens up and a small script that catches it with a before and after snapshot instead of trusting the status code.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Customer Addresses API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's V3 Customer Addresses endpoint treats a set of core fields, <code>first_name</code>, <code>last_name</code>, <code>company</code>, <code>phone</code>, <code>address_type</code>, <code>address1</code>, <code>address2</code>, <code>city</code>, <code>country_code</code>, <code>state_or_province</code>, and <code>postal_code</code>, as a uniqueness key per customer. When a <code>POST /v3/customers/addresses</code> payload matches an existing address on every one of these fields, BigCommerce makes no change and returns a 200 or 207 success, but the address is omitted from the response body's <code>data</code>, so no new address id ever comes back. Snapshot the customer's addresses with <code>GET /v3/customers/addresses?customer_id:in={customer_id}</code> before the write, POST the new address, then re-GET and diff <code>meta.pagination.total</code> and the set of address ids against the pre-write snapshot. If the total is unchanged and no new id appears despite the 200, that is the confirmed silent no-op. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>BigCommerce's V3 Customers Addresses API lets a store keep a list of saved addresses per customer, the kind a shopper builds up over repeat orders shipped to the same handful of places. When you call <code>POST /v3/customers/addresses</code> to add one, BigCommerce first checks whether an address with exactly the same core fields already exists for that customer. If it does, BigCommerce does not create a second, identical record, and it does not touch the existing one either.</p>
+  <p>That decision is reasonable on its own. Nobody wants five copies of the same shipping address cluttering a customer's account. The problem is how BigCommerce reports it. Instead of an error that says "this address already exists" or a response that hands back the matched record's id, the API returns a 200 or 207, the same status code you would get on a genuine successful create, but the deduped address is simply missing from the response body's <code>data</code>. An integration written to assume "200 means a new address was persisted, and the id is in the response" will misreport the operation every time this happens, and its own bookkeeping will quietly drift out of sync with what BigCommerce's address list actually contains.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A client posts a new customer address that exactly matches an existing one on every uniqueness field. BigCommerce dedupes it, returns a 200 success, but the address is missing from the response data and no new address id is returned.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="155" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="87" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">POST address</text>
+      <text x="87" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">matches an existing one</text>
+      <line x1="168" y1="103" x2="210" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="213" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="293" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Uniqueness check</text>
+      <text x="293" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">11 fields, exact match</text>
+      <line x1="376" y1="103" x2="445" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">deduped, no id</text>
+      <rect x="448" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">200 / 207 OK</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">data omits address</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">address_id</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">never returned</text>
+      <line x1="611" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>BigCommerce answers with success either way. Only the missing id, and an unchanged address count on a re-GET, reveal that nothing was actually created.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few things about how the Customer Addresses v3 endpoint is built make this the expected shape of the response, not a bug:</p>
+  <ul>
+    <li>BigCommerce documents <code>first_name</code>, <code>last_name</code>, <code>company</code>, <code>phone</code>, <code>address_type</code>, <code>address1</code>, <code>address2</code>, <code>city</code>, <code>country_code</code>, <code>state_or_province</code>, and <code>postal_code</code> as the set that together define a unique address for a given customer. It is a wide key, so an address that matches on all of it is, by BigCommerce's own definition, the same address.</li>
+    <li>The API is designed to be idempotent on that exact-match case rather than to throw a conflict error. Since nothing is actually wrong, from BigCommerce's point of view there is nothing to report as a failure, so it reports success.</li>
+    <li>The response contract for the create endpoint wraps results in <code>data</code>, but a deduped record is simply not one of the results, it is omitted rather than represented with a status flag or a pointer back to the matched existing address.</li>
+    <li>This is a known point of confusion in BigCommerce's own support community: integrations built against the assumption that "the create endpoint always returns the created or matched record" find that assumption false for this specific case. See the citations below for the exact threads and docs.</li>
+  </ul>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A 200 from <code>POST /v3/customers/addresses</code> is not proof that anything was created. The address count is. So the safe pattern is not "trust the status code," it is "snapshot before, write, then snapshot after, and diff." We treat <code>GET /v3/customers/addresses?customer_id:in={customer_id}</code>, indexed by the same uniqueness fields BigCommerce itself uses, as the source of truth, and we classify the write as a real create only when a new address id actually shows up in the post-write snapshot. This is not a data-repair scenario, the existing address is already correct, so the only safe action on a confirmed no-op is to flag it for a human, never to retry the identical POST or attempt to force it through.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how addresses get created. We wrap the create call with a before and after read of the customer's address list, and a pure function that classifies what actually happened from those two snapshots plus the POST response, instead of trusting the status code alone.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The script snapshots a customer's addresses, posts the new address, snapshots again, and a pure classification function compares the two snapshots and the response to decide whether the result was created, a silent no-op, or an error, flagging no-ops for review instead of retrying.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Pre-write snapshot</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">GET addresses, index ids</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">POST address</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">capture status and data</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="360,106 447,138 360,170 273,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="360" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Classify (pure fn)</text>
+      <text x="360" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">created / no-op / error?</text>
+      <text x="452" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">created</text>
+      <line x1="447" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="368" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no-op, flag for review</text>
+      <line x1="360" y1="170" x2="360" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="485" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="577" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Post-write snapshot</text>
+      <text x="577" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">re-GET, diff ids and total</text>
+      <path d="M577,168 C577,195 684,180 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">confirmed</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">created or no-op</text>
+    </svg>
+    <figcaption>The pure classification function only compares snapshots and the response. The actual GET/POST calls happen outside it, one pre-write, one create, one post-write.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Customers (modify) scope so it can read and create addresses. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   # start safe, no writes happen until you flip this</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export DRY_RUN="true"   // start safe, no writes happen until you flip this</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Customer Addresses REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and POST and returns the parsed JSON body along with the status code, since we need to inspect a 200 body closely rather than just trust it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {"data": [], "meta": {"pagination": {"total": 0}}}
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    return r.status_code, (r.json() if r.text else {})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : { data: [], meta: { pagination: { total: 0 } } };
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  const text = await res.text();
+  return [res.status, text ? JSON.parse(text) : {}];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Snapshot the customer's addresses before you write</h3>
+      <p>Call <code>GET /v3/customers/addresses?customer_id:in={customer_id}&amp;limit=250</code>, paginating through <code>meta.pagination.links.next</code> if there is more than one page. Build a snapshot of the current address ids and the total, so the post-write comparison has something real to diff against.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def snapshot_addresses(customer_id):
+    ids = set()
+    page = 1
+    while True:
+        body = bc_get("/customers/addresses", {
+            "customer_id:in": customer_id,
+            "page": page,
+            "limit": 250,
+        })
+        data = body.get("data") or []
+        for addr in data:
+            ids.add(addr["id"])
+        pagination = (body.get("meta") or {}).get("pagination") or {}
+        total = pagination.get("total", len(ids))
+        if not data or not pagination.get("links", {}).get("next"):
+            return {"ids": ids, "total": total}
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function snapshotAddresses(customerId) {
+  const ids = new Set();
+  let page = 1;
+  while (true) {
+    const body = await bcGet("/customers/addresses", {
+      "customer_id:in": customerId,
+      page,
+      limit: 250,
+    });
+    const data = body.data || [];
+    for (const addr of data) ids.add(addr.id);
+    const pagination = (body.meta || {}).pagination || {};
+    const total = pagination.total ?? ids.size;
+    if (!data.length || !pagination.links || !pagination.links.next) {
+      return { ids, total };
+    }
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the classification in its own function that takes only the pre-write snapshot, the POST response, and the post-write snapshot, plain values in, plain string out. It never makes a network call itself. A non-2xx status is an error. A 2xx with an empty or id-less <code>data</code>, an unchanged total, and no new id in the post-write snapshot is a silent no-op. Anything else, a new id genuinely appearing, is a real create.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from typing import Literal
+
+def classify_address_create_result(
+    pre_snapshot: dict, post_response: dict, post_snapshot: dict
+) -&gt; Literal["created", "silent_noop", "error"]:
+    status = post_response.get("status")
+    if status is None or status &gt;= 400:
+        return "error"
+
+    data = post_response.get("data")
+    data_has_id = bool(data) and (
+        (isinstance(data, dict) and data.get("id") is not None)
+        or (isinstance(data, list) and len(data) &gt; 0 and any(
+            isinstance(item, dict) and item.get("id") is not None for item in data
+        ))
+    )
+
+    pre_ids = pre_snapshot.get("ids") or set()
+    post_ids = post_snapshot.get("ids") or set()
+    new_ids = post_ids - pre_ids
+
+    total_unchanged = post_snapshot.get("total") == pre_snapshot.get("total")
+    ids_unchanged = post_ids.issubset(pre_ids) and not new_ids
+
+    if not data_has_id and total_unchanged and ids_unchanged:
+        return "silent_noop"
+
+    return "created"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function classifyAddressCreateResult(preSnapshot, postResponse, postSnapshot) {
+  const status = postResponse.status;
+  if (status === undefined || status === null || status &gt;= 400) return "error";
+
+  const data = postResponse.data;
+  const dataHasId =
+    (Array.isArray(data) &amp;&amp; data.some((item) =&gt; item &amp;&amp; typeof item === "object" &amp;&amp; item.id != null)) ||
+    (data &amp;&amp; typeof data === "object" &amp;&amp; !Array.isArray(data) &amp;&amp; data.id != null);
+
+  const preIds = preSnapshot.ids || new Set();
+  const postIds = postSnapshot.ids || new Set();
+  const newIds = [...postIds].filter((id) =&gt; !preIds.has(id));
+
+  const totalUnchanged = postSnapshot.total === preSnapshot.total;
+  const idsUnchanged = [...postIds].every((id) =&gt; preIds.has(id)) &amp;&amp; newIds.length === 0;
+
+  if (!dataHasId &amp;&amp; totalUnchanged &amp;&amp; idsUnchanged) return "silent_noop";
+
+  return "created";
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Find the matched existing address for the report</h3>
+      <p>When the classification comes back <code>silent_noop</code>, the report is more useful with the existing address id BigCommerce actually deduped against. Build a normalized uniqueness key from the same 11 fields BigCommerce uses, index the pre-write snapshot's full address records by that key, and look up the attempted payload's key in that index.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">match.py</div>
+      <pre><code class="language-python">UNIQUENESS_FIELDS = [
+    "first_name", "last_name", "company", "phone", "address_type",
+    "address1", "address2", "city", "country_code", "state_or_province", "postal_code",
+]
+
+def uniqueness_key(fields):
+    return tuple((fields.get(f) or "").strip().lower() for f in UNIQUENESS_FIELDS)
+
+def find_matched_address_id(existing_addresses, attempted_fields):
+    target = uniqueness_key(attempted_fields)
+    for addr in existing_addresses:
+        if uniqueness_key(addr) == target:
+            return addr["id"]
+    return None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">match.js</div>
+      <pre><code class="language-javascript">const UNIQUENESS_FIELDS = [
+  "first_name", "last_name", "company", "phone", "address_type",
+  "address1", "address2", "city", "country_code", "state_or_province", "postal_code",
+];
+
+function uniquenessKey(fields) {
+  return UNIQUENESS_FIELDS.map((f) =&gt; String(fields[f] || "").trim().toLowerCase()).join("|");
+}
+
+function findMatchedAddressId(existingAddresses, attemptedFields) {
+  const target = uniquenessKey(attemptedFields);
+  for (const addr of existingAddresses) {
+    if (uniquenessKey(addr) === target) return addr.id;
+  }
+  return null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run function snapshots before, posts the address, snapshots after, classifies the result, and logs accordingly. On <code>silent_noop</code>, it logs a structured warning with the customer id, the attempted fields, and the matched existing address id, and never retries the POST. <code>DRY_RUN</code> defaults to true. When true, it only reads and reports, no address is ever posted, which is the safest way to run this against a real store the first few times.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never retry an identical POST after a confirmed silent no-op, and never attempt a PUT to force a duplicate through. BigCommerce has no mechanism for that, and the fields defining uniqueness are effectively immutable for this check. If the caller genuinely intends a distinct address, surface it for a human to adjust a field like the unit or suite, do not automate around it.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and only ever reports a silent no-op, it never retries the create or writes anything to correct it, since there is no bad state to repair.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/duplicate-address-create-silent-noop" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">detect_address_noop.py</div>
+      <pre><code class="language-python">"""Detect a silent no-op when POST /v3/customers/addresses matches a duplicate.
+
+BigCommerce's V3 Customer Addresses endpoint treats first_name, last_name,
+company, phone, address_type, address1, address2, city, country_code,
+state_or_province, and postal_code as a uniqueness key per customer. When a
+POST matches an existing address on all of these fields, BigCommerce makes no
+change to the existing record and returns a 200 or 207 success, but the
+address is omitted from the response body's data, so no new address id is
+ever returned. An integration that assumes 200 means "created, id returned"
+will misreport the operation and drift out of sync with the store's real
+address list. This script snapshots a customer's addresses before the write,
+posts the new address, snapshots again, and classifies the result with a pure
+function. A confirmed silent no-op is flagged and reported with the matched
+existing address id, never retried, since there is no bad state to repair.
+
+Guide: https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/
+"""
+import os
+import logging
+from typing import Literal
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("detect_address_noop")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+UNIQUENESS_FIELDS = [
+    "first_name", "last_name", "company", "phone", "address_type",
+    "address1", "address2", "city", "country_code", "state_or_province", "postal_code",
+]
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return {"data": [], "meta": {"pagination": {"total": 0}}}
+    return r.json()
+
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    return r.status_code, (r.json() if r.text else {})
+
+
+def uniqueness_key(fields):
+    return tuple((fields.get(f) or "").strip().lower() for f in UNIQUENESS_FIELDS)
+
+
+def find_matched_address_id(existing_addresses, attempted_fields):
+    target = uniqueness_key(attempted_fields)
+    for addr in existing_addresses:
+        if uniqueness_key(addr) == target:
+            return addr["id"]
+    return None
+
+
+def snapshot_addresses(customer_id):
+    """Page through GET /v3/customers/addresses for one customer.
+
+    Returns {"ids": set(...), "total": int, "records": [...]} so callers can
+    both diff by id/total and look up the matched record's full fields.
+    """
+    ids = set()
+    records = []
+    page = 1
+    total = 0
+    while True:
+        body = bc_get(
+            "/customers/addresses",
+            {"customer_id:in": customer_id, "page": page, "limit": 250},
+        )
+        data = body.get("data") or []
+        for addr in data:
+            ids.add(addr["id"])
+            records.append(addr)
+        pagination = (body.get("meta") or {}).get("pagination") or {}
+        total = pagination.get("total", len(ids))
+        next_link = (pagination.get("links") or {}).get("next")
+        if not data or not next_link:
+            break
+        page += 1
+    return {"ids": ids, "total": total, "records": records}
+
+
+def classify_address_create_result(
+    pre_snapshot: dict, post_response: dict, post_snapshot: dict
+) -&gt; Literal["created", "silent_noop", "error"]:
+    """Pure decision. No network, no side effects.
+
+    if post_response["status"] &gt;= 400: error.
+    Else if the response has no address id in data, and the post-write
+    snapshot's total and id set are unchanged from the pre-write snapshot,
+    silent_noop. Otherwise a new id appeared, or data has an id: created.
+    """
+    status = post_response.get("status")
+    if status is None or status &gt;= 400:
+        return "error"
+
+    data = post_response.get("data")
+    data_has_id = bool(data) and (
+        (isinstance(data, dict) and data.get("id") is not None)
+        or (
+            isinstance(data, list)
+            and len(data) &gt; 0
+            and any(isinstance(item, dict) and item.get("id") is not None for item in data)
+        )
+    )
+
+    pre_ids = pre_snapshot.get("ids") or set()
+    post_ids = post_snapshot.get("ids") or set()
+    new_ids = post_ids - pre_ids
+
+    total_unchanged = post_snapshot.get("total") == pre_snapshot.get("total")
+    ids_unchanged = post_ids.issubset(pre_ids) and not new_ids
+
+    if not data_has_id and total_unchanged and ids_unchanged:
+        return "silent_noop"
+
+    return "created"
+
+
+def create_customer_address(address_fields):
+    return bc_post("/customers/addresses", [address_fields])
+
+
+def run(customer_id, address_fields):
+    pre_snapshot = snapshot_addresses(customer_id)
+
+    if DRY_RUN:
+        log.info(
+            "DRY_RUN: would POST address for customer_id=%s. Skipping write, "
+            "pre_snapshot_total=%s",
+            customer_id, pre_snapshot["total"],
+        )
+        return "dry_run"
+
+    status, body = bc_post("/customers/addresses", [address_fields])
+    post_response = {"status": status, "data": body.get("data")}
+
+    post_snapshot = snapshot_addresses(customer_id)
+    decision = classify_address_create_result(pre_snapshot, post_response, post_snapshot)
+
+    if decision == "error":
+        log.error(
+            "Address create failed. customer_id=%s status=%s body=%s",
+            customer_id, status, body,
+        )
+        return decision
+
+    if decision == "silent_noop":
+        matched_id = find_matched_address_id(pre_snapshot["records"], address_fields)
+        log.warning(
+            "address_create_silent_noop: exact duplicate already existed, no new "
+            "address_id created. customer_id=%s matched_existing_address_id=%s "
+            "attempted_fields=%s",
+            customer_id, matched_id, address_fields,
+        )
+        return decision
+
+    log.info("Address created for customer_id=%s. total now %s", customer_id, post_snapshot["total"])
+    return decision
+
+
+if __name__ == "__main__":
+    run(
+        customer_id=123,
+        address_fields={
+            "first_name": "Jamie",
+            "last_name": "Rivera",
+            "address1": "123 Main St",
+            "city": "Austin",
+            "country_code": "US",
+            "state_or_province": "Texas",
+            "postal_code": "78701",
+        },
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-address-noop.js</div>
+      <pre><code class="language-javascript">/**
+ * Detect a silent no-op when POST /v3/customers/addresses matches a duplicate.
+ *
+ * BigCommerce's V3 Customer Addresses endpoint treats first_name, last_name,
+ * company, phone, address_type, address1, address2, city, country_code,
+ * state_or_province, and postal_code as a uniqueness key per customer. When a
+ * POST matches an existing address on all of these fields, BigCommerce makes
+ * no change to the existing record and returns a 200 or 207 success, but the
+ * address is omitted from the response body's data, so no new address id is
+ * ever returned. An integration that assumes 200 means "created, id returned"
+ * will misreport the operation and drift out of sync with the store's real
+ * address list. This script snapshots a customer's addresses before the
+ * write, posts the new address, snapshots again, and classifies the result
+ * with a pure function. A confirmed silent no-op is flagged and reported
+ * with the matched existing address id, never retried, since there is no bad
+ * state to repair.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/duplicate-address-create-silent-noop/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const UNIQUENESS_FIELDS = [
+  "first_name", "last_name", "company", "phone", "address_type",
+  "address1", "address2", "city", "country_code", "state_or_province", "postal_code",
+];
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+function uniquenessKey(fields) {
+  return UNIQUENESS_FIELDS.map((f) =&gt; String(fields[f] || "").trim().toLowerCase()).join("|");
+}
+
+function findMatchedAddressId(existingAddresses, attemptedFields) {
+  const target = uniquenessKey(attemptedFields);
+  for (const addr of existingAddresses) {
+    if (uniquenessKey(addr) === target) return addr.id;
+  }
+  return null;
+}
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * if postResponse.status &gt;= 400: "error".
+ * Else if the response has no address id in data, and the post-write
+ * snapshot's total and id set are unchanged from the pre-write snapshot,
+ * "silent_noop". Otherwise a new id appeared, or data has an id: "created".
+ */
+export function classifyAddressCreateResult(preSnapshot, postResponse, postSnapshot) {
+  const status = postResponse.status;
+  if (status === undefined || status === null || status &gt;= 400) return "error";
+
+  const data = postResponse.data;
+  const dataHasId =
+    (Array.isArray(data) &amp;&amp; data.some((item) =&gt; item &amp;&amp; typeof item === "object" &amp;&amp; item.id != null)) ||
+    (data &amp;&amp; typeof data === "object" &amp;&amp; !Array.isArray(data) &amp;&amp; data.id != null);
+
+  const preIds = preSnapshot.ids || new Set();
+  const postIds = postSnapshot.ids || new Set();
+  const newIds = [...postIds].filter((id) =&gt; !preIds.has(id));
+
+  const totalUnchanged = postSnapshot.total === preSnapshot.total;
+  const idsUnchanged = [...postIds].every((id) =&gt; preIds.has(id)) &amp;&amp; newIds.length === 0;
+
+  if (!dataHasId &amp;&amp; totalUnchanged &amp;&amp; idsUnchanged) return "silent_noop";
+
+  return "created";
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : { data: [], meta: { pagination: { total: 0 } } };
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  return [res.status, text ? JSON.parse(text) : {}];
+}
+
+async function snapshotAddresses(customerId) {
+  const ids = new Set();
+  const records = [];
+  let page = 1;
+  let total = 0;
+  while (true) {
+    const body = await bcGet("/customers/addresses", {
+      "customer_id:in": customerId,
+      page,
+      limit: 250,
+    });
+    const data = body.data || [];
+    for (const addr of data) {
+      ids.add(addr.id);
+      records.push(addr);
+    }
+    const pagination = (body.meta || {}).pagination || {};
+    total = pagination.total ?? ids.size;
+    const nextLink = (pagination.links || {}).next;
+    if (!data.length || !nextLink) break;
+    page += 1;
+  }
+  return { ids, total, records };
+}
+
+async function createCustomerAddress(addressFields) {
+  return bcPost("/customers/addresses", [addressFields]);
+}
+
+export async function run(customerId, addressFields) {
+  const preSnapshot = await snapshotAddresses(customerId);
+
+  if (DRY_RUN) {
+    console.log(
+      `DRY_RUN: would POST address for customer_id=${customerId}. Skipping write, ` +
+      `pre_snapshot_total=${preSnapshot.total}`
+    );
+    return "dry_run";
+  }
+
+  const [status, body] = await createCustomerAddress(addressFields);
+  const postResponse = { status, data: body.data };
+
+  const postSnapshot = await snapshotAddresses(customerId);
+  const decision = classifyAddressCreateResult(preSnapshot, postResponse, postSnapshot);
+
+  if (decision === "error") {
+    console.error(`Address create failed. customer_id=${customerId} status=${status} body=${JSON.stringify(body)}`);
+    return decision;
+  }
+
+  if (decision === "silent_noop") {
+    const matchedId = findMatchedAddressId(preSnapshot.records, addressFields);
+    console.warn(
+      "address_create_silent_noop: exact duplicate already existed, no new " +
+      `address_id created. customer_id=${customerId} matched_existing_address_id=${matchedId} ` +
+      `attempted_fields=${JSON.stringify(addressFields)}`
+    );
+    return decision;
+  }
+
+  console.log(`Address created for customer_id=${customerId}. total now ${postSnapshot.total}`);
+  return decision;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run(123, {
+    first_name: "Jamie",
+    last_name: "Rivera",
+    address1: "123 Main St",
+    city: "Austin",
+    country_code: "US",
+    state_or_province: "Texas",
+    postal_code: "78701",
+  }).catch((err) =&gt; {
+    console.error(err);
+    process.exit(1);
+  });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The classification function is the part most worth testing, because it decides whether the script reports a real create or catches a silent no-op. Because <code>classify_address_create_result</code> takes only plain snapshots and a plain response, the test needs no network and no BigCommerce store. It just feeds in fixture snapshots and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_duplicate_address_noop.py</div>
+      <pre><code class="language-python">from detect_address_noop import classify_address_create_result, find_matched_address_id
+
+
+def snapshot(ids, total=None):
+    id_set = set(ids)
+    return {"ids": id_set, "total": total if total is not None else len(id_set)}
+
+
+def test_created_when_a_new_id_appears():
+    pre = snapshot([1, 2])
+    post = snapshot([1, 2, 3])
+    response = {"status": 201, "data": {"id": 3}}
+    assert classify_address_create_result(pre, response, post) == "created"
+
+
+def test_silent_noop_when_total_and_ids_unchanged_and_no_id_in_data():
+    pre = snapshot([1, 2])
+    post = snapshot([1, 2])
+    response = {"status": 200, "data": []}
+    assert classify_address_create_result(pre, response, post) == "silent_noop"
+
+
+def test_silent_noop_when_data_is_empty_object():
+    pre = snapshot([1, 2])
+    post = snapshot([1, 2])
+    response = {"status": 207, "data": {}}
+    assert classify_address_create_result(pre, response, post) == "silent_noop"
+
+
+def test_error_on_4xx_status():
+    pre = snapshot([1, 2])
+    post = snapshot([1, 2])
+    response = {"status": 422, "data": {}}
+    assert classify_address_create_result(pre, response, post) == "error"
+
+
+def test_created_when_data_has_id_even_if_totals_look_equal():
+    # Defensive: if the response itself carries an id, trust it as created.
+    pre = snapshot([1, 2])
+    post = snapshot([1, 2, 3])
+    response = {"status": 200, "data": [{"id": 3}]}
+    assert classify_address_create_result(pre, response, post) == "created"
+
+
+def test_find_matched_address_id_returns_the_matching_existing_record():
+    existing = [
+        {"id": 55, "first_name": "Jamie", "last_name": "Rivera", "company": "",
+         "phone": "", "address_type": "residential", "address1": "123 Main St",
+         "address2": "", "city": "Austin", "country_code": "US",
+         "state_or_province": "Texas", "postal_code": "78701"},
+    ]
+    attempted = {
+        "first_name": "Jamie", "last_name": "Rivera", "address1": "123 Main St",
+        "city": "Austin", "country_code": "US", "state_or_province": "Texas",
+        "postal_code": "78701",
+    }
+    assert find_matched_address_id(existing, attempted) == 55
+
+
+def test_find_matched_address_id_returns_none_when_no_match():
+    existing = [
+        {"id": 55, "first_name": "Jamie", "last_name": "Rivera", "address1": "123 Main St",
+         "city": "Austin", "country_code": "US", "state_or_province": "Texas", "postal_code": "78701"},
+    ]
+    attempted = {"first_name": "Alex", "last_name": "Nguyen", "address1": "9 Other Ave",
+                 "city": "Dallas", "country_code": "US", "state_or_province": "Texas", "postal_code": "75001"}
+    assert find_matched_address_id(existing, attempted) is None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">detect-address-noop.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { classifyAddressCreateResult } from "./detect-address-noop.js";
+
+const snapshot = (ids, total) =&gt; {
+  const idSet = new Set(ids);
+  return { ids: idSet, total: total !== undefined ? total : idSet.size };
+};
+
+test("created when a new id appears", () =&gt; {
+  const pre = snapshot([1, 2]);
+  const post = snapshot([1, 2, 3]);
+  const response = { status: 201, data: { id: 3 } };
+  assert.equal(classifyAddressCreateResult(pre, response, post), "created");
+});
+
+test("silent_noop when total and ids unchanged and no id in data", () =&gt; {
+  const pre = snapshot([1, 2]);
+  const post = snapshot([1, 2]);
+  const response = { status: 200, data: [] };
+  assert.equal(classifyAddressCreateResult(pre, response, post), "silent_noop");
+});
+
+test("silent_noop when data is empty object", () =&gt; {
+  const pre = snapshot([1, 2]);
+  const post = snapshot([1, 2]);
+  const response = { status: 207, data: {} };
+  assert.equal(classifyAddressCreateResult(pre, response, post), "silent_noop");
+});
+
+test("error on 4xx status", () =&gt; {
+  const pre = snapshot([1, 2]);
+  const post = snapshot([1, 2]);
+  const response = { status: 422, data: {} };
+  assert.equal(classifyAddressCreateResult(pre, response, post), "error");
+});
+
+test("created when data has id even if totals look equal", () =&gt; {
+  const pre = snapshot([1, 2]);
+  const post = snapshot([1, 2, 3]);
+  const response = { status: 200, data: [{ id: 3 }] };
+  assert.equal(classifyAddressCreateResult(pre, response, post), "created");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Address book import</span>
+      <h4>The migration script that thought it re-created everything</h4>
+      <p>A store migrated customer address books from a legacy platform. The import ran twice, once as a dry pass to check for errors, once for real, both times reading each address from the same export file. The second run's log showed a clean 200 for every single address, and the job reported a full success count matching the number of rows in the file.</p>
+      <p>Only a manual spot check in the BigCommerce admin caught it. The address totals per customer had not moved between the two runs. Every one of the "created" addresses in the second pass was a silent no-op against what the first pass had already created. Adding the before and after snapshot diff turned that invisible gap into an explicit, logged no-op count the team could see on every run going forward.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Checkout retry</span>
+      <h4>The storefront that quietly stopped saving a second address</h4>
+      <p>A returning shopper's checkout flow saved their shipping address to their account on every order, so a repeat order to the same address would post the same fields again. The team assumed each checkout was adding a fresh row, since the endpoint always answered 200, and could not explain why the customer's saved address count in a support ticket did not match the number of orders they had placed.</p>
+      <p>Running the classification against a snapshot before and after the save confirmed it was never creating a new record for a repeat address, it was deduping every time, exactly as documented. The team stopped counting saved addresses as a proxy for order count and used the real order history instead.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this check is in place, a 200 from <code>POST /v3/customers/addresses</code> is never taken at face value. Every write is measured against a real before and after snapshot, a genuine create is confirmed by a new id actually appearing, and a silent no-op is logged with the matched existing address id instead of being miscounted as a new row. Nothing is auto-repaired, because there is nothing broken to repair, the existing address was already correct all along.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does POST /v3/customers/addresses return 200 but not create a new address?</summary>
+      <p>BigCommerce treats a set of core fields, first_name, last_name, company, phone, address_type, address1, address2, city, country_code, state_or_province, and postal_code, as a uniqueness key per customer. When a new address submission matches an existing address on all of these fields, BigCommerce intentionally dedupes rather than erroring. It makes no change to the existing record and returns a 200 or 207 success, but the address is omitted from the response body's data, so no new address id is ever returned.</p>
+    </details>
+    <details>
+      <summary>How do I tell a silent no-op apart from a real address create?</summary>
+      <p>Snapshot the customer's addresses with GET /v3/customers/addresses?customer_id:in={customer_id} before the POST, indexed by a normalized uniqueness key. After the POST, check whether the response status is 2xx with an empty or id-less data, then re-GET the same endpoint and diff meta.pagination.total and the set of address ids against the pre-write snapshot. If the total is unchanged and no new id appears despite the 200, that is the confirmed silent no-op signature.</p>
+    </details>
+    <details>
+      <summary>Should I retry the POST or try to force the duplicate address to save?</summary>
+      <p>No. The POST already succeeded from BigCommerce's perspective, since deduping by design is not an error condition, so there is nothing to correct with a retry. Do not attempt a PUT to force a duplicate either, BigCommerce has no mechanism for that and the uniqueness fields are effectively immutable for this check. Flag the (customer_id, attempted fields) pair with the matched existing address id and surface it for human review instead.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce API Reference: Create Customers Addresses (POST /v3/customers/addresses). <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/customers/v3/addresses/create-customers-addresses" rel="noopener">docs.bigcommerce.com create customers addresses</a></li>
+      <li>BigCommerce Developer Center: Customer Addresses reference and uniqueness fields. <a href="https://developer.bigcommerce.com/docs/rest-management/customers/customer-addresses" rel="noopener">developer.bigcommerce.com customer addresses</a></li>
+      <li>BigCommerce Help Center: the API allowing duplicate customers/addresses. <a href="https://support.bigcommerce.com/s/question/0D5130000356vUzCAI/the-bc-api-for-constantcontact-allows-duplicates?language=en_US" rel="noopener">support.bigcommerce.com API allows duplicates</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce API Reference: Create Customers Addresses (response shape). <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/customers/v3/addresses/create-customers-addresses" rel="noopener">docs.bigcommerce.com create customers addresses</a></li>
+      <li>BigCommerce API Reference: List Customers Addresses (GET, pagination). <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/customers/v3/addresses/get-customers-addresses" rel="noopener">docs.bigcommerce.com list customers addresses</a></li>
+      <li>BigCommerce Developer Center: Customers v3 API reference. <a href="https://developer.bigcommerce.com/docs/rest-management/customers" rel="noopener">developer.bigcommerce.com customers v3</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a silent no-op for you?</h3>
+    <p>If this saved you from an address import that quietly drifted out of sync, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

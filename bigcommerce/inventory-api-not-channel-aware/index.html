@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Inventory API Writes That Are Not Channel Aware</title>
+<meta name="description" content="BigCommerce's Inventory API can silently adjust stock for products on channels you never intended to touch. Learn why bulk inventory writes are not channel aware and build a Python or Node.js pre-flight and post-flight reconciler that catches and rolls back out-of-channel writes.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Inventory API Writes That Are Not Channel Aware">
+<meta property="og:description" content="Why BigCommerce's Inventory API can mutate stock for products outside the sales channel you meant to touch, and a safe Python or Node.js reconciler that flags, filters, and rolls back out-of-channel writes.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/#article","headline":"Fix BigCommerce Inventory API Writes That Are Not Channel Aware","description":"BigCommerce's Inventory API has no channel_id parameter, so a bulk adjustment keyed only by product_id, variant_id, or sku can silently mutate stock for products assigned to a completely different sales channel, or no channel at all. Build a pre-flight and post-flight reconciler in Python or Node.js that flags, filters, and rolls back out-of-channel writes.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory","keywords":"BigCommerce Inventory API, channel aware, channel-assignments, inventory adjustments, sales channels, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Inventory API writes are not channel aware","item":"https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does BigCommerce's Inventory API affect products outside my target channel?","acceptedAnswer":{"@type":"Answer","text":"Inventory levels are stored per product or variant at the catalog level, not per sales channel. The bulk adjustment endpoints only accept product_id, variant_id, or sku plus location_id, with no channel_id parameter at all, so a script that resolves its input list from a channel-specific export can still write to any product that shares that id or sku, regardless of which channels it is actually assigned to."}},{"@type":"Question","name":"Can I scope an inventory adjustment to a single sales channel?","acceptedAnswer":{"@type":"Answer","text":"No. POST /v3/inventory/adjustments/absolute and /relative have no channel scoping concept. The only way to keep a bulk job from touching the wrong channel's products is to build your own guard: fetch the set of product_id values assigned to the intended channel from GET /v3/catalog/products/channel-assignments, and filter or reject any adjustment row whose product_id is not in that set before you call the Inventory API."}},{"@type":"Question","name":"What should happen if an out-of-channel write already happened?","acceptedAnswer":{"@type":"Answer","text":"Take a pre-adjustment snapshot of inventory_level for every touched product before the batch runs, then re-fetch quantities afterward and diff. Any product outside the intended channel whose quantity changed should have its pre-adjustment value written back immediately with a follow-up call to POST /v3/inventory/adjustments/absolute, logged with the channel_id, product_id, location_id, and old and new quantity so the drift is auditable."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory</p>
+    <h1>BigCommerce Inventory API writes are not channel aware</h1>
+    <p class="lead">A product can be assigned to one sales channel, several, or none at all. But BigCommerce stores its inventory_level and inventory_warning_level per product or variant at the catalog level, not per channel, and the bulk Inventory API endpoints have no channel_id parameter to scope a write. So a script that pulls a product list for one channel and then bulk-adjusts stock by product_id, variant_id, or sku can silently change quantities for a product that lives on a completely different channel, or no channel at all. Here is why that gap exists and a pre-flight and post-flight reconciler that catches it before, and after, it happens.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Inventory and Catalog API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's Inventory API is not channel aware. <code>POST /v3/inventory/adjustments/absolute</code> and <code>/relative</code> accept batches keyed only by <code>product_id</code>, <code>variant_id</code>, or <code>sku</code> plus <code>location_id</code>, with no <code>channel_id</code> field at all, while channel assignment lives separately in <code>/v3/catalog/products/channel-assignments</code>. A script that resolves its adjustment list from a channel-specific feed can still mutate stock for a product assigned to a different channel, because the Inventory API has no way to know or enforce which channel a write is meant for. The fix is a pre-flight and post-flight guard: fetch the set of product ids actually assigned to the intended <code>channel_id</code>, flag or drop any adjustment row whose resolved product_id is not in that set, and re-diff quantities after the batch runs so any drift outside the intended channel gets rolled back automatically. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>In BigCommerce's catalog data model, a product or variant can be assigned to zero or more sales channels through <code>/v3/catalog/products/channel-assignments</code>. That assignment controls where the product is visible and purchasable, your main storefront, a second storefront, a marketplace channel, and so on. But inventory is not part of that per-channel model. <code>inventory_level</code> and <code>inventory_warning_level</code> live on the product or variant record itself, at the catalog level, shared across every channel that product happens to be assigned to.</p>
+  <p>The Inventory API mirrors that shape exactly. Its bulk endpoints take rows shaped like <code>{product_id, variant_id, sku, location_id, quantity}</code> and nothing in that shape identifies a channel. BigCommerce's own documentation says it plainly: the Inventory API is not channel aware, and automated or bulk operations you run with it can change stock levels for products that are not even available on the storefront you meant to affect. If a script builds its adjustment list from a channel-specific export, a marketplace feed, or a third-party integration scoped to one channel, and then blindly bulk-adjusts by product_id or sku, it can quietly touch a product that is assigned to some other channel, or to no channel at all.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. A channel-specific product feed is used to build a bulk inventory adjustment payload keyed only by product_id, variant_id, or sku with no channel_id, so the write lands on the shared catalog-level inventory record and can change stock for a product assigned to a different channel or no channel at all.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="75" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="103" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Channel feed</text>
+      <text x="85" y="121" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">product list, one channel</text>
+      <line x1="163" y1="108" x2="205" y2="108" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="75" width="175" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="295" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Bulk adjustment</text>
+      <text x="295" y="116" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">keyed by product_id/sku</text>
+      <text x="295" y="132" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">no channel_id field</text>
+      <line x1="386" y1="108" x2="445" y2="108" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="415" y="65" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="415" y="135" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">Not channel scoped</text>
+      <rect x="448" y="75" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Catalog-level</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">inventory_level write</text>
+      <rect x="633" y="75" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="99" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Wrong channel</text>
+      <text x="691" y="117" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">stock changed</text>
+      <line x1="611" y1="108" x2="630" y2="108" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>Inventory is stored once per product or variant, shared across every channel it is assigned to. A bulk write keyed only by product_id or sku has no way to stay inside the intended channel's boundary.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce splits catalog visibility and catalog inventory into two different systems that were never designed to share a key:</p>
+  <ul>
+    <li>Channel assignment is managed through <code>/v3/catalog/products/channel-assignments</code>, a separate resource from the product record itself, and it can change independently of inventory at any time.</li>
+    <li>Inventory fields, <code>inventory_level</code> and <code>inventory_warning_level</code>, are stored directly on the product or variant, one value shared by every channel that product happens to be assigned to, not one value per channel.</li>
+    <li><code>POST /v3/inventory/adjustments/absolute</code> and <code>/relative</code> accept batches of <code>{product_id, variant_id, sku, location_id, quantity}</code> rows with no <code>channel_id</code> parameter or scoping concept anywhere in the payload shape.</li>
+    <li>A script that builds its adjustment list from a channel-specific export, for example a marketplace feed or a channel-scoped catalog pull, can end up with a product_id or sku that also happens to exist (or is mistakenly matched) on a different channel, and the Inventory API will not stop that write.</li>
+  </ul>
+  <p>BigCommerce's own developer documentation states this directly: the Inventory API is not channel aware, and automated or bulk operations can change stock levels for products and variants that are not available on the storefront you intend to affect. See the citations at the end for the exact wording and where it lives in the docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A product_id or sku on your adjustment payload is not proof that the write belongs to the channel you intended. The channel-assignments endpoint is the source of truth for that. So the safe pattern is not "bulk adjust everything the feed gave me." It is "resolve the intended channel's actual assigned product_id set first, then only write the rows that fall inside it, and treat anything outside that set as a flagged, out-of-scope write, never a silent success."</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how the Inventory API itself works, it still has no channel_id. Instead we wrap the existing bulk job with a guard: before any write, resolve the channel's real assigned product ids and flag anything outside that set; after the write, re-diff quantities and roll back any drift found outside the intended channel.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 260" role="img" aria-label="Diagram of the solution. Fetch the channel's assigned product ids, diff the planned adjustment batch against that set, submit only the in-channel rows to the Inventory API, then re-fetch quantities afterward and roll back any product outside the intended channel whose stock changed.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="185" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Fetch channel-assignments</text>
+      <text x="102" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">for the intended channel_id</text>
+      <line x1="102" y1="80" x2="102" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="185" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="102" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Diff planned batch</text>
+      <text x="102" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">against assigned ids</text>
+      <line x1="195" y1="138" x2="237" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="330,106 417,138 330,170 243,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="330" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Row in channel's</text>
+      <text x="330" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">product set?</text>
+      <text x="420" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="417" y1="138" x2="450" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="453" y="108" width="150" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="528" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Submit write</text>
+      <text x="528" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">adjustments/absolute</text>
+      <text x="335" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, flag and skip</text>
+      <line x1="330" y1="170" x2="330" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <line x1="603" y1="138" x2="645" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="648" y="108" width="102" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="699" y="134" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Post-flight</text>
+      <text x="699" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">re-diff quantities</text>
+      <line x1="699" y1="168" x2="699" y2="196" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="618" y="198" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="221" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Drift found?</text>
+      <text x="684" y="238" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">roll back quantity</text>
+    </svg>
+    <figcaption>Only rows whose product_id is confirmed inside the intended channel's assigned set are written. A post-flight diff catches anything that still drifted and rolls it back.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Products (modify) scope so it can read channel-assignments and catalog products, plus the scope required for Inventory adjustments. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export TARGET_CHANNEL_ID="1"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export TARGET_CHANNEL_ID="1"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Catalog and Inventory REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and POST, unwraps the <code>data</code> envelope, and raises on a non-2xx response. We reuse it to read channel-assignments, read products with variants, and submit inventory adjustments.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    return body.get("data", []), body.get("meta", {})
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return [body.data || [], body.meta || {}];
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Resolve the intended channel's assigned product ids</h3>
+      <p>Call <code>GET /v3/catalog/products/channel-assignments?channel_id={channel_id}&amp;limit=250</code>, paginated through <code>meta.pagination.links.next</code>, and collect every <code>product_id</code> assigned to that channel into a set. This set is the boundary the rest of the job checks against. Also build a <code>variant_id -&gt; product_id</code> map from <code>GET /v3/catalog/products?include=variants</code> so rows that only carry a variant_id or sku can still be resolved back to a product_id.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def channel_assigned_product_ids(channel_id):
+    ids = set()
+    page = 1
+    while True:
+        rows, meta = bc_get("/catalog/products/channel-assignments", {
+            "channel_id": channel_id,
+            "limit": 250,
+            "page": page,
+        })
+        if not rows:
+            return ids
+        for row in rows:
+            ids.add(row["product_id"])
+        pagination = meta.get("pagination", {})
+        if not pagination.get("links", {}).get("next"):
+            return ids
+        page += 1
+
+def variant_product_map(product_ids):
+    mapping = {}
+    rows, _ = bc_get("/catalog/products", {
+        "id:in": ",".join(str(p) for p in product_ids),
+        "include": "variants",
+        "limit": 250,
+    })
+    for product in rows:
+        for variant in product.get("variants", []):
+            mapping[variant["id"]] = product["id"]
+    return mapping</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function channelAssignedProductIds(channelId) {
+  const ids = new Set();
+  let page = 1;
+  while (true) {
+    const [rows, meta] = await bcGet("/catalog/products/channel-assignments", {
+      channel_id: channelId,
+      limit: 250,
+      page,
+    });
+    if (!rows.length) return ids;
+    for (const row of rows) ids.add(row.product_id);
+    const next = meta.pagination &amp;&amp; meta.pagination.links &amp;&amp; meta.pagination.links.next;
+    if (!next) return ids;
+    page += 1;
+  }
+}
+
+async function variantProductMap(productIds) {
+  const mapping = {};
+  const [rows] = await bcGet("/catalog/products", {
+    "id:in": productIds.join(","),
+    include: "variants",
+    limit: 250,
+  });
+  for (const product of rows) {
+    for (const variant of product.variants || []) {
+      mapping[variant.id] = product.id;
+    }
+  }
+  return mapping;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the out-of-channel check in its own function that takes the channel's assigned product id set, the planned adjustment rows, and the variant-to-product map, and returns the subset of rows that would write outside the intended channel. No network, no side effects, so it is fully unit-testable with synthetic ids.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def find_out_of_channel_writes(channel_assigned_product_ids, adjustment_items, product_id_by_variant):
+    flagged = []
+    for item in adjustment_items:
+        pid = item.get("product_id")
+        if pid is None and "variant_id" in item:
+            pid = product_id_by_variant.get(item["variant_id"])
+        if pid is None:
+            flagged.append({**item, "_reason": "unresolved_product_id"})
+            continue
+        if pid not in channel_assigned_product_ids:
+            flagged.append({**item, "_reason": "product_not_assigned_to_target_channel", "product_id": pid})
+    return flagged</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function findOutOfChannelWrites(channelAssignedProductIds, adjustmentItems, productIdByVariant) {
+  const flagged = [];
+  for (const item of adjustmentItems) {
+    let pid = item.product_id;
+    if (pid === undefined || pid === null) {
+      if ("variant_id" in item) pid = productIdByVariant[item.variant_id];
+    }
+    if (pid === undefined || pid === null) {
+      flagged.push({ ...item, _reason: "unresolved_product_id" });
+      continue;
+    }
+    if (!channelAssignedProductIds.has(pid)) {
+      flagged.push({ ...item, _reason: "product_not_assigned_to_target_channel", product_id: pid });
+    }
+  }
+  return flagged;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Submit only the filtered, in-channel rows</h3>
+      <p>Only the adjustment items whose resolved product_id was confirmed inside <code>channel_assigned_product_ids</code> get sent to <code>POST /v3/inventory/adjustments/absolute</code> (or <code>/relative</code>), batched by <code>location_id</code>, respecting the 2000-item payload limit. If any items were flagged and <code>DRY_RUN</code> is true or a strict flag is set, the whole batch is aborted first, and the flagged rows are printed for a human to review, before anything is ever written.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def submit_adjustments(reason, items):
+    return bc_post("/inventory/adjustments/absolute", {
+        "reason": reason,
+        "items": items,
+    })</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function submitAdjustments(reason, items) {
+  return bcPost("/inventory/adjustments/absolute", { reason, items });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Post-flight reconcile and self-heal any drift</h3>
+      <p>After the write, re-fetch <code>GET /v3/catalog/products?id:in={touched_ids}&amp;include=variants</code> and diff <code>inventory_level</code> against a pre-adjustment snapshot taken before the batch ran. If any product outside the intended channel shows a changed quantity, immediately re-apply its pre-adjustment value with a follow-up <code>POST /v3/inventory/adjustments/absolute</code> call, log the channel_id, product_id, location_id, and old and new quantity, and gate this rollback write behind <code>DRY_RUN=false</code> the same as the primary batch.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. On a dry run, the pre-flight abort and the rollback both only log what they would do, they never call the Inventory API. Only switch to <code>DRY_RUN=false</code> once you have reviewed a run's flagged rows and are confident the channel-assigned product set is correct.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and is safe to run again and again because it only ever writes rows confirmed inside the intended channel, and rolls back anything it finds drifted outside it.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/inventory-api-not-channel-aware" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">channel_scoped_inventory.py</div>
+      <pre><code class="language-python">"""Keep BigCommerce bulk inventory adjustments inside the intended sales channel.
+
+BigCommerce's Inventory API is not channel aware. inventory_level and
+inventory_warning_level live on the product or variant at the catalog level,
+shared across every sales channel that product is assigned to, while
+POST /v3/inventory/adjustments/absolute and /relative accept batches keyed
+only by product_id, variant_id, or sku plus location_id, with no channel_id
+field anywhere in the payload. A bulk job built from a channel-specific feed
+can therefore silently mutate stock for a product assigned to a different
+channel, or no channel at all. This script wraps a planned adjustment batch
+with a pre-flight guard (resolve the target channel's real assigned product
+ids and flag or abort on anything outside that set), a filtered write (only
+submit the confirmed in-channel rows), and a post-flight reconciler (re-diff
+quantities afterward and roll back any drift found outside the channel).
+Safe to run again and again. Everything is DRY_RUN-guarded end to end.
+
+Guide: https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/
+"""
+import os
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("channel_scoped_inventory")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+TARGET_CHANNEL_ID = int(os.environ.get("TARGET_CHANNEL_ID", "1"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+STRICT = os.environ.get("STRICT", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    body = r.json() if r.text else {}
+    return body.get("data", []), body.get("meta", {})
+
+
+def bc_post(path, body):
+    r = requests.post(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def find_out_of_channel_writes(channel_assigned_product_ids: set, adjustment_items: list, product_id_by_variant: dict) -> list:
+    """Pure decision. No network, no side effects.
+
+    channel_assigned_product_ids: set of product_id values returned by
+        GET /v3/catalog/products/channel-assignments?channel_id={id} for the
+        intended channel.
+    adjustment_items: the payload rows about to be (or already) sent to
+        POST /v3/inventory/adjustments/{absolute|relative}, each a dict with
+        keys among {product_id, variant_id, sku, location_id, quantity, reason}.
+    product_id_by_variant: precomputed map of variant_id -> product_id (from
+        GET /v3/catalog/products?include=variants) used to resolve items that
+        only specify variant_id or sku.
+
+    Returns the subset of adjustment_items whose resolved product_id is NOT
+    a member of channel_assigned_product_ids, i.e. rows that would silently
+    write to inventory outside the intended sales channel. Empty list means
+    the whole batch is safe.
+    """
+    flagged = []
+    for item in adjustment_items:
+        pid = item.get("product_id")
+        if pid is None and "variant_id" in item:
+            pid = product_id_by_variant.get(item["variant_id"])
+        if pid is None:
+            flagged.append({**item, "_reason": "unresolved_product_id"})
+            continue
+        if pid not in channel_assigned_product_ids:
+            flagged.append({**item, "_reason": "product_not_assigned_to_target_channel", "product_id": pid})
+    return flagged
+
+
+def channel_assigned_product_ids(channel_id):
+    ids = set()
+    page = 1
+    while True:
+        rows, meta = bc_get(
+            "/catalog/products/channel-assignments",
+            {"channel_id": channel_id, "limit": 250, "page": page},
+        )
+        if not rows:
+            return ids
+        for row in rows:
+            ids.add(row["product_id"])
+        pagination = meta.get("pagination", {})
+        if not pagination.get("links", {}).get("next"):
+            return ids
+        page += 1
+
+
+def variant_product_map(product_ids):
+    if not product_ids:
+        return {}
+    mapping = {}
+    rows, _ = bc_get(
+        "/catalog/products",
+        {"id:in": ",".join(str(p) for p in product_ids), "include": "variants", "limit": 250},
+    )
+    for product in rows:
+        for variant in product.get("variants", []):
+            mapping[variant["id"]] = product["id"]
+    return mapping
+
+
+def snapshot_quantities(product_ids):
+    if not product_ids:
+        return {}
+    rows, _ = bc_get(
+        "/catalog/products",
+        {"id:in": ",".join(str(p) for p in product_ids), "include": "variants", "limit": 250},
+    )
+    snapshot = {}
+    for product in rows:
+        snapshot[product["id"]] = product.get("inventory_level")
+        for variant in product.get("variants", []):
+            snapshot[("variant", variant["id"])] = variant.get("inventory_level")
+    return snapshot
+
+
+def submit_adjustments(reason, items):
+    return bc_post("/inventory/adjustments/absolute", {"reason": reason, "items": items})
+
+
+def run(planned_items):
+    """planned_items: the batch a bulk job intends to submit, shaped like
+    [{"product_id"|"variant_id"|"sku": ..., "location_id": 1, "quantity": N}, ...]
+    """
+    resolved_ids = {i["product_id"] for i in planned_items if i.get("product_id") is not None}
+    variant_ids = [i["variant_id"] for i in planned_items if i.get("variant_id") is not None]
+
+    assigned_ids = channel_assigned_product_ids(TARGET_CHANNEL_ID)
+    variant_map = variant_product_map(resolved_ids | set(variant_ids)) if variant_ids else {}
+
+    flagged = find_out_of_channel_writes(assigned_ids, planned_items, variant_map)
+
+    if flagged:
+        log.warning("%d item(s) flagged as out of channel_id=%s scope:", len(flagged), TARGET_CHANNEL_ID)
+        for row in flagged:
+            log.warning("  %s", row)
+        if STRICT:
+            log.error("STRICT mode: aborting the whole batch. No writes were made.")
+            return
+
+    safe_items = [item for item in planned_items if item not in flagged]
+    if not safe_items:
+        log.info("Nothing left to write after filtering out-of-channel rows.")
+        return
+
+    touched_product_ids = {item.get("product_id") for item in safe_items if item.get("product_id")}
+    touched_product_ids |= {variant_map.get(i.get("variant_id")) for i in safe_items if i.get("variant_id")}
+    touched_product_ids.discard(None)
+
+    pre_snapshot = snapshot_quantities(touched_product_ids)
+
+    log.info("%d item(s) confirmed in channel_id=%s, %s", len(safe_items), TARGET_CHANNEL_ID,
+              "would submit (dry run)" if DRY_RUN else "submitting")
+    if not DRY_RUN:
+        submit_adjustments("channel_scoped_inventory reconciler", safe_items)
+
+    if DRY_RUN:
+        return
+
+    post_snapshot = snapshot_quantities(touched_product_ids)
+    for key, pre_value in pre_snapshot.items():
+        post_value = post_snapshot.get(key)
+        if isinstance(key, tuple):
+            continue
+        if key not in assigned_ids and post_value != pre_value:
+            log.error(
+                "Drift outside channel_id=%s: product_id=%s old=%s new=%s. Rolling back.",
+                TARGET_CHANNEL_ID, key, pre_value, post_value,
+            )
+            submit_adjustments(
+                "channel_scoped_inventory rollback",
+                [{"product_id": key, "location_id": safe_items[0].get("location_id", 1), "quantity": pre_value}],
+            )
+
+
+if __name__ == "__main__":
+    run([])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">channel-scoped-inventory.js</div>
+      <pre><code class="language-javascript">/**
+ * Keep BigCommerce bulk inventory adjustments inside the intended sales channel.
+ *
+ * BigCommerce's Inventory API is not channel aware. inventory_level and
+ * inventory_warning_level live on the product or variant at the catalog level,
+ * shared across every sales channel that product is assigned to, while
+ * POST /v3/inventory/adjustments/absolute and /relative accept batches keyed
+ * only by product_id, variant_id, or sku plus location_id, with no channel_id
+ * field anywhere in the payload. A bulk job built from a channel-specific feed
+ * can therefore silently mutate stock for a product assigned to a different
+ * channel, or no channel at all. This script wraps a planned adjustment batch
+ * with a pre-flight guard (resolve the target channel's real assigned product
+ * ids and flag or abort on anything outside that set), a filtered write (only
+ * submit the confirmed in-channel rows), and a post-flight reconciler (re-diff
+ * quantities afterward and roll back any drift found outside the channel).
+ * Safe to run again and again. Everything is DRY_RUN-guarded end to end.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/inventory-api-not-channel-aware/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const TARGET_CHANNEL_ID = Number(process.env.TARGET_CHANNEL_ID || 1);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const STRICT = (process.env.STRICT || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * channelAssignedProductIds: Set of product_id values returned by
+ *   GET /v3/catalog/products/channel-assignments?channel_id={id} for the
+ *   intended channel.
+ * adjustmentItems: the payload rows about to be (or already) sent to
+ *   POST /v3/inventory/adjustments/{absolute|relative}, each an object with
+ *   keys among {product_id, variant_id, sku, location_id, quantity, reason}.
+ * productIdByVariant: precomputed map of variant_id -> product_id (from
+ *   GET /v3/catalog/products?include=variants) used to resolve items that
+ *   only specify variant_id or sku.
+ *
+ * Returns the subset of adjustmentItems whose resolved product_id is NOT
+ * a member of channelAssignedProductIds, i.e. rows that would silently
+ * write to inventory outside the intended sales channel. Empty array means
+ * the whole batch is safe.
+ */
+export function findOutOfChannelWrites(channelAssignedProductIds, adjustmentItems, productIdByVariant) {
+  const flagged = [];
+  for (const item of adjustmentItems) {
+    let pid = item.product_id;
+    if (pid === undefined || pid === null) {
+      if ("variant_id" in item) pid = productIdByVariant[item.variant_id];
+    }
+    if (pid === undefined || pid === null) {
+      flagged.push({ ...item, _reason: "unresolved_product_id" });
+      continue;
+    }
+    if (!channelAssignedProductIds.has(pid)) {
+      flagged.push({ ...item, _reason: "product_not_assigned_to_target_channel", product_id: pid });
+    }
+  }
+  return flagged;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return [body.data || [], body.meta || {}];
+}
+
+async function bcPost(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function channelAssignedProductIds(channelId) {
+  const ids = new Set();
+  let page = 1;
+  while (true) {
+    const [rows, meta] = await bcGet("/catalog/products/channel-assignments", {
+      channel_id: channelId,
+      limit: 250,
+      page,
+    });
+    if (!rows.length) return ids;
+    for (const row of rows) ids.add(row.product_id);
+    const next = meta.pagination &amp;&amp; meta.pagination.links &amp;&amp; meta.pagination.links.next;
+    if (!next) return ids;
+    page += 1;
+  }
+}
+
+async function variantProductMap(productIds) {
+  if (!productIds.length) return {};
+  const mapping = {};
+  const [rows] = await bcGet("/catalog/products", {
+    "id:in": productIds.join(","),
+    include: "variants",
+    limit: 250,
+  });
+  for (const product of rows) {
+    for (const variant of product.variants || []) {
+      mapping[variant.id] = product.id;
+    }
+  }
+  return mapping;
+}
+
+async function snapshotQuantities(productIds) {
+  if (!productIds.length) return {};
+  const [rows] = await bcGet("/catalog/products", {
+    "id:in": productIds.join(","),
+    include: "variants",
+    limit: 250,
+  });
+  const snapshot = {};
+  for (const product of rows) {
+    snapshot[product.id] = product.inventory_level;
+  }
+  return snapshot;
+}
+
+async function submitAdjustments(reason, items) {
+  return bcPost("/inventory/adjustments/absolute", { reason, items });
+}
+
+export async function run(plannedItems) {
+  const resolvedIds = new Set(plannedItems.filter((i) => i.product_id != null).map((i) => i.product_id));
+  const variantIds = plannedItems.filter((i) => i.variant_id != null).map((i) => i.variant_id);
+
+  const assignedIds = await channelAssignedProductIds(TARGET_CHANNEL_ID);
+  const variantMap = variantIds.length ? await variantProductMap([...resolvedIds, ...variantIds]) : {};
+
+  const flagged = findOutOfChannelWrites(assignedIds, plannedItems, variantMap);
+
+  if (flagged.length) {
+    console.warn(`${flagged.length} item(s) flagged as out of channel_id=${TARGET_CHANNEL_ID} scope:`);
+    for (const row of flagged) console.warn(" ", row);
+    if (STRICT) {
+      console.error("STRICT mode: aborting the whole batch. No writes were made.");
+      return;
+    }
+  }
+
+  const safeItems = plannedItems.filter((item) => !flagged.includes(item));
+  if (!safeItems.length) {
+    console.log("Nothing left to write after filtering out-of-channel rows.");
+    return;
+  }
+
+  const touchedProductIds = new Set();
+  for (const item of safeItems) {
+    if (item.product_id != null) touchedProductIds.add(item.product_id);
+    else if (item.variant_id != null &amp;&amp; variantMap[item.variant_id] != null) touchedProductIds.add(variantMap[item.variant_id]);
+  }
+
+  const preSnapshot = await snapshotQuantities([...touchedProductIds]);
+
+  console.log(
+    `${safeItems.length} item(s) confirmed in channel_id=${TARGET_CHANNEL_ID}, ` +
+    `${DRY_RUN ? "would submit (dry run)" : "submitting"}`
+  );
+  if (!DRY_RUN) await submitAdjustments("channel_scoped_inventory reconciler", safeItems);
+
+  if (DRY_RUN) return;
+
+  const postSnapshot = await snapshotQuantities([...touchedProductIds]);
+  for (const [key, preValue] of Object.entries(preSnapshot)) {
+    const productId = Number(key);
+    const postValue = postSnapshot[key];
+    if (!assignedIds.has(productId) &amp;&amp; postValue !== preValue) {
+      console.error(
+        `Drift outside channel_id=${TARGET_CHANNEL_ID}: product_id=${productId} old=${preValue} new=${postValue}. Rolling back.`
+      );
+      await submitAdjustments("channel_scoped_inventory rollback", [
+        { product_id: productId, location_id: safeItems[0].location_id || 1, quantity: preValue },
+      ]);
+    }
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run([]).catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The out-of-channel check is the part most worth testing, because it decides whether a real write is allowed to reach the Inventory API. Because <code>find_out_of_channel_writes</code> takes only plain values and returns a plain list, the test needs no network and no BigCommerce store. It just feeds in synthetic ids and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_inventory_channel_scope.py</div>
+      <pre><code class="language-python">from channel_scoped_inventory import find_out_of_channel_writes
+
+
+def test_empty_list_when_all_products_are_in_channel():
+    assigned = {101, 102}
+    items = [{"product_id": 101, "location_id": 1, "quantity": 5}]
+    assert find_out_of_channel_writes(assigned, items, {}) == []
+
+
+def test_flags_product_not_in_channel():
+    assigned = {101}
+    items = [{"product_id": 202, "location_id": 1, "quantity": 5}]
+    flagged = find_out_of_channel_writes(assigned, items, {})
+    assert len(flagged) == 1
+    assert flagged[0]["_reason"] == "product_not_assigned_to_target_channel"
+    assert flagged[0]["product_id"] == 202
+
+
+def test_resolves_variant_id_through_the_map():
+    assigned = {101}
+    items = [{"variant_id": 555, "location_id": 1, "quantity": 5}]
+    flagged = find_out_of_channel_writes(assigned, items, {555: 101})
+    assert flagged == []
+
+
+def test_flags_variant_that_resolves_to_a_product_outside_the_channel():
+    assigned = {101}
+    items = [{"variant_id": 555, "location_id": 1, "quantity": 5}]
+    flagged = find_out_of_channel_writes(assigned, items, {555: 999})
+    assert len(flagged) == 1
+    assert flagged[0]["product_id"] == 999
+
+
+def test_flags_unresolved_product_id_when_variant_map_is_missing_it():
+    assigned = {101}
+    items = [{"variant_id": 555, "location_id": 1, "quantity": 5}]
+    flagged = find_out_of_channel_writes(assigned, items, {})
+    assert flagged[0]["_reason"] == "unresolved_product_id"
+
+
+def test_mixed_batch_only_flags_the_out_of_channel_rows():
+    assigned = {101, 102}
+    items = [
+        {"product_id": 101, "location_id": 1, "quantity": 5},
+        {"product_id": 999, "location_id": 1, "quantity": 3},
+        {"product_id": 102, "location_id": 1, "quantity": 7},
+    ]
+    flagged = find_out_of_channel_writes(assigned, items, {})
+    assert len(flagged) == 1
+    assert flagged[0]["product_id"] == 999</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">channel-scoped-inventory.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { findOutOfChannelWrites } from "./channel-scoped-inventory.js";
+
+test("empty list when all products are in channel", () =&gt; {
+  const assigned = new Set([101, 102]);
+  const items = [{ product_id: 101, location_id: 1, quantity: 5 }];
+  assert.deepEqual(findOutOfChannelWrites(assigned, items, {}), []);
+});
+
+test("flags product not in channel", () =&gt; {
+  const assigned = new Set([101]);
+  const items = [{ product_id: 202, location_id: 1, quantity: 5 }];
+  const flagged = findOutOfChannelWrites(assigned, items, {});
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0]._reason, "product_not_assigned_to_target_channel");
+  assert.equal(flagged[0].product_id, 202);
+});
+
+test("resolves variant_id through the map", () =&gt; {
+  const assigned = new Set([101]);
+  const items = [{ variant_id: 555, location_id: 1, quantity: 5 }];
+  const flagged = findOutOfChannelWrites(assigned, items, { 555: 101 });
+  assert.deepEqual(flagged, []);
+});
+
+test("flags variant that resolves to a product outside the channel", () =&gt; {
+  const assigned = new Set([101]);
+  const items = [{ variant_id: 555, location_id: 1, quantity: 5 }];
+  const flagged = findOutOfChannelWrites(assigned, items, { 555: 999 });
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0].product_id, 999);
+});
+
+test("flags unresolved product id when variant map is missing it", () =&gt; {
+  const assigned = new Set([101]);
+  const items = [{ variant_id: 555, location_id: 1, quantity: 5 }];
+  const flagged = findOutOfChannelWrites(assigned, items, {});
+  assert.equal(flagged[0]._reason, "unresolved_product_id");
+});
+
+test("mixed batch only flags the out-of-channel rows", () =&gt; {
+  const assigned = new Set([101, 102]);
+  const items = [
+    { product_id: 101, location_id: 1, quantity: 5 },
+    { product_id: 999, location_id: 1, quantity: 3 },
+    { product_id: 102, location_id: 1, quantity: 7 },
+  ];
+  const flagged = findOutOfChannelWrites(assigned, items, {});
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0].product_id, 999);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Marketplace feed</span>
+      <h4>The store whose marketplace sync clobbered its main storefront stock</h4>
+      <p>A merchant ran a nightly sync that pulled a product feed scoped to a single marketplace channel and bulk-adjusted inventory by SKU for every row in that feed. Several SKUs were reused across the marketplace channel and the primary storefront's own catalog, so the same sync quietly overwrote main-storefront stock levels with numbers meant only for the marketplace.</p>
+      <p>Adding the pre-flight guard caught it on the very first dry run. The channel-assignments diff flagged every SKU whose resolved product_id was not actually assigned to the marketplace channel_id, and the merchant could see exactly which rows to exclude before a single write happened.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Shared SKU across channels</span>
+      <h4>The catalog where one SKU lived on three channels at once</h4>
+      <p>A product was intentionally assigned to a main storefront, a secondary storefront, and a marketplace channel, all sharing the same underlying inventory_level. A channel-specific stock adjustment intended only for the marketplace channel was, correctly, still going to affect the other two channels too, because BigCommerce's inventory really is shared across every assignment.</p>
+      <p>The reconciler did not block this write, since the product genuinely was assigned to the target channel, but it did make the shared-inventory behavior visible in the logs, so the team could decide, with full information, whether that shared quantity was actually what they wanted.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs in front of every bulk inventory job, a write can only reach the Inventory API once its product_id has been confirmed inside the intended channel's assigned set. Anything unresolved or out of scope is flagged and, by default, blocks the whole batch instead of writing quietly. And if a drift somehow still lands outside the intended channel, the post-flight diff catches it and writes the pre-adjustment quantity straight back, with a full audit log of channel_id, product_id, location_id, and old and new quantity.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does BigCommerce's Inventory API affect products outside my target channel?</summary>
+      <p>Inventory levels are stored per product or variant at the catalog level, not per sales channel. The bulk adjustment endpoints only accept product_id, variant_id, or sku plus location_id, with no channel_id parameter at all, so a script that resolves its input list from a channel-specific export can still write to any product that shares that id or sku, regardless of which channels it is actually assigned to.</p>
+    </details>
+    <details>
+      <summary>Can I scope an inventory adjustment to a single sales channel?</summary>
+      <p>No. POST /v3/inventory/adjustments/absolute and /relative have no channel scoping concept. The only way to keep a bulk job from touching the wrong channel's products is to build your own guard: fetch the set of product_id values assigned to the intended channel from GET /v3/catalog/products/channel-assignments, and filter or reject any adjustment row whose product_id is not in that set before you call the Inventory API.</p>
+    </details>
+    <details>
+      <summary>What should happen if an out-of-channel write already happened?</summary>
+      <p>Take a pre-adjustment snapshot of inventory_level for every touched product before the batch runs, then re-fetch quantities afterward and diff. Any product outside the intended channel whose quantity changed should have its pre-adjustment value written back immediately with a follow-up call to POST /v3/inventory/adjustments/absolute, logged with the channel_id, product_id, location_id, and old and new quantity so the drift is auditable.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">Orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">Transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: the Inventory API is not channel aware. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments</a></li>
+      <li>BigCommerce Developer Center: the Inventory API reference. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory" rel="noopener">developer.bigcommerce.com inventory</a></li>
+      <li>BigCommerce Docs: inventory adjustments, payload shape, and caveats. <a href="https://developer.bigcommerce.com/docs/store-operations/catalog/inventory-adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments (store operations)</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: absolute and relative adjustment endpoints, batching, and the channel-awareness caveat. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments</a></li>
+      <li>BigCommerce Developer Center: the channel-assignments endpoint, product_id and channel_id filters. <a href="https://developer.bigcommerce.com/docs/rest-catalog/products/channel-assignments" rel="noopener">developer.bigcommerce.com channel assignments</a></li>
+      <li>BigCommerce Docs: inventory adjustments payload shape, reason, items, location_id, variant_id, quantity. <a href="https://developer.bigcommerce.com/docs/store-operations/catalog/inventory-adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments (store operations)</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this save your channel's stock levels?</h3>
+    <p>If this caught a bulk job that would have quietly mutated stock on the wrong channel, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

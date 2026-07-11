@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Order Count Endpoint Disagreeing With the Order List</title>
+<meta name="description" content="BigCommerce's GET /v2/orders/count and a full GET /v2/orders pagination scan return two different totals. Learn why the implicit status_id filters diverge and build a Python or Node.js reconciler that sums per-status counts and reports the exact mismatch.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Order Count Endpoint Disagreeing With the Order List">
+<meta property="og:description" content="Why GET /v2/orders/count and a paginated GET /v2/orders scan can report two different totals, and a safe Python or Node.js script that reconciles them per status_id instead of guessing.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/#article","headline":"Fix BigCommerce Order Count Endpoint Disagreeing With the Order List","description":"BigCommerce's GET /v2/orders/count and a full pagination of GET /v2/orders can report two different totals because each call applies its own implicit status_id filter when none is passed. A Python or Node.js reconciler sums per-status counts and compares them against a full paginated scan to localize and report the exact mismatch.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Orders","keywords":"BigCommerce orders count, GET /v2/orders/count, status_id, order pagination, Incomplete orders, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Order count endpoint disagrees with actual paginated order list","item":"https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does GET /v2/orders/count not match the number of orders I get from paginating /v2/orders?","acceptedAnswer":{"@type":"Answer","text":"Both endpoints accept the same status_id, min_date_created, max_date_created, and customer_id filters, and both apply an implicit default when you omit status_id. If your count call and your pagination loop do not pass the exact same filters, you end up comparing two different result sets, most commonly because Incomplete orders (status_id 0, abandoned at payment) are excluded from one call's default scope but included in the other's unfiltered scan."}},{"@type":"Question","name":"Should I trust one unfiltered GET /v2/orders/count call for a store-wide total?","acceptedAnswer":{"@type":"Answer","text":"No. A single unfiltered count call depends on an implicit default you do not control and cannot verify from the response alone. Sum the per-status counts by calling GET /v2/orders/count?status_id={id} for each of the 15 known status_id values and compare that sum against a full paginated scan with the same filters."}},{"@type":"Question","name":"If the counts still do not match after aligning filters, should the script delete or fix orders automatically?","acceptedAnswer":{"@type":"Answer","text":"No. A count mismatch is a query-semantics or timing signal, not proof of data corruption. The correct response is to emit a dry run report with the unfiltered count, the per-status sum, the paginated total, and the specific order id deltas grouped by status_id, so a human can decide whether to escalate to BigCommerce support before anything is changed."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Orders</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Orders</p>
+    <h1>BigCommerce order count endpoint disagrees with actual paginated order list</h1>
+    <p class="lead">One script calls GET /v2/orders/count and gets back a tidy number. Another script pages all the way through GET /v2/orders and counts as it goes. The two totals do not match, and nothing in either response tells you why. The gap is almost never store-data corruption. It is two calls quietly applying two different implicit status_id filters, plus the fact that a count is a snapshot while a multi-page scan takes real time. Here is why that happens and a small reconciler that localizes the mismatch instead of guessing at it.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 Orders API</span>
+      <span class="chip">Report only, no writes</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>GET /v2/orders/count and GET /v2/orders both accept the same filters, status_id, min_date_created, max_date_created, customer_id, and both apply an implicit default scope when status_id is omitted. Incomplete orders (status_id 0, abandoned at payment) are commonly excluded from an unfiltered count's default scope but still show up in an unfiltered pagination scan of /v2/orders, so a script that calls one endpoint with no filters and the other with a different filter set is comparing two different result sets. A secondary cause is timing: count is a point-in-time snapshot, and a multi-page scan on a large store can take long enough for orders to be created or cancelled in between. The fix is not to trust either single number. Call GET /v2/orders/count?status_id={id} for each of the 15 known status_id values, sum them, and compare that sum against a full paginated scan using the same filters. Any remaining delta gets reported per status_id for a human to review, never auto-repaired.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>GET /v2/orders/count looks like a shortcut. Call it once, get {"count": N}, done. GET /v2/orders is the workhorse, you page through it 250 rows at a time to actually list orders. Both endpoints take the same query parameters, status_id, min_date_created, max_date_created, customer_id, so it is natural to assume that calling /count with no filters and then paginating /v2/orders with no filters returns the same total. They often do not.</p>
+  <p>The catch is what happens when status_id is left out. Some client code paths, and some store configurations, treat an unfiltered order count as "all customer-facing orders," which quietly excludes status_id 0, Incomplete, since those are carts abandoned mid-payment and were never meant to show up in storefront-facing order totals. Meanwhile an unfiltered pagination of /v2/orders has no such carve-out built in and will return every order row it can see, Incomplete included. Sum fifteen different status buckets by hand and you can get a third number that matches neither of the first two, because the buckets were never queried with a consistent filter set to begin with.</p>
+  <p>On top of the filter mismatch, a full pagination scan is not instantaneous. On a large store, paging through every order at limit=250 per page can take seconds to minutes. If an order is created, cancelled, or deleted while that scan is running, the count you fetched before the scan started is already stale by the time the last page comes back, even if the filters were identical.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A count call with no filters returns one number, a paginated scan with a different or missing filter returns a different number, and Incomplete orders at status_id 0 are the most common source of the gap, producing a total that disagrees.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="20" width="200" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="110" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">GET /v2/orders/count</text>
+      <text x="110" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">no status_id, excludes 0</text>
+      <rect x="10" y="130" width="200" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="110" y="156" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Paginate GET /v2/orders</text>
+      <text x="110" y="173" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">no filter, includes 0</text>
+      <line x1="212" y1="50" x2="330" y2="95" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="212" y1="160" x2="330" y2="105" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <polygon points="410,68 497,100 410,132 323,100" fill="#fbeeec" stroke="#cf4b3f"></polygon>
+      <text x="410" y="95" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Two different</text>
+      <text x="410" y="110" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">implicit scopes</text>
+      <line x1="500" y1="100" x2="560" y2="100" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="563" y="70" width="187" height="60" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="656" y="96" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Totals disagree</text>
+      <text x="656" y="113" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">status_id 0 is the usual gap</text>
+    </svg>
+    <figcaption>Both endpoints accept the same filters, but an unfiltered count and an unfiltered pagination scan can each apply a different implicit default, most often around Incomplete (status_id 0) orders.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <ul>
+    <li>GET /v2/orders/count and GET /v2/orders both accept status_id, min_date_created, max_date_created, and customer_id, so a script calling /count with no filters and paginating /v2/orders with a different (or no) filter set is not actually asking the same question twice.</li>
+    <li>Incomplete orders, status_id 0, are abandoned at payment and are excluded from storefront-facing order counts by design in some client implementations, but a raw unfiltered pagination of /v2/orders has no such exclusion and will still return them.</li>
+    <li>A one-off unfiltered /count call is a point-in-time snapshot. A full pagination scan of a large order catalog, at limit=250 per page, can take seconds to minutes, so orders created, cancelled, or deleted mid-scan drift the paginated total away from a count taken before the scan started.</li>
+    <li>Summing counts across all 15 status_id values by hand, without also verifying against a paginated scan using the identical filters, hides silent mistakes, a typo in a status_id, a missed value, a stale cached total, that would otherwise show up as a per-status delta.</li>
+  </ul>
+  <p>This is a recurring question on BigCommerce's own support forum, developers see /v2/orders/count return a number that a script's paginated total does not match, and the API reference does not call out the implicit default behavior in the response itself. See the citations at the end for the exact threads and docs.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>Neither /v2/orders/count nor a single pagination run is the source of truth on its own. The source of truth is what you get when you query both endpoints with the identical filter set and compare. Call GET /v2/orders/count?status_id={id} for each of the 15 known status_id values, sum them, and separately sum len(orders) from a full pagination of /v2/orders using those same status_id filters. If the two totals still disagree after the filters are aligned and the scan is re-run within a short window, the mismatch is real and localized to specific status_id buckets, and that is a report for a human, not something to auto-repair.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch any order record. We add a reconciler that queries the count endpoint per status_id, fully paginates the order list with the same filters, and compares the two, bucket by bucket, emitting a dry run report of exactly where they disagree.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. The reconciler calls GET /v2/orders/count for each status_id from 0 to 14 and sums them, separately paginates GET /v2/orders with the same filters and counts orders per status_id, then compares the two per-status totals. If every status_id balances the report says consistent, otherwise it lists the mismatched status_id buckets for a human to review.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="190" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="105" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Count per status_id</text>
+      <text x="105" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">/count?status_id=0..14</text>
+      <rect x="10" y="130" width="190" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="105" y="156" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Paginate all orders</text>
+      <text x="105" y="173" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">same filters, tally status_id</text>
+      <line x1="202" y1="50" x2="270" y2="95" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <line x1="202" y1="160" x2="270" y2="105" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="273" y="70" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="363" y="96" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Reconcile per bucket</text>
+      <text x="363" y="113" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">delta = count - paginated</text>
+      <line x1="456" y1="100" x2="497" y2="100" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="590,68 677,100 590,132 503,100" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="590" y="95" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">All deltas</text>
+      <text x="590" y="110" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">zero?</text>
+      <text x="680" y="90" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="677" y1="100" x2="700" y2="70" stroke="#4c9a2a" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="640" y="20" width="110" height="42" rx="9" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="695" y="46" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#4c9a2a">Consistent</text>
+      <text x="683" y="145" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no</text>
+      <line x1="590" y1="132" x2="590" y2="185" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="500" y="185" width="180" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="590" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Dry run report</text>
+      <text x="590" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">mismatched status_id list</text>
+    </svg>
+    <figcaption>The reconciler never writes anything. It only produces a report of which status_id buckets disagree, for a human to review before escalating.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Orders (read-only) scope is enough, since this reconciler never writes. You need the store hash from your control panel URL and the access token, sent on every call as the X-Auth-Token header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MIN_DATE_CREATED=""   # optional, e.g. "2026-01-01"
+export DRY_RUN="true"        # this reconciler only ever reports, never writes</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MIN_DATE_CREATED=""   // optional, e.g. "2026-01-01"
+export DRY_RUN="true"        // this reconciler only ever reports, never writes</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 Orders REST API</h3>
+      <p>Every call goes to https://api.bigcommerce.com/stores/{store_hash}/v2/ with the token in the X-Auth-Token header. A small helper handles GET and raises on a non-2xx response. We reuse it for both the count endpoint and the paginated order list.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Fetch a count per status_id, and fully paginate the order list</h3>
+      <p>Call GET /v2/orders/count?status_id={id} for each of the 15 known status_id values, 0 through 14, passing the same min_date_created filter each time if you use one. Separately, fully paginate GET /v2/orders?page={p}&amp;limit=250&amp;sort=id:asc with the same filters, incrementing page until a page returns fewer than 250 rows or an empty array, and tally each order's status_id as you go.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">ALL_STATUS_IDS = list(range(15))  # 0 Incomplete .. 14 Partially Refunded
+
+def count_by_status(min_date_created=None):
+    totals = {}
+    for status_id in ALL_STATUS_IDS:
+        params = {"status_id": status_id}
+        if min_date_created:
+            params["min_date_created"] = min_date_created
+        body = bc_get("/orders/count", params)
+        totals[status_id] = body.get("count", 0)
+    return totals
+
+def paginate_all_order_status_ids(min_date_created=None):
+    status_ids = []
+    page = 1
+    while True:
+        params = {"page": page, "limit": 250, "sort": "id:asc"}
+        if min_date_created:
+            params["min_date_created"] = min_date_created
+        orders = bc_get("/orders", params)
+        if not orders:
+            return status_ids
+        for order in orders:
+            status_ids.append(order["status_id"])
+        if len(orders) &lt; 250:
+            return status_ids
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const ALL_STATUS_IDS = Array.from({ length: 15 }, (_, i) => i); // 0 Incomplete .. 14 Partially Refunded
+
+async function countByStatus(minDateCreated) {
+  const totals = {};
+  for (const statusId of ALL_STATUS_IDS) {
+    const params = { status_id: statusId };
+    if (minDateCreated) params.min_date_created = minDateCreated;
+    const body = await bcGet("/orders/count", params);
+    totals[statusId] = body.count || 0;
+  }
+  return totals;
+}
+
+async function paginateAllOrderStatusIds(minDateCreated) {
+  const statusIds = [];
+  let page = 1;
+  while (true) {
+    const params = { page, limit: 250, sort: "id:asc" };
+    if (minDateCreated) params.min_date_created = minDateCreated;
+    const orders = await bcGet("/orders", params);
+    if (!orders.length) return statusIds;
+    for (const order of orders) statusIds.push(order.status_id);
+    if (orders.length &lt; 250) return statusIds;
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Reconcile with one pure function</h3>
+      <p>Keep the comparison in its own function that takes the per-status count map and the flat list of status_id values seen while paginating, and returns a plain report. No network, no BigCommerce client, just two data structures already fetched by the caller. This is what makes it fully unit-testable with synthetic inputs.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile.py</div>
+      <pre><code class="language-python">from collections import Counter
+from dataclasses import dataclass, field
+
+@dataclass
+class ReconciliationReport:
+    total_count_endpoint: int
+    total_paginated: int
+    per_status_deltas: dict
+    mismatched_status_ids: list
+    is_consistent: bool
+
+def reconcile_order_counts(count_endpoint_totals: dict, paginated_order_status_ids: list) -&gt; ReconciliationReport:
+    paginated_counts = Counter(paginated_order_status_ids)
+    all_status_ids = set(count_endpoint_totals) | set(paginated_counts)
+
+    per_status_deltas = {}
+    for status_id in all_status_ids:
+        expected = count_endpoint_totals.get(status_id, 0)
+        actual = paginated_counts.get(status_id, 0)
+        per_status_deltas[status_id] = expected - actual
+
+    mismatched_status_ids = [sid for sid, delta in per_status_deltas.items() if delta != 0]
+
+    return ReconciliationReport(
+        total_count_endpoint=sum(count_endpoint_totals.values()),
+        total_paginated=len(paginated_order_status_ids),
+        per_status_deltas=per_status_deltas,
+        mismatched_status_ids=mismatched_status_ids,
+        is_consistent=all(delta == 0 for delta in per_status_deltas.values()),
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile.js</div>
+      <pre><code class="language-javascript">export function reconcileOrderCounts(countEndpointTotals, paginatedOrderStatusIds) {
+  const paginatedCounts = new Map();
+  for (const statusId of paginatedOrderStatusIds) {
+    paginatedCounts.set(statusId, (paginatedCounts.get(statusId) || 0) + 1);
+  }
+
+  const allStatusIds = new Set([
+    ...Object.keys(countEndpointTotals).map(Number),
+    ...paginatedCounts.keys(),
+  ]);
+
+  const perStatusDeltas = {};
+  for (const statusId of allStatusIds) {
+    const expected = countEndpointTotals[statusId] || 0;
+    const actual = paginatedCounts.get(statusId) || 0;
+    perStatusDeltas[statusId] = expected - actual;
+  }
+
+  const mismatchedStatusIds = Object.keys(perStatusDeltas)
+    .map(Number)
+    .filter((sid) => perStatusDeltas[sid] !== 0);
+
+  return {
+    totalCountEndpoint: Object.values(countEndpointTotals).reduce((a, b) => a + b, 0),
+    totalPaginated: paginatedOrderStatusIds.length,
+    perStatusDeltas,
+    mismatchedStatusIds,
+    isConsistent: mismatchedStatusIds.length === 0,
+  };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Re-check the timing window, then emit the report</h3>
+      <p>Before trusting a mismatch, re-run the per-status count calls immediately after pagination completes and compare that against the first snapshot. If the two count snapshots agree with each other but not with the paginated total, the mismatch is real, not a timing artifact from orders created or cancelled mid-scan. Either way, log the full report, unfiltered_count, sum_per_status_count, paginated_total, and mismatched_status_ids, for a human. Never write anything.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def log_report(report):
+    print(f"unfiltered_count={report.total_count_endpoint}")
+    print(f"paginated_total={report.total_paginated}")
+    print(f"is_consistent={report.is_consistent}")
+    if not report.is_consistent:
+        print(f"mismatched_status_ids={report.mismatched_status_ids}")
+        for status_id in report.mismatched_status_ids:
+            print(f"  status_id={status_id} delta={report.per_status_deltas[status_id]}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">function logReport(report) {
+  console.log(`unfiltered_count=${report.totalCountEndpoint}`);
+  console.log(`paginated_total=${report.totalPaginated}`);
+  console.log(`is_consistent=${report.isConsistent}`);
+  if (!report.isConsistent) {
+    console.log(`mismatched_status_ids=${JSON.stringify(report.mismatchedStatusIds)}`);
+    for (const statusId of report.mismatchedStatusIds) {
+      console.log(`  status_id=${statusId} delta=${report.perStatusDeltas[statusId]}`);
+    }
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together, report only, never write</h3>
+      <p>The run loop fetches the per-status counts, fully paginates the order list with the same filters, re-fetches the per-status counts a second time to rule out timing drift, and reconciles all three. This reconciler has no write path at all. Its only output is a report. If it finds a genuine, timing-adjusted mismatch, the next step is a human decision, for example escalating to BigCommerce support with the store hash, date range, and the specific status_id deltas, never an automatic delete or status change.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Report, do not repair</div>
+    <p>A count mismatch is a query-semantics or timing signal, not proof that order data is corrupted. Never delete or modify an order based on a count discrepancy alone. Always align filters first, re-run within a short window to rule out concurrency drift, and only then treat a remaining delta as something to escalate.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, sums per-status counts, fully paginates the order list with the same filters, reconciles the two, and re-checks the count snapshot after the scan to separate a real mismatch from ordinary concurrency drift. It never writes to a single order.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/order-count-endpoint-mismatch" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_order_counts.py</div>
+      <pre><code class="language-python">"""Reconcile a BigCommerce order count mismatch between /v2/orders/count and /v2/orders.
+
+GET /v2/orders/count and GET /v2/orders both accept status_id, min_date_created,
+max_date_created, and customer_id, and both apply an implicit default scope when
+status_id is omitted. Incomplete orders (status_id 0, abandoned at payment) are
+commonly excluded from an unfiltered count's default scope but still appear in an
+unfiltered pagination scan, so a script calling one endpoint with no filters and
+the other with a different filter set ends up comparing two different result
+sets. A secondary cause is timing: count is a point-in-time snapshot, while a
+multi-page scan can take seconds to minutes on a large store. This job sums
+per-status counts across all 15 status_id values, fully paginates the order list
+with the same filters, reconciles the two totals bucket by bucket, and re-checks
+the count snapshot after pagination to rule out concurrency drift. It only ever
+reports. It never deletes or modifies an order based on a count mismatch alone.
+
+Guide: https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/
+"""
+import os
+import logging
+from collections import Counter
+from dataclasses import dataclass
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_order_counts")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v2"
+MIN_DATE_CREATED = os.environ.get("MIN_DATE_CREATED") or None
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+ALL_STATUS_IDS = list(range(15))  # 0 Incomplete .. 14 Partially Refunded
+PAGE_LIMIT = 250
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+@dataclass
+class ReconciliationReport:
+    total_count_endpoint: int
+    total_paginated: int
+    per_status_deltas: dict
+    mismatched_status_ids: list
+    is_consistent: bool
+
+
+def reconcile_order_counts(count_endpoint_totals: dict, paginated_order_status_ids: list) -&gt; ReconciliationReport:
+    """Pure comparison. No network, no side effects.
+
+    count_endpoint_totals maps status_id -&gt; count returned by
+    GET /v2/orders/count?status_id={id} for each of the 15 status_id values.
+    paginated_order_status_ids is the flat list of status_id values collected by
+    fully paginating GET /v2/orders with the same filters. Returns a plain report
+    with the two grand totals, a per-status delta map, the list of status_id
+    values where the two disagree, and whether every bucket balances.
+    """
+    paginated_counts = Counter(paginated_order_status_ids)
+    all_status_ids = set(count_endpoint_totals) | set(paginated_counts)
+
+    per_status_deltas = {}
+    for status_id in all_status_ids:
+        expected = count_endpoint_totals.get(status_id, 0)
+        actual = paginated_counts.get(status_id, 0)
+        per_status_deltas[status_id] = expected - actual
+
+    mismatched_status_ids = sorted(sid for sid, delta in per_status_deltas.items() if delta != 0)
+
+    return ReconciliationReport(
+        total_count_endpoint=sum(count_endpoint_totals.values()),
+        total_paginated=len(paginated_order_status_ids),
+        per_status_deltas=per_status_deltas,
+        mismatched_status_ids=mismatched_status_ids,
+        is_consistent=all(delta == 0 for delta in per_status_deltas.values()),
+    )
+
+
+def count_by_status():
+    totals = {}
+    for status_id in ALL_STATUS_IDS:
+        params = {"status_id": status_id}
+        if MIN_DATE_CREATED:
+            params["min_date_created"] = MIN_DATE_CREATED
+        body = bc_get("/orders/count", params)
+        totals[status_id] = body.get("count", 0)
+    return totals
+
+
+def paginate_all_order_status_ids():
+    status_ids = []
+    page = 1
+    while True:
+        params = {"page": page, "limit": PAGE_LIMIT, "sort": "id:asc"}
+        if MIN_DATE_CREATED:
+            params["min_date_created"] = MIN_DATE_CREATED
+        orders = bc_get("/orders", params)
+        if not orders:
+            return status_ids
+        for order in orders:
+            status_ids.append(order["status_id"])
+        if len(orders) &lt; PAGE_LIMIT:
+            return status_ids
+        page += 1
+
+
+def log_report(label, report):
+    log.info("[%s] unfiltered_count=%s paginated_total=%s is_consistent=%s",
+              label, report.total_count_endpoint, report.total_paginated, report.is_consistent)
+    if not report.is_consistent:
+        for status_id in report.mismatched_status_ids:
+            log.warning("[%s] status_id=%s delta=%s", label, status_id, report.per_status_deltas[status_id])
+
+
+def run():
+    log.info("Fetching per-status counts before pagination (DRY_RUN=%s, report only, no writes).", DRY_RUN)
+    counts_before = count_by_status()
+
+    paginated_status_ids = paginate_all_order_status_ids()
+
+    log.info("Fetching per-status counts again after pagination to check for concurrency drift.")
+    counts_after = count_by_status()
+
+    report_before = reconcile_order_counts(counts_before, paginated_status_ids)
+    report_after = reconcile_order_counts(counts_after, paginated_status_ids)
+
+    log_report("pre-scan snapshot", report_before)
+    log_report("post-scan snapshot", report_after)
+
+    if report_before.is_consistent and report_after.is_consistent:
+        log.info("Consistent. Counts and pagination agree across all status_id buckets.")
+        return
+
+    if not report_before.is_consistent and report_after.is_consistent:
+        log.info("Mismatch resolved by the post-scan snapshot. Likely concurrency drift during the scan window.")
+        return
+
+    log.warning(
+        "Persistent mismatch after re-checking the count snapshot. mismatched_status_ids=%s. "
+        "This is a report for a human, escalate to BigCommerce support with store_hash=%s, "
+        "min_date_created=%s, and the mismatched status_id list. No orders were modified.",
+        report_after.mismatched_status_ids, STORE_HASH, MIN_DATE_CREATED,
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-order-counts.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile a BigCommerce order count mismatch between /v2/orders/count and /v2/orders.
+ *
+ * GET /v2/orders/count and GET /v2/orders both accept status_id, min_date_created,
+ * max_date_created, and customer_id, and both apply an implicit default scope when
+ * status_id is omitted. Incomplete orders (status_id 0, abandoned at payment) are
+ * commonly excluded from an unfiltered count's default scope but still appear in an
+ * unfiltered pagination scan, so a script calling one endpoint with no filters and
+ * the other with a different filter set ends up comparing two different result
+ * sets. A secondary cause is timing: count is a point-in-time snapshot, while a
+ * multi-page scan can take seconds to minutes on a large store. This job sums
+ * per-status counts across all 15 status_id values, fully paginates the order list
+ * with the same filters, reconciles the two totals bucket by bucket, and re-checks
+ * the count snapshot after pagination to rule out concurrency drift. It only ever
+ * reports. It never deletes or modifies an order based on a count mismatch alone.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/order-count-endpoint-mismatch/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v2`;
+const MIN_DATE_CREATED = process.env.MIN_DATE_CREATED || null;
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const ALL_STATUS_IDS = Array.from({ length: 15 }, (_, i) => i); // 0 Incomplete .. 14 Partially Refunded
+const PAGE_LIMIT = 250;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure comparison. No network, no side effects.
+ *
+ * countEndpointTotals maps statusId -&gt; count returned by
+ * GET /v2/orders/count?status_id={id} for each of the 15 status_id values.
+ * paginatedOrderStatusIds is the flat list of status_id values collected by
+ * fully paginating GET /v2/orders with the same filters. Returns a plain report
+ * with the two grand totals, a per-status delta map, the list of status_id
+ * values where the two disagree, and whether every bucket balances.
+ */
+export function reconcileOrderCounts(countEndpointTotals, paginatedOrderStatusIds) {
+  const paginatedCounts = new Map();
+  for (const statusId of paginatedOrderStatusIds) {
+    paginatedCounts.set(statusId, (paginatedCounts.get(statusId) || 0) + 1);
+  }
+
+  const allStatusIds = new Set([
+    ...Object.keys(countEndpointTotals).map(Number),
+    ...paginatedCounts.keys(),
+  ]);
+
+  const perStatusDeltas = {};
+  for (const statusId of allStatusIds) {
+    const expected = countEndpointTotals[statusId] || 0;
+    const actual = paginatedCounts.get(statusId) || 0;
+    perStatusDeltas[statusId] = expected - actual;
+  }
+
+  const mismatchedStatusIds = Object.keys(perStatusDeltas)
+    .map(Number)
+    .filter((sid) => perStatusDeltas[sid] !== 0)
+    .sort((a, b) => a - b);
+
+  return {
+    totalCountEndpoint: Object.values(countEndpointTotals).reduce((a, b) => a + b, 0),
+    totalPaginated: paginatedOrderStatusIds.length,
+    perStatusDeltas,
+    mismatchedStatusIds,
+    isConsistent: mismatchedStatusIds.length === 0,
+  };
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function countByStatus() {
+  const totals = {};
+  for (const statusId of ALL_STATUS_IDS) {
+    const params = { status_id: statusId };
+    if (MIN_DATE_CREATED) params.min_date_created = MIN_DATE_CREATED;
+    const body = await bcGet("/orders/count", params);
+    totals[statusId] = body.count || 0;
+  }
+  return totals;
+}
+
+async function paginateAllOrderStatusIds() {
+  const statusIds = [];
+  let page = 1;
+  while (true) {
+    const params = { page, limit: PAGE_LIMIT, sort: "id:asc" };
+    if (MIN_DATE_CREATED) params.min_date_created = MIN_DATE_CREATED;
+    const orders = await bcGet("/orders", params);
+    if (!orders.length) return statusIds;
+    for (const order of orders) statusIds.push(order.status_id);
+    if (orders.length &lt; PAGE_LIMIT) return statusIds;
+    page += 1;
+  }
+}
+
+function logReport(label, report) {
+  console.log(`[${label}] unfiltered_count=${report.totalCountEndpoint} paginated_total=${report.totalPaginated} is_consistent=${report.isConsistent}`);
+  if (!report.isConsistent) {
+    for (const statusId of report.mismatchedStatusIds) {
+      console.warn(`[${label}] status_id=${statusId} delta=${report.perStatusDeltas[statusId]}`);
+    }
+  }
+}
+
+export async function run() {
+  console.log(`Fetching per-status counts before pagination (DRY_RUN=${DRY_RUN}, report only, no writes).`);
+  const countsBefore = await countByStatus();
+
+  const paginatedStatusIds = await paginateAllOrderStatusIds();
+
+  console.log("Fetching per-status counts again after pagination to check for concurrency drift.");
+  const countsAfter = await countByStatus();
+
+  const reportBefore = reconcileOrderCounts(countsBefore, paginatedStatusIds);
+  const reportAfter = reconcileOrderCounts(countsAfter, paginatedStatusIds);
+
+  logReport("pre-scan snapshot", reportBefore);
+  logReport("post-scan snapshot", reportAfter);
+
+  if (reportBefore.isConsistent &amp;&amp; reportAfter.isConsistent) {
+    console.log("Consistent. Counts and pagination agree across all status_id buckets.");
+    return;
+  }
+
+  if (!reportBefore.isConsistent &amp;&amp; reportAfter.isConsistent) {
+    console.log("Mismatch resolved by the post-scan snapshot. Likely concurrency drift during the scan window.");
+    return;
+  }
+
+  console.warn(
+    `Persistent mismatch after re-checking the count snapshot. mismatchedStatusIds=${JSON.stringify(reportAfter.mismatchedStatusIds)}. ` +
+    `This is a report for a human, escalate to BigCommerce support with store_hash=${STORE_HASH}, ` +
+    `min_date_created=${MIN_DATE_CREATED}, and the mismatched status_id list. No orders were modified.`
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The reconciler function is the part most worth testing, because it decides whether the store's counts are actually consistent. Because reconcile_order_counts takes only plain dicts and lists and returns a plain data object, the test needs no network and no BigCommerce store. It just feeds in synthetic count maps and status_id lists and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_order_count_reconciler.py</div>
+      <pre><code class="language-python">from reconcile_order_counts import reconcile_order_counts
+
+
+def test_is_consistent_when_every_bucket_matches():
+    counts = {0: 3, 1: 5, 2: 2}
+    paginated = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
+    report = reconcile_order_counts(counts, paginated)
+    assert report.is_consistent is True
+    assert report.mismatched_status_ids == []
+    assert report.total_count_endpoint == 10
+    assert report.total_paginated == 10
+
+
+def test_flags_status_id_zero_when_incomplete_orders_are_missing_from_count():
+    counts = {0: 0, 1: 5}  # count endpoint excluded Incomplete orders
+    paginated = [0, 0, 1, 1, 1, 1, 1]  # pagination still saw them
+    report = reconcile_order_counts(counts, paginated)
+    assert report.is_consistent is False
+    assert report.mismatched_status_ids == [0]
+    assert report.per_status_deltas[0] == -2
+    assert report.per_status_deltas[1] == 0
+
+
+def test_handles_status_id_present_only_in_pagination():
+    counts = {1: 2}
+    paginated = [1, 1, 5]
+    report = reconcile_order_counts(counts, paginated)
+    assert report.mismatched_status_ids == [5]
+    assert report.per_status_deltas[5] == -1
+
+
+def test_handles_status_id_present_only_in_count_endpoint():
+    counts = {1: 2, 9: 4}
+    paginated = [1, 1]
+    report = reconcile_order_counts(counts, paginated)
+    assert report.mismatched_status_ids == [9]
+    assert report.per_status_deltas[9] == 4
+
+
+def test_empty_inputs_are_consistent():
+    report = reconcile_order_counts({}, [])
+    assert report.is_consistent is True
+    assert report.total_count_endpoint == 0
+    assert report.total_paginated == 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-order-counts.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { reconcileOrderCounts } from "./reconcile-order-counts.js";
+
+test("is consistent when every bucket matches", () =&gt; {
+  const counts = { 0: 3, 1: 5, 2: 2 };
+  const paginated = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2];
+  const report = reconcileOrderCounts(counts, paginated);
+  assert.equal(report.isConsistent, true);
+  assert.deepEqual(report.mismatchedStatusIds, []);
+  assert.equal(report.totalCountEndpoint, 10);
+  assert.equal(report.totalPaginated, 10);
+});
+
+test("flags status_id 0 when Incomplete orders are missing from count", () =&gt; {
+  const counts = { 0: 0, 1: 5 }; // count endpoint excluded Incomplete orders
+  const paginated = [0, 0, 1, 1, 1, 1, 1]; // pagination still saw them
+  const report = reconcileOrderCounts(counts, paginated);
+  assert.equal(report.isConsistent, false);
+  assert.deepEqual(report.mismatchedStatusIds, [0]);
+  assert.equal(report.perStatusDeltas[0], -2);
+  assert.equal(report.perStatusDeltas[1], 0);
+});
+
+test("handles a status_id present only in pagination", () =&gt; {
+  const counts = { 1: 2 };
+  const paginated = [1, 1, 5];
+  const report = reconcileOrderCounts(counts, paginated);
+  assert.deepEqual(report.mismatchedStatusIds, [5]);
+  assert.equal(report.perStatusDeltas[5], -1);
+});
+
+test("handles a status_id present only in the count endpoint", () =&gt; {
+  const counts = { 1: 2, 9: 4 };
+  const paginated = [1, 1];
+  const report = reconcileOrderCounts(counts, paginated);
+  assert.deepEqual(report.mismatchedStatusIds, [9]);
+  assert.equal(report.perStatusDeltas[9], 4);
+});
+
+test("empty inputs are consistent", () =&gt; {
+  const report = reconcileOrderCounts({}, []);
+  assert.equal(report.isConsistent, true);
+  assert.equal(report.totalCountEndpoint, 0);
+  assert.equal(report.totalPaginated, 0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Incomplete orders</span>
+      <h4>The store where the dashboard total never matched the export</h4>
+      <p>A merchant's finance team exported all orders via a script that paginated GET /v2/orders with no filters, while an internal dashboard called GET /v2/orders/count once a day with no filters either. The export always had a few dozen more rows than the dashboard's number, every single day, and nobody could explain the gap without opening both tools side by side.</p>
+      <p>Running the reconciler localized it immediately: status_id 0, Incomplete, was the entire delta. The dashboard's count call excluded abandoned-at-payment orders by convention, the export's pagination did not filter status_id at all and picked them up. Once both were run with an explicit status_id list, the numbers matched every time.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Timing drift</span>
+      <h4>The large catalog where the scan itself took minutes</h4>
+      <p>A high-volume store's nightly reconciliation job paginated tens of thousands of orders, a scan that took close to four minutes end to end. The count snapshot taken at the start of the run was reliably a handful of orders lower than the paginated total, because new orders kept coming in from checkout while the scan was still running.</p>
+      <p>Re-running the per-status count immediately after the scan finished, and comparing that second snapshot instead of the first, made the discrepancy disappear. The reconciler now takes both snapshots automatically and only flags a mismatch that survives the post-scan recheck, so ordinary order volume during a long scan no longer triggers a false alarm.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs, nobody has to guess whether a store's order counts are "close enough." Every status_id bucket is checked against both the count endpoint and a full paginated scan using identical filters, timing drift from a long scan is ruled out with a second snapshot, and if a genuine mismatch remains it comes with the exact status_id and delta needed to escalate, instead of a single confusing number that disagrees with another single confusing number.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does GET /v2/orders/count not match the number of orders I get from paginating /v2/orders?</summary>
+      <p>Both endpoints accept the same status_id, min_date_created, max_date_created, and customer_id filters, and both apply an implicit default when you omit status_id. If your count call and your pagination loop do not pass the exact same filters, you end up comparing two different result sets, most commonly because Incomplete orders (status_id 0, abandoned at payment) are excluded from one call's default scope but included in the other's unfiltered scan.</p>
+    </details>
+    <details>
+      <summary>Should I trust one unfiltered GET /v2/orders/count call for a store-wide total?</summary>
+      <p>No. A single unfiltered count call depends on an implicit default you do not control and cannot verify from the response alone. Sum the per-status counts by calling GET /v2/orders/count?status_id={id} for each of the 15 known status_id values and compare that sum against a full paginated scan with the same filters.</p>
+    </details>
+    <details>
+      <summary>If the counts still do not match after aligning filters, should the script delete or fix orders automatically?</summary>
+      <p>No. A count mismatch is a query-semantics or timing signal, not proof of data corruption. The correct response is to emit a dry run report with the unfiltered count, the per-status sum, the paginated total, and the specific order id deltas grouped by status_id, so a human can decide whether to escalate to BigCommerce support before anything is changed.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">Orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">Transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Support: why does the Get a Count of Orders API call return incorrect counts. <a href="https://support.bigcommerce.com/s/question/0D54O000073SEOoSAO/why-does-get-a-count-of-orders-api-call-return-incorrect-counts?language=en_US" rel="noopener">support.bigcommerce.com why does get a count of orders return incorrect counts</a></li>
+      <li>BigCommerce Support: API V2 not displaying all orders. <a href="https://support.bigcommerce.com/s/question/0D51B00005c0KTwSAM/api-v2-not-displaying-all-orders?language=en_US" rel="noopener">support.bigcommerce.com api v2 not displaying all orders</a></li>
+      <li>BigCommerce Support: how to get the number of orders. <a href="https://support.bigcommerce.com/s/question/0D51B00003n6cJvSAI/how-to-get-number-of-orders?language=en_US" rel="noopener">support.bigcommerce.com how to get number of orders</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce API Reference: Orders V2, status_id, and the count and list endpoints. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders" rel="noopener">docs.bigcommerce.com orders v2</a></li>
+      <li>BigCommerce API Reference: List Orders, pagination and filters. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/orders/get-orders" rel="noopener">docs.bigcommerce.com list orders</a></li>
+      <li>BigCommerce Developer Center: Orders overview. <a href="https://developer.bigcommerce.com/docs/store-operations/orders" rel="noopener">developer.bigcommerce.com orders overview</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this clear up a confusing order count?</h3>
+    <p>If this saved you from chasing a phantom data bug that was actually a filter mismatch, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

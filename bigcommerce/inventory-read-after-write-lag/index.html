@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Inventory Read Immediately After Write Returns Stale Stock</title>
+<meta name="description" content="A BigCommerce inventory adjustment returns 200 but the very next GET still shows the old quantity. Learn why the Inventory API is eventually consistent and build a Python or Node.js script that polls with backoff and flags, never re-writes, an unconfirmed adjustment.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Inventory Read Immediately After Write Returns Stale Stock">
+<meta property="og:description" content="Why a GET right after an inventory adjustment can still show the pre-write quantity, and a safe Python or Node.js script that polls with backoff and flags, never re-submits, an adjustment that never confirms.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/#article","headline":"Fix BigCommerce Inventory Read Immediately After Write Returns Stale Stock","description":"Why a GET right after an inventory adjustment can return the pre-write quantity, and a safe Python or Node.js script that polls with backoff for confirmation and flags, never auto-repairs, an adjustment that never confirms in time.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory","keywords":"BigCommerce Inventory API, inventory adjustments, eventual consistency, available_to_sell, v3 inventory, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Inventory read immediately after write returns stale stock","item":"https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a GET right after a BigCommerce inventory adjustment show the old quantity?","acceptedAnswer":{"@type":"Answer","text":"The Inventory API processes adjustments asynchronously. The PUT to /v3/inventory/adjustments returns 200 with an action id as soon as the request is accepted into the processing pipeline, not after the new quantity is durably committed and propagated to the read path. BigCommerce's own docs describe this as eventual consistency, with a short delay before data is updated after the endpoint is called."}},{"@type":"Question","name":"Is it safe to just re-submit the adjustment if the read still looks stale?","acceptedAnswer":{"@type":"Answer","text":"No. This is a read-timing problem, not corrupt data, so re-issuing the same adjustment risks double-applying a relative delta or masking a real downstream failure. The safe response is to poll the read path with backoff and, if it still does not confirm within budget, flag the adjustment for an operator instead of writing again."}},{"@type":"Question","name":"Can a relative adjustment race against an absolute adjustment that is still in flight?","acceptedAnswer":{"@type":"Answer","text":"Yes. BigCommerce warns that a relative adjustment can race against a still-in-flight absolute adjustment's pre-check stage, applying the pre-adjustment value instead of the value the absolute adjustment was about to set. That is one more reason to confirm a write by reading it back rather than assuming a 200 means the new quantity is already live."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Inventory</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Inventory</p>
+    <h1>Inventory read immediately after write returns stale stock</h1>
+    <p class="lead">You PUT an inventory adjustment, BigCommerce answers 200 with an action id, and your very next GET still shows the old quantity. Nothing errored. Nothing looks wrong. The Inventory API commits and propagates writes asynchronously, so a read that lands too soon can see the pre-write stock with no signal that it is stale. Here is why that gap opens up and a small script that polls for confirmation with backoff and flags, never silently re-submits, anything that never catches up.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Inventory API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's Inventory API (<code>PUT /v3/inventory/adjustments/absolute</code> or <code>/relative</code>) is eventually consistent. The 200 response and its <code>data.id</code> action identifier confirm the write was accepted into the processing pipeline, not that the new quantity is already durable and visible on the read path. A GET against <code>/v3/inventory/items</code> or a variant's stock fields immediately after can still return the old number, with no error to tell you so. Run a small Python or Node.js script that, after every adjustment, polls the read endpoint with exponential backoff until the observed quantity matches what you expect, and if it never matches within the retry budget, flags the adjustment for an operator instead of re-submitting the write. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>When you call <code>PUT /v3/inventory/adjustments/absolute</code> or <code>/v3/inventory/adjustments/relative</code>, BigCommerce hands back a 200 with a top-level <code>data.id</code>, an action identifier, and each item's echoed <code>identity</code> (its sku, product_id, or variant_id) and <code>location_id</code>. That response tells you the request was accepted. It does not tell you the new quantity has finished writing through to wherever a GET on <code>/v3/inventory/items</code> or a product's variant stock field reads from.</p>
+  <p>BigCommerce's own documentation is direct about this: the Inventory API is eventually consistent, and "there may be a short delay before data is updated after the endpoints are called." For most integrations that delay is invisible, a few hundred milliseconds nobody notices. But a script that writes an adjustment and immediately reads it back to confirm, log, or chain the next step can catch the window where the old value is still what comes back. Nothing in that GET response says "this is stale." It looks exactly like a normal, successful read of the current stock, except it is not current yet.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. A PUT to the inventory adjustments endpoint returns 200 with an action id right away, while the new quantity is still propagating through BigCommerce's processing pipeline. A GET issued immediately after reads the old, pre-write quantity with no error or staleness signal.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="150" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">PUT adjustment</text>
+      <text x="85" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">absolute or relative</text>
+      <line x1="163" y1="103" x2="205" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="288" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">200 + data.id</text>
+      <text x="288" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">accepted, not committed</text>
+      <line x1="371" y1="103" x2="440" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="405" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="405" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">still propagating</text>
+      <rect x="443" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="523" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">GET /v3/inventory</text>
+      <text x="523" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">reads old quantity</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Looks like</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">a real value</text>
+      <line x1="606" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The write is accepted before it is durable. A read that lands in that gap sees the pre-write quantity with no error, no flag, nothing to say it is stale.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce's Inventory API accepts an adjustment into a processing pipeline and returns as soon as the request is validated and queued, not after the new quantity is durably committed and propagated to every read path. A few concrete ways this bites real integrations:</p>
+  <ul>
+    <li>A checkout, sync job, or admin action writes an adjustment and immediately reads <code>available_to_sell</code> to confirm it or to chain a follow-up decision, and the read lands inside the propagation window.</li>
+    <li>Two adjustments for the same item land close together. BigCommerce's docs specifically warn that a relative adjustment can race against a still-in-flight absolute adjustment's pre-check stage, applying the pre-adjustment value instead of the value the absolute call was about to set.</li>
+    <li>A bulk import or migration script fires adjustments in a tight loop and reads back after each one to log a before/after diff, and under load the propagation delay grows past whatever gap the script assumed was safe.</li>
+    <li>Nothing in the GET response distinguishes a confirmed, settled quantity from one still catching up, so a script with no polling logic will happily treat a stale read as ground truth and act on it.</li>
+  </ul>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A 200 from <code>/v3/inventory/adjustments</code> means the write was accepted, not that it is visible yet. The only way to know a write has actually landed is to read it back and compare against the quantity you expect, retrying with backoff until it matches or you run out of budget. And because this is a timing problem, not a data problem, the correct response to an unconfirmed write is never to resubmit the adjustment. Re-issuing a relative delta against a write that may have already applied risks double-counting the change, and it can mask a real failure downstream that deserves a human's attention instead of a silent retry of the write itself.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how adjustments are submitted. We wrap every adjustment with a confirmation loop: submit the write, then poll the read endpoint with exponential backoff until the observed quantity matches the expected quantity, honoring BigCommerce's rate limit headers along the way. If it never matches, we flag the adjustment with everything an operator needs, and we never call <code>/v3/inventory/adjustments</code> again to "fix" it.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. Submit the adjustment, capture the action id, then poll the read endpoint with exponential backoff. If the observed quantity matches expected, confirm. If the poll budget runs out first, flag the adjustment for an operator rather than resubmitting the write.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Submit adjustment</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">capture data.id</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Poll the read path</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">GET inventory items</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Compare quantity</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">observed vs expected</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Matches or</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">budget left?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">matches</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="580" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no match, retry backoff</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">stale_flagged</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">budget exhausted</text>
+      <rect x="618" y="20" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="43" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">confirmed</text>
+      <text x="684" y="60" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">read matches write</text>
+      <path d="M690,138 C712,138 684,110 684,78" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>Confirm never resubmit. A write is either confirmed by a matching read, or it exhausts its poll budget and gets flagged for an operator, never a second call to the adjustments endpoint.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Inventory (modify) scope so it can submit adjustments and read stock levels. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MAX_ATTEMPTS="6"
+export BASE_DELAY_S="1.0"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MAX_ATTEMPTS="6"
+export BASE_DELAY_S="1.0"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Inventory REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and PUT and raises on a non-2xx response. We reuse it to submit the adjustment and to poll the item back.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Submit the adjustment and capture what you need to confirm it</h3>
+      <p>Call <code>PUT /v3/inventory/adjustments/absolute</code> (or <code>/relative</code>) with a <code>reason</code> and an <code>items</code> array of <code>{"variant_id" or "product_id" or "sku", "location_id", "quantity"}</code>. From the 200 response, keep the top-level <code>data.id</code> action identifier and each item's echoed <code>identity</code> and <code>location_id</code>, everything the poll step needs to look the write back up.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def submit_adjustment(mode, reason, sku, location_id, quantity):
+    """mode is 'absolute' or 'relative'."""
+    body = {
+        "reason": reason,
+        "items": [{"sku": sku, "location_id": location_id, "quantity": quantity}],
+    }
+    return bc_put(f"/inventory/adjustments/{mode}", body)
+
+def read_item(sku, location_id):
+    data = bc_get("/inventory/items", {"location_ids": location_id, "skus": sku})
+    rows = data.get("data") or []
+    return rows[0] if rows else None</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function submitAdjustment(mode, reason, sku, locationId, quantity) {
+  // mode is "absolute" or "relative"
+  const body = {
+    reason,
+    items: [{ sku, location_id: locationId, quantity }],
+  };
+  return bcPut(`/inventory/adjustments/${mode}`, body);
+}
+
+async function readItem(sku, locationId) {
+  const data = await bcGet("/inventory/items", { location_ids: locationId, skus: sku });
+  const rows = data.data || [];
+  return rows.length ? rows[0] : null;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the expected quantity, the observed quantity from the latest poll, the adjustment id, the current attempt, and the retry budget, and returns one of three outcomes. It has no I/O of its own, so it is trivial to test: feed it plain numbers and check the answer.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def confirm_inventory_write(
+    expected_quantity, observed_quantity, adjustment_id, attempt, max_attempts,
+    base_delay_s=1.0, max_delay_s=60.0,
+):
+    if adjustment_id is None:
+        return {"status": "stale_flagged", "next_delay_s": None,
+                "reason": "missing action id, cannot confirm"}
+    if observed_quantity == expected_quantity:
+        return {"status": "confirmed", "next_delay_s": None, "reason": "quantity matches"}
+    if attempt &gt;= max_attempts:
+        return {"status": "stale_flagged", "next_delay_s": None,
+                "reason": "poll budget exhausted"}
+    delay = min(base_delay_s * (2 ** attempt), max_delay_s)
+    return {"status": "retry", "next_delay_s": delay, "reason": "quantity not yet confirmed"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">function confirmInventoryWrite(
+  expectedQuantity, observedQuantity, adjustmentId, attempt, maxAttempts,
+  baseDelayS = 1.0, maxDelayS = 60.0,
+) {
+  if (adjustmentId === null || adjustmentId === undefined) {
+    return { status: "stale_flagged", nextDelayS: null, reason: "missing action id, cannot confirm" };
+  }
+  if (observedQuantity === expectedQuantity) {
+    return { status: "confirmed", nextDelayS: null, reason: "quantity matches" };
+  }
+  if (attempt &gt;= maxAttempts) {
+    return { status: "stale_flagged", nextDelayS: null, reason: "poll budget exhausted" };
+  }
+  const delay = Math.min(baseDelayS * 2 ** attempt, maxDelayS);
+  return { status: "retry", nextDelayS: delay, reason: "quantity not yet confirmed" };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Poll with backoff, honoring the rate limit headers</h3>
+      <p>Wrap the read in a loop that calls the pure decision function after each attempt. Respect <code>X-Rate-Limit-Remaining</code> or <code>X-Rate-Limit-Requests-Left</code> if BigCommerce sends them back, so a retry storm on a single item never eats into the budget the rest of the job needs.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">poll.py</div>
+      <pre><code class="language-python">import time
+
+def poll_until_confirmed(sku, location_id, expected_quantity, adjustment_id, max_attempts):
+    attempt = 0
+    while True:
+        item = read_item(sku, location_id)
+        observed = item.get("available_to_sell") if item else None
+        decision = confirm_inventory_write(
+            expected_quantity, observed, adjustment_id, attempt, max_attempts
+        )
+        if decision["status"] != "retry":
+            return decision, observed, attempt
+        time.sleep(decision["next_delay_s"])
+        attempt += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">poll.js</div>
+      <pre><code class="language-javascript">function sleep(ms) {
+  return new Promise((resolve) =&gt; setTimeout(resolve, ms));
+}
+
+async function pollUntilConfirmed(sku, locationId, expectedQuantity, adjustmentId, maxAttempts) {
+  let attempt = 0;
+  while (true) {
+    const item = await readItem(sku, locationId);
+    const observed = item ? item.available_to_sell : null;
+    const decision = confirmInventoryWrite(expectedQuantity, observed, adjustmentId, attempt, maxAttempts);
+    if (decision.status !== "retry") return { decision, observed, attempt };
+    await sleep(decision.nextDelayS * 1000);
+    attempt += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The loop ties every piece together: submit, poll, and either move on or flag. Notice the dry run guard. On the first few runs, leave <code>DRY_RUN</code> on so the script logs the {adjustment_id, sku/variant_id, location_id, expected_quantity, last_observed_quantity, attempts, elapsed_ms} record for anything it would flag, without ever calling the adjustments endpoint a second time. If a write never confirms, the only allowed follow-up action is one more GET on a longer final backoff, never a PUT.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Never resubmit an adjustment to "fix" a stale read. A relative adjustment resubmitted on top of one that already applied can double the change, and it can hide a genuine downstream failure that needs a human, not a retry. Confirm by reading, escalate by flagging, and leave the write path alone.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it does, respects the dry run flag, and never issues a second write for the same adjustment; it only polls and, if the poll budget runs out, flags the adjustment for an operator.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/inventory-read-after-write-lag" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">confirm_inventory_write.py</div>
+      <pre><code class="language-python">"""Confirm BigCommerce inventory adjustments instead of trusting the write's 200.
+
+BigCommerce's Inventory API (PUT /v3/inventory/adjustments/absolute or /relative)
+processes writes asynchronously. The call returns 200 with an action id (data.id)
+as soon as the request is accepted into the processing pipeline, not after the new
+quantity is durably committed and propagated to the read path. BigCommerce's own
+docs describe this as eventual consistency: "there may be a short delay before
+data is updated after the endpoints are called." A relative adjustment can even
+race against a still-in-flight absolute adjustment's pre-check stage and apply
+the pre-adjustment value. A GET immediately after a write can therefore return
+the pre-write quantity with no error or signal that it is stale.
+
+This script submits an adjustment, then polls the read endpoint with exponential
+backoff until the observed quantity matches the expected quantity. If the poll
+budget runs out first, it flags the adjustment for an operator instead of ever
+calling /v3/inventory/adjustments again. Re-submitting a write to "fix" a stale
+read risks double-applying a relative delta or masking a real failure downstream.
+
+Guide: https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/
+"""
+import os
+import time
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("confirm_inventory_write")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "6"))
+BASE_DELAY_S = float(os.environ.get("BASE_DELAY_S", "1.0"))
+MAX_DELAY_S = float(os.environ.get("MAX_DELAY_S", "60.0"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def confirm_inventory_write(
+    expected_quantity: int,
+    observed_quantity,
+    adjustment_id,
+    attempt: int,
+    max_attempts: int,
+    base_delay_s: float = 1.0,
+    max_delay_s: float = 60.0,
+) -> dict:
+    """Pure decision. No network, no side effects.
+
+    Decide whether an inventory read confirms a prior write, and if not,
+    whether to retry or flag.
+
+    Returns {"status": "confirmed"|"retry"|"stale_flagged", "next_delay_s": float|None, "reason": str}
+
+    if adjustment_id is None: status="stale_flagged", reason="missing action id, cannot confirm"
+    elif observed_quantity == expected_quantity: status="confirmed"
+    elif attempt >= max_attempts: status="stale_flagged", reason="poll budget exhausted"
+    else: status="retry", next_delay_s=min(base_delay_s * (2 ** attempt), max_delay_s)
+    """
+    if adjustment_id is None:
+        return {
+            "status": "stale_flagged",
+            "next_delay_s": None,
+            "reason": "missing action id, cannot confirm",
+        }
+    if observed_quantity == expected_quantity:
+        return {"status": "confirmed", "next_delay_s": None, "reason": "quantity matches"}
+    if attempt >= max_attempts:
+        return {
+            "status": "stale_flagged",
+            "next_delay_s": None,
+            "reason": "poll budget exhausted",
+        }
+    delay = min(base_delay_s * (2 ** attempt), max_delay_s)
+    return {"status": "retry", "next_delay_s": delay, "reason": "quantity not yet confirmed"}
+
+
+def submit_adjustment(mode, reason, sku, location_id, quantity):
+    """mode is 'absolute' or 'relative'."""
+    body = {
+        "reason": reason,
+        "items": [{"sku": sku, "location_id": location_id, "quantity": quantity}],
+    }
+    return bc_put(f"/inventory/adjustments/{mode}", body)
+
+
+def read_item(sku, location_id):
+    data = bc_get("/inventory/items", {"location_ids": location_id, "skus": sku})
+    rows = data.get("data") or []
+    return rows[0] if rows else None
+
+
+def confirm_write(sku, location_id, expected_quantity, adjustment_id):
+    """Submit-independent confirmation loop. Only ever reads, never re-writes."""
+    started = time.monotonic()
+    attempt = 0
+    observed = None
+    while True:
+        item = read_item(sku, location_id)
+        observed = item.get("available_to_sell") if item else None
+        decision = confirm_inventory_write(
+            expected_quantity, observed, adjustment_id, attempt, MAX_ATTEMPTS,
+            BASE_DELAY_S, MAX_DELAY_S,
+        )
+        if decision["status"] != "retry":
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            return decision, observed, attempt, elapsed_ms
+        time.sleep(decision["next_delay_s"])
+        attempt += 1
+
+
+def run(sku, location_id, expected_quantity, mode="absolute", reason="stock recount"):
+    log.info(
+        "Submitting %s adjustment sku=%s location_id=%s expected_quantity=%s (%s)",
+        mode, sku, location_id, expected_quantity, "dry run" if DRY_RUN else "writing",
+    )
+
+    if DRY_RUN:
+        log.info("DRY_RUN=true, skipping the write and the confirmation poll.")
+        return
+
+    response = submit_adjustment(mode, reason, sku, location_id, expected_quantity)
+    adjustment_id = (response.get("data") or {}).get("id")
+
+    decision, observed, attempt, elapsed_ms = confirm_write(
+        sku, location_id, expected_quantity, adjustment_id
+    )
+
+    if decision["status"] == "confirmed":
+        log.info(
+            "Confirmed sku=%s location_id=%s quantity=%s after %d attempt(s), %dms",
+            sku, location_id, observed, attempt, elapsed_ms,
+        )
+        return
+
+    record = {
+        "adjustment_id": adjustment_id,
+        "sku": sku,
+        "location_id": location_id,
+        "expected_quantity": expected_quantity,
+        "last_observed_quantity": observed,
+        "attempts": attempt,
+        "elapsed_ms": elapsed_ms,
+    }
+    log.warning("STALE_FLAGGED %s reason=%s", record, decision["reason"])
+
+
+if __name__ == "__main__":
+    run(
+        sku=os.environ.get("SKU", "example-sku"),
+        location_id=int(os.environ.get("LOCATION_ID", "1")),
+        expected_quantity=int(os.environ.get("EXPECTED_QUANTITY", "0")),
+    )</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">confirm-inventory-write.js</div>
+      <pre><code class="language-javascript">/**
+ * Confirm BigCommerce inventory adjustments instead of trusting the write's 200.
+ *
+ * BigCommerce's Inventory API (PUT /v3/inventory/adjustments/absolute or /relative)
+ * processes writes asynchronously. The call returns 200 with an action id (data.id)
+ * as soon as the request is accepted into the processing pipeline, not after the new
+ * quantity is durably committed and propagated to the read path. BigCommerce's own
+ * docs describe this as eventual consistency: "there may be a short delay before
+ * data is updated after the endpoints are called." A relative adjustment can even
+ * race against a still-in-flight absolute adjustment's pre-check stage and apply
+ * the pre-adjustment value. A GET immediately after a write can therefore return
+ * the pre-write quantity with no error or signal that it is stale.
+ *
+ * This script submits an adjustment, then polls the read endpoint with exponential
+ * backoff until the observed quantity matches the expected quantity. If the poll
+ * budget runs out first, it flags the adjustment for an operator instead of ever
+ * calling /v3/inventory/adjustments again. Re-submitting a write to "fix" a stale
+ * read risks double-applying a relative delta or masking a real failure downstream.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/inventory-read-after-write-lag/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 6);
+const BASE_DELAY_S = Number(process.env.BASE_DELAY_S || 1.0);
+const MAX_DELAY_S = Number(process.env.MAX_DELAY_S || 60.0);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * Decide whether an inventory read confirms a prior write, and if not,
+ * whether to retry or flag.
+ *
+ * Returns { status: "confirmed"|"retry"|"stale_flagged", nextDelayS: number|null, reason: string }
+ *
+ * if adjustmentId is null/undefined: status="stale_flagged", reason="missing action id, cannot confirm"
+ * else if observedQuantity === expectedQuantity: status="confirmed"
+ * else if attempt >= maxAttempts: status="stale_flagged", reason="poll budget exhausted"
+ * else: status="retry", nextDelayS=min(baseDelayS * (2 ** attempt), maxDelayS)
+ */
+export function confirmInventoryWrite(
+  expectedQuantity,
+  observedQuantity,
+  adjustmentId,
+  attempt,
+  maxAttempts,
+  baseDelayS = 1.0,
+  maxDelayS = 60.0,
+) {
+  if (adjustmentId === null || adjustmentId === undefined) {
+    return {
+      status: "stale_flagged",
+      nextDelayS: null,
+      reason: "missing action id, cannot confirm",
+    };
+  }
+  if (observedQuantity === expectedQuantity) {
+    return { status: "confirmed", nextDelayS: null, reason: "quantity matches" };
+  }
+  if (attempt >= maxAttempts) {
+    return { status: "stale_flagged", nextDelayS: null, reason: "poll budget exhausted" };
+  }
+  const delay = Math.min(baseDelayS * 2 ** attempt, maxDelayS);
+  return { status: "retry", nextDelayS: delay, reason: "quantity not yet confirmed" };
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : {};
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function submitAdjustment(mode, reason, sku, locationId, quantity) {
+  // mode is "absolute" or "relative"
+  const body = {
+    reason,
+    items: [{ sku, location_id: locationId, quantity }],
+  };
+  return bcPut(`/inventory/adjustments/${mode}`, body);
+}
+
+async function readItem(sku, locationId) {
+  const data = await bcGet("/inventory/items", { location_ids: locationId, skus: sku });
+  const rows = data.data || [];
+  return rows.length ? rows[0] : null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function confirmWrite(sku, locationId, expectedQuantity, adjustmentId) {
+  const started = Date.now();
+  let attempt = 0;
+  let observed = null;
+  while (true) {
+    const item = await readItem(sku, locationId);
+    observed = item ? item.available_to_sell : null;
+    const decision = confirmInventoryWrite(
+      expectedQuantity, observed, adjustmentId, attempt, MAX_ATTEMPTS,
+      BASE_DELAY_S, MAX_DELAY_S,
+    );
+    if (decision.status !== "retry") {
+      const elapsedMs = Date.now() - started;
+      return { decision, observed, attempt, elapsedMs };
+    }
+    await sleep(decision.nextDelayS * 1000);
+    attempt += 1;
+  }
+}
+
+export async function run(
+  sku = process.env.SKU || "example-sku",
+  locationId = Number(process.env.LOCATION_ID || 1),
+  expectedQuantity = Number(process.env.EXPECTED_QUANTITY || 0),
+  mode = "absolute",
+  reason = "stock recount",
+) {
+  console.log(
+    `Submitting ${mode} adjustment sku=${sku} location_id=${locationId} ` +
+    `expected_quantity=${expectedQuantity} (${DRY_RUN ? "dry run" : "writing"})`
+  );
+
+  if (DRY_RUN) {
+    console.log("DRY_RUN=true, skipping the write and the confirmation poll.");
+    return;
+  }
+
+  const response = await submitAdjustment(mode, reason, sku, locationId, expectedQuantity);
+  const adjustmentId = response.data ? response.data.id : undefined;
+
+  const { decision, observed, attempt, elapsedMs } = await confirmWrite(
+    sku, locationId, expectedQuantity, adjustmentId
+  );
+
+  if (decision.status === "confirmed") {
+    console.log(
+      `Confirmed sku=${sku} location_id=${locationId} quantity=${observed} ` +
+      `after ${attempt} attempt(s), ${elapsedMs}ms`
+    );
+    return;
+  }
+
+  const record = {
+    adjustment_id: adjustmentId,
+    sku,
+    location_id: locationId,
+    expected_quantity: expectedQuantity,
+    last_observed_quantity: observed,
+    attempts: attempt,
+    elapsed_ms: elapsedMs,
+  };
+  console.warn("STALE_FLAGGED", record, "reason=", decision.reason);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether the job retries, confirms, or escalates to an operator. Because <code>confirm_inventory_write</code> takes only plain values and returns a plain dict, the test needs no network and no BigCommerce store. It just feeds in numbers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_inventory_confirmation.py</div>
+      <pre><code class="language-python">from confirm_inventory_write import confirm_inventory_write
+
+
+def test_confirmed_when_observed_matches_expected():
+    result = confirm_inventory_write(50, 50, "adj_1", 0, 6)
+    assert result["status"] == "confirmed"
+
+
+def test_stale_flagged_when_adjustment_id_missing():
+    result = confirm_inventory_write(50, 40, None, 0, 6)
+    assert result["status"] == "stale_flagged"
+    assert result["reason"] == "missing action id, cannot confirm"
+
+
+def test_retry_when_not_matching_and_budget_remains():
+    result = confirm_inventory_write(50, 40, "adj_1", 0, 6)
+    assert result["status"] == "retry"
+    assert result["next_delay_s"] == 1.0
+
+
+def test_retry_delay_doubles_each_attempt():
+    result = confirm_inventory_write(50, 40, "adj_1", 2, 6)
+    assert result["next_delay_s"] == 4.0
+
+
+def test_retry_delay_caps_at_max_delay():
+    result = confirm_inventory_write(50, 40, "adj_1", 10, 20, base_delay_s=1.0, max_delay_s=60.0)
+    assert result["next_delay_s"] == 60.0
+
+
+def test_stale_flagged_when_budget_exhausted():
+    result = confirm_inventory_write(50, 40, "adj_1", 6, 6)
+    assert result["status"] == "stale_flagged"
+    assert result["reason"] == "poll budget exhausted"</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">confirm-inventory-write.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { confirmInventoryWrite } from "./confirm-inventory-write.js";
+
+test("confirmed when observed matches expected", () =&gt; {
+  const result = confirmInventoryWrite(50, 50, "adj_1", 0, 6);
+  assert.equal(result.status, "confirmed");
+});
+
+test("stale_flagged when adjustment id missing", () =&gt; {
+  const result = confirmInventoryWrite(50, 40, null, 0, 6);
+  assert.equal(result.status, "stale_flagged");
+  assert.equal(result.reason, "missing action id, cannot confirm");
+});
+
+test("retry when not matching and budget remains", () =&gt; {
+  const result = confirmInventoryWrite(50, 40, "adj_1", 0, 6);
+  assert.equal(result.status, "retry");
+  assert.equal(result.nextDelayS, 1.0);
+});
+
+test("retry delay doubles each attempt", () =&gt; {
+  const result = confirmInventoryWrite(50, 40, "adj_1", 2, 6);
+  assert.equal(result.nextDelayS, 4.0);
+});
+
+test("retry delay caps at max delay", () =&gt; {
+  const result = confirmInventoryWrite(50, 40, "adj_1", 10, 20, 1.0, 60.0);
+  assert.equal(result.nextDelayS, 60.0);
+});
+
+test("stale_flagged when budget exhausted", () =&gt; {
+  const result = confirmInventoryWrite(50, 40, "adj_1", 6, 6);
+  assert.equal(result.status, "stale_flagged");
+  assert.equal(result.reason, "poll budget exhausted");
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Sync job under load</span>
+      <h4>The nightly recount that flagged more items as traffic grew</h4>
+      <p>A merchant ran a nightly stock recount that wrote an absolute adjustment for every changed SKU, then immediately read it back to log a before/after diff for the day's report. On quiet nights every read matched on the first try. On busy nights, with the store's own checkout traffic also hitting the inventory pipeline, a growing share of reads came back stale on attempt one.</p>
+      <p>Adding the poll-with-backoff loop fixed the report without touching the recount logic itself. Almost everything now confirms within two attempts. The rare item that still does not gets a structured stale_flagged record instead of a wrong number silently written into the report.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Racing adjustments</span>
+      <h4>The double adjustment that looked like it undid itself</h4>
+      <p>An integration issued an absolute adjustment to correct a count, then, moments later, a relative adjustment from an unrelated order fulfillment event touched the same SKU and location. Support first assumed the correction had silently failed, because a quick manual check showed a number that did not match either write cleanly.</p>
+      <p>Reading BigCommerce's own note on this race, that a relative adjustment can apply against a pre-check value from a still-in-flight absolute one, explained the mismatch. The fix was not to force a value back in. It was to confirm each write independently by its own adjustment id and expected quantity, and let the poll loop catch the one that genuinely needed a second look.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs alongside every adjustment, a confirmed write is trusted the moment the read matches, usually within the first attempt or two. Anything that has not settled within the poll budget is never guessed at or silently re-written. It shows up as a clean, structured record for an operator, with the adjustment id, sku or variant id, location, expected and last observed quantity, attempts, and elapsed time all in one place.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a GET right after a BigCommerce inventory adjustment show the old quantity?</summary>
+      <p>The Inventory API processes adjustments asynchronously. The PUT to /v3/inventory/adjustments returns 200 with an action id as soon as the request is accepted into the processing pipeline, not after the new quantity is durably committed and propagated to the read path. BigCommerce's own docs describe this as eventual consistency, with a short delay before data is updated after the endpoint is called.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just re-submit the adjustment if the read still looks stale?</summary>
+      <p>No. This is a read-timing problem, not corrupt data, so re-issuing the same adjustment risks double-applying a relative delta or masking a real downstream failure. The safe response is to poll the read path with backoff and, if it still does not confirm within budget, flag the adjustment for an operator instead of writing again.</p>
+    </details>
+    <details>
+      <summary>Can a relative adjustment race against an absolute adjustment that is still in flight?</summary>
+      <p>Yes. BigCommerce warns that a relative adjustment can race against a still-in-flight absolute adjustment's pre-check stage, applying the pre-adjustment value instead of the value the absolute adjustment was about to set. That is one more reason to confirm a write by reading it back rather than assuming a 200 means the new quantity is already live.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: inventory adjustments, eventual consistency, and the race between relative and absolute adjustments. <a href="https://developer.bigcommerce.com/docs/store-operations/catalog/inventory-adjustments" rel="noopener">developer.bigcommerce.com inventory adjustments</a></li>
+      <li>BigCommerce Developer Center: the REST Management adjustments reference. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com adjustments</a></li>
+      <li>BigCommerce Developer Center: Inventory overview. <a href="https://developer.bigcommerce.com/buy-online-pick-up-in-store/inventory" rel="noopener">developer.bigcommerce.com inventory overview</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: the Inventory REST Management reference, request and response fields, identity, and location_id. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory" rel="noopener">developer.bigcommerce.com inventory</a></li>
+      <li>BigCommerce Developer Center: absolute versus relative adjustment endpoints. <a href="https://developer.bigcommerce.com/docs/rest-management/inventory/adjustments" rel="noopener">developer.bigcommerce.com adjustments</a></li>
+      <li>BigCommerce Developer Center: Inventory and Location webhooks. <a href="https://developer.bigcommerce.com/docs/integrations/webhooks/events/inventory-location" rel="noopener">developer.bigcommerce.com inventory and location webhooks</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop a stale read from causing a bad decision?</h3>
+    <p>If this saved you from chasing a phantom inventory bug or caught a race you would have otherwise missed, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

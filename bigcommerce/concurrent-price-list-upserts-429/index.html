@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Concurrent Price List Bulk Upserts Failing with 429</title>
+<meta name="description" content="A BigCommerce bulk price list upsert batch vanishes with a 429 instead of applying. Learn why the platform allows only one in-flight bulk upsert job per store and build a Python or Node.js script that serializes jobs with a lock and retries safely.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Concurrent Price List Bulk Upserts Failing with 429">
+<meta property="og:description" content="Why concurrent PUT /v3/pricelists/{id}/records calls drop the entire batch with 429, and a safe Python or Node.js script that serializes bulk upserts with a per-store lock and retries.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/#article","headline":"Fix BigCommerce Concurrent Price List Bulk Upserts Failing with 429","description":"BigCommerce allows only one in-flight bulk upsert job per store on the price list records endpoint. Concurrent PUT /v3/pricelists/{id}/records calls collide and the whole batch is dropped with a 429, not partially applied. A safe Python or Node.js script serializes jobs with a per-store lock and retries with backoff.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Pricing / Price Lists","keywords":"BigCommerce Price Lists, bulk upsert 429, pricelists records, rate limit, X-Rate-Limit-Time-Reset-Ms, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Concurrent price list bulk upserts fail the whole batch with 429","item":"https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a bulk price list upsert fail with 429 when I have API rate limit left?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce serializes writes to Price List records at the store level. The bulk upsert endpoint allows only one in-flight bulk upsert job per store at a time, regardless of which price list is targeted. A second overlapping PUT is rejected with 429 from the price-list processing lock, which is a different limit than the general API rate limit bucket, so you can see this 429 even when X-Rate-Limit-Requests-Left is well above zero."}},{"@type":"Question","name":"When a bulk upsert batch gets a 429, did any of the records get applied?","acceptedAnswer":{"@type":"Answer","text":"No. Unlike a partial-batch validation error, a 429 from the concurrent-lock collision drops the entire batch. None of the up to 1000 records in that call are upserted, so you cannot assume partial progress and must resubmit the identical batch once the lock clears."}},{"@type":"Question","name":"Is it safe to just resubmit the same batch after a 429?","acceptedAnswer":{"@type":"Answer","text":"Yes, once you back off and the lock has cleared. PUT /v3/pricelists/{id}/records is an idempotent upsert keyed on variant_id or sku plus price_list_id and currency, so resubmitting the identical batch does not create duplicates or double-apply anything. What is not safe is resubmitting immediately without a delay, or running multiple jobs in parallel against the same store, since that just recreates the collision."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Pricing / Price Lists</p>
+    <p class="eyebrow"><span class="pill pill--repair">Repair</span> Pricing / Price Lists</p>
+    <h1>Concurrent price list bulk upserts fail the whole batch with 429</h1>
+    <p class="lead">A nightly sync fans out one bulk upsert job per price list. Most of the time it works. Some nights, one or more of those jobs comes back with a 429 and none of its up to 1000 price records land, silently. BigCommerce allows only one in-flight bulk upsert job per store at a time on the price list records endpoint, no matter which price list each job targets, and a 429 from that lock drops the entire batch rather than applying it partially. Here is why that collision happens and a small script that serializes the writes and retries safely.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V3 Price Lists API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce serializes writes to Price List records at the store level. The bulk upsert endpoint, <code>PUT /v3/pricelists/{price_list_id}/records</code>, allows only one in-flight bulk upsert job per store at a time, regardless of which price list is targeted. When multiple jobs, cron tasks, or app instances submit bulk PUT batches concurrently, the platform's price-list processing lock rejects every overlapping request with HTTP 429, and unlike a partial-batch validation error, the entire batch is dropped rather than partially applied. Fix it by acquiring a per-store lock (for example a Redis key <code>pricelist:{store_hash}:bulk_lock</code>) before every bulk PUT, queuing competing jobs instead of racing them, and on a 429 backing off with jitter and resubmitting the identical batch, since the upsert is idempotent on variant_id or sku plus price_list_id and currency. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Price List records in BigCommerce are not just another catalog resource you can hammer with parallel writes. The bulk upsert endpoint processes each PUT as a job against the store's price list subsystem, and that subsystem only lets one such job run at a time, store-wide. It does not matter that job A is writing to price list 12 and job B is writing to price list 47. They still collide, because the lock is scoped to the store, not to the individual price list.</p>
+  <p>This becomes a problem the moment more than one thing can submit a bulk upsert: a nightly sync that fans out a batch per price list, a retry that fires while the original request is still being processed, or a second app instance running the same job. The second (and any later) overlapping request gets HTTP 429 back immediately. The catch is what that 429 actually means here. It is not the general API rate limit bucket telling you to slow down, and it is not a partial success where some records made it in. It is a flat rejection of the whole call, so none of the up to 1000 records in that batch are upserted. A caller that only checks for a 2xx and moves on, or that blindly retries without backing off, ends up quietly losing whole batches of price, sale_price, and map_price updates, with no partial-failure signal to notice by.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the problem. Two jobs submit bulk upsert PUT requests to different price lists at the same time. The store-level processing lock is already held by job A, so job B's request is rejected with 429 and its entire batch of records is dropped, not partially applied.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="18" width="185" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="42" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Job A: PUT records</text>
+      <text x="102" y="59" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">price_list_id 12</text>
+      <rect x="10" y="150" width="185" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="102" y="174" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Job B: PUT records</text>
+      <text x="102" y="191" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">price_list_id 47</text>
+      <line x1="195" y1="47" x2="270" y2="47" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <line x1="195" y1="179" x2="270" y2="105" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="273" y="18" width="200" height="150" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="373" y="42" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Store-level bulk</text>
+      <text x="373" y="59" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">upsert lock</text>
+      <text x="373" y="86" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">one job in flight</text>
+      <text x="373" y="103" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">per store, any</text>
+      <text x="373" y="120" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">price list</text>
+      <text x="373" y="147" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#4c9a2a">&#10003;</text>
+      <line x1="473" y1="47" x2="545" y2="47" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="548" y="18" width="200" height="58" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="648" y="42" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#4c9a2a">Job A batch</text>
+      <text x="648" y="59" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">up to 1000 records upserted</text>
+      <text x="490" y="112" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="440" y="140" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">429, lock held</text>
+      <line x1="473" y1="105" x2="548" y2="150" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="548" y="122" width="200" height="58" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="648" y="146" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Job B batch</text>
+      <text x="648" y="163" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">whole batch dropped</text>
+    </svg>
+    <figcaption>The lock is store-wide, not per price list. Job B's records for price list 47 are not partially applied, they are dropped entirely, because the store already had job A's batch in flight.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few concrete situations reliably trigger this collision:</p>
+  <ul>
+    <li>A nightly sync that fans out one bulk upsert job per price list, submitting them in parallel to finish faster, unaware that the platform only allows one in flight per store regardless of which price list each job targets.</li>
+    <li>A retry mechanism that resubmits a batch as soon as it sees a non-2xx response, while the original request is still being processed and still holds the lock, so the retry itself collides and gets its own 429.</li>
+    <li>Two app instances or two scheduled tasks (for example a cron job and a manual admin trigger) both writing price updates to the same store hash at overlapping times.</li>
+    <li>Confusing this 429 with the general API rate limit bucket. The general bucket exhaustion shows <code>X-Rate-Limit-Requests-Left: 0</code> in the response headers; the price-list concurrency lock does not necessarily exhaust that bucket at all, so you can get a 429 here with plenty of general rate limit budget left.</li>
+  </ul>
+  <p>See the citations at the end for the price list records API reference, a community thread on bulk price updates, and BigCommerce's own rate limit documentation.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>This 429 is not the same signal as running out of API rate limit. It is a concurrency lock on price list processing, scoped to the whole store, not to an individual price list. Confirm which one you are looking at by checking the response headers: general rate limit exhaustion carries <code>X-Rate-Limit-Requests-Left: 0</code>, while a concurrent bulk-upsert collision typically does not, and instead is best confirmed by cross-referencing your own job registry or lock table to see that a second job attempted a write while another job's lock was still held. Once you know it is the concurrency lock, the fix is serialization, not just generic rate-limit backoff.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change what gets written. We add a per-store lock that every bulk upsert job must acquire before calling the records endpoint, queue anything that arrives while the lock is held, and on a 429 back off and resubmit the identical batch rather than treating it as a failure to abandon.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job requests the per-store lock. If the lock is free it acquires it, submits the bulk PUT, and releases the lock on success. If the response is 429 it waits with backoff and resubmits the identical batch, because the upsert is idempotent, until it succeeds or the max attempts are reached.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Bulk upsert job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">ready to submit</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Acquire per-store</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">bulk_lock (queue if held)</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">PUT records</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">one batch, one price list</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Status</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">200/201/207?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="560" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">429, backoff, resubmit</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <path d="M575,215 C440,215 350,190 350,170" fill="none" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ah2)"></path>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Release lock</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">batch upserted</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The lock forces one bulk upsert in flight per store. A 429 is not a failure to give up on, it is a signal to back off and resubmit the same idempotent batch once the lock clears.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Price Lists (modify) scope so it can list and write price list records. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MAX_ATTEMPTS="6"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MAX_ATTEMPTS="6"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V3 Price Lists REST API</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. A small helper handles GET and PUT, returns the parsed JSON body alongside the status code and headers (we need those for the 429 case), and never raises on a 429 so the caller can decide what to do with it.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def bc_put_records(price_list_id, records):
+    r = requests.put(
+        f"{API_BASE}/pricelists/{price_list_id}/records",
+        headers=HEADERS, json=records, timeout=60,
+    )
+    body = r.json() if r.text else {}
+    return r.status_code, dict(r.headers), body</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcPutRecords(priceListId, records) {
+  const res = await fetch(`${API_BASE}/pricelists/${priceListId}/records`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(records),
+  });
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return { status: res.status, headers: Object.fromEntries(res.headers.entries()), body };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Enumerate price lists and hold a per-store lock</h3>
+      <p>Call <code>GET /v3/pricelists?limit=250</code>, paginated via <code>meta.pagination</code>, to get every price_list_id and its active/name state. Before any job issues a bulk PUT for one of those price lists, it must acquire a per-store lock, for example <code>SETNX pricelist:{store_hash}:bulk_lock</code> in Redis with a TTL, or an in-process semaphore of size 1 if everything runs in one process. Competing jobs queue instead of racing, and the lock is released only after the PUT call returns something other than 429.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">import threading
+
+def all_price_lists():
+    page = 1
+    while True:
+        payload = bc_get("/pricelists", {"limit": 250, "page": page})
+        data = payload.get("data") or []
+        if not data:
+            return
+        for price_list in data:
+            yield price_list
+        pagination = (payload.get("meta") or {}).get("pagination") or {}
+        if page >= (pagination.get("total_pages") or page):
+            return
+        page += 1
+
+# In-process serialization. Swap for a Redis SETNX lock across multiple hosts.
+STORE_BULK_LOCK = threading.Lock()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* allPriceLists() {
+  let page = 1;
+  while (true) {
+    const payload = await bcGet("/pricelists", { limit: 250, page });
+    const data = payload.data || [];
+    if (!data.length) return;
+    for (const priceList of data) yield priceList;
+    const pagination = (payload.meta || {}).pagination || {};
+    if (page >= (pagination.total_pages || page)) return;
+    page += 1;
+  }
+}
+
+// In-process serialization. Swap for a Redis SETNX lock across multiple hosts.
+let storeBulkLockHeld = false;
+async function withStoreBulkLock(fn) {
+  while (storeBulkLockHeld) await new Promise((r) =&gt; setTimeout(r, 50));
+  storeBulkLockHeld = true;
+  try {
+    return await fn();
+  } finally {
+    storeBulkLockHeld = false;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the retry decision in its own function that takes the response status, the attempt count, and the response headers, and returns exactly what to do next. Success statuses (200, 201, 207) mean the batch was accepted. A 429 means retry with a computed wait, honoring <code>X-Rate-Limit-Time-Reset-Ms</code> or <code>Retry-After</code> if BigCommerce sent one, otherwise capped exponential backoff. Any other 4xx gives up immediately since it will not resolve itself. A 5xx is treated as transient and retried the same as a 429, up to the attempt cap.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def decide_retry(status_code, attempt, headers, max_attempts=6):
+    if status_code in (200, 201, 207):
+        return {"action": "success"}
+
+    if status_code == 429:
+        if attempt &gt;= max_attempts:
+            return {"action": "give_up", "reason": "max_attempts_exceeded"}
+        wait_ms = _compute_wait_ms(attempt, headers)
+        return {"action": "retry", "wait_ms": wait_ms, "reason": "concurrent_bulk_lock"}
+
+    if 500 &lt;= status_code &lt; 600:
+        if attempt &gt;= max_attempts:
+            return {"action": "give_up", "reason": "server_error_max_attempts"}
+        wait_ms = _compute_wait_ms(attempt, headers)
+        return {"action": "retry", "wait_ms": wait_ms, "reason": "server_error"}
+
+    return {"action": "give_up", "reason": "client_error_non_retryable"}
+
+
+def _compute_wait_ms(attempt, headers):
+    headers = headers or {}
+    reset_ms = headers.get("X-Rate-Limit-Time-Reset-Ms")
+    if reset_ms is not None:
+        try:
+            return int(reset_ms)
+        except (TypeError, ValueError):
+            pass
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return int(float(retry_after) * 1000)
+        except (TypeError, ValueError):
+            pass
+    return min(60000, 2000 * (2 ** (attempt - 1)))</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function decideRetry(statusCode, attempt, headers, maxAttempts = 6) {
+  if ([200, 201, 207].includes(statusCode)) {
+    return { action: "success" };
+  }
+
+  if (statusCode === 429) {
+    if (attempt &gt;= maxAttempts) {
+      return { action: "give_up", reason: "max_attempts_exceeded" };
+    }
+    return { action: "retry", wait_ms: computeWaitMs(attempt, headers), reason: "concurrent_bulk_lock" };
+  }
+
+  if (statusCode &gt;= 500 &amp;&amp; statusCode &lt; 600) {
+    if (attempt &gt;= maxAttempts) {
+      return { action: "give_up", reason: "server_error_max_attempts" };
+    }
+    return { action: "retry", wait_ms: computeWaitMs(attempt, headers), reason: "server_error" };
+  }
+
+  return { action: "give_up", reason: "client_error_non_retryable" };
+}
+
+function computeWaitMs(attempt, headers) {
+  headers = headers || {};
+  const resetMs = headers["X-Rate-Limit-Time-Reset-Ms"] ?? headers["x-rate-limit-time-reset-ms"];
+  if (resetMs !== undefined &amp;&amp; resetMs !== null &amp;&amp; !Number.isNaN(Number(resetMs))) {
+    return Number(resetMs);
+  }
+  const retryAfter = headers["Retry-After"] ?? headers["retry-after"];
+  if (retryAfter !== undefined &amp;&amp; retryAfter !== null &amp;&amp; !Number.isNaN(Number(retryAfter))) {
+    return Number(retryAfter) * 1000;
+  }
+  return Math.min(60000, 2000 * 2 ** (attempt - 1));
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Submit inside the lock, retry on the identical batch</h3>
+      <p>When it is a job's turn to hold the lock, it submits the batch, feeds the response into <code>decide_retry</code>, and either releases the lock on success, waits and resubmits the same records array on retry, or releases the lock and gives up, logging the reason. Because the endpoint upserts on variant_id or sku plus price_list_id and currency, resubmitting the identical batch never double-applies anything.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">import time
+
+def submit_batch_with_retry(price_list_id, records, max_attempts=6, dry_run=True):
+    attempt = 1
+    while True:
+        if dry_run:
+            return {"action": "success", "dry_run": True, "attempt": attempt}
+
+        status_code, headers, body = bc_put_records(price_list_id, records)
+        decision = decide_retry(status_code, attempt, headers, max_attempts)
+
+        if decision["action"] == "success":
+            return {"action": "success", "attempt": attempt, "body": body}
+        if decision["action"] == "give_up":
+            return decision
+
+        time.sleep(decision["wait_ms"] / 1000)
+        attempt += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function submitBatchWithRetry(priceListId, records, maxAttempts = 6, dryRun = true) {
+  let attempt = 1;
+  while (true) {
+    if (dryRun) {
+      return { action: "success", dry_run: true, attempt };
+    }
+
+    const { status, headers, body } = await bcPutRecords(priceListId, records);
+    const decision = decideRetry(status, attempt, headers, maxAttempts);
+
+    if (decision.action === "success") return { action: "success", attempt, body };
+    if (decision.action === "give_up") return decision;
+
+    await new Promise((r) =&gt; setTimeout(r, decision.wait_ms));
+    attempt += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>The run loop takes each pending job, acquires the store lock, submits with retry, and releases the lock. Notice the dry run guard. Under <code>DRY_RUN=true</code>, the job only logs the planned serialized submission order and the lock or queue wait time per job, it never acquires a real lock or issues the PUT. Read the output, agree with it, then switch it off and let it serialize your real jobs.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, never fan out bulk upsert jobs in parallel against the same store, and never treat a 429 on this endpoint as proof the batch is gone for good without first checking whether it should simply be retried after the lock clears.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, serializes bulk upserts with a lock, retries a 429 with backoff on the identical idempotent batch, and respects the dry run flag so nothing writes until you are ready.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/concurrent-price-list-upserts-429" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">serialize_price_list_upserts.py</div>
+      <pre><code class="language-python">"""Serialize BigCommerce price list bulk upserts so concurrent jobs stop losing batches to 429.
+
+BigCommerce serializes writes to Price List records at the store level. The bulk
+upsert endpoint, PUT /v3/pricelists/{price_list_id}/records, allows only one
+in-flight bulk upsert job per store at a time, regardless of which price list is
+targeted. When multiple jobs, cron tasks, or app instances submit bulk PUT batches
+concurrently, the platform's price-list processing lock rejects every overlapping
+request with HTTP 429, and unlike a partial-batch validation error, the entire
+batch is dropped rather than partially applied. This script acquires a per-store
+lock before every bulk PUT, queues competing jobs instead of racing them, and on a
+429 backs off with jitter and resubmits the identical batch, which is safe because
+the endpoint upserts on variant_id or sku plus price_list_id and currency. Run one
+instance per store. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/
+"""
+import os
+import time
+import random
+import logging
+import threading
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("serialize_price_list_upserts")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "6"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+# In-process serialization for a single-host scheduler. For multiple hosts or
+# processes, swap this for a Redis lock, e.g. SETNX pricelist:{store_hash}:bulk_lock
+# with a TTL, released only after the PUT call returns a non-429 status.
+_STORE_BULK_LOCK = threading.Lock()
+
+
+def decide_retry(status_code, attempt, headers, max_attempts=6):
+    """Pure decision logic (no I/O) for handling a price-list bulk-upsert response.
+
+    status 200/201/207 -> success (batch accepted/upserted)
+    status 429 and attempt < max_attempts -> retry with a computed wait_ms,
+        reason "concurrent_bulk_lock"
+    status 429 and attempt >= max_attempts -> give_up, "max_attempts_exceeded"
+    status 4xx (not 429) -> give_up, "client_error_non_retryable"
+    status 5xx -> retry (transient) up to max_attempts, else give_up
+        "server_error_max_attempts"
+    """
+    if status_code in (200, 201, 207):
+        return {"action": "success"}
+
+    if status_code == 429:
+        if attempt >= max_attempts:
+            return {"action": "give_up", "reason": "max_attempts_exceeded"}
+        return {
+            "action": "retry",
+            "wait_ms": _compute_wait_ms(attempt, headers),
+            "reason": "concurrent_bulk_lock",
+        }
+
+    if 500 <= status_code < 600:
+        if attempt >= max_attempts:
+            return {"action": "give_up", "reason": "server_error_max_attempts"}
+        return {
+            "action": "retry",
+            "wait_ms": _compute_wait_ms(attempt, headers),
+            "reason": "server_error",
+        }
+
+    return {"action": "give_up", "reason": "client_error_non_retryable"}
+
+
+def _compute_wait_ms(attempt, headers):
+    headers = headers or {}
+    reset_ms = headers.get("X-Rate-Limit-Time-Reset-Ms")
+    if reset_ms is not None:
+        try:
+            return int(reset_ms)
+        except (TypeError, ValueError):
+            pass
+    retry_after = headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return int(float(retry_after) * 1000)
+        except (TypeError, ValueError):
+            pass
+    base = min(60000, 2000 * (2 ** (attempt - 1)))
+    jitter = random.randint(0, 250)
+    return base + jitter
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def bc_put_records(price_list_id, records):
+    r = requests.put(
+        f"{API_BASE}/pricelists/{price_list_id}/records",
+        headers=HEADERS,
+        json=records,
+        timeout=60,
+    )
+    body = r.json() if r.text else {}
+    return r.status_code, dict(r.headers), body
+
+
+def all_price_lists():
+    page = 1
+    while True:
+        payload = bc_get("/pricelists", {"limit": 250, "page": page})
+        data = payload.get("data") or []
+        if not data:
+            return
+        for price_list in data:
+            yield price_list
+        pagination = (payload.get("meta") or {}).get("pagination") or {}
+        if page >= (pagination.get("total_pages") or page):
+            return
+        page += 1
+
+
+def submit_batch_with_retry(price_list_id, records, max_attempts=MAX_ATTEMPTS, dry_run=DRY_RUN):
+    attempt = 1
+    while True:
+        if dry_run:
+            log.info(
+                "DRY RUN: would submit batch price_list_id=%s records=%d attempt=%d",
+                price_list_id, len(records), attempt,
+            )
+            return {"action": "success", "dry_run": True, "attempt": attempt}
+
+        status_code, headers, body = bc_put_records(price_list_id, records)
+        decision = decide_retry(status_code, attempt, headers, max_attempts)
+
+        if decision["action"] == "success":
+            log.info(
+                "price_list_id=%s records=%d upserted on attempt %d",
+                price_list_id, len(records), attempt,
+            )
+            return {"action": "success", "attempt": attempt, "body": body}
+
+        if decision["action"] == "give_up":
+            log.error(
+                "price_list_id=%s gave up after attempt %d: %s",
+                price_list_id, attempt, decision["reason"],
+            )
+            return decision
+
+        log.warning(
+            "price_list_id=%s got %s on attempt %d, retrying in %dms (%s)",
+            price_list_id, status_code, attempt, decision["wait_ms"], decision["reason"],
+        )
+        time.sleep(decision["wait_ms"] / 1000)
+        attempt += 1
+
+
+def run_job(price_list_id, records):
+    """Acquire the per-store lock, submit with retry, release the lock."""
+    if DRY_RUN:
+        log.info(
+            "DRY RUN: job for price_list_id=%s queued, would wait for store lock",
+            price_list_id,
+        )
+        return submit_batch_with_retry(price_list_id, records)
+
+    with _STORE_BULK_LOCK:
+        return submit_batch_with_retry(price_list_id, records)
+
+
+def run(jobs):
+    """jobs: iterable of (price_list_id, records) tuples to submit, one at a time."""
+    results = []
+    for price_list_id, records in jobs:
+        results.append(run_job(price_list_id, records))
+    succeeded = sum(1 for r in results if r["action"] == "success")
+    log.info("Done. %d/%d job(s) succeeded.", succeeded, len(results))
+    return results
+
+
+if __name__ == "__main__":
+    example_jobs = [
+        (price_list["id"], [])
+        for price_list in all_price_lists()
+    ]
+    run(example_jobs)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">serialize-price-list-upserts.js</div>
+      <pre><code class="language-javascript">/**
+ * Serialize BigCommerce price list bulk upserts so concurrent jobs stop losing batches to 429.
+ *
+ * BigCommerce serializes writes to Price List records at the store level. The bulk
+ * upsert endpoint, PUT /v3/pricelists/{price_list_id}/records, allows only one
+ * in-flight bulk upsert job per store at a time, regardless of which price list is
+ * targeted. When multiple jobs, cron tasks, or app instances submit bulk PUT batches
+ * concurrently, the platform's price-list processing lock rejects every overlapping
+ * request with HTTP 429, and unlike a partial-batch validation error, the entire
+ * batch is dropped rather than partially applied. This script acquires a per-store
+ * lock before every bulk PUT, queues competing jobs instead of racing them, and on a
+ * 429 backs off with jitter and resubmits the identical batch, which is safe because
+ * the endpoint upserts on variant_id or sku plus price_list_id and currency. Run one
+ * instance per store.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/concurrent-price-list-upserts-429/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS || 6);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+// In-process serialization for a single-host scheduler. For multiple hosts or
+// processes, swap this for a Redis lock, e.g. SETNX pricelist:{store_hash}:bulk_lock
+// with a TTL, released only after the PUT call returns a non-429 status.
+let storeBulkLockHeld = false;
+async function withStoreBulkLock(fn) {
+  while (storeBulkLockHeld) await new Promise((r) => setTimeout(r, 25));
+  storeBulkLockHeld = true;
+  try {
+    return await fn();
+  } finally {
+    storeBulkLockHeld = false;
+  }
+}
+
+/**
+ * Pure decision logic (no I/O) for handling a price-list bulk-upsert response.
+ *
+ * status 200/201/207 -> success (batch accepted/upserted)
+ * status 429 and attempt < maxAttempts -> retry with a computed wait_ms,
+ *     reason "concurrent_bulk_lock"
+ * status 429 and attempt >= maxAttempts -> give_up, "max_attempts_exceeded"
+ * status 4xx (not 429) -> give_up, "client_error_non_retryable"
+ * status 5xx -> retry (transient) up to maxAttempts, else give_up
+ *     "server_error_max_attempts"
+ */
+export function decideRetry(statusCode, attempt, headers, maxAttempts = 6) {
+  if ([200, 201, 207].includes(statusCode)) {
+    return { action: "success" };
+  }
+
+  if (statusCode === 429) {
+    if (attempt >= maxAttempts) {
+      return { action: "give_up", reason: "max_attempts_exceeded" };
+    }
+    return {
+      action: "retry",
+      wait_ms: computeWaitMs(attempt, headers),
+      reason: "concurrent_bulk_lock",
+    };
+  }
+
+  if (statusCode >= 500 && statusCode < 600) {
+    if (attempt >= maxAttempts) {
+      return { action: "give_up", reason: "server_error_max_attempts" };
+    }
+    return {
+      action: "retry",
+      wait_ms: computeWaitMs(attempt, headers),
+      reason: "server_error",
+    };
+  }
+
+  return { action: "give_up", reason: "client_error_non_retryable" };
+}
+
+function computeWaitMs(attempt, headers) {
+  headers = headers || {};
+  const resetMs = headers["X-Rate-Limit-Time-Reset-Ms"] ?? headers["x-rate-limit-time-reset-ms"];
+  if (resetMs !== undefined && resetMs !== null && !Number.isNaN(Number(resetMs))) {
+    return Number(resetMs);
+  }
+  const retryAfter = headers["Retry-After"] ?? headers["retry-after"];
+  if (retryAfter !== undefined && retryAfter !== null && !Number.isNaN(Number(retryAfter))) {
+    return Number(retryAfter) * 1000;
+  }
+  const base = Math.min(60000, 2000 * 2 ** (attempt - 1));
+  const jitter = Math.floor(Math.random() * 250);
+  return base + jitter;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function bcPutRecords(priceListId, records) {
+  const res = await fetch(`${API_BASE}/pricelists/${priceListId}/records`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(records),
+  });
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  return { status: res.status, headers: Object.fromEntries(res.headers.entries()), body };
+}
+
+async function* allPriceLists() {
+  let page = 1;
+  while (true) {
+    const payload = await bcGet("/pricelists", { limit: 250, page });
+    const data = payload.data || [];
+    if (!data.length) return;
+    for (const priceList of data) yield priceList;
+    const pagination = (payload.meta || {}).pagination || {};
+    if (page >= (pagination.total_pages || page)) return;
+    page += 1;
+  }
+}
+
+async function submitBatchWithRetry(priceListId, records, maxAttempts = MAX_ATTEMPTS, dryRun = DRY_RUN) {
+  let attempt = 1;
+  while (true) {
+    if (dryRun) {
+      console.log(
+        `DRY RUN: would submit batch price_list_id=${priceListId} records=${records.length} attempt=${attempt}`
+      );
+      return { action: "success", dry_run: true, attempt };
+    }
+
+    const { status, headers, body } = await bcPutRecords(priceListId, records);
+    const decision = decideRetry(status, attempt, headers, maxAttempts);
+
+    if (decision.action === "success") {
+      console.log(`price_list_id=${priceListId} records=${records.length} upserted on attempt ${attempt}`);
+      return { action: "success", attempt, body };
+    }
+
+    if (decision.action === "give_up") {
+      console.error(`price_list_id=${priceListId} gave up after attempt ${attempt}: ${decision.reason}`);
+      return decision;
+    }
+
+    console.warn(
+      `price_list_id=${priceListId} got ${status} on attempt ${attempt}, retrying in ${decision.wait_ms}ms (${decision.reason})`
+    );
+    await new Promise((r) => setTimeout(r, decision.wait_ms));
+    attempt += 1;
+  }
+}
+
+async function runJob(priceListId, records) {
+  if (DRY_RUN) {
+    console.log(`DRY RUN: job for price_list_id=${priceListId} queued, would wait for store lock`);
+    return submitBatchWithRetry(priceListId, records);
+  }
+  return withStoreBulkLock(() => submitBatchWithRetry(priceListId, records));
+}
+
+export async function run(jobs) {
+  const results = [];
+  for (const [priceListId, records] of jobs) {
+    results.push(await runJob(priceListId, records));
+  }
+  const succeeded = results.filter((r) => r.action === "success").length;
+  console.log(`Done. ${succeeded}/${results.length} job(s) succeeded.`);
+  return results;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  (async () => {
+    const jobs = [];
+    for await (const priceList of allPriceLists()) {
+      jobs.push([priceList.id, []]);
+    }
+    await run(jobs);
+  })().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The retry decision is the part most worth testing, because it decides whether a real batch gets resubmitted, abandoned, or wrongly treated as done. Because <code>decide_retry</code> takes only plain values and returns a plain object, the test needs no network and no BigCommerce store. It just feeds in status codes, attempt counts, and headers, and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_concurrent_bulk_retry.py</div>
+      <pre><code class="language-python">from serialize_price_list_upserts import decide_retry
+
+
+def test_success_on_200():
+    assert decide_retry(200, 1, {}) == {"action": "success"}
+
+
+def test_success_on_207_multi_status():
+    assert decide_retry(207, 1, {}) == {"action": "success"}
+
+
+def test_429_retries_with_reset_header_ms():
+    result = decide_retry(429, 1, {"X-Rate-Limit-Time-Reset-Ms": "1500"}, max_attempts=6)
+    assert result["action"] == "retry"
+    assert result["wait_ms"] == 1500
+    assert result["reason"] == "concurrent_bulk_lock"
+
+
+def test_429_retries_with_retry_after_seconds():
+    result = decide_retry(429, 1, {"Retry-After": "2"}, max_attempts=6)
+    assert result["action"] == "retry"
+    assert result["wait_ms"] == 2000
+
+
+def test_429_falls_back_to_capped_exponential_backoff():
+    result = decide_retry(429, 3, {}, max_attempts=6)
+    assert result["action"] == "retry"
+    # base 2000 * 2**(attempt-1) = 8000, plus up to 250ms of jitter
+    assert 8000 &lt;= result["wait_ms"] &lt;= 8250
+
+
+def test_429_gives_up_after_max_attempts():
+    result = decide_retry(429, 6, {}, max_attempts=6)
+    assert result == {"action": "give_up", "reason": "max_attempts_exceeded"}
+
+
+def test_non_429_client_error_gives_up_immediately():
+    result = decide_retry(422, 1, {}, max_attempts=6)
+    assert result == {"action": "give_up", "reason": "client_error_non_retryable"}
+
+
+def test_server_error_retries_then_gives_up():
+    retry = decide_retry(503, 1, {}, max_attempts=2)
+    assert retry["action"] == "retry"
+    give_up = decide_retry(503, 2, {}, max_attempts=2)
+    assert give_up == {"action": "give_up", "reason": "server_error_max_attempts"}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">serialize-price-list-upserts.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { decideRetry } from "./serialize-price-list-upserts.js";
+
+test("success on 200", () =&gt; {
+  assert.deepEqual(decideRetry(200, 1, {}), { action: "success" });
+});
+
+test("success on 207 multi-status", () =&gt; {
+  assert.deepEqual(decideRetry(207, 1, {}), { action: "success" });
+});
+
+test("429 retries with reset header ms", () =&gt; {
+  const result = decideRetry(429, 1, { "X-Rate-Limit-Time-Reset-Ms": "1500" }, 6);
+  assert.equal(result.action, "retry");
+  assert.equal(result.wait_ms, 1500);
+  assert.equal(result.reason, "concurrent_bulk_lock");
+});
+
+test("429 retries with retry-after seconds", () =&gt; {
+  const result = decideRetry(429, 1, { "Retry-After": "2" }, 6);
+  assert.equal(result.action, "retry");
+  assert.equal(result.wait_ms, 2000);
+});
+
+test("429 falls back to capped exponential backoff", () =&gt; {
+  const result = decideRetry(429, 3, {}, 6);
+  assert.equal(result.action, "retry");
+  // base 2000 * 2**(attempt-1) = 8000, plus up to 250ms of jitter
+  assert.ok(result.wait_ms &gt;= 8000 &amp;&amp; result.wait_ms &lt;= 8250);
+});
+
+test("429 gives up after max attempts", () =&gt; {
+  assert.deepEqual(decideRetry(429, 6, {}, 6), { action: "give_up", reason: "max_attempts_exceeded" });
+});
+
+test("non-429 client error gives up immediately", () =&gt; {
+  assert.deepEqual(decideRetry(422, 1, {}, 6), { action: "give_up", reason: "client_error_non_retryable" });
+});
+
+test("server error retries then gives up", () =&gt; {
+  const retry = decideRetry(503, 1, {}, 2);
+  assert.equal(retry.action, "retry");
+  const giveUp = decideRetry(503, 2, {}, 2);
+  assert.deepEqual(giveUp, { action: "give_up", reason: "server_error_max_attempts" });
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Nightly sync fan-out</span>
+      <h4>The store that synced every price list in parallel to save time</h4>
+      <p>A merchant ran a nightly job that pulled fresh cost and margin data from an external system and pushed it into BigCommerce, one bulk upsert per price list, fired all at once to keep the sync fast. Every few nights, one or two price lists would simply not update, with no error surfaced anywhere except a 429 buried in a log no one was reading.</p>
+      <p>Switching the sync to acquire a single per-store lock before each bulk PUT, and queuing the rest, cost a few extra minutes of total run time but eliminated the silent drops entirely. Every price list updates every night now, in a predictable order.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Retry made it worse</span>
+      <h4>The retry loop that collided with itself</h4>
+      <p>A team had added a naive retry: on any non-2xx response, immediately resubmit. That "fix" made things worse, because the immediate resubmission fired while the original request's lock was often still held, generating a second 429 back to back, sometimes a third, before eventually giving up and logging a generic failure.</p>
+      <p>Feeding the response into <code>decide_retry</code> instead of retrying blindly fixed it. The wait_ms it returns, informed by <code>X-Rate-Limit-Time-Reset-Ms</code> when BigCommerce sends one, gives the lock time to actually clear before the resubmission, so the second attempt usually succeeds outright.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs, every bulk price list upsert against a store goes through one lock, one at a time, so no job ever races another for the same store-level slot. A 429 is expected occasionally under load and handled by waiting and resubmitting the identical, safely idempotent batch, never by silently dropping price data or hammering the endpoint with an instant retry.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a bulk price list upsert fail with 429 when I have API rate limit left?</summary>
+      <p>BigCommerce serializes writes to Price List records at the store level. The bulk upsert endpoint allows only one in-flight bulk upsert job per store at a time, regardless of which price list is targeted. A second overlapping PUT is rejected with 429 from the price-list processing lock, which is a different limit than the general API rate limit bucket, so you can see this 429 even when X-Rate-Limit-Requests-Left is well above zero.</p>
+    </details>
+    <details>
+      <summary>When a bulk upsert batch gets a 429, did any of the records get applied?</summary>
+      <p>No. Unlike a partial-batch validation error, a 429 from the concurrent-lock collision drops the entire batch. None of the up to 1000 records in that call are upserted, so you cannot assume partial progress and must resubmit the identical batch once the lock clears.</p>
+    </details>
+    <details>
+      <summary>Is it safe to just resubmit the same batch after a 429?</summary>
+      <p>Yes, once you back off and the lock has cleared. PUT /v3/pricelists/{id}/records is an idempotent upsert keyed on variant_id or sku plus price_list_id and currency, so resubmitting the identical batch does not create duplicates or double-apply anything. What is not safe is resubmitting immediately without a delay, or running multiple jobs in parallel against the same store, since that just recreates the collision.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: Price Lists Records reference. <a href="https://developer.bigcommerce.com/docs/rest-management/price-lists/price-lists-records" rel="noopener">developer.bigcommerce.com price lists records</a></li>
+      <li>BigCommerce Support: bulk price update based on SKU, community question and answer. <a href="https://support.bigcommerce.com/s/question/0D51B00004jbIa3SAE/bulk-price-update-based-on-sku?language=en_US" rel="noopener">support.bigcommerce.com bulk price update based on SKU</a></li>
+      <li>BigCommerce Developer Center: API rate limits. <a href="https://developer.bigcommerce.com/docs/start/best-practices/api-rate-limits" rel="noopener">developer.bigcommerce.com API rate limits</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce API Reference: Create Batch of Price Lists Records. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/price-lists/price-lists-records/create-price-lists-records" rel="noopener">docs.bigcommerce.com create price lists records</a></li>
+      <li>BigCommerce API Reference: Price Lists. <a href="https://docs.bigcommerce.com/developer/api-reference/rest/admin/management/price-lists" rel="noopener">docs.bigcommerce.com price lists</a></li>
+      <li>BigCommerce Resource Hub: Navigating BigCommerce's API Rate Limits Update. <a href="https://developer.bigcommerce.com/resource-hub/navigating-bigcommerces-api-rate-limits-update" rel="noopener">developer.bigcommerce.com navigating API rate limits update</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or pricing that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop your nightly sync from losing batches?</h3>
+    <p>If this saved you a pile of silently dropped price updates or a confusing 429 chase, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

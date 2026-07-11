@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce 429 Responses That Omit Rate Limit Headers</title>
+<meta name="description" content="Under high platform load, BigCommerce's REST API can return a bare 429 Too Many Requests with none of the usual rate limit headers. Learn why that happens and build a Python or Node.js backoff helper that never hot-loops on a header-less 429.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce 429 Responses That Omit Rate Limit Headers">
+<meta property="og:description" content="Why BigCommerce's edge layer sometimes returns a 429 with no X-Rate-Limit-* headers under high load, and a safe capped exponential backoff with jitter that keeps client scripts from hot-looping.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/#article","headline":"Fix BigCommerce 429 Responses That Omit Rate Limit Headers","description":"Why BigCommerce's REST API can return a bare 429 Too Many Requests with none of the usual X-Rate-Limit-* headers when the platform itself is under high load, and a safe capped exponential backoff with jitter that stops client scripts from hot-looping.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/","image":"https://www.allanninal.dev/og-image.png","articleSection":"API Fundamentals","keywords":"BigCommerce 429 Too Many Requests, X-Rate-Limit-Time-Reset-Ms, rate limit headers, API throttling, exponential backoff, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"429 responses sometimes omit rate limit headers under high load","item":"https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does a BigCommerce 429 response sometimes have no rate limit headers?","acceptedAnswer":{"@type":"Answer","text":"BigCommerce normally stamps every 429 with X-Rate-Limit-Time-Window-Ms, X-Rate-Limit-Time-Reset-Ms, X-Rate-Limit-Requests-Quota, and X-Rate-Limit-Requests-Left because the per-token rate-limit accounting logic adds them. When the platform itself is under high load, excessive traffic across a store or the shared infrastructure tier, the edge or proxy layer can throttle the request before it ever reaches that accounting logic, so it returns a bare 429 with none of those headers attached."}},{"@type":"Question","name":"Is a header-less 429 a bug in my BigCommerce store or app?","acceptedAnswer":{"@type":"Answer","text":"No. There is nothing to repair in your store data and no record to patch through the Management API. It is expected platform behavior under high load, and the only thing to fix is client-side retry logic so it falls back to a safe backoff instead of crashing or retrying immediately when the reset header is missing."}},{"@type":"Question","name":"What should my script do when X-Rate-Limit-Time-Reset-Ms is missing?","acceptedAnswer":{"@type":"Answer","text":"Fall back to a capped exponential backoff with jitter, for example a 1 second base that doubles on each attempt, capped around 60 seconds, with roughly plus or minus 20 percent random jitter. Never retry immediately and never treat the missing header as a fatal error, since either of those makes the platform-wide overload worse."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / API Fundamentals</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> API Fundamentals</p>
+    <h1>429 responses sometimes omit rate limit headers under high load</h1>
+    <p class="lead">A normal BigCommerce 429 comes with four headers that tell you exactly how long to wait. But when the platform itself is under high load, not just your own store's quota, the edge layer can return a bare 429 with none of those headers attached. Scripts that expect X-Rate-Limit-Time-Reset-Ms and choke on its absence end up retrying immediately in a hot loop, which makes the overload worse. Here is why the headers go missing and a small backoff helper that never depends on them.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce REST API</span>
+      <span class="chip">Safe by default (dry run)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's REST API normally returns 429 Too Many Requests with X-Rate-Limit-Time-Window-Ms, X-Rate-Limit-Time-Reset-Ms, X-Rate-Limit-Requests-Quota, and X-Rate-Limit-Requests-Left, so a client can compute exactly how long to back off. When the platform itself is under high load, excessive traffic across a store or a shared infrastructure tier, the edge or proxy layer can throttle a request before it ever reaches the per-token accounting logic that stamps those headers, so it comes back as a bare 429 with none of them. A script that treats the missing header as an error, or retries immediately because it found nothing to parse, worsens the very overload that caused the 429. The fix is a small pure function, <code>compute_backoff_seconds</code>, that uses the exact reset time when it is present and falls back to a capped exponential backoff with jitter when it is not. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Every BigCommerce v2 and v3 endpoint enforces a per-token rate limit, and when you exceed it, the response comes back as 429 with a set of headers that tell you your time window, your quota, how many requests you have left, and how many milliseconds until the window resets. A well-behaved client reads <code>X-Rate-Limit-Time-Reset-Ms</code>, sleeps for that long, and tries again. That is the documented, expected path.</p>
+  <p>But that header set is added by the per-token rate-limit accounting logic, and that logic sits behind BigCommerce's edge and proxy layer. When the platform itself is under heavy load, a spike of traffic across a whole store, or pressure on a shared infrastructure tier that many stores sit on, the edge layer can throttle a request before it ever reaches the code that stamps those headers. The response is still a 429, but it arrives with none of the four rate limit headers attached. There is no quota number to read and no reset time to wait on, because the request never got far enough into the pipeline to be given one.</p>
+  <p>Client code that was only ever tested against the normal, headers-present 429 tends to fall over here. If it does <code>int(response.headers["X-Rate-Limit-Time-Reset-Ms"])</code> without a fallback, it throws a KeyError or a parse error. Some scripts catch that error clumsily and just retry on the spot. Either way, the result is a hot loop of near-immediate retries hammering an endpoint that is already under load, which is the opposite of what you want to do during a platform-wide throttling event.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A request hits BigCommerce's edge layer. Under normal load it passes through to the per-token accounting logic which returns a 429 with rate limit headers. Under high platform load the edge layer throttles the request first and returns a bare 429 with no headers, and a script that only expects the headers case crashes or retries immediately.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="16" width="150" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="41" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">API request</text>
+      <text x="85" y="58" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">v2 or v3 endpoint</text>
+      <line x1="163" y1="45" x2="205" y2="45" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="208" y="16" width="170" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="293" y="41" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Edge / proxy layer</text>
+      <text x="293" y="58" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">platform-wide load check</text>
+      <line x1="293" y1="74" x2="293" y2="102" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <text x="140" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">normal load</text>
+      <line x1="208" y1="45" x2="150" y2="102" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="20" y="104" width="220" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="130" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Per-token accounting</text>
+      <text x="130" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">429 + all 4 headers</text>
+      <text x="440" y="98" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f" font-weight="700">high platform load</text>
+      <line x1="378" y1="45" x2="470" y2="102" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <rect x="380" y="104" width="220" height="58" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="490" y="129" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#cf4b3f">Throttled at the edge</text>
+      <text x="490" y="146" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">bare 429, no headers</text>
+      <line x1="490" y1="162" x2="490" y2="188" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+      <rect x="380" y="190" width="220" height="26" rx="8" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="490" y="207" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">Hot loop if unguarded</text>
+    </svg>
+    <figcaption>Under normal per-store throttling the response carries all four rate limit headers. Under platform-wide high load the edge layer can throttle first, so the 429 arrives with no headers at all.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>BigCommerce's own documentation and support channels describe this as expected behavior at the edge, not a bug in a specific store. A few things line up to cause it:</p>
+  <ul>
+    <li>The four X-Rate-Limit-* headers (Time-Window-Ms, Time-Reset-Ms, Requests-Quota, Requests-Left) are added by the per-token rate-limit accounting logic, which only runs for requests that actually reach it.</li>
+    <li>Platform-wide high load, excessive traffic across a store or pressure on a shared infrastructure tier, is handled further upstream, at the edge or proxy layer, before a request gets anywhere near per-token accounting.</li>
+    <li>When the edge layer throttles first, the 429 it returns never passes through the code that stamps the rate limit headers, so the response body and headers look materially different from the normal, per-store quota 429.</li>
+    <li>This is distinct from your own app simply exceeding its per-store quota. That case is normal, expected, and always comes with headers. The header-less case only shows up when the platform itself is under stress.</li>
+  </ul>
+  <p>Since there is no dedicated endpoint to list affected records, this is not something you query for in the Management API. It only shows up by instrumenting your own HTTP call sites and inspecting the raw response every time a 429 comes back. See the citations at the end for BigCommerce's own rate limit documentation and the support threads where this has come up.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>A missing X-Rate-Limit-Time-Reset-Ms header is not an error condition, it is a signal that the throttling happened somewhere that does not know your precise reset time. The safe pattern is not "parse the header or fail." It is "use the header when it is there, and always have a capped exponential backoff with jitter ready for when it is not." That way a header-less 429 during a platform-wide load spike gets the same respectful backoff as a normal one, instead of triggering a crash or a hot loop that adds to the load.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not change how BigCommerce throttles requests, because there is nothing on the platform side to configure or repair. We add a guard in the client's retry path that checks for the headers on every 429, uses the exact reset time when present, and always has a safe fallback when it is not.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Diagram of the solution. A request returns 429. The script checks the response headers. If X-Rate-Limit-Time-Reset-Ms is present it waits exactly that long. If the header is missing it falls back to a capped exponential backoff with jitter and logs the header-less occurrence for monitoring. Either way it retries after waiting instead of hot-looping.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="150" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="85" y="45" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Response is 429</text>
+      <text x="85" y="62" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">any BigCommerce call</text>
+      <line x1="163" y1="49" x2="200" y2="49" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="280,17 372,49 280,81 188,49" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="280" y="44" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">Reset-Ms header</text>
+      <text x="280" y="59" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="700" fill="#14213d">present?</text>
+      <text x="392" y="38" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="372" y1="49" x2="420" y2="49" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="423" y="20" width="180" height="58" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="513" y="45" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Wait exact reset</text>
+      <text x="513" y="62" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">reset_ms / 1000 seconds</text>
+      <text x="270" y="102" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, missing or unparseable</text>
+      <line x1="280" y1="81" x2="280" y2="116" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="190" y="118" width="220" height="58" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="300" y="143" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Capped backoff + jitter</text>
+      <text x="300" y="160" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">base doubling, max 60s</text>
+      <line x1="300" y1="176" x2="300" y2="200" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="190" y="202" width="220" height="26" rx="8" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="300" y="219" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">Log header-less 429</text>
+      <path d="M513,78 C513,150 410,138 412,150" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+      <rect x="633" y="118" width="117" height="58" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="691" y="143" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Retry</text>
+      <text x="691" y="160" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">after waiting</text>
+      <line x1="410" y1="147" x2="630" y2="147" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+    </svg>
+    <figcaption>Either path ends in a wait, never an immediate retry. The only difference is whether the wait is the exact reset time or a capped exponential backoff with jitter.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or reuse an existing app's credentials. Any scope that lets you call the endpoints you actually need is enough, since this fix lives entirely in how you handle 429 responses, not in what you request. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MAX_RETRIES="5"
+export DRY_RUN="true"   # start safe, change to false to run live calls</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export MAX_RETRIES="5"
+export DRY_RUN="true"   // start safe, change to false to run live calls</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the REST API and keep the raw headers</h3>
+      <p>Every call goes to <code>https://api.bigcommerce.com/stores/{store_hash}/</code> with the token in the <code>X-Auth-Token</code> header. The important detail here is that on a 429, the helper must hand back the response headers exactly as received, not just the status code, because that is the only way to tell a normal per-store 429 apart from a header-less platform-load 429.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    """Returns (status_code, headers, body). Never raises on 429,
+    so the caller can inspect headers and decide how long to wait."""
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    body = r.json() if r.text else {}
+    return r.status_code, r.headers, body</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+// Returns { statusCode, headers, body }. Never throws on 429,
+// so the caller can inspect headers and decide how long to wait.
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  const headers = Object.fromEntries(res.headers.entries());
+  return { statusCode: res.status, headers, body };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Detect which kind of 429 you got</h3>
+      <p>For every 429, check whether all four headers, X-Rate-Limit-Time-Window-Ms, X-Rate-Limit-Time-Reset-Ms, X-Rate-Limit-Requests-Quota, and X-Rate-Limit-Requests-Left, are present in the response. If they are, this is normal per-store quota throttling. If any are missing, this is the platform-wide high-load case, and it is worth logging the request path, store hash, and timestamp so you can see how often it happens.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">RATE_LIMIT_HEADERS = [
+    "X-Rate-Limit-Time-Window-Ms",
+    "X-Rate-Limit-Time-Reset-Ms",
+    "X-Rate-Limit-Requests-Quota",
+    "X-Rate-Limit-Requests-Left",
+]
+
+def headers_present(headers):
+    """headers is a case-insensitive mapping, e.g. requests.Response.headers."""
+    return all(h in headers for h in RATE_LIMIT_HEADERS)
+
+def log_headerless_429(path, store_hash, timestamp):
+    print(f"[flag] header-less 429 path={path} store_hash={store_hash} at={timestamp}")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const RATE_LIMIT_HEADERS = [
+  "x-rate-limit-time-window-ms",
+  "x-rate-limit-time-reset-ms",
+  "x-rate-limit-requests-quota",
+  "x-rate-limit-requests-left",
+];
+
+// headers here is a plain lowercase-keyed object, e.g. from bcGet() above.
+function headersPresent(headers) {
+  const keys = new Set(Object.keys(headers).map((k) => k.toLowerCase()));
+  return RATE_LIMIT_HEADERS.every((h) => keys.has(h));
+}
+
+function logHeaderlessRateLimit(path, storeHash, timestamp) {
+  console.log(`[flag] header-less 429 path=${path} store_hash=${storeHash} at=${timestamp}`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Decide the wait, with one pure function</h3>
+      <p>This is the core of the fix. <code>compute_backoff_seconds</code> takes the status code, the response headers, and the current attempt number, and returns exactly how long to wait, in seconds. Non-429 responses need no backoff at all. A 429 with a parseable reset header waits exactly that long. Anything else, missing header, empty value, or a value that will not parse as a number, falls back to a capped exponential backoff with jitter so repeated header-less 429s during a load spike still back off further and further instead of hammering the same endpoint.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">import random
+
+RESET_HEADER = "X-Rate-Limit-Time-Reset-Ms"
+
+def compute_backoff_seconds(
+    status_code, headers, attempt,
+    base_seconds=1.0, max_seconds=60.0, jitter_ratio=0.2,
+):
+    if status_code != 429:
+        return 0
+
+    reset_ms = None
+    for key, value in (headers or {}).items():
+        if key.lower() == RESET_HEADER.lower():
+            reset_ms = value
+            break
+
+    if reset_ms is not None:
+        try:
+            reset_ms_num = float(reset_ms)
+            if reset_ms_num &gt;= 0:
+                return reset_ms_num / 1000.0
+        except (TypeError, ValueError):
+            pass
+
+    wait = min(base_seconds * (2 ** attempt), max_seconds)
+    jitter = wait * jitter_ratio
+    return wait + random.uniform(-jitter, jitter)</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">const RESET_HEADER = "x-rate-limit-time-reset-ms";
+
+export function computeBackoffSeconds(
+  statusCode, headers, attempt,
+  baseSeconds = 1.0, maxSeconds = 60.0, jitterRatio = 0.2,
+) {
+  if (statusCode !== 429) return 0;
+
+  let resetMs = null;
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === RESET_HEADER) {
+      resetMs = value;
+      break;
+    }
+  }
+
+  if (resetMs !== null &amp;&amp; resetMs !== undefined &amp;&amp; resetMs !== "") {
+    const resetMsNum = Number.parseFloat(resetMs);
+    if (Number.isFinite(resetMsNum) &amp;&amp; resetMsNum &gt;= 0) {
+      return resetMsNum / 1000.0;
+    }
+  }
+
+  const wait = Math.min(baseSeconds * 2 ** attempt, maxSeconds);
+  const jitter = wait * jitterRatio;
+  return wait + (Math.random() * 2 - 1) * jitter;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Wrap real calls in the retry guard</h3>
+      <p>Any function that calls a BigCommerce endpoint now checks the status code first. On a 429, it looks up whether the headers were present, logs the header-less case if that is what happened, sleeps for <code>compute_backoff_seconds</code>, and tries again, up to a configured max attempts. On anything else, it returns normally or raises for a real error.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">import time
+
+def get_with_backoff(path, params=None, max_retries=5):
+    for attempt in range(max_retries + 1):
+        status_code, headers, body = bc_get(path, params)
+        if status_code != 429:
+            return status_code, headers, body
+
+        if not headers_present(headers):
+            log_headerless_429(path, os.environ.get("BIGCOMMERCE_STORE_HASH"), time.time())
+
+        wait_seconds = compute_backoff_seconds(status_code, headers, attempt)
+        time.sleep(wait_seconds)
+
+    return status_code, headers, body</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">function sleep(seconds) {
+  return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+}
+
+async function getWithBackoff(path, params = {}, maxRetries = 5) {
+  let last = null;
+  for (let attempt = 0; attempt &lt;= maxRetries; attempt += 1) {
+    last = await bcGet(path, params);
+    if (last.statusCode !== 429) return last;
+
+    if (!headersPresent(last.headers)) {
+      logHeaderlessRateLimit(path, process.env.BIGCOMMERCE_STORE_HASH, Date.now());
+    }
+
+    const waitSeconds = computeBackoffSeconds(last.statusCode, last.headers, attempt);
+    await sleep(waitSeconds);
+  }
+  return last;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Run it in dry run first</h3>
+      <p>With <code>DRY_RUN=true</code>, the script only logs each detected header-less 429 (store hash, endpoint, timestamp) without changing behavior. This is a flag/report tool at heart, since there is nothing on BigCommerce's side to mutate. Switch to live mode once you have confirmed the flagged endpoints and can decide whether repeated platform-level throttling on a store is worth reporting to BigCommerce support.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>, and never let a retry loop fire immediately after a 429 just because the reset header was missing. A hot loop against an endpoint that is already being throttled at the platform level only adds to the load causing the throttling.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete helper in one file for each language. It reads settings from the environment, checks every 429 for the four rate limit headers, logs the header-less case, and always waits before retrying, using the exact reset time when it has one and a capped exponential backoff with jitter when it does not.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/429-missing-rate-limit-headers" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">rate_limit_backoff.py</div>
+      <pre><code class="language-python">"""Back off safely on BigCommerce 429s, even when rate limit headers are missing.
+
+BigCommerce's REST API normally returns 429 Too Many Requests with four headers,
+X-Rate-Limit-Time-Window-Ms, X-Rate-Limit-Time-Reset-Ms, X-Rate-Limit-Requests-Quota,
+and X-Rate-Limit-Requests-Left, so a client can compute exactly how long to wait.
+When the platform itself is under high load, excessive traffic across a store or a
+shared infrastructure tier, the edge or proxy layer can throttle a request before it
+reaches the per-token accounting logic that stamps those headers, so it returns a
+bare 429 with none of them. Client code that expects the reset header and crashes or
+retries immediately when it is missing makes the overload worse. This helper checks
+every 429 for the four headers, uses the exact reset time when present, and falls
+back to a capped exponential backoff with jitter when it is not. It also logs the
+header-less occurrence (store hash, endpoint, timestamp) for monitoring. There is
+nothing to write back to BigCommerce here, this is a client-side guard, not a
+store-data repair.
+
+Guide: https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/
+"""
+import os
+import time
+import random
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("rate_limit_backoff")
+
+STORE_HASH = os.environ.get("BIGCOMMERCE_STORE_HASH", "example_hash")
+ACCESS_TOKEN = os.environ.get("BIGCOMMERCE_ACCESS_TOKEN", "bc_dummy")
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "5"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+RATE_LIMIT_HEADERS = [
+    "X-Rate-Limit-Time-Window-Ms",
+    "X-Rate-Limit-Time-Reset-Ms",
+    "X-Rate-Limit-Requests-Quota",
+    "X-Rate-Limit-Requests-Left",
+]
+RESET_HEADER = "X-Rate-Limit-Time-Reset-Ms"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def compute_backoff_seconds(
+    status_code: int,
+    headers: dict,
+    attempt: int,
+    base_seconds: float = 1.0,
+    max_seconds: float = 60.0,
+    jitter_ratio: float = 0.2,
+) -&gt; float:
+    """Pure decision. No I/O, no sleep call, no network access.
+
+    if status_code != 429: return 0, no backoff needed.
+    If X-Rate-Limit-Time-Reset-Ms is present (case-insensitive) and parses as a
+    non-negative number, return that value divided by 1000 as exact seconds to wait.
+    Otherwise fall back to min(base_seconds * 2**attempt, max_seconds) with
+    +/- jitter_ratio random jitter applied.
+    """
+    if status_code != 429:
+        return 0
+
+    reset_ms = None
+    for key, value in (headers or {}).items():
+        if key.lower() == RESET_HEADER.lower():
+            reset_ms = value
+            break
+
+    if reset_ms is not None:
+        try:
+            reset_ms_num = float(reset_ms)
+            if reset_ms_num &gt;= 0:
+                return reset_ms_num / 1000.0
+        except (TypeError, ValueError):
+            pass
+
+    wait = min(base_seconds * (2 ** attempt), max_seconds)
+    jitter = wait * jitter_ratio
+    return wait + random.uniform(-jitter, jitter)
+
+
+def headers_present(headers) -&gt; bool:
+    keys = {str(k).lower() for k in (headers or {}).keys()}
+    return all(h.lower() in keys for h in RATE_LIMIT_HEADERS)
+
+
+def log_headerless_429(path, store_hash, timestamp):
+    log.warning(
+        "Header-less 429 detected. path=%s store_hash=%s at=%s",
+        path, store_hash, timestamp,
+    )
+
+
+def bc_get(path, params=None):
+    """Returns (status_code, headers, body). Never raises on 429."""
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    body = r.json() if r.text else {}
+    return r.status_code, r.headers, body
+
+
+def get_with_backoff(path, params=None, max_retries=MAX_RETRIES):
+    status_code, headers, body = None, {}, {}
+    for attempt in range(max_retries + 1):
+        status_code, headers, body = bc_get(path, params)
+        if status_code != 429:
+            return status_code, headers, body
+
+        if not headers_present(headers):
+            log_headerless_429(path, STORE_HASH, time.time())
+            if DRY_RUN:
+                log.info("DRY_RUN: would back off and retry attempt=%d", attempt)
+                return status_code, headers, body
+
+        wait_seconds = compute_backoff_seconds(status_code, headers, attempt)
+        log.info("429 on %s, waiting %.2fs before retry (attempt %d)", path, wait_seconds, attempt)
+        if not DRY_RUN:
+            time.sleep(wait_seconds)
+
+    return status_code, headers, body
+
+
+def run():
+    status_code, headers, body = get_with_backoff("/catalog/products", {"limit": 1})
+    log.info("Final status=%s headers_present=%s", status_code, headers_present(headers))
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">rate-limit-backoff.js</div>
+      <pre><code class="language-javascript">/**
+ * Back off safely on BigCommerce 429s, even when rate limit headers are missing.
+ *
+ * BigCommerce's REST API normally returns 429 Too Many Requests with four headers,
+ * X-Rate-Limit-Time-Window-Ms, X-Rate-Limit-Time-Reset-Ms, X-Rate-Limit-Requests-Quota,
+ * and X-Rate-Limit-Requests-Left, so a client can compute exactly how long to wait.
+ * When the platform itself is under high load, excessive traffic across a store or a
+ * shared infrastructure tier, the edge or proxy layer can throttle a request before it
+ * reaches the per-token accounting logic that stamps those headers, so it returns a
+ * bare 429 with none of them. Client code that expects the reset header and crashes or
+ * retries immediately when it is missing makes the overload worse. This helper checks
+ * every 429 for the four headers, uses the exact reset time when present, and falls
+ * back to a capped exponential backoff with jitter when it is not. It also logs the
+ * header-less occurrence (store hash, endpoint, timestamp) for monitoring. There is
+ * nothing to write back to BigCommerce here, this is a client-side guard, not a
+ * store-data repair.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/429-missing-rate-limit-headers/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const RATE_LIMIT_HEADERS = [
+  "x-rate-limit-time-window-ms",
+  "x-rate-limit-time-reset-ms",
+  "x-rate-limit-requests-quota",
+  "x-rate-limit-requests-left",
+];
+const RESET_HEADER = "x-rate-limit-time-reset-ms";
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No I/O, no sleep call, no network access.
+ *
+ * if statusCode !== 429: return 0, no backoff needed.
+ * If x-rate-limit-time-reset-ms is present (case-insensitive) and parses as a
+ * non-negative number, return that value divided by 1000 as exact seconds to wait.
+ * Otherwise fall back to Math.min(baseSeconds * 2**attempt, maxSeconds) with
+ * +/- jitterRatio random jitter applied.
+ */
+export function computeBackoffSeconds(
+  statusCode,
+  headers,
+  attempt,
+  baseSeconds = 1.0,
+  maxSeconds = 60.0,
+  jitterRatio = 0.2,
+) {
+  if (statusCode !== 429) return 0;
+
+  let resetMs = null;
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === RESET_HEADER) {
+      resetMs = value;
+      break;
+    }
+  }
+
+  if (resetMs !== null &amp;&amp; resetMs !== undefined &amp;&amp; resetMs !== "") {
+    const resetMsNum = Number.parseFloat(resetMs);
+    if (Number.isFinite(resetMsNum) &amp;&amp; resetMsNum &gt;= 0) {
+      return resetMsNum / 1000.0;
+    }
+  }
+
+  const wait = Math.min(baseSeconds * 2 ** attempt, maxSeconds);
+  const jitter = wait * jitterRatio;
+  return wait + (Math.random() * 2 - 1) * jitter;
+}
+
+export function headersPresent(headers) {
+  const keys = new Set(Object.keys(headers || {}).map((k) => k.toLowerCase()));
+  return RATE_LIMIT_HEADERS.every((h) => keys.has(h));
+}
+
+function logHeaderlessRateLimit(path, storeHash, timestamp) {
+  console.warn(`Header-less 429 detected. path=${path} store_hash=${storeHash} at=${timestamp}`);
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  const text = await res.text();
+  const body = text ? JSON.parse(text) : {};
+  const headers = Object.fromEntries(res.headers.entries());
+  return { statusCode: res.status, headers, body };
+}
+
+function sleep(seconds) {
+  return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+}
+
+async function getWithBackoff(path, params = {}, maxRetries = MAX_RETRIES) {
+  let last = { statusCode: null, headers: {}, body: {} };
+  for (let attempt = 0; attempt &lt;= maxRetries; attempt += 1) {
+    last = await bcGet(path, params);
+    if (last.statusCode !== 429) return last;
+
+    if (!headersPresent(last.headers)) {
+      logHeaderlessRateLimit(path, STORE_HASH, Date.now());
+      if (DRY_RUN) {
+        console.log(`DRY_RUN: would back off and retry attempt=${attempt}`);
+        return last;
+      }
+    }
+
+    const waitSeconds = computeBackoffSeconds(last.statusCode, last.headers, attempt);
+    console.log(`429 on ${path}, waiting ${waitSeconds.toFixed(2)}s before retry (attempt ${attempt})`);
+    if (!DRY_RUN) await sleep(waitSeconds);
+  }
+  return last;
+}
+
+export async function run() {
+  const { statusCode, headers } = await getWithBackoff("/catalog/products", { limit: 1 });
+  console.log(`Final status=${statusCode} headers_present=${headersPresent(headers)}`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision function is the part most worth testing, because it decides whether a retry loop backs off safely or hammers an already-overloaded endpoint. Because <code>compute_backoff_seconds</code> takes only plain values and returns a plain number, the test needs no network and no BigCommerce store. It just feeds in a status code, a headers object, and an attempt number, and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_missing_headers_backoff.py</div>
+      <pre><code class="language-python">from rate_limit_backoff import compute_backoff_seconds
+
+
+def test_non_429_needs_no_backoff():
+    assert compute_backoff_seconds(200, {}, 0) == 0
+    assert compute_backoff_seconds(500, {"X-Rate-Limit-Time-Reset-Ms": "2000"}, 0) == 0
+
+
+def test_headers_present_returns_exact_reset_seconds():
+    headers = {"X-Rate-Limit-Time-Reset-Ms": "2500"}
+    assert compute_backoff_seconds(429, headers, 0) == 2.5
+
+
+def test_headers_present_is_case_insensitive():
+    headers = {"x-rate-limit-time-reset-ms": "1000"}
+    assert compute_backoff_seconds(429, headers, 0) == 1.0
+
+
+def test_headers_missing_falls_back_to_bounded_exponential_backoff():
+    wait = compute_backoff_seconds(429, {}, 3, base_seconds=1.0, max_seconds=60.0, jitter_ratio=0.2)
+    # attempt 3 -&gt; base 8s +/- 20% jitter, well under the 60s cap
+    assert 6.0 &lt;= wait &lt;= 10.0
+
+
+def test_headers_missing_backoff_is_capped():
+    wait = compute_backoff_seconds(429, {}, 20, base_seconds=1.0, max_seconds=60.0, jitter_ratio=0.2)
+    assert wait &lt;= 60.0 * 1.2
+
+
+def test_attempts_produce_monotonically_non_decreasing_backoff_up_to_cap():
+    # Compare the jitter-free midpoints across attempts, since jitter alone
+    # could make one sample noisy, but the underlying curve must not decrease.
+    previous = 0.0
+    for attempt in range(0, 8):
+        base_wait = min(1.0 * (2 ** attempt), 60.0)
+        assert base_wait &gt;= previous
+        previous = base_wait
+
+
+def test_unparseable_reset_header_falls_back_to_backoff():
+    wait = compute_backoff_seconds(429, {"X-Rate-Limit-Time-Reset-Ms": "not-a-number"}, 0)
+    assert wait &gt; 0
+
+
+def test_empty_reset_header_falls_back_to_backoff():
+    wait = compute_backoff_seconds(429, {"X-Rate-Limit-Time-Reset-Ms": ""}, 0)
+    assert wait &gt; 0</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">rate-limit-backoff.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { computeBackoffSeconds } from "./rate-limit-backoff.js";
+
+test("non-429 needs no backoff", () =&gt; {
+  assert.equal(computeBackoffSeconds(200, {}, 0), 0);
+  assert.equal(computeBackoffSeconds(500, { "X-Rate-Limit-Time-Reset-Ms": "2000" }, 0), 0);
+});
+
+test("headers present returns exact reset seconds", () =&gt; {
+  const headers = { "X-Rate-Limit-Time-Reset-Ms": "2500" };
+  assert.equal(computeBackoffSeconds(429, headers, 0), 2.5);
+});
+
+test("headers present is case insensitive", () =&gt; {
+  const headers = { "x-rate-limit-time-reset-ms": "1000" };
+  assert.equal(computeBackoffSeconds(429, headers, 0), 1.0);
+});
+
+test("headers missing falls back to bounded exponential backoff", () =&gt; {
+  const wait = computeBackoffSeconds(429, {}, 3, 1.0, 60.0, 0.2);
+  // attempt 3 -&gt; base 8s +/- 20% jitter, well under the 60s cap
+  assert.ok(wait &gt;= 6.0 &amp;&amp; wait &lt;= 10.0);
+});
+
+test("headers missing backoff is capped", () =&gt; {
+  const wait = computeBackoffSeconds(429, {}, 20, 1.0, 60.0, 0.2);
+  assert.ok(wait &lt;= 60.0 * 1.2);
+});
+
+test("attempts produce monotonically non-decreasing backoff up to cap", () =&gt; {
+  let previous = 0;
+  for (let attempt = 0; attempt &lt; 8; attempt += 1) {
+    const baseWait = Math.min(1.0 * 2 ** attempt, 60.0);
+    assert.ok(baseWait &gt;= previous);
+    previous = baseWait;
+  }
+});
+
+test("unparseable reset header falls back to backoff", () =&gt; {
+  const wait = computeBackoffSeconds(429, { "X-Rate-Limit-Time-Reset-Ms": "not-a-number" }, 0);
+  assert.ok(wait &gt; 0);
+});
+
+test("empty reset header falls back to backoff", () =&gt; {
+  const wait = computeBackoffSeconds(429, { "X-Rate-Limit-Time-Reset-Ms": "" }, 0);
+  assert.ok(wait &gt; 0);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">Flash sale traffic</span>
+      <h4>The store whose sync job crashed during a flash sale</h4>
+      <p>A store's inventory sync hit GET /v3/catalog/products every few minutes without incident for months. During a site-wide flash sale, traffic across the shared infrastructure tier spiked, and the sync job started getting 429s that had no X-Rate-Limit-Time-Reset-Ms header at all. The script's original retry code did <code>int(response.headers["X-Rate-Limit-Time-Reset-Ms"])</code> directly, so it threw a KeyError on every one of those responses and the whole job died mid-sync.</p>
+      <p>After adding the backoff helper, the same header-less 429s now fall through to the capped exponential backoff instead of crashing. The job logs each occurrence, waits progressively longer, and finishes the sync once the flash sale traffic subsides, instead of needing someone to notice the crash and restart it by hand.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Hot loop from a naive retry</span>
+      <h4>The order poller that made its own throttling worse</h4>
+      <p>An order polling script retried immediately, no wait at all, whenever it could not parse a rate limit header from the response. During normal per-store throttling, this rarely mattered because it only happened occasionally. But during a period of platform-wide load, the header-less case became the common case, and the immediate retries turned into a tight loop hitting the endpoint dozens of times a second.</p>
+      <p>The fix was not a bigger retry budget, it was recognizing that a missing header is not a special error to retry past quickly, it is a sign the wait needs to be a safe estimate instead of an exact one. The same script now backs off exponentially with jitter on every header-less 429, and the request rate during load spikes dropped back to something reasonable within a couple of retries.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this guard is in place, every 429 gets a wait before the next retry, whether the exact reset time was available or not. Normal per-store throttling waits exactly as long as BigCommerce says to. Platform-wide high-load throttling, the header-less case, waits a capped, growing, jittered amount instead of crashing or hammering the endpoint again immediately. Repeated header-less 429s on a store get logged so you can notice a pattern and report it to BigCommerce support if it keeps happening.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does a BigCommerce 429 response sometimes have no rate limit headers?</summary>
+      <p>BigCommerce normally stamps every 429 with X-Rate-Limit-Time-Window-Ms, X-Rate-Limit-Time-Reset-Ms, X-Rate-Limit-Requests-Quota, and X-Rate-Limit-Requests-Left because the per-token rate-limit accounting logic adds them. When the platform itself is under high load, excessive traffic across a store or the shared infrastructure tier, the edge or proxy layer can throttle the request before it ever reaches that accounting logic, so it returns a bare 429 with none of those headers attached.</p>
+    </details>
+    <details>
+      <summary>Is a header-less 429 a bug in my BigCommerce store or app?</summary>
+      <p>No. There is nothing to repair in your store data and no record to patch through the Management API. It is expected platform behavior under high load, and the only thing to fix is client-side retry logic so it falls back to a safe backoff instead of crashing or retrying immediately when the reset header is missing.</p>
+    </details>
+    <details>
+      <summary>What should my script do when X-Rate-Limit-Time-Reset-Ms is missing?</summary>
+      <p>Fall back to a capped exponential backoff with jitter, for example a 1 second base that doubles on each attempt, capped around 60 seconds, with roughly plus or minus 20 percent random jitter. Never retry immediately and never treat the missing header as a fatal error, since either of those makes the platform-wide overload worse.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Developer Center: API Fundamentals, rate limit headers and 429 behavior. <a href="https://developer.bigcommerce.com/docs/start/best-practices/api-rate-limits" rel="noopener">developer.bigcommerce.com api-rate-limits</a></li>
+      <li>BigCommerce Support Community: API rate limit question thread. <a href="https://support.bigcommerce.com/s/question/0D54O00007j15vlSAA/api-rate-limit?language=en_US" rel="noopener">support.bigcommerce.com api-rate-limit</a></li>
+      <li>BigCommerce Help Center: 429 Too Many Requests question thread. <a href="https://support.bigcommerce.com/s/question/0D54O00007XrFhYSAV/429-too-many-requests?language=en_US" rel="noopener">support.bigcommerce.com 429-too-many-requests</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: API Rate Limits, headers, 429 behavior, and backoff guidance. <a href="https://developer.bigcommerce.com/docs/start/best-practices/api-rate-limits" rel="noopener">developer.bigcommerce.com api-rate-limits</a></li>
+      <li>BigCommerce Resource Hub: Navigating BigCommerce's API Rate Limits Update. <a href="https://developer.bigcommerce.com/resource-hub/navigating-bigcommerces-api-rate-limits-update" rel="noopener">developer.bigcommerce.com rate-limits-update</a></li>
+      <li>BigCommerce Help Center: Platform Limits reference. <a href="https://support.bigcommerce.com/s/article/Platform-Limits?language=en_US" rel="noopener">support.bigcommerce.com platform-limits</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or rate limiting that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop a retry loop from making things worse?</h3>
+    <p>If this saved you from a hot loop or a crashed sync job during a platform load spike, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

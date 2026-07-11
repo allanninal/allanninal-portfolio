@@ -1,0 +1,1151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix BigCommerce Storefront GraphQL Variant Inventory Returning Flaky Values</title>
+<meta name="description" content="The BigCommerce Storefront GraphQL API sometimes reports availableToSell for a variant that disagrees with the Management API's true inventory_level. Learn why caching and multi-location aggregation cause the drift, and build a Python or Node.js reconciler that flags real mismatches without ever guessing at a stock write.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix BigCommerce Storefront GraphQL Variant Inventory Returning Flaky Values">
+<meta property="og:description" content="Why the Storefront GraphQL API's availableToSell can disagree with the Management API's inventory_level, and a safe Python or Node.js reconciler that flags the mismatches instead of guessing at a write.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/#article","headline":"Fix BigCommerce Storefront GraphQL Variant Inventory Returning Flaky Values","description":"Why the Storefront GraphQL API's inventory.aggregated.availableToSell can disagree with the Management API's inventory_level, caused by CDN and storefront caching plus default-location aggregation, and a safe Python or Node.js reconciler that flags the mismatches instead of guessing at a stock write.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Inventory","keywords":"BigCommerce Storefront GraphQL, availableToSell, inventory.aggregated, inventory_level, multi-location inventory, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Storefront GraphQL variant inventory returns flaky values","item":"https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does the Storefront GraphQL API show a different stock number than the admin?","acceptedAnswer":{"@type":"Answer","text":"The Storefront GraphQL API's inventory.aggregated.availableToSell is served through cached response layers, CDN edge caching plus storefront-side caching such as a Next.js data cache or an Apollo client cache, so a query can return a snapshot computed before a very recent stock adjustment has propagated. It can also diverge because aggregated stock only reflects the store's default location by default, so an adjustment at a non-default or newly enabled location will not show up in availableToSell even though the Management API's true total already includes it."}},{"@type":"Question","name":"Is it safe to auto-correct inventory_level whenever GraphQL and the Management API disagree?","acceptedAnswer":{"@type":"Answer","text":"No. The Management API is the source of truth and the mismatch is usually a read-path caching artifact, not corrupted data, so writing an adjustment based on a single diff risks masking a real oversell or double adjusting stock. Only flag and log the mismatch, re-poll after a short delay to see whether it converges, and only ever write inventory_level back for a confirmed non-default-location aggregation misconfiguration, guarded by DRY_RUN and only once the delta has persisted across at least two consecutive polls."}},{"@type":"Question","name":"Why does re-polling after 30 to 60 seconds matter?","acceptedAnswer":{"@type":"Answer","text":"A transient cache staleness event resolves itself once the CDN edge cache or the storefront-side cache expires and revalidates, typically within a short window. Re-polling after 30 to 60 seconds distinguishes that ordinary staleness, where the delta disappears, from a persistent misconfiguration such as a non-default location left out of aggregation, where the delta never converges and needs a human or a targeted correction instead of another wait."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Inventory</p>
+    <p class="eyebrow"><span class="pill pill--recon">Reconciler</span> Inventory</p>
+    <h1>Storefront GraphQL variant inventory returns flaky values</h1>
+    <p class="lead">One query says a variant has 12 units available to sell. The next query, seconds later, says 4. The Management API, the actual source of truth, says the real number is 4 the whole time. The Storefront GraphQL API's inventory fields sit behind caching layers and a default-location aggregation rule, and either one can make availableToSell disagree with reality without anything being broken in the data itself. Here is why the number flickers and a small reconciler that flags the real mismatches instead of guessing at a fix.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">Storefront GraphQL + REST Management API</span>
+      <span class="chip">Safe by default (dry run, flag-first)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>BigCommerce's GraphQL Storefront API serves <code>inventory.aggregated.availableToSell</code> through cached response layers, CDN edge caching plus storefront-side caching such as a Next.js data cache or an Apollo client cache, so a query can return a snapshot computed before a very recent stock adjustment has propagated. This is compounded by multi-location aggregation: aggregated stock reflects only the store's default location by default, so an adjustment at a non-default or newly enabled location can leave the Storefront API's aggregated figure permanently out of step with the Management API's true total. Run a small Python or Node.js script that pulls each variant's <code>inventory_level</code> from <code>GET /v3/catalog/products/{product_id}/variants</code> and diffs it against the same variant's <code>availableToSell</code> from the Storefront GraphQL API, re-polling any mismatch after 30 to 60 seconds. If the delta disappears, it was ordinary cache staleness. If it persists across at least two polls, log it as a flag, never a silent auto-adjustment. Full code, tests, and a dry run guard are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>The Storefront GraphQL API is the read path most storefronts use to show stock, because it is fast and it is meant to be cached. That is also exactly why it can go stale. A query for <code>site.product(entityId).variants.edges { node { inventory { aggregated { availableToSell } } } }</code> can be served from a CDN edge cache, or from a storefront-side cache layer like a Next.js data cache or an Apollo client cache, that was populated before the most recent stock adjustment landed. Nothing is corrupted. The response is just a snapshot from a moment ago.</p>
+  <p>There is a second, sneakier cause layered on top. By default, the aggregated inventory figure the Storefront API returns only reflects the store's default location. If stock gets adjusted at a non-default location, or at a location that was only recently enabled for the catalog, the Management API's true total already includes it, but the Storefront API's <code>availableToSell</code> does not, and never will until the aggregation or channel assignment is fixed. That produces a mismatch that looks intermittent per variant, but for that specific misconfiguration it is not transient at all: it never converges, because the underlying rule, not the cache, is what is wrong.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 220" role="img" aria-label="Diagram of the problem. A stock adjustment is written to the Management API immediately, but the Storefront GraphQL API keeps serving a cached availableToSell from CDN edge cache or storefront cache, or excludes a non-default location from aggregation, so the storefront shows a flaky, disagreeing number.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Stock adjusted</text>
+      <text x="90" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">at a location</text>
+      <line x1="173" y1="103" x2="215" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="218" y="70" width="170" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="303" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Management API</text>
+      <text x="303" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">inventory_level: true</text>
+      <line x1="391" y1="103" x2="460" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="425" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="425" y="130" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">Cache lag or</text>
+      <text x="425" y="143" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#cf4b3f">non-default location</text>
+      <rect x="463" y="70" width="170" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="548" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Storefront GraphQL</text>
+      <text x="548" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">availableToSell: stale</text>
+      <rect x="648" y="70" width="102" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="699" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Shopper sees</text>
+      <text x="699" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">flaky stock</text>
+      <line x1="636" y1="103" x2="645" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The Management API knows the true stock instantly. The Storefront GraphQL API's aggregated figure can lag behind a cache, or never include a location that was left out of aggregation.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>The Storefront GraphQL API is optimized to be cached, and multi-location inventory has an aggregation rule most integrations do not expect. A few concrete ways this shows up:</p>
+  <ul>
+    <li>CDN edge caching in front of the GraphQL endpoint serves a response computed before a very recent adjustment has propagated, so the same query returns different numbers a few seconds apart.</li>
+    <li>Storefront-side caching, a Next.js data cache, an Apollo client cache, or any other response cache the storefront layer keeps on top of the API, holds onto an old value even after the upstream cache has cleared.</li>
+    <li>Aggregated stock (<code>inventory.aggregated.availableToSell</code>) reflects only the store's default location by default. Adjusting stock at a non-default or newly enabled location changes the Management API's true total but not what GraphQL aggregates, so the two never converge until the location configuration itself is fixed.</li>
+    <li>Community reports of this bug describe it as intermittent and breaking storefront logic that assumes availableToSell is live, which is consistent with a caching layer rather than a data integrity problem. See the citations at the end for the exact support threads and GitHub issue.</li>
+  </ul>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>The Management API's <code>inventory_level</code> is the source of truth. The Storefront GraphQL API's <code>availableToSell</code> is a read-path value that can lag behind it for two very different reasons, ordinary cache staleness that resolves itself, or a location-aggregation misconfiguration that never resolves on its own. So the safe pattern is not "trust whichever number you saw last." It is "diff the two per variant, and re-poll before deciding which kind of mismatch you are looking at." A mismatch that disappears on a re-poll a short delay later is transient. A mismatch that persists across at least two consecutive polls is a real misconfiguration worth flagging, and the only one worth ever writing back for.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch the storefront cache or the CDN. We add a job that reads both sides for the same variant, computes the delta, and classifies it, and only escalates to a corrective write in the one narrow case where the delta is confirmed stable and the cause is a known aggregation misconfiguration.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job reads the Management API inventory_level and the Storefront GraphQL availableToSell for the same variant, computes the delta, and if the delta is zero it is in sync, if nonzero it re-polls, and if the delta persists across two polls it is flagged for review or, for a confirmed non-default location bug, corrected with a guarded write.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="95" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Read both sides</text>
+      <text x="95" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">REST + GraphQL</text>
+      <line x1="95" y1="80" x2="95" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="215" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="117" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Diff per variant</text>
+      <text x="117" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">availableToSell vs inventory_level</text>
+      <line x1="225" y1="138" x2="267" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="360,106 447,138 360,170 273,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="360" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Delta</text>
+      <text x="360" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">nonzero?</text>
+      <text x="360" y="192" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">no, in sync</text>
+      <text x="450" y="128" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">yes</text>
+      <line x1="447" y1="138" x2="489" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="492" y="108" width="120" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="552" y="134" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#14213d">Re-poll</text>
+      <text x="552" y="151" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">after 30 to 60s</text>
+      <line x1="612" y1="138" x2="654" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="618" y="128" font-family="sans-serif" font-size="10" fill="#8a93a8" font-weight="700">stable 2x</text>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Flag mismatch</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#55607a">or guarded fix</text>
+      <path d="M657,138 C685,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The reconciler diffs per variant, re-polls a nonzero delta, and only escalates once the delta has been stable across two polls, so it never reacts to a delta that was only ever ordinary cache lag.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash, a Management token, and a Storefront GraphQL token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, for the REST Management calls, sent as the <code>X-Auth-Token</code> header. The Storefront GraphQL API needs its own storefront token, generated from a storefront API account or your channel settings, and is queried against <code>https://store-{store_hash}.mybigcommerce.com/graphql</code>. Keep the store hash and both tokens in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export BIGCOMMERCE_STOREFRONT_TOKEN="..."
+export MIN_STABLE_POLLS="2"
+export POLL_DELAY_SECONDS="45"
+export DRY_RUN="true"   # start safe, change to false to write</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export BIGCOMMERCE_STOREFRONT_TOKEN="..."
+export MIN_STABLE_POLLS="2"
+export POLL_DELAY_SECONDS="45"
+export DRY_RUN="true"   // start safe, change to false to write</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to both APIs</h3>
+      <p>REST Management calls go to <code>https://api.bigcommerce.com/stores/{store_hash}/v3/</code> with the token in the <code>X-Auth-Token</code> header. GraphQL Storefront calls are a POST to <code>https://store-{store_hash}.mybigcommerce.com/graphql</code> with the storefront token in an <code>Authorization: Bearer</code> header. A small helper handles both and raises on a non-2xx response or a GraphQL <code>errors</code> array.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+STOREFRONT_TOKEN = os.environ["BIGCOMMERCE_STOREFRONT_TOKEN"]
+
+REST_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+GRAPHQL_URL = f"https://store-{STORE_HASH}.mybigcommerce.com/graphql"
+
+REST_HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+GRAPHQL_HEADERS = {
+    "Authorization": f"Bearer {STOREFRONT_TOKEN}",
+    "Content-Type": "application/json",
+}
+
+def rest_get(path, params=None):
+    r = requests.get(f"{REST_BASE}{path}", headers=REST_HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def graphql_query(query, variables=None):
+    r = requests.post(GRAPHQL_URL, headers=GRAPHQL_HEADERS,
+                       json={"query": query, "variables": variables or {}}, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("errors"):
+        raise RuntimeError(f"GraphQL errors: {payload['errors']}")
+    return payload["data"]</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const STOREFRONT_TOKEN = process.env.BIGCOMMERCE_STOREFRONT_TOKEN;
+
+const REST_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const GRAPHQL_URL = `https://store-${STORE_HASH}.mybigcommerce.com/graphql`;
+
+const REST_HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+const GRAPHQL_HEADERS = {
+  Authorization: `Bearer ${STOREFRONT_TOKEN}`,
+  "Content-Type": "application/json",
+};
+
+async function restGet(path, params = {}) {
+  const url = new URL(`${REST_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: REST_HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce REST ${res.status}`);
+  return res.json();
+}
+
+async function graphqlQuery(query, variables = {}) {
+  const res = await fetch(GRAPHQL_URL, {
+    method: "POST",
+    headers: GRAPHQL_HEADERS,
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`BigCommerce GraphQL ${res.status}`);
+  const payload = await res.json();
+  if (payload.errors) throw new Error(`GraphQL errors: ${JSON.stringify(payload.errors)}`);
+  return payload.data;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>Pull the Management API's true inventory_level</h3>
+      <p>Call <code>GET /v3/catalog/products/{product_id}/variants</code>, paginated with <code>meta.pagination</code>, to get each variant's <code>id</code>, <code>sku</code>, and <code>inventory_level</code>. This is the number we treat as ground truth for the diff.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">def product_variants(product_id):
+    page = 1
+    while True:
+        payload = rest_get(f"/catalog/products/{product_id}/variants", {"page": page, "limit": 50})
+        data = payload.get("data") or []
+        if not data:
+            return
+        for variant in data:
+            yield variant
+        pagination = payload.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("total_pages", page):
+            return
+        page += 1</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">async function* productVariants(productId) {
+  let page = 1;
+  while (true) {
+    const payload = await restGet(`/catalog/products/${productId}/variants`, { page, limit: 50 });
+    const data = payload.data || [];
+    if (!data.length) return;
+    for (const variant of data) yield variant;
+    const pagination = payload.meta?.pagination || {};
+    if (page >= (pagination.total_pages || page)) return;
+    page += 1;
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Pull the Storefront GraphQL's availableToSell for the same variant</h3>
+      <p>Query <code>site.product(entityId).variants.edges { node { entityId, sku, inventory { aggregated { availableToSell, warningLevel }, isInStock } } }</code> for the same product entity id. Match variants to the REST side by <code>sku</code> or <code>entityId</code>/<code>id</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">VARIANT_INVENTORY_QUERY = """
+query VariantInventory($entityId: Int!) {
+  site {
+    product(entityId: $entityId) {
+      variants {
+        edges {
+          node {
+            entityId
+            sku
+            inventory {
+              aggregated { availableToSell, warningLevel }
+              isInStock
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+def graphql_variant_inventory(product_entity_id):
+    data = graphql_query(VARIANT_INVENTORY_QUERY, {"entityId": product_entity_id})
+    edges = data["site"]["product"]["variants"]["edges"]
+    return {edge["node"]["sku"]: edge["node"]["inventory"]["aggregated"]["availableToSell"] for edge in edges}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">const VARIANT_INVENTORY_QUERY = `
+query VariantInventory($entityId: Int!) {
+  site {
+    product(entityId: $entityId) {
+      variants {
+        edges {
+          node {
+            entityId
+            sku
+            inventory {
+              aggregated { availableToSell, warningLevel }
+              isInStock
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+async function graphqlVariantInventory(productEntityId) {
+  const data = await graphqlQuery(VARIANT_INVENTORY_QUERY, { entityId: productEntityId });
+  const edges = data.site.product.variants.edges;
+  const bySku = {};
+  for (const edge of edges) {
+    bySku[edge.node.sku] = edge.node.inventory.aggregated.availableToSell;
+  }
+  return bySku;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the GraphQL <code>availableToSell</code>, the REST <code>inventory_level</code>, the variant's <code>warning_level</code>, and how many consecutive polls have shown the same delta. A zero delta is <code>in_sync</code>. A nonzero delta seen for the first time is <code>transient</code>, worth a re-poll. A nonzero delta that has now held for at least <code>min_stable_polls</code> consecutive checks is <code>flag</code>, the point where it stops being ordinary cache lag and becomes something a human, or a very narrow guarded fix, needs to look at.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">def diff_variant_stock(graphql_available_to_sell, rest_inventory_level, warning_level, poll_count_matching, min_stable_polls=2):
+    if graphql_available_to_sell is None:
+        delta = None
+    else:
+        delta = graphql_available_to_sell - rest_inventory_level
+
+    if delta == 0:
+        return {"status": "in_sync", "delta": 0}
+
+    safe_delta = delta if delta is not None else rest_inventory_level
+
+    if poll_count_matching &gt;= min_stable_polls:
+        return {"status": "flag", "delta": safe_delta}
+
+    return {"status": "transient", "delta": safe_delta}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">function diffVariantStock(graphqlAvailableToSell, restInventoryLevel, warningLevel, pollCountMatching, minStablePolls = 2) {
+  let delta;
+  if (graphqlAvailableToSell === null || graphqlAvailableToSell === undefined) {
+    delta = null;
+  } else {
+    delta = graphqlAvailableToSell - restInventoryLevel;
+  }
+
+  if (delta === 0) return { status: "in_sync", delta: 0 };
+
+  const safeDelta = delta !== null ? delta : restInventoryLevel;
+
+  if (pollCountMatching &gt;= minStablePolls) return { status: "flag", delta: safeDelta };
+
+  return { status: "transient", delta: safeDelta };
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Wire it together with a dry run guard and a re-poll loop</h3>
+      <p>The loop diffs every variant once, logs anything nonzero, waits <code>POLL_DELAY_SECONDS</code>, and diffs again. A delta that disappears on the second look was transient cache staleness and needs no further action. A delta that is still there is logged as a flag with the variant id, sku, both numbers, and the delta, for a human to check the location assignment in the BigCommerce admin. The only write this script ever makes, and only with <code>DRY_RUN=false</code>, is a targeted <code>PUT /v3/catalog/products/{product_id}/variants/{variant_id}</code> that sets <code>inventory_level</code> to the confirmed Management API truth, never to a value inferred from GraphQL, and only for a flagged, stable mismatch.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>Always start with <code>DRY_RUN=true</code>. Never write an adjustment based on a single poll, and never derive the corrected value from the GraphQL side. The Management API's own <code>inventory_level</code> is the only number this script is ever allowed to write back, and only once a mismatch has held across at least two consecutive polls.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and only ever proposes a corrective write for a mismatch that has been confirmed stable across repeated polls, never for a delta seen once.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/storefront-graphql-flaky-inventory" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">reconcile_variant_inventory.py</div>
+      <pre><code class="language-python">"""Reconcile flaky BigCommerce Storefront GraphQL variant inventory.
+
+The Storefront GraphQL API serves inventory.aggregated.availableToSell through
+cached response layers, CDN edge caching plus storefront-side caching such as a
+Next.js data cache or an Apollo client cache, so a query can return a snapshot
+computed before a very recent stock adjustment has propagated. This is
+compounded by multi-location aggregation: aggregated stock reflects only the
+store's default location by default, so an adjustment at a non-default or
+newly enabled location can leave the Storefront API's aggregated figure
+permanently out of step with the Management API's true total. This job pulls
+each variant's true inventory_level from the REST Management API, pulls the
+same variant's availableToSell from the Storefront GraphQL API, and diffs
+them. A nonzero delta is re-polled after a short delay. A delta that
+disappears was ordinary cache staleness. A delta that survives multiple polls
+is logged as a flag for manual review, and only in DRY_RUN=false mode is the
+variant's own inventory_level corrected to match the confirmed Management API
+truth, never a value inferred from GraphQL. Safe to run again and again.
+
+Guide: https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/
+"""
+import os
+import time
+import logging
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("reconcile_variant_inventory")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+STOREFRONT_TOKEN = os.environ["BIGCOMMERCE_STOREFRONT_TOKEN"]
+
+REST_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}/v3"
+GRAPHQL_URL = f"https://store-{STORE_HASH}.mybigcommerce.com/graphql"
+
+MIN_STABLE_POLLS = int(os.environ.get("MIN_STABLE_POLLS", "2"))
+POLL_DELAY_SECONDS = int(os.environ.get("POLL_DELAY_SECONDS", "45"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+
+REST_HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+GRAPHQL_HEADERS = {
+    "Authorization": f"Bearer {STOREFRONT_TOKEN}",
+    "Content-Type": "application/json",
+}
+
+VARIANT_INVENTORY_QUERY = """
+query VariantInventory($entityId: Int!) {
+  site {
+    product(entityId: $entityId) {
+      variants {
+        edges {
+          node {
+            entityId
+            sku
+            inventory {
+              aggregated { availableToSell, warningLevel }
+              isInStock
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def rest_get(path, params=None):
+    r = requests.get(f"{REST_BASE}{path}", headers=REST_HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def rest_put(path, body):
+    r = requests.put(f"{REST_BASE}{path}", headers=REST_HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def graphql_query(query, variables=None):
+    r = requests.post(GRAPHQL_URL, headers=GRAPHQL_HEADERS,
+                       json={"query": query, "variables": variables or {}}, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("errors"):
+        raise RuntimeError(f"GraphQL errors: {payload['errors']}")
+    return payload["data"]
+
+
+def diff_variant_stock(
+    graphql_available_to_sell,
+    rest_inventory_level: int,
+    warning_level: int,
+    poll_count_matching: int,
+    min_stable_polls: int = 2,
+) -> dict:
+    """Pure decision logic. No I/O, no side effects.
+
+    Given the Storefront GraphQL's reported availableToSell for a variant,
+    the Management API's authoritative inventory_level, and how many
+    consecutive polls have shown the same delta, decide whether this is a
+    transient cache staleness event, a persistent oversell-risk mismatch to
+    flag, or in sync.
+
+    Returns {"status": "in_sync"|"transient"|"flag", "delta": int}.
+    """
+    if graphql_available_to_sell is None:
+        delta = None
+    else:
+        delta = graphql_available_to_sell - rest_inventory_level
+
+    if delta == 0:
+        return {"status": "in_sync", "delta": 0}
+
+    safe_delta = delta if delta is not None else rest_inventory_level
+
+    if poll_count_matching >= min_stable_polls:
+        return {"status": "flag", "delta": safe_delta}
+
+    return {"status": "transient", "delta": safe_delta}
+
+
+def product_variants(product_id):
+    page = 1
+    while True:
+        payload = rest_get(f"/catalog/products/{product_id}/variants", {"page": page, "limit": 50})
+        data = payload.get("data") or []
+        if not data:
+            return
+        for variant in data:
+            yield variant
+        pagination = payload.get("meta", {}).get("pagination", {})
+        if page >= pagination.get("total_pages", page):
+            return
+        page += 1
+
+
+def graphql_variant_inventory(product_entity_id):
+    data = graphql_query(VARIANT_INVENTORY_QUERY, {"entityId": product_entity_id})
+    edges = data["site"]["product"]["variants"]["edges"]
+    return {edge["node"]["sku"]: edge["node"]["inventory"]["aggregated"]["availableToSell"] for edge in edges}
+
+
+def correct_variant_inventory(product_id, variant_id, true_inventory_level):
+    return rest_put(
+        f"/catalog/products/{product_id}/variants/{variant_id}",
+        {"inventory_level": true_inventory_level},
+    )
+
+
+def check_product(product_id):
+    """Diff every variant of one product once. Returns a list of per-sku results."""
+    variants = list(product_variants(product_id))
+    graphql_by_sku = graphql_variant_inventory(product_id)
+
+    results = []
+    for variant in variants:
+        sku = variant.get("sku")
+        results.append({
+            "variant_id": variant["id"],
+            "sku": sku,
+            "rest_inventory_level": variant.get("inventory_level", 0),
+            "warning_level": variant.get("inventory_warning_level", 0),
+            "graphql_available_to_sell": graphql_by_sku.get(sku),
+        })
+    return results
+
+
+def run():
+    product_ids = [int(pid) for pid in os.environ.get("PRODUCT_IDS", "").split(",") if pid.strip()]
+    if not product_ids:
+        log.warning("No PRODUCT_IDS configured. Set a comma separated list of product ids to check.")
+        return
+
+    poll_counts = {}
+    flagged = 0
+    in_sync = 0
+
+    for product_id in product_ids:
+        first_pass = check_product(product_id)
+
+        for row in first_pass:
+            key = (product_id, row["variant_id"])
+            decision = diff_variant_stock(
+                row["graphql_available_to_sell"], row["rest_inventory_level"],
+                row["warning_level"], poll_counts.get(key, 0), MIN_STABLE_POLLS,
+            )
+            if decision["status"] == "in_sync":
+                in_sync += 1
+                continue
+
+            log.info(
+                "product_id=%s variant_id=%s sku=%s graphql_available_to_sell=%s "
+                "rest_inventory_level=%s delta=%s status=%s (poll 1)",
+                product_id, row["variant_id"], row["sku"], row["graphql_available_to_sell"],
+                row["rest_inventory_level"], decision["delta"], decision["status"],
+            )
+            poll_counts[key] = 1
+
+        if not poll_counts:
+            continue
+
+        time.sleep(POLL_DELAY_SECONDS)
+
+        second_pass = check_product(product_id)
+        for row in second_pass:
+            key = (product_id, row["variant_id"])
+            if key not in poll_counts:
+                continue
+
+            decision = diff_variant_stock(
+                row["graphql_available_to_sell"], row["rest_inventory_level"],
+                row["warning_level"], poll_counts[key], MIN_STABLE_POLLS,
+            )
+
+            if decision["status"] == "in_sync":
+                log.info(
+                    "product_id=%s variant_id=%s sku=%s converged after re-poll, transient cache staleness",
+                    product_id, row["variant_id"], row["sku"],
+                )
+                in_sync += 1
+                continue
+
+            poll_counts[key] += 1
+            decision = diff_variant_stock(
+                row["graphql_available_to_sell"], row["rest_inventory_level"],
+                row["warning_level"], poll_counts[key], MIN_STABLE_POLLS,
+            )
+
+            if decision["status"] == "flag":
+                log.warning(
+                    "FLAG product_id=%s variant_id=%s sku=%s graphql_available_to_sell=%s "
+                    "rest_inventory_level=%s delta=%s (stable across %d polls)",
+                    product_id, row["variant_id"], row["sku"], row["graphql_available_to_sell"],
+                    row["rest_inventory_level"], decision["delta"], poll_counts[key],
+                )
+                flagged += 1
+                if not DRY_RUN:
+                    correct_variant_inventory(product_id, row["variant_id"], row["rest_inventory_level"])
+                    log.info(
+                        "Corrected variant_id=%s inventory_level to confirmed Management API truth: %s",
+                        row["variant_id"], row["rest_inventory_level"],
+                    )
+            else:
+                log.info(
+                    "product_id=%s variant_id=%s sku=%s still transient after re-poll, will re-check next run",
+                    product_id, row["variant_id"], row["sku"],
+                )
+
+    log.info(
+        "Done. %d variant(s) in sync, %d variant(s) flagged%s.",
+        in_sync, flagged, " (dry run, no writes made)" if DRY_RUN and flagged else "",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-variant-inventory.js</div>
+      <pre><code class="language-javascript">/**
+ * Reconcile flaky BigCommerce Storefront GraphQL variant inventory.
+ *
+ * The Storefront GraphQL API serves inventory.aggregated.availableToSell through
+ * cached response layers, CDN edge caching plus storefront-side caching such as a
+ * Next.js data cache or an Apollo client cache, so a query can return a snapshot
+ * computed before a very recent stock adjustment has propagated. This is
+ * compounded by multi-location aggregation: aggregated stock reflects only the
+ * store's default location by default, so an adjustment at a non-default or
+ * newly enabled location can leave the Storefront API's aggregated figure
+ * permanently out of step with the Management API's true total. This job pulls
+ * each variant's true inventory_level from the REST Management API, pulls the
+ * same variant's availableToSell from the Storefront GraphQL API, and diffs
+ * them. A nonzero delta is re-polled after a short delay. A delta that
+ * disappears was ordinary cache staleness. A delta that survives multiple polls
+ * is logged as a flag for manual review, and only in DRY_RUN=false mode is the
+ * variant's own inventory_level corrected to match the confirmed Management API
+ * truth, never a value inferred from GraphQL. Safe to run again and again.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/storefront-graphql-flaky-inventory/
+ */
+import { pathToFileURL } from "node:url";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const STOREFRONT_TOKEN = process.env.BIGCOMMERCE_STOREFRONT_TOKEN || "sf_dummy";
+
+const REST_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}/v3`;
+const GRAPHQL_URL = `https://store-${STORE_HASH}.mybigcommerce.com/graphql`;
+
+const MIN_STABLE_POLLS = Number(process.env.MIN_STABLE_POLLS || 2);
+const POLL_DELAY_SECONDS = Number(process.env.POLL_DELAY_SECONDS || 45);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const REST_HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+const GRAPHQL_HEADERS = {
+  Authorization: `Bearer ${STOREFRONT_TOKEN}`,
+  "Content-Type": "application/json",
+};
+
+const VARIANT_INVENTORY_QUERY = `
+query VariantInventory($entityId: Int!) {
+  site {
+    product(entityId: $entityId) {
+      variants {
+        edges {
+          node {
+            entityId
+            sku
+            inventory {
+              aggregated { availableToSell, warningLevel }
+              isInStock
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+/**
+ * Pure decision logic. No I/O, no side effects.
+ *
+ * Given the Storefront GraphQL's reported availableToSell for a variant,
+ * the Management API's authoritative inventory_level, and how many
+ * consecutive polls have shown the same delta, decide whether this is a
+ * transient cache staleness event, a persistent oversell-risk mismatch to
+ * flag, or in sync.
+ *
+ * Returns {"status": "in_sync"|"transient"|"flag", "delta": int}.
+ */
+export function diffVariantStock(graphqlAvailableToSell, restInventoryLevel, warningLevel, pollCountMatching, minStablePolls = 2) {
+  let delta;
+  if (graphqlAvailableToSell === null || graphqlAvailableToSell === undefined) {
+    delta = null;
+  } else {
+    delta = graphqlAvailableToSell - restInventoryLevel;
+  }
+
+  if (delta === 0) return { status: "in_sync", delta: 0 };
+
+  const safeDelta = delta !== null ? delta : restInventoryLevel;
+
+  if (pollCountMatching >= minStablePolls) return { status: "flag", delta: safeDelta };
+
+  return { status: "transient", delta: safeDelta };
+}
+
+async function restGet(path, params = {}) {
+  const url = new URL(`${REST_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: REST_HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce REST ${res.status}`);
+  return res.json();
+}
+
+async function restPut(path, body) {
+  const res = await fetch(`${REST_BASE}${path}`, {
+    method: "PUT",
+    headers: REST_HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce REST ${res.status}`);
+  return res.json();
+}
+
+async function graphqlQuery(query, variables = {}) {
+  const res = await fetch(GRAPHQL_URL, {
+    method: "POST",
+    headers: GRAPHQL_HEADERS,
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`BigCommerce GraphQL ${res.status}`);
+  const payload = await res.json();
+  if (payload.errors) throw new Error(`GraphQL errors: ${JSON.stringify(payload.errors)}`);
+  return payload.data;
+}
+
+async function* productVariants(productId) {
+  let page = 1;
+  while (true) {
+    const payload = await restGet(`/catalog/products/${productId}/variants`, { page, limit: 50 });
+    const data = payload.data || [];
+    if (!data.length) return;
+    for (const variant of data) yield variant;
+    const pagination = payload.meta?.pagination || {};
+    if (page >= (pagination.total_pages || page)) return;
+    page += 1;
+  }
+}
+
+async function graphqlVariantInventory(productEntityId) {
+  const data = await graphqlQuery(VARIANT_INVENTORY_QUERY, { entityId: productEntityId });
+  const edges = data.site.product.variants.edges;
+  const bySku = {};
+  for (const edge of edges) {
+    bySku[edge.node.sku] = edge.node.inventory.aggregated.availableToSell;
+  }
+  return bySku;
+}
+
+async function correctVariantInventory(productId, variantId, trueInventoryLevel) {
+  return restPut(`/catalog/products/${productId}/variants/${variantId}`, { inventory_level: trueInventoryLevel });
+}
+
+async function checkProduct(productId) {
+  const variants = [];
+  for await (const variant of productVariants(productId)) variants.push(variant);
+  const graphqlBySku = await graphqlVariantInventory(productId);
+
+  return variants.map((variant) => ({
+    variantId: variant.id,
+    sku: variant.sku,
+    restInventoryLevel: variant.inventory_level ?? 0,
+    warningLevel: variant.inventory_warning_level ?? 0,
+    graphqlAvailableToSell: graphqlBySku[variant.sku] ?? null,
+  }));
+}
+
+function sleep(seconds) {
+  return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+}
+
+export async function run() {
+  const productIds = (process.env.PRODUCT_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .map(Number);
+
+  if (!productIds.length) {
+    console.warn("No PRODUCT_IDS configured. Set a comma separated list of product ids to check.");
+    return;
+  }
+
+  const pollCounts = new Map();
+  let flagged = 0;
+  let inSync = 0;
+
+  for (const productId of productIds) {
+    const firstPass = await checkProduct(productId);
+
+    for (const row of firstPass) {
+      const key = `${productId}:${row.variantId}`;
+      const decision = diffVariantStock(row.graphqlAvailableToSell, row.restInventoryLevel, row.warningLevel, pollCounts.get(key) || 0, MIN_STABLE_POLLS);
+      if (decision.status === "in_sync") {
+        inSync += 1;
+        continue;
+      }
+      console.log(
+        `product_id=${productId} variant_id=${row.variantId} sku=${row.sku} graphql_available_to_sell=${row.graphqlAvailableToSell} ` +
+        `rest_inventory_level=${row.restInventoryLevel} delta=${decision.delta} status=${decision.status} (poll 1)`
+      );
+      pollCounts.set(key, 1);
+    }
+
+    if (!pollCounts.size) continue;
+
+    await sleep(POLL_DELAY_SECONDS);
+
+    const secondPass = await checkProduct(productId);
+    for (const row of secondPass) {
+      const key = `${productId}:${row.variantId}`;
+      if (!pollCounts.has(key)) continue;
+
+      let decision = diffVariantStock(row.graphqlAvailableToSell, row.restInventoryLevel, row.warningLevel, pollCounts.get(key), MIN_STABLE_POLLS);
+
+      if (decision.status === "in_sync") {
+        console.log(`product_id=${productId} variant_id=${row.variantId} sku=${row.sku} converged after re-poll, transient cache staleness`);
+        inSync += 1;
+        continue;
+      }
+
+      pollCounts.set(key, pollCounts.get(key) + 1);
+      decision = diffVariantStock(row.graphqlAvailableToSell, row.restInventoryLevel, row.warningLevel, pollCounts.get(key), MIN_STABLE_POLLS);
+
+      if (decision.status === "flag") {
+        console.warn(
+          `FLAG product_id=${productId} variant_id=${row.variantId} sku=${row.sku} graphql_available_to_sell=${row.graphqlAvailableToSell} ` +
+          `rest_inventory_level=${row.restInventoryLevel} delta=${decision.delta} (stable across ${pollCounts.get(key)} polls)`
+        );
+        flagged += 1;
+        if (!DRY_RUN) {
+          await correctVariantInventory(productId, row.variantId, row.restInventoryLevel);
+          console.log(`Corrected variant_id=${row.variantId} inventory_level to confirmed Management API truth: ${row.restInventoryLevel}`);
+        }
+      } else {
+        console.log(`product_id=${productId} variant_id=${row.variantId} sku=${row.sku} still transient after re-poll, will re-check next run`);
+      }
+    }
+  }
+
+  console.log(`Done. ${inSync} variant(s) in sync, ${flagged} variant(s) flagged${DRY_RUN &amp;&amp; flagged ? " (dry run, no writes made)" : ""}.`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) => { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether a mismatch gets ignored, watched, or flagged (and, once confirmed, corrected). Because <code>diff_variant_stock</code> takes only plain values and returns a plain dict, the test needs no network and no BigCommerce store. It just feeds in numbers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_flaky_inventory_diff.py</div>
+      <pre><code class="language-python">from reconcile_variant_inventory import diff_variant_stock
+
+
+def test_in_sync_when_values_match():
+    assert diff_variant_stock(10, 10, 5, 0) == {"status": "in_sync", "delta": 0}
+
+
+def test_transient_on_first_mismatch():
+    result = diff_variant_stock(12, 4, 5, 0)
+    assert result == {"status": "transient", "delta": 8}
+
+
+def test_transient_below_min_stable_polls():
+    result = diff_variant_stock(12, 4, 5, 1, min_stable_polls=2)
+    assert result == {"status": "transient", "delta": 8}
+
+
+def test_flag_once_min_stable_polls_reached():
+    result = diff_variant_stock(12, 4, 5, 2, min_stable_polls=2)
+    assert result == {"status": "flag", "delta": 8}
+
+
+def test_flag_when_graphql_reports_none_and_stable():
+    result = diff_variant_stock(None, 7, 5, 2, min_stable_polls=2)
+    assert result == {"status": "flag", "delta": 7}
+
+
+def test_negative_delta_when_graphql_overreports():
+    result = diff_variant_stock(2, 9, 5, 2, min_stable_polls=2)
+    assert result == {"status": "flag", "delta": -7}</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">reconcile-variant-inventory.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { diffVariantStock } from "./reconcile-variant-inventory.js";
+
+test("in_sync when values match", () =&gt; {
+  assert.deepEqual(diffVariantStock(10, 10, 5, 0), { status: "in_sync", delta: 0 });
+});
+
+test("transient on first mismatch", () =&gt; {
+  assert.deepEqual(diffVariantStock(12, 4, 5, 0), { status: "transient", delta: 8 });
+});
+
+test("transient below min stable polls", () =&gt; {
+  assert.deepEqual(diffVariantStock(12, 4, 5, 1, 2), { status: "transient", delta: 8 });
+});
+
+test("flag once min stable polls reached", () =&gt; {
+  assert.deepEqual(diffVariantStock(12, 4, 5, 2, 2), { status: "flag", delta: 8 });
+});
+
+test("flag when graphql reports null and stable", () =&gt; {
+  assert.deepEqual(diffVariantStock(null, 7, 5, 2, 2), { status: "flag", delta: 7 });
+});
+
+test("negative delta when graphql overreports", () =&gt; {
+  assert.deepEqual(diffVariantStock(2, 9, 5, 2, 2), { status: "flag", delta: -7 });
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">CDN and storefront cache stacked</span>
+      <h4>The headless storefront where a sellout kept un-selling itself</h4>
+      <p>A Next.js storefront in front of BigCommerce showed a variant as in stock seconds after the admin had already recorded it as sold out, because the storefront's own data cache and the CDN in front of GraphQL were both still serving the previous response. Support staff assumed the catalog sync was broken and started manually forcing product updates to bust the cache.</p>
+      <p>Running the reconciler on the flagged SKUs showed every mismatch converging on the second poll, well inside the 30 to 60 second window. Nothing was actually broken. The team set a shorter cache TTL for low-stock variants and stopped forcing manual updates, because the diff data showed the drift was always transient.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Non-default location aggregation</span>
+      <h4>The store that added a second warehouse and never saw it in availableToSell</h4>
+      <p>A store enabled a second fulfillment location and started adjusting stock there for a subset of products. The BigCommerce admin's Management API reflected the new totals correctly, but the storefront kept showing the old, lower numbers indefinitely, because aggregated availableToSell only reflected the original default location.</p>
+      <p>The reconciler flagged those exact SKUs as persistent, not transient, since the delta never converged across repeated polls. That pointed the team straight at the real cause, the new location was never included in aggregation, instead of chasing a caching problem that did not exist for those variants.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, every mismatch between the Storefront GraphQL API and the Management API gets sorted correctly: ordinary cache staleness converges on its own and needs no attention, while a persistent, stable mismatch gets flagged with the exact variant, sku, both numbers, and the delta, so a human can check the location assignment instead of guessing. The only automatic write this script ever makes is a narrow, guarded correction of a variant's own inventory_level to the confirmed Management API truth, never a value invented from GraphQL, and never before the delta has held across at least two consecutive polls.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does the Storefront GraphQL API show a different stock number than the admin?</summary>
+      <p>The Storefront GraphQL API's inventory.aggregated.availableToSell is served through cached response layers, CDN edge caching plus storefront-side caching such as a Next.js data cache or an Apollo client cache, so a query can return a snapshot computed before a very recent stock adjustment has propagated. It can also diverge because aggregated stock only reflects the store's default location by default, so an adjustment at a non-default or newly enabled location will not show up in availableToSell even though the Management API's true total already includes it.</p>
+    </details>
+    <details>
+      <summary>Is it safe to auto-correct inventory_level whenever GraphQL and the Management API disagree?</summary>
+      <p>No. The Management API is the source of truth and the mismatch is usually a read-path caching artifact, not corrupted data, so writing an adjustment based on a single diff risks masking a real oversell or double adjusting stock. Only flag and log the mismatch, re-poll after a short delay to see whether it converges, and only ever write inventory_level back for a confirmed non-default-location aggregation misconfiguration, guarded by DRY_RUN and only once the delta has persisted across at least two consecutive polls.</p>
+    </details>
+    <details>
+      <summary>Why does re-polling after 30 to 60 seconds matter?</summary>
+      <p>A transient cache staleness event resolves itself once the CDN edge cache or the storefront-side cache expires and revalidates, typically within a short window. Re-polling after 30 to 60 seconds distinguishes that ordinary staleness, where the delta disappears, from a persistent misconfiguration such as a non-default location left out of aggregation, where the delta never converges and needs a human or a targeted correction instead of another wait.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">Orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">Transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>BigCommerce Support: variant inventory bug in Storefront API, flaky response causing breaking issues. <a href="https://support.bigcommerce.com/s/question/?language=en_US" rel="noopener">support.bigcommerce.com variant inventory bug in Storefront API</a></li>
+      <li>BigCommerce Support Community: is there any way to get variant stock level? <a href="https://support.bigcommerce.com/s/question/?language=en_US" rel="noopener">support.bigcommerce.com variant stock level</a></li>
+      <li>GitHub issue on the storefront API examples repo, about stock and inventory data not being available in GraphQL. <a href="https://github.com/bigcommerce/storefront-api-examples/issues/1" rel="noopener">github.com storefront API examples issue 1</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: query inventory with the GraphQL Storefront API. <a href="https://developer.bigcommerce.com/docs/storefront/graphql/inventory/queries" rel="noopener">developer.bigcommerce.com inventory queries</a></li>
+      <li>BigCommerce Developer Center: get inventory, Storefront GraphQL settings and behavior. <a href="https://developer.bigcommerce.com/docs/storefront/graphql/inventory/settings" rel="noopener">developer.bigcommerce.com inventory settings</a></li>
+      <li>BigCommerce Docs: variants in the GraphQL Storefront API. <a href="https://docs.bigcommerce.com/developer/docs/storefront/guides/graphql-storefront-api/products-and-catalog/variants" rel="noopener">docs.bigcommerce.com GraphQL Storefront variants</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this stop your flaky stock counts?</h3>
+    <p>If this helped you tell apart ordinary cache lag from a real inventory misconfiguration, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>

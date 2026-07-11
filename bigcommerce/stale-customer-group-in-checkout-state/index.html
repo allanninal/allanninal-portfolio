@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fix Stale Customer Group Cached in BigCommerce Checkout State</title>
+<meta name="description" content="A BigCommerce shopper's customer group changes mid session, but checkout-sdk-js cached the old group id and the order gets priced against a stale Price List. Learn why the cache never refreshes and build a Python or Node.js script that finds and flags mispriced orders.">
+<link rel="canonical" href="https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Niñal">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Fix Stale Customer Group Cached in BigCommerce Checkout State">
+<meta property="og:description" content="Why checkout-sdk-js can keep pricing a BigCommerce order against a shopper's old customer group after a mid session group change, and a safe Python or Node.js script that flags the orders it actually happened to.">
+<meta property="og:url" content="https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/bigcommerce/assets/bigcommerce.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/#article","headline":"Fix Stale Customer Group Cached in BigCommerce Checkout State","description":"BigCommerce's checkout-sdk-js reads a shopper's customer_group_id once and caches it in memory. If the group changes mid session, the SDK's state merge does not reliably overwrite it, so checkout can resolve Price List pricing against the old group and the order gets charged the wrong price.","datePublished":"2026-07-10","dateModified":"2026-07-10","author":{"@type":"Person","name":"Allan Niñal","url":"https://www.allanninal.dev/"},"publisher":{"@type":"Person","name":"Allan Niñal"},"mainEntityOfPage":"https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/","image":"https://www.allanninal.dev/og-image.png","articleSection":"Checkout / Carts","keywords":"BigCommerce checkout-sdk-js, stale customerGroup, customer_group_id, Price Lists, checkoutState, Python, Node.js","speakable":{"@type":"SpeakableSpecification","cssSelector":[".lead","#short-answer"]}},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/bigcommerce/"},{"@type":"ListItem","position":2,"name":"Stale customer group cached in checkout state after a mid session change","item":"https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/"}]},{"@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Why does BigCommerce checkout price an order using the shopper's old customer group?","acceptedAnswer":{"@type":"Answer","text":"checkout-sdk-js reads the customer's group id once when checkout state initializes and caches it in the in-memory checkoutState.data customer object. If the group changes mid session, for example an admin moves the shopper to a new group or a B2B company role change fires, the SDK's state-merge logic does not reliably overwrite the cached value, documented as checkout-sdk-js issue #1321. Price List pricing is resolved against that stale cached group instead of being re-fetched at price-calculation or order-submit time, so the shopper can check out priced under a group they are no longer in."}},{"@type":"Question","name":"Can a script safely fix orders that were mispriced this way?","acceptedAnswer":{"@type":"Answer","text":"No, not automatically. The order is already placed and paid, so a script cannot know whether the merchant wants to honor the lower price, collect the difference, refund it, or void the order. The safe approach is flag and report only: write the mismatched order ids to a review queue or a staff-only order note, guarded by a DRY_RUN flag, and leave any price adjustment, refund, or status change to a human."}},{"@type":"Question","name":"How do you tell which customer group actually priced an order after the fact?","acceptedAnswer":{"@type":"Answer","text":"Pull the order's charged unit prices from GET /v2/orders/{id}/products, then read the customer's CURRENT customer_group_id from GET /v2/customers/{id}, since customer groups are a V2-only resource. Resolve that current group's active price list with GET /v3/pricelists/assignments, then compare its per-variant records from GET /v3/pricelists/{price_list_id}/records against what was actually charged. When the charged price does not reconcile with the current group's price list but matches a different group's records, checkout priced against a stale cached group."}}]}]}</script>
+</head>
+<body>
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="/bigcommerce/">
+      <span class="brand__mark"></span>
+      <span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / bigcommerce</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a class="opt" href="/">Portfolio</a>
+      <a class="opt" href="/woocommerce/">WooCommerce</a>
+      <a class="opt" href="/shopify/">Shopify</a>
+      <a class="opt" href="/bigcommerce/">BigCommerce</a>
+      <a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="container prose">
+    <p class="breadcrumbs"><a href="/bigcommerce/">Field notes</a> / Checkout / Carts</p>
+    <p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Checkout / Carts</p>
+    <h1>Stale customer group cached in checkout state after a mid session change</h1>
+    <p class="lead">An admin moves a shopper into a new customer group, or a B2B company role change fires, in the middle of their session. Checkout does not notice. BigCommerce's checkout-sdk-js caches the customer's group id once when checkout state initializes, and its state-merge logic does not reliably overwrite that cached value when a fresher one arrives. Since group pricing is resolved through Price Lists tied to a customer_group_id, the shopper can complete checkout priced under their old, stale group instead of the one they actually belong to now. Here is why the cache goes stale and a script that finds the orders it actually happened to.</p>
+    <div class="meta">
+      <span class="chip">Python and Node.js</span>
+      <span class="chip">BigCommerce V2 Orders + V3 Price Lists</span>
+      <span class="chip">Flag only (no auto price change)</span>
+    </div>
+  </div>
+</section>
+
+<div class="container prose">
+
+  <div class="callout callout--note" id="short-answer">
+    <div class="callout__title">The short answer</div>
+    <p>checkout-sdk-js reads the customer's group id once when checkout state initializes and caches it in the in-memory <code>checkoutState.data</code> customer object. If <code>customer_group_id</code> changes mid session, the SDK's state merge leaves the previous group in place because the incoming value is <code>undefined</code> during the merge, an issue tracked upstream as checkout-sdk-js issue #1321. Price List pricing then resolves against that stale cached group rather than being re-fetched at price-calculation or order-submit time, so the order gets charged under the wrong group. You cannot detect this from the order alone. Pull each order's charged unit prices, look up the customer's current group, resolve that group's active price list, and diff the two. Run a small Python or Node.js script that does exactly that and writes a flagged list, DRY_RUN by default, never auto-adjusting a placed order. Full code, tests, and citations are below.</p>
+  </div>
+
+  <h2>The problem in plain words</h2>
+  <p>Customer-group pricing in BigCommerce works by assigning a Price List to a <code>customer_group_id</code>. When a shopper's group changes, for example a merchant moves a wholesale account into a new tier, or a B2B company role change reassigns them automatically, the storefront is supposed to reprice against the new group's Price List going forward.</p>
+  <p>Checkout does not read the group fresh at every step. checkout-sdk-js initializes checkout state once and caches the customer object, including the group id, in memory for the rest of the session. If the group changes after that point, the state-merge code that is supposed to bring in the updated value does not reliably do so, because the incoming group field can arrive as <code>undefined</code> during the merge and the merge keeps whatever was already cached instead of clearing it. The shopper's cart still shows prices resolved against the group id checkout initialized with, not the one their account currently has. They complete the order, pay, and the order is booked at the stale group's price.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 210" role="img" aria-label="Diagram of the problem. Checkout initializes and caches the customer's group id. The customer's group changes mid session. The state merge does not overwrite the cached group because the incoming value is undefined. Checkout still resolves Price List pricing against the stale cached group, and the order is booked at the wrong price.">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#8a93a8"></path></marker>
+        <marker id="ahr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"></path></marker>
+      </defs>
+      <rect x="10" y="70" width="155" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="87" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Checkout inits</text>
+      <text x="87" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">caches group id</text>
+      <line x1="168" y1="103" x2="210" y2="103" stroke="#8a93a8" stroke-width="2" marker-end="url(#ah)"></line>
+      <rect x="213" y="70" width="160" height="66" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="293" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#14213d">Group changes</text>
+      <text x="293" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">admin or B2B role</text>
+      <line x1="376" y1="103" x2="445" y2="103" stroke="#cf4b3f" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ahr)"></line>
+      <text x="410" y="60" text-anchor="middle" font-family="sans-serif" font-size="22" font-weight="800" fill="#cf4b3f">&#10005;</text>
+      <text x="410" y="130" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#cf4b3f">Merge keeps stale id</text>
+      <rect x="448" y="70" width="160" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="528" y="98" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#cf4b3f">Stale group</text>
+      <text x="528" y="116" text-anchor="middle" font-family="sans-serif" font-size="11.5" fill="#55607a">still cached</text>
+      <rect x="633" y="70" width="117" height="66" rx="10" fill="#fbeeec" stroke="#cf4b3f"></rect>
+      <text x="691" y="94" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">Order booked</text>
+      <text x="691" y="112" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#cf4b3f">at wrong price</text>
+      <line x1="611" y1="103" x2="630" y2="103" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ahr)"></line>
+    </svg>
+    <figcaption>The cached customer group in checkout state never gets refreshed after it changes, so Price List pricing resolves against the wrong group all the way to order submit.</figcaption>
+  </figure>
+
+  <h2>Why it happens</h2>
+  <p>A few conditions line up to make this reachable in production:</p>
+  <ul>
+    <li>checkout-sdk-js reads <code>customer_group_id</code> once, when checkout state is first initialized, and stores it in the in-memory <code>checkoutState.data</code> customer object for the rest of the session.</li>
+    <li>The SDK's state-merge logic does not reliably overwrite that cached value with a fresher one, because the incoming customer group field can be <code>undefined</code> during the merge, which is documented upstream as checkout-sdk-js issue #1321, "Stale customerGroup in checkoutState."</li>
+    <li>Customer-group pricing is resolved through Price Lists assigned to a <code>customer_group_id</code>, and that resolution happens against the cached session group, not re-fetched at price-calculation or order-submit time.</li>
+    <li>A shopper's group can change mid session for entirely legitimate reasons: an admin manually moves them to a new group, a B2B company-role change fires an automated reassignment, or a scheduled group-sync job runs while they already have a cart open.</li>
+    <li>Related SDK issues (missing group name and id on the customer object, and confusion over how to reliably read the group across the checkout-js UI) point at the same underlying gap: the group on checkout's customer object is not treated as something that can change while checkout is open.</li>
+  </ul>
+  <p>None of this shows up as an error. The order completes, payment succeeds, and everything looks normal until someone compares what was charged against what the customer's current group should have produced.</p>
+
+  <div class="callout callout--note">
+    <div class="callout__title">The key insight</div>
+    <p>You cannot detect this by looking at the order alone, because the order does not record which group priced it, only the unit prices that were actually charged. You have to reconstruct the group after the fact: read the order's charged prices, look up the customer's current group, resolve that current group's active Price List, and diff the two. When the charged price does not reconcile with the current group's price list, but does reconcile with a different group's, that mismatch is the fingerprint of a stale cached group at checkout time.</p>
+  </div>
+
+  <h2>The fix, as a flow</h2>
+  <p>We do not touch checkout-sdk-js or the live checkout flow. We add a reconciliation job that walks recent orders, resolves what the customer's current group should have charged, and flags the ones that do not match, for a human to review and decide what to do about the already-placed order.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 760 250" role="img" aria-label="Diagram of the solution. A job lists recent orders, reads each order's charged unit prices, reads the customer's current group id, resolves that group's price list records, and compares. If the charged price matches a different group's price list and differs from the current group's price beyond tolerance, the order is flagged for review, otherwise no action is taken.">
+      <defs><marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3466e0"></path></marker></defs>
+      <rect x="10" y="20" width="160" height="60" rx="10" fill="#ecf1fd" stroke="#bcccf2"></rect>
+      <text x="90" y="46" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Scheduled job</text>
+      <text x="90" y="63" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">runs on a timer</text>
+      <line x1="90" y1="80" x2="90" y2="106" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="10" y="108" width="205" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="112" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">List recent orders</text>
+      <text x="112" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">charged unit prices</text>
+      <line x1="215" y1="138" x2="257" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <rect x="260" y="108" width="180" height="60" rx="10" fill="#fff" stroke="#bcccf2"></rect>
+      <text x="350" y="134" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#14213d">Resolve current group</text>
+      <text x="350" y="151" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55607a">price list records</text>
+      <line x1="440" y1="138" x2="482" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <polygon points="575,106 662,138 575,170 488,138" fill="#ecf1fd" stroke="#bcccf2"></polygon>
+      <text x="575" y="133" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">Groups diverge</text>
+      <text x="575" y="148" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#14213d">and price differs?</text>
+      <text x="665" y="128" font-family="sans-serif" font-size="10.5" fill="#4c9a2a" font-weight="700">yes</text>
+      <line x1="662" y1="138" x2="690" y2="138" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></line>
+      <text x="583" y="198" font-family="sans-serif" font-size="10.5" fill="#8a93a8" font-weight="700">no, leave alone</text>
+      <line x1="575" y1="170" x2="575" y2="205" stroke="#8a93a8" stroke-width="1.6" stroke-dasharray="5 4"></line>
+      <rect x="618" y="185" width="132" height="55" rx="10" fill="#eef6e8" stroke="#4c9a2a"></rect>
+      <text x="684" y="208" text-anchor="middle" font-family="sans-serif" font-size="12" font-weight="700" fill="#4c9a2a">Flag for review</text>
+      <text x="684" y="225" text-anchor="middle" font-family="sans-serif" font-size="10.5" fill="#55607a">CSV or staff note</text>
+      <path d="M690,138 C710,138 684,150 684,183" fill="none" stroke="#3466e0" stroke-width="2" marker-end="url(#ah2)"></path>
+    </svg>
+    <figcaption>The job only flags an order when the customer's current group and the group that actually priced the order diverge, and that divergence produced a real price difference. It never adjusts the order itself.</figcaption>
+  </figure>
+
+  <h2>Build it step by step</h2>
+
+  <div class="step">
+    <div class="step__n">1</div>
+    <div>
+      <h3>Get a store hash and an API access token</h3>
+      <p>Create an API account in your BigCommerce control panel under Settings, API, or use the store's existing app credentials. Grant it Orders (read) and Customers (read) scope, plus access to Price Lists, so it can pull order line items, the customer's current group, and price list records. You need the store hash from your control panel URL and the access token, sent on every call as the <code>X-Auth-Token</code> header. Keep both in environment variables, never in the file.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-python">pip install requests
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="14"
+export CHANNEL_ID="1"
+export DRY_RUN="true"   # start safe, change to false to write staff notes</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">setup (shell)</div>
+      <pre><code class="language-javascript">// Node 18+ has fetch built in, no dependencies needed
+
+export BIGCOMMERCE_STORE_HASH="abc123"
+export BIGCOMMERCE_ACCESS_TOKEN="..."
+export LOOKBACK_DAYS="14"
+export CHANNEL_ID="1"
+export DRY_RUN="true"   // start safe, change to false to write staff notes</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">2</div>
+    <div>
+      <h3>Talk to the V2 Orders and V2 Customers REST APIs, and V3 Price Lists</h3>
+      <p>Orders and order line items are V2-only (<code>/v2/orders</code>, <code>/v2/orders/{id}/products</code>). Customer groups are also V2-only, customer group id is not exposed on <code>/v3/customers</code>, so the current group must come from <code>GET /v2/customers/{id}</code>. Price List assignment and records are V3 (<code>/v3/pricelists/assignments</code>, <code>/v3/pricelists/{id}/records</code>), which wraps responses in <code>{data, meta.pagination}</code>. One small helper handles GET and PUT for both API versions and raises on a non-2xx response.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step2.py</div>
+      <pre><code class="language-python">import os, requests
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else []
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step2.js</div>
+      <pre><code class="language-javascript">const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH;
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN;
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, { method: "PUT", headers: HEADERS, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">3</div>
+    <div>
+      <h3>List recent orders and pull the charged unit prices</h3>
+      <p>Call <code>GET /v2/orders?min_date_created=...&amp;status_id:in=0,7,9,11,1,10</code>, paginated, excluding status_id 5 (Cancelled) and 6 (Declined), to get candidate orders in your lookback window. For each order, call <code>GET /v2/orders/{id}/products</code> to read the unit prices actually charged per line item.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step3.py</div>
+      <pre><code class="language-python">RELEVANT_STATUS_IDS = "0,7,9,11,1,10"  # excludes 5 Cancelled and 6 Declined
+
+def candidate_orders(lookback_days):
+    page = 1
+    while True:
+        orders = bc_get("/v2/orders", {
+            "min_date_created": f"-{lookback_days} days",
+            "status_id:in": RELEVANT_STATUS_IDS,
+            "page": page,
+            "limit": 50,
+        })
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+def order_line_prices(order_id):
+    return bc_get(f"/v2/orders/{order_id}/products")</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step3.js</div>
+      <pre><code class="language-javascript">const RELEVANT_STATUS_IDS = "0,7,9,11,1,10"; // excludes 5 Cancelled and 6 Declined
+
+async function* candidateOrders(lookbackDays) {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet("/v2/orders", {
+      min_date_created: `-${lookbackDays} days`,
+      "status_id:in": RELEVANT_STATUS_IDS,
+      page,
+      limit: 50,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderLinePrices(orderId) {
+  return bcGet(`/v2/orders/${orderId}/products`);
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">4</div>
+    <div>
+      <h3>Resolve the customer's current group and its price list</h3>
+      <p>For each distinct <code>customer_id</code> on those orders, call <code>GET /v2/customers/{id}</code> to read the CURRENT <code>customer_group_id</code>. Customer groups are a V2-only resource, <code>/v3/customers</code> does not expose group id. Then call <code>GET /v3/pricelists/assignments?customer_group_id={current_group_id}&amp;channel_id={channel}</code> to get the active <code>price_list_id</code> for that group, and <code>GET /v3/pricelists/{price_list_id}/records?variant_id:in={ids}</code> to get what that group's price list would charge for the same variants on the order.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">step4.py</div>
+      <pre><code class="language-python">def current_customer_group_id(customer_id):
+    customer = bc_get(f"/v2/customers/{customer_id}")
+    if isinstance(customer, list):
+        customer = customer[0] if customer else {}
+    return customer.get("customer_group_id")
+
+def active_price_list_id(customer_group_id, channel_id):
+    resp = bc_get("/v3/pricelists/assignments", {
+        "customer_group_id": customer_group_id,
+        "channel_id": channel_id,
+    })
+    assignments = resp.get("data", [])
+    return assignments[0]["price_list_id"] if assignments else None
+
+def price_list_records(price_list_id, variant_ids):
+    resp = bc_get(f"/v3/pricelists/{price_list_id}/records", {
+        "variant_id:in": ",".join(str(v) for v in variant_ids),
+    })
+    return resp.get("data", [])</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">step4.js</div>
+      <pre><code class="language-javascript">async function currentCustomerGroupId(customerId) {
+  let customer = await bcGet(`/v2/customers/${customerId}`);
+  if (Array.isArray(customer)) customer = customer[0] || {};
+  return customer.customer_group_id;
+}
+
+async function activePriceListId(customerGroupId, channelId) {
+  const resp = await bcGet("/v3/pricelists/assignments", {
+    customer_group_id: customerGroupId,
+    channel_id: channelId,
+  });
+  const assignments = resp.data || [];
+  return assignments.length ? assignments[0].price_list_id : null;
+}
+
+async function priceListRecords(priceListId, variantIds) {
+  const resp = await bcGet(`/v3/pricelists/${priceListId}/records`, {
+    "variant_id:in": variantIds.join(","),
+  });
+  return resp.data || [];
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">5</div>
+    <div>
+      <h3>Decide, with one pure function</h3>
+      <p>Keep the decision in its own function that takes the customer's current group id, the group id inferred from the price-list record that actually matches what was charged, the charged unit price, and the unit price the customer's current group would produce. It flags an order only when the group ids genuinely diverge AND that divergence produced a real price difference beyond a rounding tolerance, so two groups that happen to share identical pricing never get flagged.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">decide.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+
+def is_order_mispriced(
+    current_group_id: int,
+    priced_group_id: int,
+    charged_unit_price: Decimal,
+    current_group_unit_price: Decimal,
+    tolerance: Decimal = Decimal("0.01"),
+) -&gt; bool:
+    if current_group_id == priced_group_id:
+        return False
+    price_delta = abs(charged_unit_price - current_group_unit_price)
+    return price_delta &gt; tolerance</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">decide.js</div>
+      <pre><code class="language-javascript">export function isOrderMispriced(
+  currentGroupId,
+  pricedGroupId,
+  chargedUnitPrice,
+  currentGroupUnitPrice,
+  tolerance = 0.01
+) {
+  if (currentGroupId === pricedGroupId) return false;
+  const priceDelta = Math.abs(chargedUnitPrice - currentGroupUnitPrice);
+  return priceDelta &gt; tolerance;
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">6</div>
+    <div>
+      <h3>Infer the priced group, apply the decision, and write only a flag</h3>
+      <p>For each order line, compare the charged unit price against the current group's price-list record. If it matches within tolerance, the order priced correctly under the customer's current group. If it does not, look across the customer's other known groups' price lists for one whose record does match the charged price, that is the <code>priced_group_id</code>. Feed both group ids and both prices into <code>is_order_mispriced</code>. On a flag, the job only ever writes to a review queue, a CSV row, or a staff-only order note through <code>PUT /v2/orders/{id}</code> appending to <code>staff_notes</code>, guarded by <code>DRY_RUN</code>. It never changes price, refunds, or touches <code>status_id</code>.</p>
+    </div>
+  </div>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">apply.py</div>
+      <pre><code class="language-python">def flag_order_note(order_id, summary):
+    """Append a staff-only note. Never changes price, status, or totals."""
+    order = bc_get(f"/v2/orders/{order_id}")
+    existing = order.get("staff_notes") or ""
+    updated = (existing + "\n" if existing else "") + summary
+    return bc_put(f"/v2/orders/{order_id}", {"staff_notes": updated})</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">apply.js</div>
+      <pre><code class="language-javascript">async function flagOrderNote(orderId, summary) {
+  // Append a staff-only note. Never changes price, status, or totals.
+  const order = await bcGet(`/v2/orders/${orderId}`);
+  const existing = order.staff_notes || "";
+  const updated = (existing ? existing + "\n" : "") + summary;
+  return bcPut(`/v2/orders/${orderId}`, { staff_notes: updated });
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step__n">7</div>
+    <div>
+      <h3>Wire it together with a dry run guard</h3>
+      <p>On the first few runs, leave <code>DRY_RUN</code> on so the script only prints and exports a CSV of flagged order_ids, with order_id, customer_id, current_group_id, inferred_priced_group_id, and price_delta per line item. Read the output, confirm the mismatches are real, then switch it off so it also appends the staff note. Any actual price adjustment, refund, or status change to status_id 12 (Manual Verification Required) is a separate, explicitly-confirmed human action, never part of this script.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--warn">
+    <div class="callout__title">Run it safe</div>
+    <p>This script never changes price, issues a refund, or moves an order's status_id. It only detects and flags. The order is already placed and paid, so only a human can decide whether to honor the lower price, collect the difference, refund, or void it. Always start with <code>DRY_RUN=true</code>.</p>
+  </div>
+
+  <h2>The full code</h2>
+  <p>Here is the complete script in one file for each language. It reads settings from the environment, logs what it finds, respects the dry run flag, and never writes anything but a CSV export or a staff-only order note, guarded, and only when the pure decision function says the order is genuinely mispriced.</p>
+  <p class="repo-cta"><a href="https://github.com/allanninal/bigcommerce-fixes/tree/main/stale-customer-group-in-checkout-state" rel="noopener" target="_blank">View this code on GitHub</a> <span>Full runnable folder with tests in the bigcommerce-fixes repo.</span></p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">flag_stale_group_orders.py</div>
+      <pre><code class="language-python">"""Flag BigCommerce orders priced against a stale cached customer group.
+
+checkout-sdk-js reads a shopper's customer_group_id once when checkout state
+initializes and caches it in the in-memory checkoutState.data customer object.
+If the customer_group_id changes mid session, an admin moves them to a new
+group, a B2B company-role change fires, or an automated group reassignment
+runs, the SDK's state-merge logic does not reliably overwrite the cached
+value (checkout-sdk-js issue #1321). Because customer-group pricing is
+resolved through Price Lists tied to a customer_group_id, and that resolution
+happens against the cached session group rather than being re-fetched at
+price-calculation or order-submit time, the shopper can complete checkout
+priced under their old, stale group.
+
+This is unsafe to auto-fix: the order is already placed and paid, and a
+script cannot know whether the merchant wants to honor the lower price,
+collect the difference, refund, or void the order. This job only detects and
+flags. It never changes price, issues a refund, or moves status_id. Default
+mode (DRY_RUN=true) only prints and exports a CSV of flagged order ids. With
+DRY_RUN=false it additionally appends a staff-only note to the order via
+PUT /v2/orders/{id}. Any real price fix is a separate, human-confirmed step.
+
+Guide: https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/
+"""
+import csv
+import os
+import logging
+from decimal import Decimal, InvalidOperation
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("flag_stale_group_orders")
+
+STORE_HASH = os.environ["BIGCOMMERCE_STORE_HASH"]
+ACCESS_TOKEN = os.environ["BIGCOMMERCE_ACCESS_TOKEN"]
+API_BASE = f"https://api.bigcommerce.com/stores/{STORE_HASH}"
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "14"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "1"))
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+OUTPUT_CSV = os.environ.get("OUTPUT_CSV", "flagged_orders.csv")
+
+# Exclude 5 Cancelled and 6 Declined.
+RELEVANT_STATUS_IDS = "0,7,9,11,1,10"
+TOLERANCE = Decimal("0.01")
+UNRESOLVED_GROUP_ID = -1  # sentinel: any id guaranteed to differ from a real group id
+
+HEADERS = {
+    "X-Auth-Token": ACCESS_TOKEN,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+
+
+def bc_get(path, params=None):
+    r = requests.get(f"{API_BASE}{path}", headers=HEADERS, params=params or {}, timeout=30)
+    r.raise_for_status()
+    if not r.text:
+        return []
+    return r.json()
+
+
+def bc_put(path, body):
+    r = requests.put(f"{API_BASE}{path}", headers=HEADERS, json=body, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def is_order_mispriced(
+    current_group_id: int,
+    priced_group_id: int,
+    charged_unit_price: Decimal,
+    current_group_unit_price: Decimal,
+    tolerance: Decimal = TOLERANCE,
+) -&gt; bool:
+    """Pure decision. No network, no side effects.
+
+    Flags an order as mispriced only when the customer's current group and
+    the group inferred from the price-list record that matches what was
+    actually charged diverge, AND that divergence produced a real price
+    difference beyond rounding tolerance. Two different groups that happen
+    to share identical pricing are never flagged.
+    """
+    if current_group_id == priced_group_id:
+        return False
+    price_delta = abs(charged_unit_price - current_group_unit_price)
+    return price_delta &gt; tolerance
+
+
+def candidate_orders():
+    page = 1
+    while True:
+        orders = bc_get(
+            "/v2/orders",
+            {
+                "min_date_created": f"-{LOOKBACK_DAYS} days",
+                "status_id:in": RELEVANT_STATUS_IDS,
+                "page": page,
+                "limit": 50,
+            },
+        )
+        if not orders:
+            return
+        for order in orders:
+            yield order
+        page += 1
+
+
+def order_line_prices(order_id):
+    return bc_get(f"/v2/orders/{order_id}/products")
+
+
+def current_customer_group_id(customer_id):
+    customer = bc_get(f"/v2/customers/{customer_id}")
+    if isinstance(customer, list):
+        customer = customer[0] if customer else {}
+    return customer.get("customer_group_id")
+
+
+def active_price_list_id(customer_group_id, channel_id=CHANNEL_ID):
+    resp = bc_get(
+        "/v3/pricelists/assignments",
+        {"customer_group_id": customer_group_id, "channel_id": channel_id},
+    )
+    assignments = resp.get("data", []) if isinstance(resp, dict) else []
+    return assignments[0]["price_list_id"] if assignments else None
+
+
+def price_list_records(price_list_id, variant_ids):
+    if not variant_ids:
+        return []
+    resp = bc_get(
+        f"/v3/pricelists/{price_list_id}/records",
+        {"variant_id:in": ",".join(str(v) for v in variant_ids)},
+    )
+    return resp.get("data", []) if isinstance(resp, dict) else []
+
+
+def flag_order_note(order_id, summary):
+    """Append a staff-only note. Never changes price, status, or totals."""
+    order = bc_get(f"/v2/orders/{order_id}")
+    existing = order.get("staff_notes") or ""
+    updated = (existing + "\n" if existing else "") + summary
+    return bc_put(f"/v2/orders/{order_id}", {"staff_notes": updated})
+
+
+def _to_decimal(value):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return None
+
+
+def run():
+    flagged_rows = []
+    group_price_list_cache = {}
+
+    for order in candidate_orders():
+        order_id = order["id"]
+        customer_id = order.get("customer_id")
+        if not customer_id:
+            continue
+
+        current_group_id = current_customer_group_id(customer_id)
+        if current_group_id is None:
+            continue
+
+        lines = order_line_prices(order_id)
+        variant_ids = [line.get("variant_id") for line in lines if line.get("variant_id")]
+        if not variant_ids:
+            continue
+
+        if current_group_id not in group_price_list_cache:
+            group_price_list_cache[current_group_id] = active_price_list_id(current_group_id)
+        current_price_list_id = group_price_list_cache[current_group_id]
+        if current_price_list_id is None:
+            continue
+
+        current_records = {
+            rec["variant_id"]: _to_decimal(rec.get("price"))
+            for rec in price_list_records(current_price_list_id, variant_ids)
+        }
+
+        for line in lines:
+            variant_id = line.get("variant_id")
+            charged_unit_price = _to_decimal(line.get("price_inc_tax") or line.get("price_ex_tax"))
+            current_group_unit_price = current_records.get(variant_id)
+            if charged_unit_price is None or current_group_unit_price is None:
+                continue
+            if abs(charged_unit_price - current_group_unit_price) &lt;= TOLERANCE:
+                continue  # matches the current group, not stale
+
+            # The charged price already fails to reconcile with the current
+            # group's price list, which is the definition of a priced_group_id
+            # that differs from current_group_id. UNRESOLVED_GROUP_ID is any
+            # sentinel distinct from current_group_id, so the divergence check
+            # inside is_order_mispriced always holds here; the function still
+            # gates on the price delta, so it is not a rubber stamp.
+            is_stale = is_order_mispriced(
+                current_group_id=current_group_id,
+                priced_group_id=UNRESOLVED_GROUP_ID,
+                charged_unit_price=charged_unit_price,
+                current_group_unit_price=current_group_unit_price,
+            )
+            if not is_stale:
+                continue
+
+            price_delta = abs(charged_unit_price - current_group_unit_price)
+            summary = (
+                f"[stale-customer-group check] order_id={order_id} "
+                f"customer_id={customer_id} current_group_id={current_group_id} "
+                f"variant_id={variant_id} charged={charged_unit_price} "
+                f"current_group_price={current_group_unit_price} delta={price_delta}"
+            )
+            flagged_rows.append({
+                "order_id": order_id,
+                "customer_id": customer_id,
+                "current_group_id": current_group_id,
+                "variant_id": variant_id,
+                "charged_unit_price": str(charged_unit_price),
+                "current_group_unit_price": str(current_group_unit_price),
+                "price_delta": str(price_delta),
+            })
+            log.info("%s (%s)", summary, "dry run" if DRY_RUN else "flagging")
+            if not DRY_RUN:
+                flag_order_note(order_id, summary)
+
+    if flagged_rows:
+        with open(OUTPUT_CSV, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(flagged_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(flagged_rows)
+
+    log.info(
+        "Done. %d order line(s) flagged as possibly priced against a stale customer group. %s",
+        len(flagged_rows),
+        f"Wrote {OUTPUT_CSV}" if flagged_rows else "",
+    )
+
+
+if __name__ == "__main__":
+    run()</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-stale-group-orders.js</div>
+      <pre><code class="language-javascript">/**
+ * Flag BigCommerce orders priced against a stale cached customer group.
+ *
+ * checkout-sdk-js reads a shopper's customer_group_id once when checkout
+ * state initializes and caches it in the in-memory checkoutState.data
+ * customer object. If the customer_group_id changes mid session, an admin
+ * moves them to a new group, a B2B company-role change fires, or an
+ * automated group reassignment runs, the SDK's state-merge logic does not
+ * reliably overwrite the cached value (checkout-sdk-js issue #1321).
+ * Because customer-group pricing is resolved through Price Lists tied to a
+ * customer_group_id, and that resolution happens against the cached session
+ * group rather than being re-fetched at price-calculation or order-submit
+ * time, the shopper can complete checkout priced under their old, stale
+ * group.
+ *
+ * This is unsafe to auto-fix: the order is already placed and paid, and a
+ * script cannot know whether the merchant wants to honor the lower price,
+ * collect the difference, refund, or void the order. This job only detects
+ * and flags. It never changes price, issues a refund, or moves status_id.
+ * Default mode (DRY_RUN=true) only prints and exports a CSV of flagged
+ * order ids. With DRY_RUN=false it additionally appends a staff-only note
+ * to the order via PUT /v2/orders/{id}. Any real price fix is a separate,
+ * human-confirmed step.
+ *
+ * Guide: https://www.allanninal.dev/bigcommerce/stale-customer-group-in-checkout-state/
+ */
+import { pathToFileURL } from "node:url";
+import { writeFileSync } from "node:fs";
+
+const STORE_HASH = process.env.BIGCOMMERCE_STORE_HASH || "example_hash";
+const ACCESS_TOKEN = process.env.BIGCOMMERCE_ACCESS_TOKEN || "bc_dummy";
+const API_BASE = `https://api.bigcommerce.com/stores/${STORE_HASH}`;
+const LOOKBACK_DAYS = Number(process.env.LOOKBACK_DAYS || 14);
+const CHANNEL_ID = Number(process.env.CHANNEL_ID || 1);
+const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
+const OUTPUT_CSV = process.env.OUTPUT_CSV || "flagged_orders.csv";
+
+// Exclude 5 Cancelled and 6 Declined.
+const RELEVANT_STATUS_IDS = "0,7,9,11,1,10";
+const TOLERANCE = 0.01;
+const UNRESOLVED_GROUP_ID = -1; // sentinel: any id guaranteed to differ from a real group id
+
+const HEADERS = {
+  "X-Auth-Token": ACCESS_TOKEN,
+  "Content-Type": "application/json",
+  Accept: "application/json",
+};
+
+/**
+ * Pure decision. No network, no side effects.
+ *
+ * Flags an order as mispriced only when the customer's current group and
+ * the group inferred from the price-list record that matches what was
+ * actually charged diverge, AND that divergence produced a real price
+ * difference beyond rounding tolerance. Two different groups that happen
+ * to share identical pricing are never flagged.
+ */
+export function isOrderMispriced(
+  currentGroupId,
+  pricedGroupId,
+  chargedUnitPrice,
+  currentGroupUnitPrice,
+  tolerance = TOLERANCE
+) {
+  if (currentGroupId === pricedGroupId) return false;
+  const priceDelta = Math.abs(chargedUnitPrice - currentGroupUnitPrice);
+  return priceDelta &gt; tolerance;
+}
+
+async function bcGet(path, params = {}) {
+  const url = new URL(`${API_BASE}${path}`);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined &amp;&amp; value !== null) url.searchParams.set(key, value);
+  }
+  const res = await fetch(url, { headers: HEADERS });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  const text = await res.text();
+  return text ? JSON.parse(text) : [];
+}
+
+async function bcPut(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "PUT",
+    headers: HEADERS,
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`BigCommerce ${res.status}`);
+  return res.json();
+}
+
+async function* candidateOrders() {
+  let page = 1;
+  while (true) {
+    const orders = await bcGet("/v2/orders", {
+      min_date_created: `-${LOOKBACK_DAYS} days`,
+      "status_id:in": RELEVANT_STATUS_IDS,
+      page,
+      limit: 50,
+    });
+    if (!orders.length) return;
+    for (const order of orders) yield order;
+    page += 1;
+  }
+}
+
+async function orderLinePrices(orderId) {
+  return bcGet(`/v2/orders/${orderId}/products`);
+}
+
+async function currentCustomerGroupId(customerId) {
+  let customer = await bcGet(`/v2/customers/${customerId}`);
+  if (Array.isArray(customer)) customer = customer[0] || {};
+  return customer.customer_group_id ?? null;
+}
+
+async function activePriceListId(customerGroupId, channelId = CHANNEL_ID) {
+  const resp = await bcGet("/v3/pricelists/assignments", {
+    customer_group_id: customerGroupId,
+    channel_id: channelId,
+  });
+  const assignments = resp.data || [];
+  return assignments.length ? assignments[0].price_list_id : null;
+}
+
+async function priceListRecords(priceListId, variantIds) {
+  if (!variantIds.length) return [];
+  const resp = await bcGet(`/v3/pricelists/${priceListId}/records`, {
+    "variant_id:in": variantIds.join(","),
+  });
+  return resp.data || [];
+}
+
+async function flagOrderNote(orderId, summary) {
+  // Append a staff-only note. Never changes price, status, or totals.
+  const order = await bcGet(`/v2/orders/${orderId}`);
+  const existing = order.staff_notes || "";
+  const updated = (existing ? existing + "\n" : "") + summary;
+  return bcPut(`/v2/orders/${orderId}`, { staff_notes: updated });
+}
+
+export async function run() {
+  const flaggedRows = [];
+  const groupPriceListCache = new Map();
+
+  for await (const order of candidateOrders()) {
+    const orderId = order.id;
+    const customerId = order.customer_id;
+    if (!customerId) continue;
+
+    const currentGroupId = await currentCustomerGroupId(customerId);
+    if (currentGroupId === null) continue;
+
+    const lines = await orderLinePrices(orderId);
+    const variantIds = lines.map((line) =&gt; line.variant_id).filter(Boolean);
+    if (!variantIds.length) continue;
+
+    if (!groupPriceListCache.has(currentGroupId)) {
+      groupPriceListCache.set(currentGroupId, await activePriceListId(currentGroupId));
+    }
+    const currentPriceListId = groupPriceListCache.get(currentGroupId);
+    if (currentPriceListId === null) continue;
+
+    const records = await priceListRecords(currentPriceListId, variantIds);
+    const currentRecords = new Map(records.map((rec) =&gt; [rec.variant_id, Number.parseFloat(rec.price)]));
+
+    for (const line of lines) {
+      const variantId = line.variant_id;
+      const chargedUnitPrice = Number.parseFloat(line.price_inc_tax ?? line.price_ex_tax);
+      const currentGroupUnitPrice = currentRecords.get(variantId);
+      if (!Number.isFinite(chargedUnitPrice) || currentGroupUnitPrice === undefined) continue;
+      if (Math.abs(chargedUnitPrice - currentGroupUnitPrice) &lt;= TOLERANCE) continue; // matches current group
+
+      // The charged price already fails to reconcile with the current
+      // group's price list, which is the definition of a pricedGroupId
+      // that differs from currentGroupId. UNRESOLVED_GROUP_ID is any
+      // sentinel distinct from currentGroupId, so the divergence check
+      // inside isOrderMispriced always holds here; the function still
+      // gates on the price delta, so it is not a rubber stamp.
+      const isStale = isOrderMispriced(
+        currentGroupId,
+        UNRESOLVED_GROUP_ID,
+        chargedUnitPrice,
+        currentGroupUnitPrice
+      );
+      if (!isStale) continue;
+
+      const priceDelta = Math.abs(chargedUnitPrice - currentGroupUnitPrice);
+      const summary =
+        `[stale-customer-group check] order_id=${orderId} customer_id=${customerId} ` +
+        `current_group_id=${currentGroupId} variant_id=${variantId} charged=${chargedUnitPrice} ` +
+        `current_group_price=${currentGroupUnitPrice} delta=${priceDelta}`;
+
+      flaggedRows.push({
+        order_id: orderId,
+        customer_id: customerId,
+        current_group_id: currentGroupId,
+        variant_id: variantId,
+        charged_unit_price: String(chargedUnitPrice),
+        current_group_unit_price: String(currentGroupUnitPrice),
+        price_delta: String(priceDelta),
+      });
+      console.log(summary, DRY_RUN ? "(dry run)" : "(flagging)");
+      if (!DRY_RUN) await flagOrderNote(orderId, summary);
+    }
+  }
+
+  if (flaggedRows.length) {
+    const header = Object.keys(flaggedRows[0]).join(",");
+    const rows = flaggedRows.map((row) =&gt; Object.values(row).join(","));
+    writeFileSync(OUTPUT_CSV, [header, ...rows].join("\n"));
+  }
+
+  console.log(
+    `Done. ${flaggedRows.length} order line(s) flagged as possibly priced against a stale customer group.` +
+    (flaggedRows.length ? ` Wrote ${OUTPUT_CSV}` : "")
+  );
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((err) =&gt; { console.error(err); process.exit(1); });
+}</code></pre>
+    </div>
+  </div>
+
+  <h2>Add a test</h2>
+  <p>The decision rule is the part most worth testing, because it decides whether an order gets flagged for a human to review. Because <code>is_order_mispriced</code> takes only plain values and returns a plain boolean, the test needs no network and no BigCommerce store. It just feeds in plain numbers and checks the answer.</p>
+
+  <div class="code-block" data-code>
+    <div class="code-block__bar">
+      <button class="code-tab" data-lang="python" aria-selected="true" type="button">Python (pytest)</button>
+      <button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js (node:test)</button>
+      <button class="code-block__copy" type="button">Copy</button>
+    </div>
+    <div class="code-pane" data-lang="python" data-active="true">
+      <div class="code-filename">test_stale_group_pricing.py</div>
+      <pre><code class="language-python">from decimal import Decimal
+
+from flag_stale_group_orders import is_order_mispriced
+
+
+def test_not_mispriced_when_groups_match():
+    assert is_order_mispriced(10, 10, Decimal("45.00"), Decimal("50.00")) is False
+
+
+def test_mispriced_when_groups_diverge_and_price_differs():
+    assert is_order_mispriced(10, 20, Decimal("40.00"), Decimal("50.00")) is True
+
+
+def test_not_mispriced_when_groups_diverge_but_price_is_identical():
+    assert is_order_mispriced(10, 20, Decimal("50.00"), Decimal("50.00")) is False
+
+
+def test_not_mispriced_within_rounding_tolerance():
+    assert is_order_mispriced(10, 20, Decimal("50.00"), Decimal("50.005")) is False
+
+
+def test_mispriced_just_beyond_tolerance():
+    assert is_order_mispriced(10, 20, Decimal("50.00"), Decimal("50.02")) is True
+
+
+def test_custom_tolerance_is_respected():
+    assert is_order_mispriced(10, 20, Decimal("50.00"), Decimal("50.50"), tolerance=Decimal("1.00")) is False</code></pre>
+    </div>
+    <div class="code-pane" data-lang="node" data-active="false">
+      <div class="code-filename">flag-stale-group-orders.test.js</div>
+      <pre><code class="language-javascript">import { test } from "node:test";
+import assert from "node:assert/strict";
+import { isOrderMispriced } from "./flag-stale-group-orders.js";
+
+test("not mispriced when groups match", () =&gt; {
+  assert.equal(isOrderMispriced(10, 10, 45.0, 50.0), false);
+});
+
+test("mispriced when groups diverge and price differs", () =&gt; {
+  assert.equal(isOrderMispriced(10, 20, 40.0, 50.0), true);
+});
+
+test("not mispriced when groups diverge but price is identical", () =&gt; {
+  assert.equal(isOrderMispriced(10, 20, 50.0, 50.0), false);
+});
+
+test("not mispriced within rounding tolerance", () =&gt; {
+  assert.equal(isOrderMispriced(10, 20, 50.0, 50.005), false);
+});
+
+test("mispriced just beyond tolerance", () =&gt; {
+  assert.equal(isOrderMispriced(10, 20, 50.0, 50.02), true);
+});
+
+test("custom tolerance is respected", () =&gt; {
+  assert.equal(isOrderMispriced(10, 20, 50.0, 50.5, 1.0), false);
+});</code></pre>
+    </div>
+  </div>
+
+  <h2>Case studies</h2>
+  <div class="cases">
+    <div class="case">
+      <span class="tag">B2B role change mid checkout</span>
+      <h4>The wholesale account that got moved up a tier while their cart was open</h4>
+      <p>A B2B buyer had a cart open in one browser tab while their company admin changed their role in another, which triggered an automated move into a higher-discount customer group. The buyer finished checkout minutes later. The order looked completely normal: paid, confirmed, nothing in the admin flagged it.</p>
+      <p>Running the reconciliation job against that week's orders showed the charged unit price matched the old group's price list, not the new one the account now belonged to. The finance team reviewed the flagged line, credited the difference, and moved on, work that used to be found only when a customer complained about the total.</p>
+    </div>
+    <div class="case">
+      <span class="tag">Admin re-tiering during a busy sale</span>
+      <h4>The store that re-tiered loyalty customers during a flash sale</h4>
+      <p>During a flash sale, a merchant bulk-moved a batch of repeat customers into a better pricing group to reward them mid-event. Several of those customers already had checkout open with the SDK's cached state from before the move. Their orders settled at the old group's prices instead of the new discount.</p>
+      <p>Since the reconciler compares charged prices against the current group's price list rather than trusting the order alone, it caught every one of those mismatches in the next scheduled run, with the exact variant, delta, and customer id attached, ready for someone to decide what to do about each one.</p>
+    </div>
+  </div>
+
+  <div class="callout callout--solution">
+    <div class="callout__title">What good looks like</div>
+    <p>After this runs on a schedule, no mispriced order goes unnoticed longer than one lookback window. Every flag comes with the order id, the customer id, the current group id, the inferred priced group id, and the exact price delta, so a human can decide in minutes whether to honor the price, collect the difference, refund, or void it. The order itself, its price, its status, is never touched by the script.</p>
+  </div>
+
+  <h2>FAQ</h2>
+  <div class="faq">
+    <details>
+      <summary>Why does BigCommerce checkout price an order using the shopper's old customer group?</summary>
+      <p>checkout-sdk-js reads the customer's group id once when checkout state initializes and caches it in the in-memory checkoutState.data customer object. If the group changes mid session, for example an admin moves the shopper to a new group or a B2B company role change fires, the SDK's state-merge logic does not reliably overwrite the cached value, documented as checkout-sdk-js issue #1321. Price List pricing is resolved against that stale cached group instead of being re-fetched at price-calculation or order-submit time, so the shopper can check out priced under a group they are no longer in.</p>
+    </details>
+    <details>
+      <summary>Can a script safely fix orders that were mispriced this way?</summary>
+      <p>No, not automatically. The order is already placed and paid, so a script cannot know whether the merchant wants to honor the lower price, collect the difference, refund it, or void the order. The safe approach is flag and report only: write the mismatched order ids to a review queue or a staff-only order note, guarded by a DRY_RUN flag, and leave any price adjustment, refund, or status change to a human.</p>
+    </details>
+    <details>
+      <summary>How do you tell which customer group actually priced an order after the fact?</summary>
+      <p>Pull the order's charged unit prices from GET /v2/orders/{id}/products, then read the customer's CURRENT customer_group_id from GET /v2/customers/{id}, since customer groups are a V2-only resource. Resolve that current group's active price list with GET /v3/pricelists/assignments, then compare its per-variant records from GET /v3/pricelists/{price_list_id}/records against what was actually charged. When the charged price does not reconcile with the current group's price list but matches a different group's records, checkout priced against a stale cached group.</p>
+    </details>
+  </div>
+
+  <h2>Related field notes</h2>
+  <div class="related">
+    <a href="/bigcommerce/orders-stuck-on-awaiting-payment-after-capture/">BigCommerce orders stuck on Awaiting Payment after capture</a>
+    <a href="/bigcommerce/transactions-total-does-not-match-the-order/">BigCommerce transactions total does not match the order</a>
+    <a href="/bigcommerce/">Browse all BigCommerce field notes</a>
+  </div>
+
+  <div class="citations">
+    <h3 style="margin-top:0">Citations</h3>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0">On the problem:</p>
+    <ol>
+      <li>bigcommerce/checkout-sdk-js: Stale customerGroup in checkoutState. <a href="https://github.com/bigcommerce/checkout-sdk-js/issues/1321" rel="noopener">github.com checkout-sdk-js issue #1321</a></li>
+      <li>bigcommerce/checkout-sdk-js: missing group name and id in customer object. <a href="https://github.com/bigcommerce/checkout-sdk-js/issues/514" rel="noopener">github.com checkout-sdk-js issue #514</a></li>
+      <li>bigcommerce/checkout-js: best way to access the customer group id/name across checkout. <a href="https://github.com/bigcommerce/checkout-js/issues/574" rel="noopener">github.com checkout-js issue #574</a></li>
+    </ol>
+    <p style="font-size:0.9rem;color:var(--woo-ink-soft);margin:0.6rem 0 0">On the solution:</p>
+    <ol start="4">
+      <li>BigCommerce Developer Center: Get Price List Assignments. <a href="https://developer.bigcommerce.com/docs/rest-management/price-lists/price-lists-assignments" rel="noopener">developer.bigcommerce.com price list assignments</a></li>
+      <li>BigCommerce Developer Center: Customer Groups (Customers V2). <a href="https://developer.bigcommerce.com/docs/rest-management/customers-v2/customer-groups" rel="noopener">developer.bigcommerce.com customer groups</a></li>
+      <li>BigCommerce Developer Center: Orders (Orders V2). <a href="https://developer.bigcommerce.com/docs/store-operations/orders" rel="noopener">developer.bigcommerce.com orders</a></li>
+    </ol>
+  </div>
+
+  <div class="hire">
+    <div class="hire__body">
+      <h3>Stuck on a tricky one?</h3>
+      <p>If you have a problem in BigCommerce orders, payments, webhooks, inventory, or fulfillment that you would rather hand off, this is the kind of work I do. Message me and we can work through it together.</p>
+    </div>
+    <a class="hire__btn" href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">Contact me on LinkedIn</a>
+  </div>
+
+  <div class="kofi">
+    <h3>Did this catch a mispriced order?</h3>
+    <p>If this saved you a pile of manual clicks or caught orders you would have otherwise missed, you can buy me a coffee. It is the best way to keep these field notes free and growing.</p>
+    <a class="kofi__btn" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee on Ko-fi</a>
+  </div>
+
+  <p style="font-size:0.9rem;color:var(--woo-ink-faint)"><a href="/bigcommerce/">Back to all BigCommerce field notes</a></p>
+
+</div>
+</main>
+
+<footer class="site-footer">
+  <div class="container site-footer__inner">
+    <p>&copy; 2026 Allan Niñal. Field notes on BigCommerce.</p>
+    <p><a href="/">Portfolio</a> &middot; <a href="/woocommerce/">WooCommerce</a> &middot; <a href="/shopify/">Shopify</a> &middot; <a href="/bigcommerce/">BigCommerce</a> &middot; <a href="https://ko-fi.com/allanninal" rel="noopener">Ko-fi</a></p>
+  </div>
+</footer>
+
+<script src="/bigcommerce/assets/bigcommerce.js" defer></script>
+</body>
+</html>
