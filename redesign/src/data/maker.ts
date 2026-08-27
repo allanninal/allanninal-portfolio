@@ -100,6 +100,7 @@ export const services = [
 ];
 
 export const fieldNotes = [
+  { href: '/aws/', name: 'AWS cost', detail: 'Idle NAT gateways, unattached EBS, log retention and tag coverage' },
   { href: '/email/', name: 'Email & SES', detail: 'Amazon SES suppression, bounce rate, DKIM and DMARC alignment fixes' },
   { href: '/woocommerce/', name: 'WooCommerce', detail: 'WooCommerce and Stripe order, subscription, and payment fixes' },
   { href: '/shopify/', name: 'Shopify', detail: 'Shopify order, inventory, and payout reconciliation fixes' },
