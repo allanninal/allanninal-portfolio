@@ -100,6 +100,7 @@ export const services = [
 ];
 
 export const fieldNotes = [
+  { href: '/email/', name: 'Email & SES', detail: 'Amazon SES suppression, bounce rate, DKIM and DMARC alignment fixes' },
   { href: '/woocommerce/', name: 'WooCommerce', detail: 'WooCommerce and Stripe order, subscription, and payment fixes' },
   { href: '/shopify/', name: 'Shopify', detail: 'Shopify order, inventory, and payout reconciliation fixes' },
   { href: '/bigcommerce/', name: 'BigCommerce', detail: 'BigCommerce order, webhook, and catalog fixes' },
