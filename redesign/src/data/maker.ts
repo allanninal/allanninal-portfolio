@@ -100,6 +100,7 @@ export const services = [
 ];
 
 export const fieldNotes = [
+  { href: '/cloudflare/', name: 'Cloudflare', detail: 'Shadowed page rules, purges that clear nothing and Flexible SSL loops' },
   { href: '/ci/', name: 'GitHub Actions', detail: 'Empty secrets in fork PRs, silent cache misses and redundant billed runs' },
   { href: '/aws/', name: 'AWS cost', detail: 'Idle NAT gateways, unattached EBS, log retention and tag coverage' },
   { href: '/email/', name: 'Email & SES', detail: 'Amazon SES suppression, bounce rate, DKIM and DMARC alignment fixes' },
