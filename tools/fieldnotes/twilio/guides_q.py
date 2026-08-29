@@ -2799,7 +2799,7 @@ test('a sender with no MMS at all says so', () => {
  ("Does the MMS Converter fix this on its own?",
   "It helps and it is not a substitute for fixing the source. The converter downsizes and transcodes what passes through the Messaging Service, but Twilio only transcodes jpeg, png and gif; anything else goes to the carrier untouched at whatever size it is. Recompress at the source and treat the converter as the safety net."),
  ("Why does the script care whether num_media is a string?",
-  "Because the 2010-04-01 API returns it as one, and \\"0\\" is truthy. A filter written as a truthiness test keeps every SMS on the account in the denominator, so a real MMS failure rate of thirty percent is reported as a fraction of a percent and nobody investigates."),
+  "Because the 2010-04-01 API returns it as one, and a string “0” is truthy. A filter written as a truthiness test keeps every SMS on the account in the denominator, so a real MMS failure rate of thirty percent is reported as a fraction of a percent and nobody investigates."),
 ],
 "related": [
  ("/twilio/ucs2-segment-inflation/", "One emoji tripling your segment count"),

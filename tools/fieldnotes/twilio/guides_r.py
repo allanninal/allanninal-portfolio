@@ -1968,4 +1968,641 @@ test('a send carrying a service sid is not a bare from', () => {
 "citations": [CITE_MSPN, CITE_30034, CITE_PNREG, CITE_SERVICE],
 },
 
+{
+"slug": "sender-pending-carrier-provisioning",
+"title": "30035 and 30024 are a clock, not a configuration mistake",
+"description": "A new sender fails for up to 24 hours while carrier routing catches up. Removing and re-adding the number restarts the clock instead of ending it.",
+"h1": "30035 and 30024 are a clock, not a configuration mistake",
+"category": "Twilio",
+"pill": "Diagnostic",
+"chips": ["Read-only key", "Python and Node.js", "Tests included"],
+"keywords": ["twilio 30035", "twilio 30024", "number pending registration",
+             "numeric sender id not provisioned", "twilio sender provisioning delay"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "The number was added to the Messaging Service an hour before the launch, which felt like plenty of margin. Sends come back <code>30035</code>. Somebody removes the number and adds it again, because that is what you do when a config change did not take. The clock they were forty minutes from the end of has just been set back to zero, and they will do it twice more before the day is out.",
+"short_answer": """<p>Page <code>GET /2010-04-01/Accounts/{AccountSid}/Messages.json?DateSent&gt;=YYYY-MM-DD&amp;PageSize=1000</code> and keep <code>error_code</code> <code>30035</code> (number pending registration) and <code>30024</code> (numeric sender ID not provisioned on the carrier), grouped by <code>from</code>. Confirm the number is in a pool with <code>GET https://messaging.twilio.com/v1/Services/{ServiceSid}/PhoneNumbers</code>.</p>
+<p>Then read the timestamps, not the codes. The age of the <strong>first</strong> failure against the 24-hour provisioning window is the entire diagnosis: inside it, wait; past it, open a ticket with the <code>PN…</code> SID. And if the most recent send from that number succeeded, the clock already ran out and there is nothing to do.</p>""",
+"problem": """<p>These two codes look like every other configuration error and they are not one. Nothing is misconfigured: the number is in the pool, the campaign is verified, the brand is approved. The carrier's routing tables simply have not been updated yet, and that update happens on the carrier's schedule, which the API cannot influence and cannot report progress on.</p>
+<p>So the only two useful facts are how long it has been failing and whether it is still failing. Neither is a field anywhere. <code>Messages.json</code> is the only surface that records a time, so a diagnosis here is arithmetic on <code>date_sent</code> and nothing else.</p>
+<p>And the natural response is the harmful one. Removing the number from the Messaging Service and adding it back is a deregistration followed by a registration, which puts the number through <code>PENDING_DEREGISTRATION</code> and then back to <code>PENDING_REGISTRATION</code>. Every retry of that adds another window. Teams that do this three times spend three days on a problem that resolves itself in one.</p>""",
+"why": """<p><strong>Waiting does not look like an action.</strong> During an incident, doing nothing is the hardest thing to justify, so somebody changes something. The change here is the one thing that measurably makes it worse, and it produces no error to tell you so.</p>
+<p><strong>There is no progress indicator.</strong> The number's A2P status is not exposed as a countdown, and no resource says how far through the window you are. The first failure's <code>date_sent</code> is a proxy for the start of the clock, and it is the best one available.</p>
+<p><strong>The two codes are not the same problem.</strong> <code>30035</code> is a registration that is in flight. <code>30024</code> is the carrier refusing that numeric sender for the destination, which can also mean the sender is wrong for the country rather than merely new. A window that only ever shows <code>30024</code> is worth reading differently from one that shows <code>30035</code>.</p>
+<p><strong>A number outside every pool produces neither.</strong> If a sender is failing and it is in no Messaging Service, nothing has been submitted for it to be waiting on: the code you will actually see is <code>30034</code>, and the fix is to add it to a pool. Checking pool membership is what stops this report from telling somebody to wait forever.</p>""",
+"steps": [
+ {"h": "Collect the provisioning failures per sender",
+  "body": """<p>Page <code>Messages.json</code> over two or three days and keep the rows where <code>error_code</code> is <code>30035</code> or <code>30024</code>, grouped by <code>from</code>. Keep the sender's successful rows too &mdash; a success after the last failure is the cleanest possible answer.</p>"""},
+ {"h": "Confirm the sender is actually in a pool",
+  "body": """<p><code>GET /v1/Services</code>, then <code>GET /v1/Services/{ServiceSid}/PhoneNumbers</code>. A failing number that is in no pool is not waiting on anything, and telling somebody to wait on it is the worst outcome this report can produce.</p>"""},
+ {"h": "Order by date_sent and take the oldest failure as the start",
+  "body": """<p><code>date_sent</code> is RFC 2822. Parse it leniently: a row you cannot date is a row you cannot use for the clock, and dropping the whole sender because of one is worse than skipping it. The oldest failure is when the window started, as far as anything observable is concerned.</p>"""},
+ {"h": "Compare its age against 24 hours",
+  "body": """<p>Under 24 hours and still failing: wait, and route the traffic through a sender that is already registered. Over 24 hours and still failing: this is no longer a clock, and it needs a Support ticket quoting the <code>PN…</code> SID and the Messaging Service.</p>"""},
+ {"h": "Check whether it already fixed itself",
+  "body": """<p>If the most recent message from that sender went through, provisioning completed while nobody was looking. Report it as resolved rather than as an open failure &mdash; otherwise the sender stays on the incident list and somebody eventually removes and re-adds it.</p>"""},
+ {"h": "Do not touch the assignment while the clock runs",
+  "body": """<p>No API repair, and specifically no repair that involves the pool. Removing and re-adding restarts the window. If the traffic cannot wait, send it from a number that was registered days ago; that is a routing change in your code, not a change to the number that is provisioning.</p>"""},
+],
+"verify": """<p>Re-run after the window has passed. Every sender that was waiting should read <code>provisioned</code> or drop out of the report entirely.</p>
+<pre><code class="language-bash">python3 twilio_sender_provisioning_clock.py --days 3
+# 1 sender(s) with provisioning errors, 0 still waiting</code></pre>""",
+"code_intro": "The classifier takes one sender's messages, the current time and whether the number is in a pool, and returns a state. Passing the clock in rather than reading it is what makes the interesting cases testable: two hours in, thirty hours in, and already recovered are three different answers from the same rows, and the only thing separating them is <code>now</code>.",
+"py_file": "twilio_sender_provisioning_clock.py",
+"py": '''"""Report senders failing on 30035 or 30024, and say whether waiting is still the answer.
+
+Read only. GET requests and nothing else: give this an API Key with read access
+rather than the account auth token. The repair is printed, never performed,
+because this script holds a credential to an account that can send messages and
+spend money.
+"""
+import argparse
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("twilio_sender_provisioning_clock")
+
+HOST = "https://api.twilio.com"
+BASE = HOST + "/2010-04-01"
+MSG = "https://messaging.twilio.com/v1"
+
+# 30035 is a registration in flight. 30024 is the carrier refusing the numeric
+# sender for that destination, which is not always a clock at all.
+PROVISIONING = {"30035": "number pending registration",
+                "30024": "numeric sender ID not provisioned on the carrier"}
+WINDOW_HOURS = 24
+
+
+def parse_when(value):
+    """date_sent is RFC 2822, not ISO 8601. Returns epoch seconds, or None.
+
+    Lenient: a row that cannot be dated is a row that cannot start the clock,
+    and dropping the whole sender over one malformed timestamp is worse.
+    """
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def ordered(messages):
+    """Oldest first. Undated rows keep their original order at the end."""
+    keyed = [(parse_when(m.get("date_sent")), i, m) for i, m in enumerate(messages)]
+    dated = sorted(k for k in keyed if k[0] is not None)
+    undated = [k for k in keyed if k[0] is None]
+    return [m for _w, _i, m in dated] + [m for _w, _i, m in undated]
+
+
+def is_provisioning(message):
+    return str(message.get("error_code") or "") in PROVISIONING
+
+
+def codes_seen(messages):
+    """The provisioning codes present, sorted, without repeats."""
+    return sorted({str(m.get("error_code")) for m in messages
+                   if is_provisioning(m)})
+
+
+def verdict(messages, now, in_pool):
+    """Classify one sender's window. Pure.
+
+    messages are every row from that sender, now is epoch seconds, in_pool says
+    whether the number is in any Messaging Service pool. Returns (state, detail).
+    """
+    rows = ordered(messages)
+    failing = [m for m in rows if is_provisioning(m)]
+    if not failing:
+        return ("clean", "no 30035 or 30024 from this sender in the window.")
+
+    codes = codes_seen(failing)
+    named = ", ".join(codes)
+
+    if not is_provisioning(rows[-1]):
+        return ("provisioned",
+                "%d x %s, and the most recent send from this number went "
+                "through. The carrier caught up while nobody was watching."
+                % (len(failing), named))
+
+    if not in_pool:
+        return ("not-in-any-pool",
+                "%d x %s from a number that is in no Messaging Service sender "
+                "pool. Nothing has been submitted for this to be waiting on, so "
+                "waiting will not end it." % (len(failing), named))
+
+    started = parse_when(failing[0].get("date_sent"))
+    if started is None:
+        return ("undated",
+                "%d x %s, but no failing row carries a parseable date_sent, so "
+                "there is no clock to read." % (len(failing), named))
+
+    tail = ""
+    if codes == ["30024"]:
+        tail = (" Only 30024 here and never 30035: that is the carrier refusing "
+                "the numeric sender for the destination, which is not always a "
+                "registration in flight. Check the destination country too.")
+
+    hours = (now - started) / 3600.0
+    if hours < WINDOW_HOURS:
+        return ("waiting",
+                "%d x %s, first seen %.1f h ago. Carrier provisioning takes up "
+                "to %d h. Do not remove and re-add the number: that restarts "
+                "the clock.%s" % (len(failing), named, hours, WINDOW_HOURS, tail))
+
+    return ("overdue",
+            "%d x %s, first seen %.1f h ago, past the %d h provisioning window "
+            "and still failing.%s"
+            % (len(failing), named, hours, WINDOW_HOURS, tail))
+
+
+def get(session, url, **params):
+    r = session.get(url, params=params, timeout=30)
+    if r.status_code in (401, 403):
+        raise SystemExit("%d from Twilio: check TWILIO_ACCOUNT_SID and that the "
+                         "API key belongs to that account with read access"
+                         % r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+
+def list_messages(session, account, since, limit):
+    """Page Messages.json. No ErrorCode filter exists on this resource."""
+    url = "%s/Accounts/%s/Messages.json" % (BASE, account)
+    params = {"PageSize": 1000, "DateSent>=": since}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("messages", []))
+        nxt = page.get("next_page_uri")
+        url, params = (HOST + nxt) if nxt else None, {}
+    return out[:limit]
+
+
+def list_v1(session, url, key, limit=1000):
+    """Page a messaging.twilio.com list. meta.next_page_url is absolute."""
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, PageSize=50)
+        out.extend(page.get(key, []))
+        url = (page.get("meta") or {}).get("next_page_url")
+    return out[:limit]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=3,
+                    help="how far back to read the Messages list")
+    ap.add_argument("--max-messages", type=int, default=20000,
+                    help="stop paging after this many messages")
+    args = ap.parse_args()
+
+    account = os.environ.get("TWILIO_ACCOUNT_SID")
+    key = os.environ.get("TWILIO_API_KEY")
+    secret = os.environ.get("TWILIO_API_SECRET")
+    if not (account and key and secret):
+        log.error("set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET "
+                  "(an API Key with read access, not the auth token)")
+        return 2
+
+    session = requests.Session()
+    session.auth = (key, secret)
+
+    pool = {}
+    for service in list_v1(session, MSG + "/Services", "services"):
+        for entry in list_v1(session, "%s/Services/%s/PhoneNumbers"
+                             % (MSG, service["sid"]), "phone_numbers"):
+            pool[str(entry.get("phone_number"))] = (service, entry)
+
+    since = (datetime.now(timezone.utc)
+             - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    messages = list_messages(session, account, since, args.max_messages)
+    if not messages:
+        log.info("no messages sent since %s", since)
+        return 0
+
+    by_sender = {}
+    for message in messages:
+        by_sender.setdefault(str(message.get("from") or ""), []).append(message)
+
+    now = time.time()
+    seen = waiting = 0
+    for sender in sorted(by_sender):
+        rows = by_sender[sender]
+        if not any(is_provisioning(m) for m in rows):
+            continue
+        seen += 1
+        service, entry = pool.get(sender, (None, None))
+        state, detail = verdict(rows, now, service is not None)
+        line = "%-16s %s  %s" % (state, sender, detail)
+        if state == "provisioned":
+            log.info(line)
+            continue
+        waiting += 1
+        log.warning(line)
+        if state == "waiting":
+            log.warning("  repair: none, and specifically not the pool. Route "
+                        "this traffic through a sender registered days ago "
+                        "until the window closes.")
+        elif state == "overdue":
+            log.warning("  repair: open Twilio Support quoting %s on %s. Past "
+                        "the window this is no longer a provisioning delay.",
+                        (entry or {}).get("sid", "the PN SID"),
+                        (service or {}).get("sid", "the Messaging Service"))
+        elif state == "not-in-any-pool":
+            log.warning("  repair: add the number to the Messaging Service that "
+                        "carries the campaign, then wait out the window once.")
+
+    log.info("%d sender(s) with provisioning errors, %d still waiting",
+             seen, waiting)
+    return 1 if waiting else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "twilio-sender-provisioning-clock.mjs",
+"js": '''/**
+ * Report senders failing on 30035 or 30024, and say whether waiting is still the answer.
+ *
+ * Read only. GET requests and nothing else: give this an API Key with read
+ * access rather than the account auth token. The repair is printed, never
+ * performed.
+ */
+const HOST = 'https://api.twilio.com';
+const BASE = `${HOST}/2010-04-01`;
+const MSG = 'https://messaging.twilio.com/v1';
+
+// 30035 is a registration in flight. 30024 is the carrier refusing the numeric
+// sender for that destination, which is not always a clock at all.
+const PROVISIONING = {
+  30035: 'number pending registration',
+  30024: 'numeric sender ID not provisioned on the carrier',
+};
+const WINDOW_HOURS = 24;
+
+/** date_sent is RFC 2822, not ISO 8601. Returns epoch seconds, or null. */
+export function parseWhen(value) {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : ms / 1000;
+}
+
+/** Oldest first. Undated rows keep their original order at the end. */
+export function ordered(messages) {
+  const keyed = messages.map((m, i) => [parseWhen(m.date_sent), i, m]);
+  const dated = keyed.filter(([w]) => w !== null)
+    .sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+  const undated = keyed.filter(([w]) => w === null);
+  return [...dated, ...undated].map(([, , m]) => m);
+}
+
+export function isProvisioning(message) {
+  return Object.prototype.hasOwnProperty.call(
+    PROVISIONING, String(message.error_code ?? ''));
+}
+
+/** The provisioning codes present, sorted, without repeats. */
+export function codesSeen(messages) {
+  return [...new Set(messages.filter(isProvisioning)
+    .map((m) => String(m.error_code)))].sort();
+}
+
+/**
+ * Classify one sender's window. Pure. messages are every row from that sender,
+ * now is epoch seconds, inPool says whether the number is in any Messaging
+ * Service pool. Returns [state, detail].
+ */
+export function verdict(messages, now, inPool) {
+  const rows = ordered(messages);
+  const failing = rows.filter(isProvisioning);
+  if (failing.length === 0) {
+    return ['clean', 'no 30035 or 30024 from this sender in the window.'];
+  }
+
+  const codes = codesSeen(failing);
+  const named = codes.join(', ');
+
+  if (!isProvisioning(rows[rows.length - 1])) {
+    return ['provisioned',
+      `${failing.length} x ${named}, and the most recent send from this number ` +
+      'went through. The carrier caught up while nobody was watching.'];
+  }
+
+  if (!inPool) {
+    return ['not-in-any-pool',
+      `${failing.length} x ${named} from a number that is in no Messaging ` +
+      'Service sender pool. Nothing has been submitted for this to be waiting ' +
+      'on, so waiting will not end it.'];
+  }
+
+  const started = parseWhen(failing[0].date_sent);
+  if (started === null) {
+    return ['undated',
+      `${failing.length} x ${named}, but no failing row carries a parseable ` +
+      'date_sent, so there is no clock to read.'];
+  }
+
+  let tail = '';
+  if (codes.length === 1 && codes[0] === '30024') {
+    tail = ' Only 30024 here and never 30035: that is the carrier refusing the ' +
+      'numeric sender for the destination, which is not always a registration ' +
+      'in flight. Check the destination country too.';
+  }
+
+  const hours = (now - started) / 3600;
+  if (hours < WINDOW_HOURS) {
+    return ['waiting',
+      `${failing.length} x ${named}, first seen ${hours.toFixed(1)} h ago. ` +
+      `Carrier provisioning takes up to ${WINDOW_HOURS} h. Do not remove and ` +
+      `re-add the number: that restarts the clock.${tail}`];
+  }
+
+  return ['overdue',
+    `${failing.length} x ${named}, first seen ${hours.toFixed(1)} h ago, past ` +
+    `the ${WINDOW_HOURS} h provisioning window and still failing.${tail}`];
+}
+
+function authHeader(key, secret) {
+  return `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}`;
+}
+
+async function get(auth, url, params = {}) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  const res = await fetch(u, { headers: { Authorization: auth } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${res.status} from Twilio: check TWILIO_ACCOUNT_SID and ` +
+                    'that the API key belongs to that account with read access');
+  }
+  if (!res.ok) throw new Error(`${res.status} from ${u.pathname}`);
+  return res.json();
+}
+
+async function listMessages(auth, account, since, limit = 20000) {
+  let url = `${BASE}/Accounts/${account}/Messages.json`;
+  let params = { PageSize: 1000, 'DateSent>=': since };
+  const out = [];
+  while (url && out.length < limit) {
+    const page = await get(auth, url, params);
+    out.push(...(page.messages ?? []));
+    url = page.next_page_uri ? HOST + page.next_page_uri : null;
+    params = {};
+  }
+  return out.slice(0, limit);
+}
+
+async function listV1(auth, url, key, limit = 1000) {
+  const out = [];
+  let next = url;
+  while (next && out.length < limit) {
+    const page = await get(auth, next, { PageSize: 50 });
+    out.push(...(page[key] ?? []));
+    next = page.meta?.next_page_url ?? null;
+  }
+  return out.slice(0, limit);
+}
+
+async function main() {
+  const account = process.env.TWILIO_ACCOUNT_SID;
+  const key = process.env.TWILIO_API_KEY;
+  const secret = process.env.TWILIO_API_SECRET;
+  if (!account || !key || !secret) {
+    console.error('set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET ' +
+                  '(an API Key with read access, not the auth token)');
+    process.exitCode = 2;
+    return;
+  }
+  const auth = authHeader(key, secret);
+
+  const pool = new Map();
+  for (const service of await listV1(auth, `${MSG}/Services`, 'services')) {
+    for (const entry of await listV1(auth,
+      `${MSG}/Services/${service.sid}/PhoneNumbers`, 'phone_numbers')) {
+      pool.set(String(entry.phone_number), [service, entry]);
+    }
+  }
+
+  const days = Number(process.argv.includes('--days')
+    ? process.argv[process.argv.indexOf('--days') + 1] : 3) || 3;
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+  const messages = await listMessages(auth, account, since);
+  if (messages.length === 0) {
+    console.log(`no messages sent since ${since}`);
+    return;
+  }
+
+  const bySender = new Map();
+  for (const message of messages) {
+    const from = String(message.from ?? '');
+    bySender.set(from, [...(bySender.get(from) ?? []), message]);
+  }
+
+  const now = Date.now() / 1000;
+  let seen = 0;
+  let waiting = 0;
+  for (const sender of [...bySender.keys()].sort()) {
+    const rows = bySender.get(sender);
+    if (!rows.some(isProvisioning)) continue;
+    seen += 1;
+    const [service, entry] = pool.get(sender) ?? [null, null];
+    const [state, detail] = verdict(rows, now, service !== null);
+    const line = `${state.padEnd(16)} ${sender}  ${detail}`;
+    if (state === 'provisioned') { console.log(line); continue; }
+    waiting += 1;
+    console.warn(line);
+    if (state === 'waiting') {
+      console.warn('  repair: none, and specifically not the pool. Route this ' +
+                   'traffic through a sender registered days ago until the ' +
+                   'window closes.');
+    } else if (state === 'overdue') {
+      console.warn(`  repair: open Twilio Support quoting ` +
+                   `${entry?.sid ?? 'the PN SID'} on ` +
+                   `${service?.sid ?? 'the Messaging Service'}. Past the window ` +
+                   'this is no longer a provisioning delay.');
+    } else if (state === 'not-in-any-pool') {
+      console.warn('  repair: add the number to the Messaging Service that ' +
+                   'carries the campaign, then wait out the window once.');
+    }
+  }
+
+  console.log(`${seen} sender(s) with provisioning errors, ${waiting} still waiting`);
+  process.exitCode = waiting ? 1 : 0;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing credentials and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "The same rows produce three different answers depending on <code>now</code>, which is exactly why the clock is a parameter and not a call to the system time. The other two cases guard the ends: a sender in no pool must never be told to wait, and a window showing only <code>30024</code> has to say that it might not be a registration at all.",
+"test_py_file": "test_twilio_sender_provisioning_clock.py",
+"test_py": '''from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
+
+from twilio_sender_provisioning_clock import codes_seen, verdict
+
+T0 = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+START = T0.timestamp()
+HOUR = 3600.0
+
+
+def at(minutes, **kw):
+    row = {"date_sent": format_datetime(T0 + timedelta(minutes=minutes)),
+           "from": "+15125550123"}
+    row.update(kw)
+    return row
+
+
+def test_a_sender_with_no_provisioning_codes_is_clean():
+    state, _ = verdict([at(0), at(5, error_code=30007)], START + HOUR, True)
+    assert state == "clean"
+
+
+def test_two_hours_in_and_still_failing_says_wait():
+    rows = [at(0, error_code=30035), at(60, error_code=30035)]
+    state, detail = verdict(rows, START + 2 * HOUR, True)
+    assert state == "waiting"
+    assert "2.0 h ago" in detail
+    assert "restarts the clock" in detail
+
+
+def test_the_same_rows_past_the_window_are_overdue():
+    rows = [at(0, error_code=30035), at(60, error_code=30035)]
+    state, detail = verdict(rows, START + 30 * HOUR, True)
+    assert state == "overdue"
+    assert "past the 24 h" in detail
+
+
+def test_a_success_after_the_last_failure_means_it_already_cleared():
+    rows = [at(0, error_code=30035), at(60, error_code=30035), at(120)]
+    state, detail = verdict(rows, START + 3 * HOUR, True)
+    assert state == "provisioned"
+    assert "caught up" in detail
+
+
+def test_a_sender_in_no_pool_is_never_told_to_wait():
+    # Nothing was submitted, so the window is not running. Telling somebody to
+    # wait here costs them the whole day.
+    state, detail = verdict([at(0, error_code=30035)], START + HOUR, False)
+    assert state == "not-in-any-pool"
+    assert "waiting will not end it" in detail
+
+
+def test_a_window_of_only_30024_is_flagged_as_maybe_not_a_clock():
+    state, detail = verdict([at(0, error_code=30024)], START + HOUR, True)
+    assert state == "waiting"
+    assert "destination country" in detail
+
+
+def test_a_mixed_window_is_not_flagged_that_way():
+    rows = [at(0, error_code=30024), at(10, error_code=30035)]
+    assert codes_seen(rows) == ["30024", "30035"]
+    assert "destination country" not in verdict(rows, START + HOUR, True)[1]
+
+
+def test_failures_with_no_usable_timestamp_report_that_rather_than_guessing():
+    rows = [{"date_sent": "not a date", "error_code": 30035}]
+    state, detail = verdict(rows, START + HOUR, True)
+    assert state == "undated"
+    assert "no clock to read" in detail
+''',
+"test_js_file": "twilio-sender-provisioning-clock.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { codesSeen, verdict } from './twilio-sender-provisioning-clock.mjs';
+
+const T0 = Date.UTC(2026, 7, 24, 12, 0, 0);
+const START = T0 / 1000;
+const HOUR = 3600;
+
+const at = (minutes, extra = {}) => ({
+  date_sent: new Date(T0 + minutes * 60000).toUTCString(),
+  from: '+15125550123',
+  ...extra,
+});
+
+test('a sender with no provisioning codes is clean', () => {
+  assert.equal(verdict([at(0), at(5, { error_code: 30007 })],
+                       START + HOUR, true)[0], 'clean');
+});
+
+test('two hours in and still failing says wait', () => {
+  const rows = [at(0, { error_code: 30035 }), at(60, { error_code: 30035 })];
+  const [state, detail] = verdict(rows, START + 2 * HOUR, true);
+  assert.equal(state, 'waiting');
+  assert.match(detail, /2\\.0 h ago/);
+  assert.match(detail, /restarts the clock/);
+});
+
+test('the same rows past the window are overdue', () => {
+  const rows = [at(0, { error_code: 30035 }), at(60, { error_code: 30035 })];
+  const [state, detail] = verdict(rows, START + 30 * HOUR, true);
+  assert.equal(state, 'overdue');
+  assert.match(detail, /past the 24 h/);
+});
+
+test('a success after the last failure means it already cleared', () => {
+  const rows = [at(0, { error_code: 30035 }), at(60, { error_code: 30035 }), at(120)];
+  const [state, detail] = verdict(rows, START + 3 * HOUR, true);
+  assert.equal(state, 'provisioned');
+  assert.match(detail, /caught up/);
+});
+
+test('a sender in no pool is never told to wait', () => {
+  const [state, detail] = verdict([at(0, { error_code: 30035 })],
+                                  START + HOUR, false);
+  assert.equal(state, 'not-in-any-pool');
+  assert.match(detail, /waiting will not end it/);
+});
+
+test('a window of only 30024 is flagged as maybe not a clock', () => {
+  const [state, detail] = verdict([at(0, { error_code: 30024 })],
+                                  START + HOUR, true);
+  assert.equal(state, 'waiting');
+  assert.match(detail, /destination country/);
+});
+
+test('a mixed window is not flagged that way', () => {
+  const rows = [at(0, { error_code: 30024 }), at(10, { error_code: 30035 })];
+  assert.deepEqual(codesSeen(rows), ['30024', '30035']);
+  assert.doesNotMatch(verdict(rows, START + HOUR, true)[1], /destination country/);
+});
+
+test('failures with no usable timestamp report that rather than guessing', () => {
+  const rows = [{ date_sent: 'not a date', error_code: 30035 }];
+  const [state, detail] = verdict(rows, START + HOUR, true);
+  assert.equal(state, 'undated');
+  assert.match(detail, /no clock to read/);
+});
+''',
+"faq": [
+ ("How long does carrier provisioning actually take?",
+  "Up to 24 hours after the number joins a Messaging Service, and usually far less. The number sits at PENDING_REGISTRATION during that time, and moving it between services puts it through PENDING_DEREGISTRATION first, which is why a move costs more than an add."),
+ ("Why does removing and re-adding the number make it worse?",
+  "Because it is a deregistration followed by a registration. The carrier starts the routing update from scratch, so each attempt adds another window rather than shortening the current one. The check exists mostly to give somebody a reason not to do it."),
+ ("What is the difference between 30035 and 30024?",
+  "30035 is a registration in flight: the number is submitted and the carrier has not finished. 30024 is the carrier refusing that numeric sender for the destination, which can be a provisioning delay or can mean the sender is not valid for that country at all. A window that only ever shows 30024 deserves a second look at where you are sending."),
+ ("What if the number is not in any Messaging Service?",
+  "Then nothing is provisioning and waiting achieves nothing. That case usually shows up as 30034 rather than 30035, and the fix is to add the number to the service that carries the campaign. The script reports it as its own state so nobody is told to wait on a submission that was never made."),
+ ("Can I poll a status field instead of reading messages?",
+  "Not usefully. There is no countdown and no progress field on the number or the pool entry, so the first failing send is the only observable start of the clock. That is why this check is arithmetic on date_sent rather than a status read."),
+],
+"related": [
+ ("/twilio/number-missing-from-campaign-sender-pool/", "A 10DLC number that is in no sender pool at all"),
+ ("/twilio/a2p-campaign-stuck-in-progress/", "A campaign parked at IN_PROGRESS is not live"),
+ ("/twilio/tollfree-number-not-verified/", "An unverified toll-free number blocks all US SMS"),
+],
+"citations": [CITE_30035, CITE_30024, CITE_MSPN, CITE_A2P],
+},
+
 ]
