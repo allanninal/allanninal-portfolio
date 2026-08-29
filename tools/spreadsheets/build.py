@@ -22,6 +22,9 @@ from products_c import PRODUCTS_C
 from guides_a import GUIDES_A
 from guides_b import GUIDES_B
 from guides_c import GUIDES_C
+from guides_d import GUIDES_D
+from guides_e import GUIDES_E
+from guides_f import GUIDES_F
 
 # The free-kit line is described once, in the repo that builds the workbooks, so the site
 # and the zips cannot disagree about what a kit contains or whether it has a Pro edition.
@@ -31,7 +34,7 @@ from kits import KITS as FREE_KITS
 GUIDES = PRODUCTS_A + PRODUCTS_B + PRODUCTS_C
 # Guide articles: no product behind them, so they are kept in a separate list and
 # rendered by build_guide. See that module for why it is not a flag on the product page.
-ARTICLES = GUIDES_A + GUIDES_B + GUIDES_C
+ARTICLES = GUIDES_A + GUIDES_B + GUIDES_C + GUIDES_D + GUIDES_E + GUIDES_F
 
 # Attach the problem/fix diagrams. Kept out of the guide dicts so the prose and the
 # pictures can be edited without stepping on each other, and so a guide with no diagram
@@ -96,7 +99,13 @@ CFG = {
     # in the gumroad-products repo), so it leads.
     "guide_group_order": ["When Excel changes your data",
                           "Formulas that do not behave as they read",
-                          "Cleaning a real export"],
+                          "Cleaning a real export",
+                          "Power Query — clean it once, not every month",
+                          "One formula, many answers",
+                          "Text work that used to need a macro",
+                          "Formatting that follows a rule",
+                          "Lookups past the basics",
+                          "When the file goes wrong"],
     "guide_group_blurb": {
         "When Excel changes your data":
             "The faults that happen on open or on paste, before you type anything — and "
@@ -107,6 +116,24 @@ CFG = {
         "Cleaning a real export":
             "One export, start to finish: which column to fix first, and the fault that is "
             "characteristic of that file.",
+        "Power Query — clean it once, not every month":
+            "The sequel to all of the above. Power Query records the cleaning as steps and "
+            "replays them on next month's file, so the work stops being manual.",
+        "One formula, many answers":
+            "Modern Excel lets one formula fill a whole column and resize itself. What that "
+            "changes, and the errors it introduces.",
+        "Text work that used to need a macro":
+            "Pulling a code out of messy text needed VBA for twenty years. It does not any "
+            "more, and almost all the advice online still says it does.",
+        "Formatting that follows a rule":
+            "Where advanced actually begins for most people: the moment a colour is decided "
+            "by a formula rather than a preset.",
+        "Lookups past the basics":
+            "The last match rather than the first, the end of a growing column, and the "
+            "references that are awkward to build.",
+        "When the file goes wrong":
+            "Getting unsaved work back, and removing the link to a file you deleted years "
+            "ago that Excel still asks about.",
     },
     "kit_groups": [
         {"title": "Free workbooks you can download now",
