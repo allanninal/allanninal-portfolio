@@ -28,8 +28,17 @@ from pathlib import Path
 SITE = Path.home() / "Projects/allanninal.dev"
 REPOS = Path.home() / "Projects"
 GH = "https://github.com/allanninal"
-PLATFORMS = ["woocommerce", "shopify", "bigcommerce", "medusa", "shopware",
-             "saleor", "prestashop", "magento", "dns"]
+# section -> repo name. Nine follow the <section>-fixes convention; the five added later
+# are named for what people would actually search GitHub for, which matters because the
+# point of this section is to be found.
+REPO = {"woocommerce": "woocommerce-fixes", "shopify": "shopify-fixes",
+        "bigcommerce": "bigcommerce-fixes", "medusa": "medusa-fixes",
+        "shopware": "shopware-fixes", "saleor": "saleor-fixes",
+        "prestashop": "prestashop-fixes", "magento": "magento-fixes",
+        "dns": "dns-fixes", "seo": "technical-seo-fixes",
+        "cloudflare": "cloudflare-fixes", "ci": "github-actions-fixes",
+        "aws": "aws-cost-fixes", "email": "email-ses-fixes"}
+PLATFORMS = list(REPO)
 APPLY = "--apply" in sys.argv
 
 # The `.repo-cta` rule in every one of the nine stylesheets styles a WRAPPER whose <a>
@@ -40,7 +49,7 @@ APPLY = "--apply" in sys.argv
 # profile, so every one of the 652 notes now offers the script AND the profile. A link to
 # a repo grows one repo; a link to the profile is what turns a reader into a follower.
 ART = ('<div class="repo-cta" data-repo-cta>\n'
-       '<a href="{gh}/{plat}-fixes/tree/main/{slug}" rel="noopener" target="_blank">'
+       '<a href="{gh}/{repo}/tree/main/{slug}" rel="noopener" target="_blank">'
        'Get this script on GitHub</a>\n'
        '<a href="{gh}" rel="noopener" target="_blank">Follow @allanninal</a>\n'
        '<span>Python and Node.js, with tests. Dry run by default. '
@@ -48,9 +57,9 @@ ART = ('<div class="repo-cta" data-repo-cta>\n'
        '</div>\n')
 
 IDX = ('<div class="repo-cta" data-repo-cta>\n'
-       '<a href="{gh}/{plat}-fixes" rel="noopener" target="_blank">'
+       '<a href="{gh}/{repo}" rel="noopener" target="_blank">'
        'Browse all {n} scripts on GitHub</a>\n'
-       '<a href="{gh}/{plat}-fixes/archive/refs/heads/main.zip">Download them all as a zip</a>\n'
+       '<a href="{gh}/{repo}/archive/refs/heads/main.zip">Download them all as a zip</a>\n'
        '<a href="{gh}" rel="noopener" target="_blank">Follow @allanninal</a>\n'
        '<span>Every fix on this page has a tested Python and Node.js script in the repo. '
        'Free, and MIT as stated in its README.</span>\n'
@@ -59,11 +68,13 @@ IDX = ('<div class="repo-cta" data-repo-cta>\n'
 # Shown in the copy, so it has to read like the platform is written elsewhere on the page.
 LABEL = {"woocommerce": "WooCommerce", "shopify": "Shopify", "bigcommerce": "BigCommerce",
          "medusa": "Medusa", "shopware": "Shopware", "saleor": "Saleor",
-         "prestashop": "PrestaShop", "magento": "Magento", "dns": "DNS and domain"}
+         "prestashop": "PrestaShop", "magento": "Magento", "dns": "DNS and domain",
+         "seo": "technical SEO", "cloudflare": "Cloudflare", "ci": "GitHub Actions",
+         "aws": "AWS cost", "email": "email and SES"}
 
 
 def folders(plat: str) -> set[str]:
-    d = REPOS / f"{plat}-fixes"
+    d = REPOS / REPO[plat]
     if not d.is_dir():
         return set()
     return {p.name for p in d.iterdir()
@@ -81,7 +92,7 @@ def patch_article(path: Path, plat: str, slug: str, n: int) -> str:
                   html, re.S)
     if not m:
         return "no anchor"
-    block = ART.format(gh=GH, plat=plat, slug=slug, n=n, label=LABEL[plat])
+    block = ART.format(gh=GH, repo=REPO[plat], slug=slug, n=n, label=LABEL[plat])
     out = html[:m.end(1)] + block + html[m.end(1):]
     if APPLY:
         path.write_text(out, encoding="utf-8")
@@ -96,7 +107,7 @@ def patch_index(path: Path, plat: str, n: int) -> str:
     m = re.search(r'(</section>\s*)(<div class="container)', html, re.S)
     if not m:
         return "no anchor"
-    block = IDX.format(gh=GH, plat=plat, n=n)
+    block = IDX.format(gh=GH, repo=REPO[plat], n=n)
     out = html[:m.end(1)] + '<div class="container prose">\n' + block + '</div>\n' + html[m.end(1):]
     if APPLY:
         path.write_text(out, encoding="utf-8")
@@ -109,7 +120,7 @@ if __name__ == "__main__":
     for plat in want:
         repo = folders(plat)
         if not repo:
-            print(f"  ⚠ {plat}: no local clone at {REPOS/(plat+'-fixes')} — skipped")
+            print(f"  ⚠ {plat}: no local clone at {REPOS/REPO[plat]} — skipped")
             continue
         sec = SITE / plat
         stats = {"patched": 0, "already": 0, "no anchor": 0, "no script": 0}
