@@ -454,6 +454,28 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
         sections.append(f'<h2>{esc(name)}</h2>\n<p>{esc(cfg["guide_group_blurb"][name])}</p>\n'
                         f'<div class="cards">\n{cards}\n</div>')
 
+    # Free kits. Each is a zip on this domain, never a Gumroad product: a $0 listing
+    # burns a create slot from the 10-per-24h quota and returns nothing. Where a paid
+    # edition already exists but is not published, the card says so as INERT TEXT —
+    # never a link, because a button that goes nowhere is worse than no button.
+    for group in cfg.get("kit_groups", []):
+        cards = []
+        for k in group["kits"]:
+            soon = ""
+            if k.get("pro"):
+                soon = (f'<div class="card__soon"><span class="pill pill--soon">Pro coming soon</span>'
+                        f'<span>{esc(k["pro"]["name"])}</span></div>')
+            cards.append(
+                f'<div class="card card--kit">'
+                f'<div class="card__meta"><span class="chip chip--cat">{esc(k["audience"])}</span></div>'
+                f'<h3>{esc(k["name"])}</h3><p>{esc(k["blurb"])}</p>{soon}'
+                f'<div class="card__foot">'
+                f'<a class="card__dl" href="/{SEC}/downloads/{esc(k["zip"])}" download>Download free</a>'
+                f'<span class="card__tabs">{len(k["tabs"])} tabs &middot; Excel + Sheets</span></div>'
+                f'</div>')
+        sections.append(f'<h2>{esc(group["title"])}</h2>\n<p>{esc(group["blurb"])}</p>\n'
+                        f'<div class="cards">\n' + "\n".join(cards) + '\n</div>')
+
     # The Pro edition that does not exist yet. Stated as coming soon rather than omitted,
     # because the free workbook's read-me already tells buyers it is being built — and a
     # promise made in a download should be visible on the site too.

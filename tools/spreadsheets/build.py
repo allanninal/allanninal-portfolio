@@ -13,6 +13,7 @@ Order of operations when something changes:
     python3 build.py
 """
 import sys
+from pathlib import Path
 
 from build_product import build
 from products_a import PRODUCTS_A
@@ -21,6 +22,11 @@ from products_c import PRODUCTS_C
 from guides_a import GUIDES_A
 from guides_b import GUIDES_B
 from guides_c import GUIDES_C
+
+# The free-kit line is described once, in the repo that builds the workbooks, so the site
+# and the zips cannot disagree about what a kit contains or whether it has a Pro edition.
+sys.path.insert(0, str(Path.home() / "Projects/gumroad-products/spreadsheets"))
+from kits import KITS as FREE_KITS
 
 GUIDES = PRODUCTS_A + PRODUCTS_B + PRODUCTS_C
 # Guide articles: no product behind them, so they are kept in a separate list and
@@ -102,6 +108,14 @@ CFG = {
             "One export, start to finish: which column to fix first, and the fault that is "
             "characteristic of that file.",
     },
+    "kit_groups": [
+        {"title": "Free workbooks you can download now",
+         "blurb": "Twelve finished workbooks, free and hosted here rather than behind a "
+                  "checkout. Each one exists because it contains a calculation that free "
+                  "templates normally get wrong.",
+         "kits": FREE_KITS},
+    ],
+
     "soon": {
         "group": "In development",
         "blurb": "Not finished, so not for sale. Listed because the free workbook's read-me "

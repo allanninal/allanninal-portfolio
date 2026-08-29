@@ -63,7 +63,8 @@ guide, and a short read-me. Free, no email required.</p>
 <li><strong>Excel-Data-Cleanup-Workbook-Free.xlsx</strong> &mdash; paste a column, read the diagnosis, take the cleaned output</li>
 <li><strong>Excel-Data-Survival-Guide.pdf</strong> &mdash; the eight failures, the import routine that prevents them, every formula explained</li>
 </ul>
-<p><a class="repo-cta" href="{KIT}" download>Download the kit &mdash; free ({kit_kb()}&nbsp;KB .zip)</a></p>
+<div class="repo-cta"><a href="{KIT}" download>Download the kit &mdash; free</a>
+<span>{kit_kb()}&nbsp;KB .zip &middot; Excel &amp; Google Sheets</span></div>
 <p class="lead">Plain <code>.xlsx</code>: no macros, no add-ins. Opens in Excel, Google Sheets,
 Apple Numbers and LibreOffice Calc.</p>
 </div>'''
