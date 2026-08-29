@@ -94,7 +94,7 @@ API = "https://api.stripe.com/v1"
 TESTMODE = "testmode_decline"
 
 
-def testmode_declines(charges, intents):
+def count_testmode_declines(charges, intents):
     """Count objects that failed because a test artefact reached live mode.
 
     Pure, so the rules can be tested without a network. Stripe records this one
@@ -176,7 +176,7 @@ def main():
         "charges": len(charges),
         "payment_intents": len(intents),
         "customers": len(customers),
-        "testmode_declines": testmode_declines(charges, intents),
+        "testmode_declines": count_testmode_declines(charges, intents),
     }
 
     state, detail = verdict(mode, account, counts)
@@ -223,7 +223,7 @@ const TESTMODE = 'testmode_decline';
  * Stripe records this one condition in three fields depending on how far the
  * payment got, so reading only one of them under-counts.
  */
-export function testmodeDeclines(charges, intents) {
+export function countTestmodeDeclines(charges, intents) {
   let n = 0;
   for (const c of charges) {
     const outcome = c.outcome ?? {};
@@ -298,7 +298,7 @@ async function main() {
     charges: charges.length,
     payment_intents: intents.length,
     customers: customers.length,
-    testmode_declines: testmodeDeclines(charges, intents),
+    testmode_declines: countTestmodeDeclines(charges, intents),
   };
 
   const [state, detail] = verdict(mode, account, counts);
@@ -334,7 +334,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 ''',
 "test_intro": "Two cases carry the note. One is the charge that only reports the condition in <code>outcome.reason</code> and not in <code>failure_code</code>, because a counter that reads a single field is the reason people conclude &ldquo;no test declines&rdquo; and go looking elsewhere for a day. The other is the silent one: a live key with an activated account and nothing at all behind it, which is not healthy and has to say so.",
 "test_py_file": "test_stripe_live_mode_check.py",
-"test_py": '''from stripe_live_mode_check import testmode_declines, verdict
+"test_py": '''from stripe_live_mode_check import count_testmode_declines, verdict
 
 LIVE = {"charges_enabled": True, "details_submitted": True}
 BUSY = {"charges": 40, "payment_intents": 40, "customers": 12}
@@ -343,18 +343,18 @@ BUSY = {"charges": 40, "payment_intents": 40, "customers": 12}
 def test_counts_a_charge_that_only_names_it_in_outcome_reason():
     # failure_code is absent here; a counter reading one field misses this.
     charges = [{"outcome": {"reason": "testmode_decline"}}]
-    assert testmode_declines(charges, []) == 1
+    assert count_testmode_declines(charges, []) == 1
 
 
 def test_counts_an_intent_that_never_produced_a_charge():
     intents = [{"last_payment_error": {"code": "testmode_decline"}}]
-    assert testmode_declines([], intents) == 1
+    assert count_testmode_declines([], intents) == 1
 
 
 def test_ordinary_declines_are_not_counted():
     charges = [{"failure_code": "card_declined",
                 "outcome": {"reason": "insufficient_funds"}}]
-    assert testmode_declines(charges, []) == 0
+    assert count_testmode_declines(charges, []) == 0
 
 
 def test_a_test_key_short_circuits_every_other_rule():
@@ -388,24 +388,24 @@ def test_busy_and_clean_is_healthy():
 "test_js_file": "stripe-live-mode-check.test.mjs",
 "test_js": '''import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { testmodeDeclines, verdict } from './stripe-live-mode-check.mjs';
+import { countTestmodeDeclines, verdict } from './stripe-live-mode-check.mjs';
 
 const LIVE = { charges_enabled: true, details_submitted: true };
 const BUSY = { charges: 40, payment_intents: 40, customers: 12 };
 
 test('counts a charge that only names it in outcome.reason', () => {
-  assert.equal(testmodeDeclines([{ outcome: { reason: 'testmode_decline' } }], []), 1);
+  assert.equal(countTestmodeDeclines([{ outcome: { reason: 'testmode_decline' } }], []), 1);
 });
 
 test('counts an intent that never produced a charge', () => {
   const intents = [{ last_payment_error: { code: 'testmode_decline' } }];
-  assert.equal(testmodeDeclines([], intents), 1);
+  assert.equal(countTestmodeDeclines([], intents), 1);
 });
 
 test('ordinary declines are not counted', () => {
   const charges = [{ failure_code: 'card_declined',
                      outcome: { reason: 'insufficient_funds' } }];
-  assert.equal(testmodeDeclines(charges, []), 0);
+  assert.equal(countTestmodeDeclines(charges, []), 0);
 });
 
 test('a test key short circuits every other rule', () => {
