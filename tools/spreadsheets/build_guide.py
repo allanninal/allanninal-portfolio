@@ -27,8 +27,20 @@ import json
 from build_product import (SITE, SEC, GA, ADS, ROOT, esc, q, url_for,
                            _header, _footer, _person, table)
 
-KIT = f"/{SEC}/downloads/Excel-Data-Cleanup-Kit.zip"
 KIT_NAME = "Excel-Data-Cleanup-Kit.zip"
+KIT = f"/{SEC}/downloads/{KIT_NAME}"
+KIT_PATH = ROOT / SEC / "downloads" / KIT_NAME
+
+
+def kit_kb() -> int:
+    """Real size of the zip on disk, so the stated figure cannot drift from the file.
+
+    Hard-coding it was wrong within an hour: the block said 122 KB for a 121 KB file.
+    A missing kit is a hard failure rather than a 0 KB label — a download block whose
+    link 404s is worse than no download block."""
+    if not KIT_PATH.exists():
+        raise SystemExit(f"free kit missing at {KIT_PATH} — every guide links to it.")
+    return round(KIT_PATH.stat().st_size / 1024)
 
 
 def dl(second: bool = False) -> str:
@@ -51,7 +63,7 @@ guide, and a short read-me. Free, no email required.</p>
 <li><strong>Excel-Data-Cleanup-Workbook-Free.xlsx</strong> &mdash; paste a column, read the diagnosis, take the cleaned output</li>
 <li><strong>Excel-Data-Survival-Guide.pdf</strong> &mdash; the eight failures, the import routine that prevents them, every formula explained</li>
 </ul>
-<p><a class="repo-cta" href="{KIT}" download>Download the kit &mdash; free (122&nbsp;KB .zip)</a></p>
+<p><a class="repo-cta" href="{KIT}" download>Download the kit &mdash; free ({kit_kb()}&nbsp;KB .zip)</a></p>
 <p class="lead">Plain <code>.xlsx</code>: no macros, no add-ins. Opens in Excel, Google Sheets,
 Apple Numbers and LibreOffice Calc.</p>
 </div>'''
