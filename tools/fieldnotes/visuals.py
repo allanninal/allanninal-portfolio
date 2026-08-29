@@ -7,12 +7,18 @@ prose, and so the guides files stay readable as writing rather than as markup.
 import json
 from pathlib import Path
 
-from visuals_cf_seo import V as _CF_SEO
-from visuals_ci_aws import V as _CI_AWS
-from visuals_email import V as _EMAIL
-from visuals_stripe import V as _STRIPE
+import importlib
 
-VISUALS = {**_CF_SEO, **_CI_AWS, **_EMAIL, **_STRIPE}
+# Discovered rather than listed. A section is now written in batches, and each
+# batch brings its own visuals_<section>_<letter>.py; hand-maintaining the import
+# list meant a batch could be written, pass its own tests, and then fail the build
+# with "no visuals for ..." purely because one line here was forgotten.
+#
+# Sorted so the order is stable. Each themed module sets its brand at the top and
+# calls reset_theme() at the bottom, so importing them in any order is safe.
+VISUALS = {}
+for _mod in sorted(p.stem for p in Path(__file__).resolve().parent.glob("visuals_*.py")):
+    VISUALS.update(importlib.import_module(_mod).V)
 PICKS = json.loads((Path(__file__).resolve().parent / "img_picks.json").read_text())
 
 

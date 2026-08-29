@@ -47,6 +47,10 @@ def check(section: str, run_tests: bool) -> int:
     guides = load(section)
     problems: list[str] = []
     seen: set[str] = set()
+    # Guides cross-reference each other, so a link to a sibling in the same batch
+    # is valid before either has been built. Only links outside this set have to
+    # already exist on disk.
+    pending = {f"/{section}/{g['slug']}/" for g in guides}
 
     for g in guides:
         slug = g.get("slug", "<no slug>")
@@ -69,7 +73,8 @@ def check(section: str, run_tests: bool) -> int:
 
         # A related link that does not resolve is a 404 shipped to a reader.
         for href, _label in g.get("related", []):
-            if href.startswith("/") and not (ROOT / href.strip("/") / "index.html").exists():
+            if (href.startswith("/") and href not in pending
+                    and not (ROOT / href.strip("/") / "index.html").exists()):
                 problems.append(f"{slug}: related link {href} does not exist")
 
         if section in READ_ONLY:

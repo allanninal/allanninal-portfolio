@@ -76,10 +76,28 @@ PDF = ('<a href="/assets/field-guides/allanninal-{repo}-field-guide.pdf" downloa
        'Field guide PDF ({n} {fixes}, {kb}&nbsp;KB)</a>\n')
 
 
+# "fix" pluralises to "fixes", not "fixs".
+PLURALS = {"fix": "fixes", "script": "scripts"}
+
+
 def plural(n: int, word: str) -> str:
     """Every section had more than one note when these strings were written, so the
     templates hard-coded the plural. A new section starts at one."""
-    return word if n == 1 else word + "s"
+    return word if n == 1 else PLURALS[word]
+
+
+def note_count(plat: str) -> int:
+    """Notes published in the section, which is what the PDF covers.
+
+    Not the same as the number of script folders in the repo: /dns/ has 58 notes
+    and 54 scripts, because four of its fixes live in a registrar's console and no
+    script can perform them. Labelling the field guide with the repo count made it
+    claim 54.
+    """
+    d = SITE / plat
+    return len([p for p in d.iterdir()
+                if p.is_dir() and p.name not in ("assets", "downloads")
+                and (p / "index.html").is_file()])
 
 
 def pdf_anchor(plat: str, n: int) -> str:
@@ -92,7 +110,8 @@ def pdf_anchor(plat: str, n: int) -> str:
     f = SITE / "assets" / "field-guides" / f"allanninal-{REPO[plat]}-field-guide.pdf"
     if not f.is_file():
         return ""
-    return PDF.format(repo=REPO[plat], n=n, fixes=plural(n, "fix"),
+    notes = note_count(plat)
+    return PDF.format(repo=REPO[plat], n=notes, fixes=plural(notes, "fix"),
                       kb=f.stat().st_size // 1024)
 
 # Shown in the copy, so it has to read like the platform is written elsewhere on the page.

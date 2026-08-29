@@ -5,7 +5,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_section import build
 from visuals import apply as apply_visuals
-from guides import GUIDES
+
+# Batches are discovered, not listed: this section is written a few notes at a
+# time and each batch arrives as its own guides_<letter>.py. Sorted so the index
+# order is stable between builds.
+import importlib
+GUIDES = []
+for _m in sorted(q.stem for q in Path(__file__).resolve().parent.glob("guides*.py")):
+    GUIDES.extend(importlib.import_module(_m).GUIDES)
 
 CFG = {
   "section": "stripe",
