@@ -421,7 +421,15 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
     for g in guides:
         groups.setdefault(g["group"], []).append(g)
 
-    sections = []
+    products_block, guides_block, kits_block, soon_block = [], [], [], []
+
+    # Travels with the paid products, because that is what it is about.
+    products_block.append(
+        f'<div class="callout callout--note">'
+        f'<div class="callout__title">{esc(cfg["scope_title"])}</div>'
+        f'{cfg["scope_body"]}</div>')
+
+    sections = products_block
     for name in cfg["group_order"]:
         gs = groups.get(name, [])
         if not gs:
@@ -440,6 +448,7 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
     # to buy, so a price chip would be a lie. The foot carries "Free guide" instead, which
     # is also the honest thing to show a reader scanning the index.
     articles = articles or []
+    sections = guides_block
     for name in cfg.get("guide_group_order", []):
         gs = [a for a in articles if a["group"] == name]
         if not gs:
@@ -458,6 +467,7 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
     # burns a create slot from the 10-per-24h quota and returns nothing. Where a paid
     # edition already exists but is not published, the card says so as INERT TEXT —
     # never a link, because a button that goes nowhere is worse than no button.
+    sections = kits_block
     for group in cfg.get("kit_groups", []):
         cards = []
         for k in group["kits"]:
@@ -479,6 +489,7 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
     # The Pro edition that does not exist yet. Stated as coming soon rather than omitted,
     # because the free workbook's read-me already tells buyers it is being built — and a
     # promise made in a download should be visible on the site too.
+    sections = soon_block
     if cfg.get("soon"):
         s_ = cfg["soon"]
         sections.append(
@@ -488,6 +499,19 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
             f'<h3>{esc(s_["title"])}</h3><p>{esc(s_["body"])}</p>'
             f'<div class="card__foot"><span class="card__tabs">No date promised</span></div>'
             f'</div>\n</div>')
+
+    # Section order is configuration, not the order the code happens to build things in.
+    # The page opens with what costs the reader nothing and closes with the ask; putting
+    # the paid products first buried the free downloads at 82% page depth, where nobody
+    # scrolls (measured 2026-08-29: the free block began at y=8868 of 10,759px).
+    blocks = {"kits": kits_block, "guides": guides_block,
+              "products": products_block, "soon": soon_block}
+    order = cfg.get("section_order", ["products", "guides", "kits", "soon"])
+    missing = set(blocks) - set(order)
+    if missing:
+        raise SystemExit(f"section_order omits {missing} — those sections would vanish "
+                         f"silently from the page.")
+    sections = [x for key in order for x in blocks[key]]
 
     graph = {
         "@context": "https://schema.org",
@@ -516,7 +540,14 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
             _person(),
         ],
     }
-    body = "\n\n".join(sections)
+    # The featured image. Regenerated every build from live counts (see build.py), so it
+    # cannot drift the way a hand-made graphic would.
+    hero_img = (f'<figure class="feature-img">\n'
+                f'<img src="/{SEC}/assets/img/guides/index.png" '
+                f'alt="Spreadsheets that do the part everyone gets wrong — '
+                f'free workbooks and guides for Excel and Google Sheets" '
+                f'width="1280" height="800" loading="eager" decoding="async">\n</figure>')
+    body = hero_img + "\n\n" + "\n\n".join(sections)
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -532,11 +563,13 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
 <meta property="og:title" content="{q(cfg["index_title"])}">
 <meta property="og:description" content="{q(cfg["index_desc"])}">
 <meta property="og:url" content="{url}">
-<meta property="og:image" content="{SITE}/og-image.png">
+<meta property="og:image" content="{SITE}/{SEC}/assets/img/guides/index.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="800">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{q(cfg["index_title"])}">
 <meta name="twitter:description" content="{q(cfg["index_desc"])}">
-<meta name="twitter:image" content="{SITE}/og-image.png">
+<meta name="twitter:image" content="{SITE}/{SEC}/assets/img/guides/index.png">
 <meta name="google-adsense-account" content="{ADS}">
 <script async src="https://www.googletagmanager.com/gtag/js?id={GA}"></script>
 <script>window.dataLayer=window.dataLayer||[];function gtag(){{dataLayer.push(arguments);}}gtag('js',new Date());gtag('config','{GA}');</script>
@@ -558,11 +591,6 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
 </section>
 
 <div class="container prose">
-<div class="callout callout--note">
-<div class="callout__title">{esc(cfg["scope_title"])}</div>
-{cfg["scope_body"]}
-</div>
-
 {body}
 
 <div class="callout callout--cta">
@@ -625,6 +653,36 @@ def render_llms(cfg: dict, guides: list, articles: list | None = None) -> str:
                          f"Free guide, no signup. Includes a free Excel workbook.")
         lines.append("")
     return "\n".join(lines)
+
+
+def stamp_root_sitemap(cfg: dict) -> None:
+    """Update this section's lastmod in the site-wide sitemap index.
+
+    The section sitemap is regenerated with the pages, so it is always current. The ROOT
+    index is a separate file that nothing was updating, so its lastmod for /spreadsheets/
+    only happened to be right because somebody edited it by hand the same day. A search
+    engine reads the index first, so a stale date there is what stops a recrawl.
+
+    Refuses loudly rather than guessing if the entry is not found — a silent no-op here
+    would be indistinguishable from working.
+    """
+    import re
+    root = ROOT / "sitemap.xml"
+    if not root.exists():
+        print("  ⚠ root sitemap.xml not found — section lastmod NOT stamped")
+        return
+    t = root.read_text(encoding="utf-8")
+    pat = re.compile(r'(<loc>' + re.escape(f"{SITE}/{SEC}/sitemap.xml") +
+                     r'</loc>\s*<lastmod>)([\d-]+)(</lastmod>)')
+    m = pat.search(t)
+    if not m:
+        print(f"  ⚠ no <loc> for {SEC}/sitemap.xml in the root index — NOT stamped")
+        return
+    if m.group(2) == cfg["date"]:
+        print(f"  ok   root sitemap lastmod already {cfg['date']}")
+        return
+    root.write_text(pat.sub(rf"\g<1>{cfg['date']}\g<3>", t, count=1), encoding="utf-8")
+    print(f"  ok   root sitemap lastmod {m.group(2)} -> {cfg['date']}")
 
 
 def build(cfg: dict, guides: list, articles: list | None = None) -> int:
@@ -693,6 +751,7 @@ def build(cfg: dict, guides: list, articles: list | None = None) -> int:
           f"t[{len(cfg['index_title'])}] d[{len(cfg['index_desc'])}] {' '.join(iflags)}")
 
     out.joinpath("sitemap.xml").write_text(render_sitemap(cfg, guides, articles), encoding="utf-8")
+    stamp_root_sitemap(cfg)
     out.joinpath("llms.txt").write_text(render_llms(cfg, guides, articles), encoding="utf-8")
     print(f"  ok   sitemap.xml + llms.txt ({len(guides) + len(articles) + 1} URLs)")
     return fails

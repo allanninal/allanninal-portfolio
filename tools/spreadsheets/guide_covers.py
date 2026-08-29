@@ -138,6 +138,67 @@ def cover(slug: str, kicker: str, headline: str, before: str, after: str,
     return p
 
 
+def index_cover(n_guides: int, n_kits: int, n_products: int) -> Path:
+    """The featured image for /spreadsheets/ itself.
+
+    A different layout from the per-guide covers: this one has no before/after pair,
+    because the section is not about a single failure. It shows what is actually here.
+
+    The three numbers are PASSED IN and rendered at build time, never typed. Every stale
+    figure on this site started life as a number somebody typed into a design once — see
+    the profile card and the gallery stat tile, both of which froze for weeks.
+    """
+    im = Image.new("RGB", (W, H), PAPER)
+    d = ImageDraw.Draw(im)
+    f_kick = _font(FONTS, 26)
+    f_head = _font(FONTS, 66)
+    f_cap = _font(FONTS, 26)
+    f_num = _font(FONTS, 76)
+    f_lbl = _font(MONOS, 21)
+    f_small = _font(MONOS, 22)
+
+    M = 84
+    d.rectangle([0, 0, W, 10], fill=GREEN)
+    d.text((M, 62), "ALLANNINAL.DEV / SPREADSHEETS", font=f_kick, fill=GREEN)
+
+    # Deliberately NOT the page's own H1. The image sits directly beneath the headline,
+    # and repeating it word for word inside the picture reads as a mistake rather than as
+    # emphasis. This line says the thing the headline does not.
+    y = 122
+    for line in wrap(d, "Free workbooks, and guides to what Excel does without asking",
+                     f_head, W - 2 * M)[:2]:
+        d.text((M, y), line, font=f_head, fill=INK)
+        y += 80
+
+    cy = max(y + 30, 330)
+    for line in wrap(d, "Every one contains a calculation that free templates normally get "
+                        "wrong. Plain .xlsx — nothing to install.", f_cap, W - 2 * M)[:2]:
+        d.text((M, cy), line, font=f_cap, fill=INK_SOFT)
+        cy += 36
+
+    # three tiles, evenly spaced across the safe width
+    ty = cy + 54
+    tw = (W - 2 * M - 2 * 26) // 3
+    tiles = [(n_kits, "FREE WORKBOOKS", OK, OK_TINT),
+             (n_guides, "GUIDES", GREEN, TINT),
+             (n_products, "PAID WORKBOOKS", INK_SOFT, SURFACE)]
+    for i, (num, label, fg, bg) in enumerate(tiles):
+        x = M + i * (tw + 26)
+        d.rounded_rectangle([x, ty, x + tw, ty + 168], radius=16, fill=bg, outline=BORDER, width=2)
+        d.text((x + 28, ty + 26), str(num), font=f_num, fill=fg)
+        d.text((x + 28, ty + 118), label, font=f_lbl, fill=INK_FAINT)
+
+    d.line([M, H - 92, W - M, H - 92], fill=BORDER, width=2)
+    d.text((M, H - 68), "Excel + Google Sheets", font=f_small, fill=INK_FAINT)
+    tag = "NO MACROS, NO ADD-INS"
+    d.text((W - M - d.textlength(tag, font=f_small), H - 68), tag, font=f_small, fill=GREEN)
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    p = OUT / "index.png"
+    im.save(p, "PNG", optimize=True)
+    return p
+
+
 def build(specs: list[dict], only: set | None = None) -> int:
     n = 0
     for s in specs:

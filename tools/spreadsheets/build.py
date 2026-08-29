@@ -135,6 +135,10 @@ CFG = {
             "Getting unsaved work back, and removing the link to a file you deleted years "
             "ago that Excel still asks about.",
     },
+    # What the visitor sees first. Free before guides before the ask: the paid products
+    # used to lead, which pushed the free downloads to 82% page depth on a 10,759px page.
+    "section_order": ["kits", "guides", "products", "soon"],
+
     "kit_groups": [
         {"title": "Free workbooks you can download now",
          "blurb": "Twelve finished workbooks, free and hosted here rather than behind a "
@@ -157,6 +161,12 @@ CFG = {
 
 
 if __name__ == "__main__":
+    # Regenerate the section's featured image with the counts as they are right now, so
+    # the picture cannot claim 23 guides on a page that lists 46.
+    from guide_covers import index_cover
+    _img = index_cover(n_guides=len(ARTICLES), n_kits=len(FREE_KITS), n_products=len(GUIDES))
+    print(f"featured image -> {_img.name} "
+          f"({len(FREE_KITS)} kits, {len(ARTICLES)} guides, {len(GUIDES)} products)")
     print(f"building /spreadsheets/ — {len(GUIDES)} products, {len(ARTICLES)} guides")
     fails = build(CFG, GUIDES, ARTICLES)
     if fails:
