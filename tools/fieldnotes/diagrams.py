@@ -37,6 +37,44 @@ TONES = {
 ARROW = {"plain": LINE, "bad": BAD, "good": GOOD, "accent": ACCENT}
 
 
+def set_theme(brand: str) -> None:
+    """Retint the diagrams to a section's brand colour.
+
+    The older sections already did this — a WooCommerce diagram is drawn in
+    WooCommerce purple, a Magento one in Adobe orange — but this module fixed the
+    palette to /dns/ indigo, so every section built through it came out indigo
+    whatever its stylesheet said. That is invisible while the sections using it
+    happen to be indigo-ish and glaring the moment one is Twilio red.
+
+    Only the neutral and accent tones move. #cf4b3f and #4c9a2a stay put in every
+    section because they mean "this is the step that fails" and "this is the one
+    that works", and a reader should not have to relearn that per page.
+
+    Module-level because a build is one section per process; a section that never
+    calls this keeps the indigo it shipped with.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from make_section_assets import hex_to_hls, hls_to_hex, mix_to_black
+
+    global INK, SUB, LINE, ACCENT, ACCENT_BG, BORDER, TONES, ARROW
+    hue, _light, sat = hex_to_hls(brand)
+    INK = hls_to_hex(hue, 0.169, sat * 0.30)
+    SUB = hls_to_hex(hue, 0.384, sat * 0.14)
+    LINE = SUB
+    ACCENT = mix_to_black(brand, 0.18)
+    ACCENT_BG = hls_to_hex(hue, 0.957, sat * 0.55)
+    BORDER = hls_to_hex(hue, 0.855, sat * 0.52)
+    TONES = {
+        "accent": (ACCENT_BG, BORDER),
+        "plain": ("#fff", BORDER),
+        "bad": (BAD_BG, "#e8bdb6"),
+        "good": (GOOD_BG, "#bfdcb1"),
+    }
+    ARROW = {"plain": LINE, "bad": BAD, "good": GOOD, "accent": ACCENT}
+
+
 def esc(t):
     return H.escape(str(t), quote=True)
 
