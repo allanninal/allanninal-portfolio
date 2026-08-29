@@ -60,10 +60,27 @@ IDX = ('<div class="repo-cta" data-repo-cta>\n'
        '<a href="{gh}/{repo}" rel="noopener" target="_blank">'
        'Browse all {n} scripts on GitHub</a>\n'
        '<a href="{gh}/{repo}/archive/refs/heads/main.zip">Download them all as a zip</a>\n'
+       '{pdf}'
        '<a href="{gh}" rel="noopener" target="_blank">Follow @allanninal</a>\n'
        '<span>Every fix on this page has a tested Python and Node.js script in the repo. '
        'Free, and MIT as stated in its README.</span>\n'
        '</div>\n')
+
+PDF = ('<a href="/assets/field-guides/allanninal-{repo}-field-guide.pdf" download>'
+       'Field guide PDF ({n} fixes, {kb}&nbsp;KB)</a>\n')
+
+
+def pdf_anchor(plat: str, n: int) -> str:
+    """The printable field guide, if one has been built for this section.
+
+    This anchor used to be pasted in by hand after each build. It was therefore
+    the first thing lost whenever a section was regenerated — which is exactly
+    what happened to /seo/. Deriving it here means a rebuild restores it.
+    """
+    f = SITE / "assets" / "field-guides" / f"allanninal-{REPO[plat]}-field-guide.pdf"
+    if not f.is_file():
+        return ""
+    return PDF.format(repo=REPO[plat], n=n, kb=f.stat().st_size // 1024)
 
 # Shown in the copy, so it has to read like the platform is written elsewhere on the page.
 LABEL = {"woocommerce": "WooCommerce", "shopify": "Shopify", "bigcommerce": "BigCommerce",
@@ -99,19 +116,27 @@ def patch_article(path: Path, plat: str, slug: str, n: int) -> str:
     return "patched"
 
 
+INDEX_BLOCK = re.compile(
+    r'<div class="container prose">\s*<div class="repo-cta" data-repo-cta>.*?</div>\s*</div>\s*',
+    re.S)
+
+
 def patch_index(path: Path, plat: str, n: int) -> str:
     html = path.read_text(encoding="utf-8")
-    if "data-repo-cta" in html:
-        return "already"
+    # Unlike the article block, this one carries a script count and a PDF size that both
+    # move. Strip any existing copy and re-emit rather than returning "already", so the
+    # numbers on the section index cannot drift away from the repo and the file.
+    had = "data-repo-cta" in html
+    html = INDEX_BLOCK.sub("", html, count=1)
     # After the hero, before the first content block on the page.
     m = re.search(r'(</section>\s*)(<div class="container)', html, re.S)
     if not m:
         return "no anchor"
-    block = IDX.format(gh=GH, repo=REPO[plat], n=n)
+    block = IDX.format(gh=GH, repo=REPO[plat], n=n, pdf=pdf_anchor(plat, n))
     out = html[:m.end(1)] + '<div class="container prose">\n' + block + '</div>\n' + html[m.end(1):]
     if APPLY:
         path.write_text(out, encoding="utf-8")
-    return "patched"
+    return "refreshed" if had else "patched"
 
 
 if __name__ == "__main__":
