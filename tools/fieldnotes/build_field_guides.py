@@ -50,6 +50,9 @@ BLURB = {
     "stripe": "Stripe fails quietly. A webhook endpoint stops delivering and the payments "
               "still succeed, so revenue looks normal while everything that should happen "
               "after a payment stops. Every script here is read only.",
+    "twilio": "Most Twilio failures are a setting, not a bug. A number still points at "
+              "the demo TwiML URL, a campaign never finished registering, a webhook has "
+              "no fallback. Every script here is read only.",
 }
 
 

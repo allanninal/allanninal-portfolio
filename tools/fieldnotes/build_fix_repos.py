@@ -60,6 +60,11 @@ SECTIONS = {
                "problems through the API — disabled webhooks, undelivered events, "
                "stalled subscriptions and blocked payouts. They report and print the "
                "repair; they never write. Guides: allanninal.dev/stripe"),
+    "twilio": ("twilio-fixes", "Twilio",
+               "Read-only Python and Node.js scripts that find Twilio problems through "
+               "the API — numbers left on demo TwiML, unregistered 10DLC campaigns, "
+               "webhooks pointing nowhere and messages filtered by carriers. They report "
+               "and print the repair; they never write. Guides: allanninal.dev/twilio"),
 }
 
 # Dependencies are DERIVED from what the extracted files actually import, not typed.
