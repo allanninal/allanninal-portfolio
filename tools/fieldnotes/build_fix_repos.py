@@ -110,6 +110,9 @@ GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n.env\n.DS_Store
 
 LICENSE = (Path.home() / "Projects/dns-fixes/LICENSE")
 
+# Sections whose scripts never write; see add_repo_links.READ_ONLY.
+READ_ONLY = {"stripe", "twilio"}
+
 # Make the module importable without real credentials, the way the existing repos do.
 ENV_PY = re.compile(r'os\.environ\[(["\'])([A-Z0-9_]+)\1\]')
 ENV_JS = re.compile(r'process\.env\.([A-Z0-9_]+)(?!\s*\|\|)')
@@ -200,10 +203,35 @@ def build(section: str) -> tuple[int, int]:
         dest.mkdir(parents=True, exist_ok=True)
         lines = "\n".join(
             f"- [{t}](./{s}/) — https://www.allanninal.dev/{section}/{s}/" for s, t, _ in entries)
+        # The read-only sections have no dry run, because they have no write mode.
+        # Telling a reader to "keep DRY_RUN=true before letting it write" describes a
+        # variable these scripts do not have and a step they cannot take.
+        if section in READ_ONLY:
+            safety_blurb = (
+                "Every script here is read only. They hold a credential to a live "
+                "account, so none of them writes: each one reads through the API, "
+                "reports exactly what is wrong, and prints the repair for you to run."
+            )
+            run_blurb = (
+                "Set the environment variables named in that folder's README and run it. "
+                "Nothing writes, so there is no dry run to enable and no flag to be "
+                "careful about \u2014 use a restricted, read-only credential and the worst "
+                "case is that it tells you nothing is wrong."
+            )
+        else:
+            safety_blurb = (
+                "Every fix is safe by default. The scripts start in a dry run mode that "
+                "reports what they would do, so you can read the plan before anything "
+                "writes."
+            )
+            run_blurb = (
+                "Set the environment variables named in that folder's README, keep "
+                "`DRY_RUN=true` for the first pass, and read what it reports before "
+                "letting it write."
+            )
         (dest / "README.md").write_text(
             f"# {label} Fixes\n\n{desc.split('. Guides:')[0]}.\n\n"
-            f"Every fix is safe by default. The scripts start in a dry run mode that reports "
-            f"what they would do, so you can read the plan before anything writes.\n\n"
+            f"{safety_blurb}\n\n"
             f"By **[Allan Niñal](https://github.com/allanninal)** — AI Solutions Engineer. "
             f"I build AI powered tools, data products, and AWS automation.\n"
             f"Full write ups with diagrams for each fix live at "
@@ -213,9 +241,7 @@ def build(section: str) -> tuple[int, int]:
             f"## The fixes\n\n{lines}\n\n"
             f"## How to run one\n\n"
             f"Each folder holds the same script in Python and in Node.js, plus its test. "
-            f"Set the environment variables named in that folder's README, keep "
-            f"`DRY_RUN=true` for the first pass, and read what it reports before letting it "
-            f"write.\n\n"
+            f"{run_blurb}\n\n"
             f"## License\n\nMIT. Use it, change it, ship it.\n", encoding="utf-8")
         (dest / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
         pip, npm = deps_for(dest)
