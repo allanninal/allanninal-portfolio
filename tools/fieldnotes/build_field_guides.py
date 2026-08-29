@@ -47,6 +47,9 @@ BLURB = {
     "prestashop": "PrestaShop stock, order state and Webservice API fixes.",
     "magento": "Magento 2 indexing, cron and MSI inventory fixes.",
     "dns": "DNS records, email authentication, DNSSEC and certificate fixes.",
+    "stripe": "Stripe fails quietly. A webhook endpoint stops delivering and the payments "
+              "still succeed, so revenue looks normal while everything that should happen "
+              "after a payment stops. Every script here is read only.",
 }
 
 

@@ -36,6 +36,18 @@ TONES = {
 }
 ARROW = {"plain": LINE, "bad": BAD, "good": GOOD, "accent": ACCENT}
 
+# Captured before anything can retint them, so reset_theme() restores the exact
+# values the six existing sections were built with rather than a recomputation
+# that lands one shade off.
+_DEFAULTS = (INK, SUB, LINE, ACCENT, ACCENT_BG, BORDER, dict(TONES), dict(ARROW))
+
+
+def reset_theme() -> None:
+    """Restore the palette the already-published sections were drawn in."""
+    global INK, SUB, LINE, ACCENT, ACCENT_BG, BORDER, TONES, ARROW
+    INK, SUB, LINE, ACCENT, ACCENT_BG, BORDER, tones, arrow = _DEFAULTS
+    TONES, ARROW = dict(tones), dict(arrow)
+
 
 def set_theme(brand: str) -> None:
     """Retint the diagrams to a section's brand colour.
@@ -63,7 +75,7 @@ def set_theme(brand: str) -> None:
     INK = hls_to_hex(hue, 0.169, sat * 0.30)
     SUB = hls_to_hex(hue, 0.384, sat * 0.14)
     LINE = SUB
-    ACCENT = mix_to_black(brand, 0.18)
+    ACCENT = brand.lower()
     ACCENT_BG = hls_to_hex(hue, 0.957, sat * 0.55)
     BORDER = hls_to_hex(hue, 0.855, sat * 0.52)
     TONES = {

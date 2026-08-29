@@ -44,6 +44,7 @@ export const guideSections = [
   { href: '/email/', name: 'Email & SES', group: 'platform' as const },
   { href: '/dns/', name: 'DNS & Domains', group: 'platform' as const },
   { href: '/seo/', name: 'Technical SEO', group: 'platform' as const },
+  { href: '/stripe/', name: 'Stripe', group: 'api' as const },
 ];
 
 export const guideCounts = guideSections.map((s) => ({ ...s, count: dirCount(s.href.replace(/\//g, '')) }));

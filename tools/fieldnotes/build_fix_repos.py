@@ -55,6 +55,11 @@ SECTIONS = {
               "Python and Node.js scripts that detect and repair email deliverability "
               "problems — Amazon SES suppression, bounce rate, DKIM and DMARC alignment. "
               "Guides: allanninal.dev/email"),
+    "stripe": ("stripe-fixes", "Stripe",
+               "Read-only Python and Node.js scripts that find Stripe integration "
+               "problems through the API — disabled webhooks, undelivered events, "
+               "stalled subscriptions and blocked payouts. They report and print the "
+               "repair; they never write. Guides: allanninal.dev/stripe"),
 }
 
 # Dependencies are DERIVED from what the extracted files actually import, not typed.

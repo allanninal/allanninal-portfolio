@@ -125,4 +125,5 @@ export const fieldNotes = [
   { href: '/prestashop/', name: 'PrestaShop', detail: 'PrestaShop stock, order state, and Webservice API fixes' },
   { href: '/magento/', name: 'Magento', detail: 'Magento 2 indexing, cron, and MSI inventory fixes' },
   { href: '/dns/', name: 'DNS & Domains', detail: 'DNS records, email auth, DNSSEC, and certificate fixes' },
+  { href: '/stripe/', name: 'Stripe', detail: 'Disabled webhooks, undelivered events, stalled subscriptions and blocked payouts' },
 ];

@@ -10,8 +10,9 @@ from pathlib import Path
 from visuals_cf_seo import V as _CF_SEO
 from visuals_ci_aws import V as _CI_AWS
 from visuals_email import V as _EMAIL
+from visuals_stripe import V as _STRIPE
 
-VISUALS = {**_CF_SEO, **_CI_AWS, **_EMAIL}
+VISUALS = {**_CF_SEO, **_CI_AWS, **_EMAIL, **_STRIPE}
 PICKS = json.loads((Path(__file__).resolve().parent / "img_picks.json").read_text())
 
 

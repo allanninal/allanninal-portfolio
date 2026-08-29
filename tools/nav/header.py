@@ -40,6 +40,13 @@ PLATFORM = [
     ("/seo/", "Technical SEO"),
 ]
 
+# Third-party APIs. Separate from PLATFORM because a reader looking for "why did
+# my Stripe webhook stop" is not looking in the same place as one chasing an AWS
+# bill, and a fifteen-item single list helps neither.
+APIS = [
+    ("/stripe/", "Stripe"),
+]
+
 WORK = [
     ("/#products", "Products", "live"),
     ("/templates/", "Templates", ""),
@@ -64,6 +71,7 @@ SECTION_LABEL = {
     "email": "/email",
     "dns": "/dns",
     "seo": "/seo",
+    "stripe": "/stripe",
     "spreadsheets": "/spreadsheets",
     "build": "/build",
     "blog": "/blog",
@@ -150,7 +158,9 @@ def render(section: str = "", main_id: str = "main") -> str:
         '<div class="anx-panel__group"><p class="anx-panel__title">Commerce platforms</p>'
         f"{_items(COMMERCE, section, with_counts=True)}</div>"
         '<div class="anx-panel__group"><p class="anx-panel__title">Platform &amp; infra</p>'
-        f"{_items(PLATFORM, section, with_counts=True)}</div></div>"
+        f"{_items(PLATFORM, section, with_counts=True)}</div>"
+        '<div class="anx-panel__group"><p class="anx-panel__title">APIs</p>'
+        f"{_items(APIS, section, with_counts=True)}</div></div>"
     )
 
     work_panel = (
@@ -203,6 +213,7 @@ def render(section: str = "", main_id: str = "main") -> str:
       <div class="anx-acc__panel" id="anx-d-guides" hidden>
         <p class="anx-panel__title">Commerce platforms</p>{_items(COMMERCE, section, with_counts=True)}
         <p class="anx-panel__title">Platform &amp; infra</p>{_items(PLATFORM, section, with_counts=True)}
+        <p class="anx-panel__title">APIs</p>{_items(APIS, section, with_counts=True)}
       </div>
     </div>
     <div class="anx-acc"><a class="anx-acc__btn" href="/blog/">Blog</a></div>

@@ -37,8 +37,14 @@ REPO = {"woocommerce": "woocommerce-fixes", "shopify": "shopify-fixes",
         "prestashop": "prestashop-fixes", "magento": "magento-fixes",
         "dns": "dns-fixes", "seo": "technical-seo-fixes",
         "cloudflare": "cloudflare-fixes", "ci": "github-actions-fixes",
-        "aws": "aws-cost-fixes", "email": "email-ses-fixes"}
+        "aws": "aws-cost-fixes", "email": "email-ses-fixes",
+        "stripe": "stripe-fixes"}
 PLATFORMS = list(REPO)
+
+# Sections whose scripts hold a credential to a live payments or messaging account.
+# Those never write at all, so "dry run by default" would understate it — there is
+# no second mode to be careful about.
+READ_ONLY = {"stripe"}
 APPLY = "--apply" in sys.argv
 
 # The `.repo-cta` rule in every one of the nine stylesheets styles a WRAPPER whose <a>
@@ -52,13 +58,13 @@ ART = ('<div class="repo-cta" data-repo-cta>\n'
        '<a href="{gh}/{repo}/tree/main/{slug}" rel="noopener" target="_blank">'
        'Get this script on GitHub</a>\n'
        '<a href="{gh}" rel="noopener" target="_blank">Follow @allanninal</a>\n'
-       '<span>Python and Node.js, with tests. Dry run by default. '
-       'One of {n} {label} fixes, free and open source.</span>\n'
+       '<span>Python and Node.js, with tests. {safety}. '
+       '{count_phrase}, free and open source.</span>\n'
        '</div>\n')
 
 IDX = ('<div class="repo-cta" data-repo-cta>\n'
        '<a href="{gh}/{repo}" rel="noopener" target="_blank">'
-       'Browse all {n} scripts on GitHub</a>\n'
+       'Browse {browse} on GitHub</a>\n'
        '<a href="{gh}/{repo}/archive/refs/heads/main.zip">Download them all as a zip</a>\n'
        '{pdf}'
        '<a href="{gh}" rel="noopener" target="_blank">Follow @allanninal</a>\n'
@@ -67,7 +73,13 @@ IDX = ('<div class="repo-cta" data-repo-cta>\n'
        '</div>\n')
 
 PDF = ('<a href="/assets/field-guides/allanninal-{repo}-field-guide.pdf" download>'
-       'Field guide PDF ({n} fixes, {kb}&nbsp;KB)</a>\n')
+       'Field guide PDF ({n} {fixes}, {kb}&nbsp;KB)</a>\n')
+
+
+def plural(n: int, word: str) -> str:
+    """Every section had more than one note when these strings were written, so the
+    templates hard-coded the plural. A new section starts at one."""
+    return word if n == 1 else word + "s"
 
 
 def pdf_anchor(plat: str, n: int) -> str:
@@ -80,14 +92,15 @@ def pdf_anchor(plat: str, n: int) -> str:
     f = SITE / "assets" / "field-guides" / f"allanninal-{REPO[plat]}-field-guide.pdf"
     if not f.is_file():
         return ""
-    return PDF.format(repo=REPO[plat], n=n, kb=f.stat().st_size // 1024)
+    return PDF.format(repo=REPO[plat], n=n, fixes=plural(n, "fix"),
+                      kb=f.stat().st_size // 1024)
 
 # Shown in the copy, so it has to read like the platform is written elsewhere on the page.
 LABEL = {"woocommerce": "WooCommerce", "shopify": "Shopify", "bigcommerce": "BigCommerce",
          "medusa": "Medusa", "shopware": "Shopware", "saleor": "Saleor",
          "prestashop": "PrestaShop", "magento": "Magento", "dns": "DNS and domain",
          "seo": "technical SEO", "cloudflare": "Cloudflare", "ci": "GitHub Actions",
-         "aws": "AWS cost", "email": "email and SES"}
+         "aws": "AWS cost", "email": "email and SES", "stripe": "Stripe"}
 
 
 def folders(plat: str) -> set[str]:
@@ -99,21 +112,31 @@ def folders(plat: str) -> set[str]:
             and p.name not in ("node_modules", "__pycache__")}
 
 
+ARTICLE_BLOCK = re.compile(r'<div class="repo-cta" data-repo-cta>.*?</div>\s*', re.S)
+
+
 def patch_article(path: Path, plat: str, slug: str, n: int) -> str:
     html = path.read_text(encoding="utf-8")
-    if "data-repo-cta" in html:
-        return "already"
+    # Refreshed, not skipped: the block names how many fixes the section has, and
+    # that number moves every time a note is added.
+    had = "data-repo-cta" in html
+    html = ARTICLE_BLOCK.sub("", html, count=1)
     # Sit it between the intro paragraph and the code itself, so the reader learns the
     # script is downloadable BEFORE scrolling past 200 lines of it.
     m = re.search(r'(<h2>The full code</h2>\s*<p>.*?</p>\s*)(<div class="code-block")',
                   html, re.S)
     if not m:
         return "no anchor"
-    block = ART.format(gh=GH, repo=REPO[plat], slug=slug, n=n, label=LABEL[plat])
+    phrase = (f"The only {LABEL[plat]} fix here so far" if n == 1
+              else f"One of {n} {LABEL[plat]} fixes")
+    block = ART.format(gh=GH, repo=REPO[plat], slug=slug, n=n, label=LABEL[plat],
+                       count_phrase=phrase,
+                       safety=("Read only, it never writes" if plat in READ_ONLY
+                               else "Dry run by default"))
     out = html[:m.end(1)] + block + html[m.end(1):]
     if APPLY:
         path.write_text(out, encoding="utf-8")
-    return "patched"
+    return "already" if had and out == path.read_text(encoding="utf-8") else ("refreshed" if had else "patched")
 
 
 INDEX_BLOCK = re.compile(
@@ -132,7 +155,8 @@ def patch_index(path: Path, plat: str, n: int) -> str:
     m = re.search(r'(</section>\s*)(<div class="container)', html, re.S)
     if not m:
         return "no anchor"
-    block = IDX.format(gh=GH, repo=REPO[plat], n=n, pdf=pdf_anchor(plat, n))
+    block = IDX.format(gh=GH, repo=REPO[plat], n=n, pdf=pdf_anchor(plat, n),
+                       browse="the script" if n == 1 else f"all {n} scripts")
     out = html[:m.end(1)] + '<div class="container prose">\n' + block + '</div>\n' + html[m.end(1):]
     if APPLY:
         path.write_text(out, encoding="utf-8")
