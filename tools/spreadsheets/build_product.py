@@ -415,7 +415,7 @@ def render(cfg: dict, g: dict) -> str:
 # index
 # --------------------------------------------------------------------------- #
 
-def render_index(cfg: dict, guides: list) -> str:
+def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
     url = f"{SITE}/{SEC}/"
     groups: dict[str, list] = {}
     for g in guides:
@@ -436,6 +436,37 @@ def render_index(cfg: dict, guides: list) -> str:
         sections.append(f'<h2>{esc(name)}</h2>\n<p>{esc(cfg["group_blurb"][name])}</p>\n'
                         f'<div class="cards">\n{cards}\n</div>')
 
+    # Guide articles. Same card markup, but no price and no tab count — there is nothing
+    # to buy, so a price chip would be a lie. The foot carries "Free guide" instead, which
+    # is also the honest thing to show a reader scanning the index.
+    articles = articles or []
+    for name in cfg.get("guide_group_order", []):
+        gs = [a for a in articles if a["group"] == name]
+        if not gs:
+            continue
+        cards = "\n".join(f'''<a class="card" href="/{SEC}/{a["slug"]}/">
+<div class="card__meta"><span class="chip chip--cat">{esc(a["category"])}</span></div>
+<h3>{esc(a["card_title"])}</h3>
+<p>{esc(a["card_blurb"])}</p>
+<div class="card__foot"><span class="card__price">Free</span>
+<span class="card__tabs">Guide &middot; free workbook</span></div>
+</a>''' for a in gs)
+        sections.append(f'<h2>{esc(name)}</h2>\n<p>{esc(cfg["guide_group_blurb"][name])}</p>\n'
+                        f'<div class="cards">\n{cards}\n</div>')
+
+    # The Pro edition that does not exist yet. Stated as coming soon rather than omitted,
+    # because the free workbook's read-me already tells buyers it is being built — and a
+    # promise made in a download should be visible on the site too.
+    if cfg.get("soon"):
+        s_ = cfg["soon"]
+        sections.append(
+            f'<h2>{esc(s_["group"])}</h2>\n<p>{esc(s_["blurb"])}</p>\n'
+            f'<div class="cards">\n<div class="card card--soon">'
+            f'<div class="card__meta"><span class="pill pill--soon">In development</span></div>'
+            f'<h3>{esc(s_["title"])}</h3><p>{esc(s_["body"])}</p>'
+            f'<div class="card__foot"><span class="card__tabs">No date promised</span></div>'
+            f'</div>\n</div>')
+
     graph = {
         "@context": "https://schema.org",
         "@graph": [
@@ -452,10 +483,10 @@ def render_index(cfg: dict, guides: list) -> str:
                                      "url": BY_KEY[g["key"]]["url"]}}
                          for g in guides]},
             {"@type": "ItemList", "@id": url + "#list",
-             "numberOfItems": len(guides),
+             "numberOfItems": len(guides) + len(articles),
              "itemListElement": [{"@type": "ListItem", "position": i + 1,
-                                  "name": g["card_title"], "url": url_for(g["slug"])}
-                                 for i, g in enumerate(guides)]},
+                                  "name": x["card_title"], "url": url_for(x["slug"])}
+                                 for i, x in enumerate(list(guides) + list(articles))]},
             {"@type": "BreadcrumbList", "itemListElement": [
                 {"@type": "ListItem", "position": 1, "name": "Home", "item": SITE + "/"},
                 {"@type": "ListItem", "position": 2, "name": "Spreadsheets",
@@ -524,7 +555,7 @@ def render_index(cfg: dict, guides: list) -> str:
 # sitemap + build
 # --------------------------------------------------------------------------- #
 
-def render_sitemap(cfg: dict, guides: list) -> str:
+def render_sitemap(cfg: dict, guides: list, articles: list | None = None) -> str:
     """Generate the section sitemap.
 
     Every other section on this site has a hand-written sitemap.xml, and the
@@ -539,12 +570,15 @@ def render_sitemap(cfg: dict, guides: list) -> str:
 
     urls = [entry(f"{SITE}/{SEC}/", "0.9")]
     urls += [entry(url_for(g["slug"]), "0.8") for g in guides]
+    # Guides go in at the same priority as products. They are the pages most likely to be
+    # found cold from a search, so leaving them out of the sitemap would be backwards.
+    urls += [entry(url_for(a["slug"]), "0.8") for a in (articles or [])]
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
             + "\n".join(urls) + "\n</urlset>\n")
 
 
-def render_llms(cfg: dict, guides: list) -> str:
+def render_llms(cfg: dict, guides: list, articles: list | None = None) -> str:
     lines = [f"# {cfg['index_title']}", "",
              f"> {cfg['index_desc']}", ""]
     for name in cfg["group_order"]:
@@ -559,10 +593,19 @@ def render_llms(cfg: dict, guides: list) -> str:
                 f"${p['price']}, {len(p['tabs'])} tabs, Excel and Google Sheets. "
                 f"Buy: {p['url']}")
         lines.append("")
+    for name in cfg.get("guide_group_order", []):
+        gs = [a for a in (articles or []) if a["group"] == name]
+        if not gs:
+            continue
+        lines += [f"## {name}", ""]
+        for a in gs:
+            lines.append(f"- [{a['card_title']}]({url_for(a['slug'])}): {a['card_blurb']} "
+                         f"Free guide, no signup. Includes a free Excel workbook.")
+        lines.append("")
     return "\n".join(lines)
 
 
-def build(cfg: dict, guides: list) -> int:
+def build(cfg: dict, guides: list, articles: list | None = None) -> int:
     out = ROOT / SEC
     out.mkdir(parents=True, exist_ok=True)
     fails = 0
@@ -590,7 +633,33 @@ def build(cfg: dict, guides: list) -> int:
         print(f"  {'FAIL' if flags else 'ok  '} {g['slug']:<38} {len(page):>7,}b "
               f"t[{len(g['title'])}] d[{len(g['description'])}] {' '.join(flags)}")
 
-    idx = render_index(cfg, guides)
+    articles = articles or []
+    if articles:
+        import build_guide
+        seen_a = set()
+        for a in articles:
+            if a["slug"] in seen or a["slug"] in seen_a:
+                raise SystemExit(f"duplicate slug: {a['slug']}")
+            seen_a.add(a["slug"])
+        for a in articles:
+            d = out / a["slug"]
+            d.mkdir(parents=True, exist_ok=True)
+            page = build_guide.render(cfg, a)
+            d.joinpath("index.html").write_text(page, encoding="utf-8")
+            flags = []
+            if len(a["title"]) > 65:
+                flags.append(f"TITLE {len(a['title'])}")
+            if len(a["description"]) > 160:
+                flags.append(f"DESC {len(a['description'])}")
+            # A guide whose featured image is missing would ship with a broken og:image
+            # and an empty figure — cheaper to fail here than to find it in a search result.
+            if not (ROOT / SEC / "assets" / "img" / "guides" / f"{a['slug']}.png").exists():
+                flags.append("NO COVER")
+            fails += bool(flags)
+            print(f"  {'FAIL' if flags else 'ok  '} {a['slug']:<38} {len(page):>7,}b "
+                  f"t[{len(a['title'])}] d[{len(a['description'])}] {' '.join(flags)}")
+
+    idx = render_index(cfg, guides, articles)
     out.joinpath("index.html").write_text(idx, encoding="utf-8")
     iflags = []
     if len(cfg["index_title"]) > 65:
@@ -601,7 +670,7 @@ def build(cfg: dict, guides: list) -> int:
     print(f"  {'FAIL' if iflags else 'ok  '} {'index.html':<38} {len(idx):>7,}b "
           f"t[{len(cfg['index_title'])}] d[{len(cfg['index_desc'])}] {' '.join(iflags)}")
 
-    out.joinpath("sitemap.xml").write_text(render_sitemap(cfg, guides), encoding="utf-8")
-    out.joinpath("llms.txt").write_text(render_llms(cfg, guides), encoding="utf-8")
-    print(f"  ok   sitemap.xml + llms.txt ({len(guides) + 1} URLs)")
+    out.joinpath("sitemap.xml").write_text(render_sitemap(cfg, guides, articles), encoding="utf-8")
+    out.joinpath("llms.txt").write_text(render_llms(cfg, guides, articles), encoding="utf-8")
+    print(f"  ok   sitemap.xml + llms.txt ({len(guides) + len(articles) + 1} URLs)")
     return fails

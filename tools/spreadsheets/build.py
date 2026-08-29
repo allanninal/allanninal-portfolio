@@ -18,8 +18,14 @@ from build_product import build
 from products_a import PRODUCTS_A
 from products_b import PRODUCTS_B
 from products_c import PRODUCTS_C
+from guides_a import GUIDES_A
+from guides_b import GUIDES_B
+from guides_c import GUIDES_C
 
 GUIDES = PRODUCTS_A + PRODUCTS_B + PRODUCTS_C
+# Guide articles: no product behind them, so they are kept in a separate list and
+# rendered by build_guide. See that module for why it is not a flag on the product page.
+ARTICLES = GUIDES_A + GUIDES_B + GUIDES_C
 
 CFG = {
     "date": "2026-08-29",
@@ -67,12 +73,40 @@ CFG = {
         "Grants and compliance":
             "Budgets that have to survive somebody else checking them.",
     },
+
+    # Guide groups, rendered after the products on the index. Ordered by measured demand:
+    # the data-integrity cluster is the largest by a wide margin (see RESEARCH-EXCEL-PAINS.md
+    # in the gumroad-products repo), so it leads.
+    "guide_group_order": ["When Excel changes your data",
+                          "Formulas that do not behave as they read",
+                          "Cleaning a real export"],
+    "guide_group_blurb": {
+        "When Excel changes your data":
+            "The faults that happen on open or on paste, before you type anything — and "
+            "which of them can still be undone.",
+        "Formulas that do not behave as they read":
+            "Formulas that are doing exactly what they were told, which is not what you "
+            "meant. Each one explained once, properly.",
+        "Cleaning a real export":
+            "One export, start to finish: which column to fix first, and the fault that is "
+            "characteristic of that file.",
+    },
+    "soon": {
+        "group": "In development",
+        "blurb": "Not finished, so not for sale. Listed because the free workbook's read-me "
+                 "mentions it, and a promise made in a download should be visible here too.",
+        "title": "Data Reconciliation Workbook (Pro)",
+        "body": "The free workbook cleans one column. The Pro edition is for reconciling two "
+                "lists that should agree and do not: fuzzy matching for names and addresses, "
+                "many-to-one matching with a running variance, an audit column recording what "
+                "changed, and no row limit.",
+    },
 }
 
 
 if __name__ == "__main__":
-    print(f"building /spreadsheets/ — {len(GUIDES)} products")
-    fails = build(CFG, GUIDES)
+    print(f"building /spreadsheets/ — {len(GUIDES)} products, {len(ARTICLES)} guides")
+    fails = build(CFG, GUIDES, ARTICLES)
     if fails:
         print(f"\n{fails} page(s) FAILED the title/description length check")
     sys.exit(1 if fails else 0)
