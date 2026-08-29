@@ -18,9 +18,17 @@ needs before spending $59-$119. Neither half works alone.
 """
 import html as H
 import json
+import sys
 from pathlib import Path
 
 from catalog import BY_KEY
+
+# The site header is shared by every page on allanninal.dev; see tools/nav/.
+# Generating it here rather than writing markup means a rebuilt section can no
+# longer drift into having its own menu, which is how the site ended up with a
+# different bar on nearly every page.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "nav"))
+import header as NAV
 
 SITE = "https://www.allanninal.dev"
 SEC = "spreadsheets"
@@ -279,29 +287,14 @@ def _head(cfg: dict, g: dict, p: dict) -> str:
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADS}" crossorigin="anonymous"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/{SEC}/assets/{SEC}.css">
+<link rel="stylesheet" href="/assets/site-nav.css">\n<link rel="stylesheet" href="/assets/site-mobile.css">
 <script type="application/ld+json">{json.dumps(graph, ensure_ascii=False, separators=(",", ":"))}</script>
 </head>'''
 
 
 def _header() -> str:
-    nav = "\n".join(f'<a class="opt" href="{h}">{esc(l)}</a>'
-                    for h, l in [("/spreadsheets/", "All spreadsheets"),
-                                 ("/templates/", "Templates"),
-                                 ("/build/", "Build"),
-                                 ("/", "Portfolio")])
-    return f'''<body>
-<header class="site-header">
-<div class="container site-header__inner">
-<a class="brand" href="/{SEC}/">
-<span class="brand__mark"></span>
-<span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / spreadsheets</span>
-</a>
-<nav class="site-nav" aria-label="Primary">
-{nav}
-</nav>
-</div>
-</header>
-<main>'''
+    """The site-wide bar, shared with every other section; see tools/nav/."""
+    return "<body>\n" + NAV.render(SEC, "main") + '\n<main id="main">'
 
 
 def _footer() -> str:
@@ -313,6 +306,7 @@ def _footer() -> str:
 </div>
 </footer>
 <script src="/{SEC}/assets/{SEC}.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
 </body>
 </html>'''
 
@@ -576,6 +570,7 @@ def render_index(cfg: dict, guides: list, articles: list | None = None) -> str:
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADS}" crossorigin="anonymous"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/{SEC}/assets/{SEC}.css">
+<link rel="stylesheet" href="/assets/site-nav.css">\n<link rel="stylesheet" href="/assets/site-mobile.css">
 <script type="application/ld+json">{json.dumps(graph, ensure_ascii=False, separators=(",", ":"))}</script>
 </head>
 {_header()}

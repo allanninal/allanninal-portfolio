@@ -15,7 +15,15 @@ whether a topic belongs in this section at all.
 import html as H
 import json
 import re
+import sys
 from pathlib import Path
+
+# The site header is shared by every page on allanninal.dev; see tools/nav/.
+# Generating it here rather than writing markup means a rebuilt section can no
+# longer drift into having its own menu, which is how the site ended up with a
+# different bar on nearly every page.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "nav"))
+import header as NAV
 
 SITE = "https://www.allanninal.dev"
 OUT = Path.home() / "Projects/allanninal.dev/email"
@@ -122,27 +130,13 @@ def head(g: dict) -> str:
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADS}" crossorigin="anonymous"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/email/assets/email.css">
+<link rel="stylesheet" href="/assets/site-nav.css">\n<link rel="stylesheet" href="/assets/site-mobile.css">
 <script type="application/ld+json">{json.dumps(graph, ensure_ascii=False, separators=(",", ":"))}</script>
 </head>'''
 
 
-HEADER = '''<body>
-<header class="site-header">
-<div class="container site-header__inner">
-<a class="brand" href="/email/">
-<span class="brand__mark"></span>
-<span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / email</span>
-</a>
-<nav class="site-nav" aria-label="Primary">
-<a class="opt" href="/">Portfolio</a>
-<a class="opt" href="/dns/">DNS</a>
-<a class="opt" href="/woocommerce/">WooCommerce</a>
-<a class="opt" href="/shopify/">Shopify</a>
-<a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
-</nav>
-</div>
-</header>
-<main>'''
+# The site-wide bar, shared with every other section; see tools/nav/.
+HEADER = '<body>\n' + NAV.render("email", "main") + '\n<main id="main">'
 
 FOOTER = '''</main>
 <footer class="site-footer">
@@ -152,6 +146,7 @@ FOOTER = '''</main>
 </div>
 </footer>
 <script src="/email/assets/email.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
 </body>
 </html>'''
 

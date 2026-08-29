@@ -6,13 +6,15 @@ export const maker = {
   handle: 'allanninal',
   title: 'AI and Software Engineer',
   tagline: 'I build AI-powered tools and data products that solve real problems.',
+  openTo: 'Open for collaboration',
   bio: [
     "I'm an AI and Software Engineer based in Talisay, Cebu, Philippines. I build intelligent products that combine data analytics with modern AI — from data pipelines and visualizations to full applications powered by state-of-the-art machine learning models.",
     "My work spans the whole stack: data engineering and analysis, AI/ML application development, and the fullstack and AWS infrastructure to ship and run them — DNS, SSL, and servers included. I care about making AI practical and accessible through well-designed software.",
-    "I ship in public and a lot: a growing portfolio of live products across AI tools, Cebu-focused services, trading, and SaaS — plus a year-long project releasing one free, MIT-licensed website template every day. If you're building something, I'd love to hear about it.",
+    "I ship in public and a lot: a growing portfolio of live products across AI tools, Cebu-focused services, trading, and SaaS — plus a year-long project releasing one free, MIT-licensed website template every day.",
+    "I'm not looking for a job. I'm looking for people to build with — co-founders, open-source collaborators, and teams with a hard problem worth solving together. If you're building something, I'd love to hear about it.",
   ],
   location: 'Talisay, Cebu, Philippines · UTC+8',
-  availableFor: 'AI solutions, data engineering, and fullstack consulting.',
+  availableFor: 'Co-building products, open-source collaboration, and joint work on AI, data, and AWS.',
   socials: {
     github: 'https://github.com/allanninal',
     linkedin: 'https://www.linkedin.com/in/allanninal/',

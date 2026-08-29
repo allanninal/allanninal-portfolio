@@ -1,7 +1,8 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./src/**/*.{astro,html,js,jsx,md,mdx,svelte,ts,tsx,vue}'],
-  // Light-only. Warm paper #F8F6F1. Electric blue #2563EB. No dark toggle.
+  darkMode: 'class',
+  // Dark-only "telemetry console": near-black ground, cyan signal, indigo second.
   theme: {
     extend: {
       fontFamily: {
@@ -17,35 +18,38 @@ export default {
         'xl':  ['1.25rem',  { lineHeight: '1.5' }],
         '2xl': ['1.5rem',   { lineHeight: '1.3' }],
         '3xl': ['1.875rem', { lineHeight: '1.2' }],
-        '4xl': ['2.5rem',   { lineHeight: '1.1' }],
-        '5xl': ['3.5rem',   { lineHeight: '1.05' }],
-        '6xl': ['4.5rem',   { lineHeight: '1.02' }],
-        '7xl': ['5.5rem',   { lineHeight: '1.0' }],
+        '4xl': ['2.5rem',   { lineHeight: '1.08' }],
+        '5xl': ['3.25rem',  { lineHeight: '1.03' }],
+        '6xl': ['4rem',     { lineHeight: '1.0' }],
+        '7xl': ['5rem',     { lineHeight: '0.98' }],
       },
       colors: {
-        // Paper base
-        paper: '#F8F6F1',
-        // Electric blue accent
+        // Ground
+        ink: {
+          950: '#05070E',
+          900: '#080C17',
+          850: '#0B1120',
+          800: '#111A2E',
+          700: '#1B2740',
+        },
+        // Cyan signal
         accent: {
-          DEFAULT: '#1D4ED8',
-          hover: '#1E40AF',
-          light: '#EFF6FF',
-          text: '#1D4ED8',
+          DEFAULT: '#22D3EE',
+          bright: '#67E8F9',
+          deep: '#0E7490',
+          hover: '#67E8F9',
+          light: 'rgba(34,211,238,0.10)',
+          text: '#22D3EE',
         },
-        // Status badge colors
-        status: {
-          live: { bg: '#DCFCE7', text: '#15803D' },
-          sunset: { bg: '#FEF9C3', text: '#854D0E' },
-          sold: { bg: '#EFF6FF', text: '#1D4ED8' },
-        },
+        indigo2: '#818CF8',
       },
       maxWidth: {
-        '7xl': '72rem',
+        '7xl': '76rem',
         content: '46rem',
       },
       letterSpacing: {
-        tightest: '-0.04em',
-        tight2: '-0.025em',
+        tightest: '-0.045em',
+        tight2: '-0.03em',
       },
     },
   },

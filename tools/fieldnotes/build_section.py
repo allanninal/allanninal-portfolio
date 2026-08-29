@@ -13,9 +13,17 @@ further.
 """
 import html as H
 import json
+import sys
 from pathlib import Path
 
 from extras import feature as _feature, flow as _flow
+
+# The site header is shared by every page on allanninal.dev; see tools/nav/.
+# Generating it here rather than writing markup means a rebuilt section can no
+# longer drift into having its own menu, which is how the site ended up with a
+# different bar on nearly every page.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "nav"))
+import header as NAV
 
 SITE = "https://www.allanninal.dev"
 GA = "G-DLRBEQ85ZN"
@@ -46,22 +54,9 @@ def code_block(fn_py: str, py: str, fn_js: str, js: str) -> str:
 
 
 def _header(cfg: dict) -> str:
-    sec = cfg["section"]
-    nav = "\n".join(f'<a class="opt" href="{href}">{label}</a>' for href, label in cfg["nav"])
-    return f'''<body>
-<header class="site-header">
-<div class="container site-header__inner">
-<a class="brand" href="/{sec}/">
-<span class="brand__mark"></span>
-<span>allanninal<span style="color:var(--woo-ink-faint)">.dev</span> / {sec}</span>
-</a>
-<nav class="site-nav" aria-label="Primary">
-{nav}
-<a class="is-cta" href="https://ko-fi.com/allanninal" rel="noopener">Buy me a coffee</a>
-</nav>
-</div>
-</header>
-<main>'''
+    """The site-wide bar. `cfg["nav"]` is no longer read: the canonical header
+    carries navigation for the whole site, not one section's shortlist."""
+    return "<body>\n" + NAV.render(cfg["section"], "main") + '\n<main id="main">'
 
 
 def _footer(cfg: dict) -> str:
@@ -74,6 +69,7 @@ def _footer(cfg: dict) -> str:
 </div>
 </footer>
 <script src="/{sec}/assets/{sec}.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
 </body>
 </html>'''
 
@@ -135,6 +131,7 @@ def _head(cfg: dict, g: dict) -> str:
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADS}" crossorigin="anonymous"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/{sec}/assets/{sec}.css">
+<link rel="stylesheet" href="/assets/site-nav.css">\n<link rel="stylesheet" href="/assets/site-mobile.css">
 <script type="application/ld+json">{json.dumps(graph, ensure_ascii=False, separators=(",", ":"))}</script>
 </head>'''
 
@@ -263,6 +260,7 @@ def render_index(cfg: dict, guides: list) -> str:
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client={ADS}" crossorigin="anonymous"></script>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/{sec}/assets/{sec}.css">
+<link rel="stylesheet" href="/assets/site-nav.css">\n<link rel="stylesheet" href="/assets/site-mobile.css">
 <script type="application/ld+json">{json.dumps(graph, ensure_ascii=False, separators=(",", ":"))}</script>
 </head>
 {_header(cfg)}
