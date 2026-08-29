@@ -30,6 +30,8 @@ echo "== $sec: field guide"
 python3 tools/fieldnotes/build_field_guides.py --apply "$sec" | tail -1
 echo "== $sec: repo links"
 python3 tools/fieldnotes/add_repo_links.py --apply "$sec" | tail -2
+echo "== $sec: read-only audit of the published repo"
+python3 tools/fieldnotes/audit_readonly.py
 echo "== site: nav + homepage"
 python3 tools/nav/apply.py | tail -1
 ./tools/nav/deploy_home.sh | tail -1
