@@ -52,6 +52,15 @@ export const products: Product[] = [
     stack: ['Astro', 'MIT Licensed'],
   },
   {
+    id: 'spreadsheets',
+    name: 'Spreadsheets by Allan Niñal',
+    description:
+      'Working Excel and Google Sheets workbooks for jobs where the arithmetic is easy to get wrong — WIP schedules, bid pricing, landed cost, underwriting and SPC.',
+    category: 'Products',
+    url: 'https://www.allanninal.dev/spreadsheets/',
+    stack: ['Excel', 'Google Sheets'],
+  },
+  {
     id: 'build',
     name: 'Build by Allan Niñal',
     description:
