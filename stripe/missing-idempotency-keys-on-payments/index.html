@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Payment-creating requests carry no idempotency key</title>
+<meta name="description" content="Occasional duplicate charges during network blips, impossible to reproduce. The events show API requests with request.idempotency_key null.">
+<link rel="canonical" href="https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Ni&ntilde;al">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Payment-creating requests carry no idempotency key">
+<meta property="og:description" content="Occasional duplicate charges during network blips, impossible to reproduce. The events show API requests with request.idempotency_key null.">
+<meta property="og:url" content="https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Payment-creating requests carry no idempotency key">
+<meta name="twitter:description" content="Occasional duplicate charges during network blips, impossible to reproduce. The events show API requests with request.idempotency_key null.">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/stripe/assets/stripe.css">
+<link rel="stylesheet" href="/assets/site-nav.css">
+<link rel="stylesheet" href="/assets/site-mobile.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/#article","headline":"Payment-creating requests carry no idempotency key","description":"Occasional duplicate charges during network blips, impossible to reproduce. The events show API requests with request.idempotency_key null.","url":"https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/"},"datePublished":"2026-08-30","dateModified":"2026-08-30","inLanguage":"en","articleSection":"Stripe","keywords":"stripe idempotency key, stripe duplicate charge, request.idempotency_key null, stripe retry duplicate payment, Idempotency-Key header","author":{"@id":"https://www.allanninal.dev/#person"},"publisher":{"@id":"https://www.allanninal.dev/#person"},"proficiencyLevel":"Intermediate","dependencies":"Python 3.9+ with requests, or Node.js 18+","citation":["https://docs.stripe.com/api/idempotent_requests","https://docs.stripe.com/api/events/object","https://docs.stripe.com/api/events/list","https://docs.stripe.com/api/versioning"]},{"@type":"Person","@id":"https://www.allanninal.dev/#person","name":"Allan Niñal","jobTitle":"AI and Software Engineer","url":"https://www.allanninal.dev/","sameAs":["https://www.linkedin.com/in/allanninal/","https://github.com/allanninal"]},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/stripe/"},{"@type":"ListItem","position":2,"name":"Stripe","item":"https://www.allanninal.dev/stripe/"},{"@type":"ListItem","position":3,"name":"Payment-creating requests carry no idempotency key","item":"https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/"}]},{"@type":"FAQPage","@id":"https://www.allanninal.dev/stripe/missing-idempotency-keys-on-payments/#faq","mainEntity":[{"@type":"Question","name":"Which requests need an idempotency key?","acceptedAnswer":{"@type":"Answer","text":"Every mutating one. GETs are already idempotent and Stripe ignores the header on them. In practice the ones that matter are the requests that create something: PaymentIntents, charges, refunds, customers, subscriptions. Those are the operations where doing it twice is visible to a customer."}},{"@type":"Question","name":"Why does request.id have to be non-null in the check?","acceptedAnswer":{"@type":"Answer","text":"Because Stripe-initiated events have both request fields null. Renewal invoices, trial_will_end, automatic payout events: none of them came from an API call of yours, so none of them could have carried a key. Without the guard those dominate the report and the real findings disappear into them."}},{"@type":"Question","name":"How long does Stripe remember an idempotency key?","acceptedAnswer":{"@type":"Answer","text":"Results are saved for roughly 24 hours, after which the key is pruned. A retry inside that window replays the saved status code and body. A request reusing the same key after pruning is treated as brand new, which is one reason keys derived from something long-lived, like a customer ID, cause duplicates rather than preventing them."}},{"@type":"Question","name":"Can I use the order ID as the key?","acceptedAnswer":{"@type":"Answer","text":"Only if it is unique per attempt at that specific request, and usually it is not. An order that is retried after a failed payment, or that creates both a customer and a PaymentIntent, reuses the value across different operations and different parameters, which returns an idempotency_error instead of protection. Derive the key from the operation and persist it."}},{"@type":"Question","name":"What does a 409 idempotency_key_in_use mean?","acceptedAnswer":{"@type":"Answer","text":"Two requests carrying the same key arrived close enough together that neither result was saved yet. It is retryable, and the retry must use the same key. It is a signal that the key is shared across concurrent operations rather than unique to one."}}]}]}</script>
+</head>
+<body>
+<div class="anx-root">
+<a class="anx-skip" href="#main">Skip to content</a>
+<header class="anx-header">
+  <div class="anx-bar">
+    <a class="anx-brand" href="/" aria-label="Allan Ni&ntilde;al &mdash; home">
+      <span class="anx-brand__mark"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 7 5 12l4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 7 19 12l-4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/></svg></span>
+      <span class="anx-brand__text">allanninal<span class="anx-brand__dim">.dev</span><span class="anx-brand__section">/stripe</span></span>
+    </a>
+
+    <nav class="anx-nav" aria-label="Primary">
+      <a class="anx-link" href="/">Home</a>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-work" aria-haspopup="true">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel" id="anx-work" hidden><p class="anx-panel__title">What I build</p><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+      </div>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-guides" aria-haspopup="true">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel anx-panel--wide" id="anx-guides" hidden><div class="anx-panel__group"><p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/" aria-current="page">Stripe<span class="anx-item__note">29</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">12</span></a></div></div>
+      </div>
+      <a class="anx-link" href="/blog/">Blog</a>
+      <a class="anx-link" href="/#about">About</a>
+    </nav>
+
+    <div class="anx-actions">
+      <a class="anx-icon" href="https://github.com/allanninal" rel="me noopener" target="_blank" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg></a>
+      <a class="anx-cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Collaborate</a>
+      <button class="anx-burger" type="button" aria-expanded="false" aria-controls="anx-drawer" aria-label="Open menu">
+        <span class="anx-burger__box" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="anx-drawer" id="anx-drawer" hidden>
+    <a class="anx-drawer__cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Open for collaboration</a>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/">Home</a></div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-work">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-work" hidden><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+    </div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-guides">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-guides" hidden>
+        <p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a>
+        <p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a>
+        <p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/" aria-current="page">Stripe<span class="anx-item__note">29</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">12</span></a>
+      </div>
+    </div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/blog/">Blog</a></div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/#about">About</a></div>
+    <div class="anx-drawer__foot">
+      <a href="https://github.com/allanninal" rel="me noopener" target="_blank"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg>GitHub</a>
+      <a href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">LinkedIn</a>
+      <a href="https://ko-fi.com/allanninal" rel="noopener" target="_blank">Ko-fi</a>
+    </div>
+  </div>
+</header>
+</div>
+<main id="main">
+<section class="hero">
+<div class="container prose">
+<p class="breadcrumbs"><a href="/stripe/">Field notes</a> / Stripe</p>
+<p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Stripe</p>
+<h1>payment-creating requests carry no idempotency key</h1>
+<p class="lead">A customer is charged twice. It happens perhaps once a week, always to someone on a phone, always during a moment when the network was bad, and never once on a developer machine. There is no bug in the checkout code. There is a missing HTTP header, and the events already recorded which requests were sent without it.</p>
+<div class="meta">
+<span class="chip">Read-only key</span>
+<span class="chip">Python and Node.js</span>
+<span class="chip">Tests included</span>
+</div>
+</div>
+</section>
+
+<div class="container prose">
+<figure class="feature-img">
+<img src="/stripe/assets/img/missing-idempotency-keys-on-payments/feature.jpg" alt="Two envelopes on a table" width="1200" height="630" loading="eager" decoding="async">
+<figcaption>Photo by <a href="https://unsplash.com/@markusspiske?utm_source=allanninal_dev&utm_medium=referral?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Markus Spiske</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+</figure>
+<div class="callout callout--note" id="short-answer">
+<div class="callout__title">The short answer</div>
+<p>Page <code>GET /v1/events</code> filtered to the types that create money or customers, and read the <code>request</code> object on each. Flag events where <code>request.id</code> is set <em>and</em> <code>request.idempotency_key</code> is null: that is an API call your code made, without a key, that a retry would have executed twice.</p>
+<p>The <code>request.id</code> guard is not optional. Stripe-initiated events &mdash; renewal invoices, <code>customer.subscription.trial_will_end</code> &mdash; have both fields null, so a check that only looks at the key reports every automated Billing event as a finding and buries the real ones.</p>
+</div>
+
+<h2>The problem in plain words</h2>
+<p>The defining property of this failure is that it is unreproducible by construction. It needs a request that reaches Stripe, succeeds, and then fails to deliver its response &mdash; a timeout, a dropped mobile connection, a load balancer giving up. Locally the response always arrives, so the retry never happens, so the second charge never exists. Every attempt to reproduce it confirms the code is fine.</p>
+<p>The retry also does not have to be yours. A user double-tapping a button, a proxy configured to retry idempotent-looking POSTs, a job runner that treats a timeout as a failure and re-queues: all of them produce a second identical request. Without a key, Stripe has no way to know it is the same operation, and it does exactly what it was asked to do a second time.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 216" role="img" aria-label="A charge created twice because the request carried no idempotency key"><defs><marker id="smik-p-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#565470"/></marker><marker id="smik-p-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="smik-p-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="smik-p-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#635bff"/></marker></defs><rect x="10.0" y="34" width="111.2" height="66" rx="10" fill="#efeefa" stroke="#c9c7ed"/><text x="66" y="56" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Checkout</text><text x="66" y="71" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">submits</text><text x="66" y="88" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">no Idempotency-Key</text><rect x="167.2" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#c9c7ed"/><text x="223" y="60" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Stripe charges</text><text x="223" y="77" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">the card is</text><text x="223" y="90" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">debited</text><rect x="324.4" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#c9c7ed"/><text x="380" y="60" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Response lost</text><text x="380" y="77" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">mobile network</text><text x="380" y="90" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">drops</text><rect x="481.59999999999997" y="34" width="111.2" height="66" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="537" y="60" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Client retries</text><text x="537" y="77" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">same parameters</text><rect x="638.8" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#c9c7ed"/><text x="694" y="60" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Charged twice</text><text x="694" y="77" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">a refund and an</text><text x="694" y="90" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">apology</text><line x1="124" y1="67" x2="161" y2="67" stroke="#565470" stroke-width="2" marker-end="url(#smik-p-plain)"/><line x1="281" y1="67" x2="318" y2="67" stroke="#565470" stroke-width="2" marker-end="url(#smik-p-plain)"/><line x1="439" y1="67" x2="476" y2="67" stroke="#cf4b3f" stroke-width="2" marker-end="url(#smik-p-bad)"/><line x1="596" y1="67" x2="633" y2="67" stroke="#565470" stroke-width="2" marker-end="url(#smik-p-plain)"/><path d="M694,100 C694,152 223,152 223,103" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#smik-p-bad)"/><text x="459" y="156" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">every retry is a new charge</text></svg>
+<figcaption>The charge succeeded the first time. Only the response was lost, and nothing in the retry can tell Stripe it is the same operation.</figcaption>
+</figure>
+
+<h2>Why it happens</h2>
+<p><strong>Nothing requires the header, so nothing reminds you.</strong> Every mutating Stripe request accepts <code>Idempotency-Key</code> and none of them demands it. Requests without one succeed normally and look identical in the logs to requests with one. The protection is opt-in and its absence is silent.</p>
+<p><strong>It lives in the options argument, not the parameters.</strong> In every official SDK the key is a second argument, separate from the request body: <code>stripe.paymentIntents.create(params, { idempotencyKey })</code> in Node, <code>idempotency_key=</code> as a keyword in Python, <code>['idempotency_key' => $key]</code> as the options array in PHP. Passing it inside the parameters hash is a very natural mistake, and it does not error &mdash; it is simply ignored.</p>
+<p><strong>A key regenerated per attempt is the same as no key at all.</strong> The common near-miss is generating a fresh UUID inside the retry loop. Each attempt then carries a different key, so Stripe sees a series of distinct operations. The key has to be derived from the business operation and stay fixed across every retry of it.</p>
+<p><strong>The events already hold the evidence, and the obvious query misreads it.</strong> Every event carries the <code>request</code> that caused it. Stripe's own automated actions produce events with a null <code>request.id</code>, and there are a lot of them on a Billing account. Filtering on the key alone drowns the real signal in renewal invoices.</p>
+
+<h2>The fix, as a flow</h2>
+<p>The script reads the request that caused each event, and separates your API calls from the ones Stripe made on your behalf, because only the first group could ever have carried a key.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 296" role="img" aria-label="Sorting events by whether the request that caused them carried a key"><defs><marker id="smik-f-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#565470"/></marker><marker id="smik-f-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="smik-f-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="smik-f-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#635bff"/></marker></defs><rect x="10" y="113.0" width="216" height="70" rx="10" fill="#efeefa" stroke="#c9c7ed"/><text x="118" y="139.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">GET /v1/events</text><text x="118" y="156.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">request.id and</text><text x="118" y="169.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">request.idempotency_key</text><rect x="300" y="22.0" width="450" height="54" rx="10" fill="#fff" stroke="#c9c7ed"/><text x="525" y="48.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Null request id</text><text x="525" y="65.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">Stripe did it, not you</text><path d="M229,148 C260,148 260,49 294,49" fill="none" stroke="#565470" stroke-width="2" marker-end="url(#smik-f-plain)"/><rect x="300" y="88.0" width="450" height="54" rx="10" fill="#eef7ea" stroke="#bfdcb1"/><text x="525" y="114.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">Key present</text><text x="525" y="131.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">a retry replays the result</text><path d="M229,148 C260,148 260,115 294,115" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#smik-f-good)"/><rect x="300" y="154.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="180.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">No key, customer created</text><text x="525" y="197.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">duplicate records</text><path d="M229,148 C260,148 260,181 294,181" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#smik-f-bad)"/><rect x="300" y="220.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="246.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f1e38">No key, money moving</text><text x="525" y="263.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#565470">duplicate charges</text><path d="M229,148 C260,148 260,247 294,247" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#smik-f-bad)"/></svg>
+<figcaption>Stripe initiated events have a null request id, and on a billing account they outnumber everything else.</figcaption>
+</figure>
+
+<h2>How to fix it</h2>
+<h3>Pull the events that represent money moving</h3>
+<p><code>GET /v1/events?types[]=payment_intent.created&amp;types[]=charge.succeeded&amp;types[]=customer.created&amp;types[]=refund.created</code>. These are the operations where a duplicate costs something real. The 30-day retention window is a large enough sample to be conclusive.</p>
+<h3>Separate your requests from Stripe's</h3>
+<p><code>request.id</code> non-null means the event was caused by an API call from your integration. Null means Stripe did it on your behalf and there was never a key to send. Only the first group can be judged, and mixing them makes the report useless.</p>
+<h3>Report the ratio per event type, not a total</h3>
+<p>A single number hides where the exposure is. If <code>customer.created</code> is unkeyed but <code>payment_intent.created</code> is not, you have duplicate customer rows, which is annoying. The reverse means duplicate charges, which is a refund and an apology. Anything above zero on a money-moving type is a finding.</p>
+<h3>Add the key at the call site, derived from the operation</h3>
+<p>A v4 UUID generated once per logical operation, persisted next to the order record, and reused verbatim for every retry of that request. Not a customer ID, not a cart ID, not a date; those repeat, and a key reused with different parameters produces an <code>idempotency_error</code> rather than protection.</p>
+<h3>Re-run after a deploy and watch the ratio fall</h3>
+<p>Because the window is rolling, the old unkeyed events stay in the sample for 30 days after the fix. The number to watch is the ratio over the last day or two, which should reach zero on money-moving types and stay there.</p>
+
+<h2>How to check it worked</h2>
+<p>Re-run the script a day after the deploy. Every money-moving type should report every API-originated event as keyed.</p>
+<pre><code class="language-bash">python3 stripe_idempotency_keys.py --days 1
+# keyed      payment_intent.created  312 API request(s), all carrying a key</code></pre>
+
+<h2>The full code</h2>
+<p>One paginated GET against <code>/v1/events</code> &mdash; a restricted key with read access to Events is enough. There are two pure functions because there are two decisions: what a single <code>request</code> object means, and what a whole type's tally means. The first is where the false positives live, so it is worth being able to test it on its own.</p>
+<div class="repo-cta" data-repo-cta>
+<a href="https://github.com/allanninal/stripe-fixes/tree/main/missing-idempotency-keys-on-payments" rel="noopener" target="_blank">Get this script on GitHub</a>
+<a href="https://github.com/allanninal" rel="noopener" target="_blank">Follow @allanninal</a>
+<span>Python and Node.js, with tests. Read only, it never writes. One of 29 Stripe fixes, free and open source.</span>
+</div>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">stripe_idempotency_keys.py</div>
+<pre><code class="language-python">&quot;&quot;&quot;Report Stripe API requests made without an Idempotency-Key.
+
+Read only. One paginated GET and no writes: give this a RESTRICTED key with
+read access to Events. The repair is printed, never performed, because this
+script holds a credential to a live payments account.
+&quot;&quot;&quot;
+import argparse
+import logging
+import os
+import sys
+import time
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+log = logging.getLogger(&quot;stripe_idempotency_keys&quot;)
+
+API = &quot;https://api.stripe.com/v1&quot;
+
+# A duplicate of any of these costs real money or real support time.
+MONEY_MOVING = (&quot;payment_intent.created&quot;, &quot;charge.succeeded&quot;, &quot;refund.created&quot;)
+WATCHED = MONEY_MOVING + (&quot;customer.created&quot;,)
+
+
+def classify(request):
+    &quot;&quot;&quot;What one event&#x27;s `request` field says about the call that caused it.
+
+    Pure. Returns one of:
+      &quot;stripe&quot;     no request id at all: Stripe did this on your behalf, and
+                   there was never a key to send. Not a finding.
+      &quot;unreported&quot; a bare string request id, which is how very old API versions
+                   rendered this field. The key is unknown, not absent.
+      &quot;keyed&quot;      an API request that carried an Idempotency-Key.
+      &quot;unkeyed&quot;    an API request that did not. This is the finding.
+    &quot;&quot;&quot;
+    if request is None:
+        return &quot;stripe&quot;
+    if isinstance(request, str):
+        return &quot;unreported&quot; if request else &quot;stripe&quot;
+    if not request.get(&quot;id&quot;):
+        return &quot;stripe&quot;
+    return &quot;keyed&quot; if request.get(&quot;idempotency_key&quot;) else &quot;unkeyed&quot;
+
+
+def verdict(event_type, api_requests, unkeyed):
+    &quot;&quot;&quot;Classify one event type&#x27;s tally. Pure, so the thresholds can be tested.&quot;&quot;&quot;
+    if not api_requests:
+        return (&quot;stripe-only&quot;,
+                &quot;no API-originated events in the window: nothing here is yours &quot;
+                &quot;to key&quot;)
+    if not unkeyed:
+        return (&quot;keyed&quot;,
+                &quot;%d API request(s), all carrying a key&quot; % api_requests)
+    pct = 100.0 * unkeyed / api_requests
+    if event_type in MONEY_MOVING:
+        return (&quot;exposed&quot;,
+                &quot;%d of %d API request(s) sent no key (%.1f%%). A retried timeout &quot;
+                &quot;on any of these charges the customer twice.&quot;
+                % (unkeyed, api_requests, pct))
+    return (&quot;unkeyed&quot;,
+            &quot;%d of %d API request(s) sent no key (%.1f%%). Retries create &quot;
+            &quot;duplicate records rather than duplicate charges.&quot;
+            % (unkeyed, api_requests, pct))
+
+
+def get(session, path, **params):
+    r = session.get(API + path, params=params, timeout=30)
+    if r.status_code == 401:
+        raise SystemExit(&quot;401 from Stripe: the key is wrong, or is for the other mode&quot;)
+    r.raise_for_status()
+    return r.json()
+
+
+def tally(session, since, limit):
+    &quot;&quot;&quot;Per-type counts of API-originated events and how many carried no key.&quot;&quot;&quot;
+    counts = {t: {&quot;api&quot;: 0, &quot;unkeyed&quot;: 0, &quot;unreported&quot;: 0} for t in WATCHED}
+    total = 0
+    params = {&quot;limit&quot;: 100, &quot;created[gte]&quot;: int(since)}
+    for i, t in enumerate(WATCHED):
+        params[&quot;types[%d]&quot; % i] = t
+    while True:
+        page = get(session, &quot;/events&quot;, **params)
+        data = page.get(&quot;data&quot;, [])
+        for ev in data:
+            total += 1
+            row = counts.get(ev.get(&quot;type&quot;))
+            if row is None:
+                continue
+            state = classify(ev.get(&quot;request&quot;))
+            if state == &quot;stripe&quot;:
+                continue
+            if state == &quot;unreported&quot;:
+                row[&quot;unreported&quot;] += 1
+                continue
+            row[&quot;api&quot;] += 1
+            if state == &quot;unkeyed&quot;:
+                row[&quot;unkeyed&quot;] += 1
+        if not data or not page.get(&quot;has_more&quot;) or total &gt;= limit:
+            break
+        params[&quot;starting_after&quot;] = data[-1][&quot;id&quot;]
+    return counts, total
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(&quot;--days&quot;, type=int, default=30,
+                    help=&quot;how far back to sample, up to the 30-day retention limit&quot;)
+    ap.add_argument(&quot;--max-events&quot;, type=int, default=5000,
+                    help=&quot;stop paginating after this many events&quot;)
+    args = ap.parse_args()
+
+    key = os.environ.get(&quot;STRIPE_API_KEY&quot;)
+    if not key:
+        log.error(&quot;set STRIPE_API_KEY (use a restricted, read-only key)&quot;)
+        return 2
+
+    s = requests.Session()
+    s.headers.update({&quot;Authorization&quot;: &quot;Bearer &quot; + key})
+
+    since = time.time() - args.days * 86400
+    counts, total = tally(s, since, args.max_events)
+    log.info(&quot;sampled %d event(s) over %d day(s)&quot;, total, args.days)
+
+    bad = 0
+    for t in WATCHED:
+        row = counts[t]
+        state, detail = verdict(t, row[&quot;api&quot;], row[&quot;unkeyed&quot;])
+        line = &quot;%-11s %-24s %s&quot; % (state, t, detail)
+        if state in (&quot;keyed&quot;, &quot;stripe-only&quot;):
+            log.info(line)
+        else:
+            bad += 1
+            log.warning(line)
+        if row[&quot;unreported&quot;]:
+            log.info(&quot;  %d event(s) rendered at an API version that does not &quot;
+                     &quot;report the key; upgrade the endpoint pin to judge them&quot;,
+                     row[&quot;unreported&quot;])
+
+    if bad:
+        log.warning(&quot;  repair: send an Idempotency-Key header on every mutating &quot;
+                    &quot;request, in the options argument rather than the params:&quot;)
+        log.warning(&quot;  node:   stripe.paymentIntents.create(params, { idempotencyKey })&quot;)
+        log.warning(&quot;  python: stripe.PaymentIntent.create(..., idempotency_key=key)&quot;)
+        log.warning(&quot;  php:    $stripe-&gt;paymentIntents-&gt;create($params, &quot;
+                    &quot;[&#x27;idempotency_key&#x27; =&gt; $key])&quot;)
+        log.warning(&quot;  the key is a v4 uuid per logical operation, persisted with &quot;
+                    &quot;the order and reused unchanged for every retry of it&quot;)
+    return 1 if bad else 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">stripe-idempotency-keys.mjs</div>
+<pre><code class="language-javascript">/**
+ * Report Stripe API requests made without an Idempotency-Key.
+ *
+ * Read only. One paginated GET and no writes: give this a RESTRICTED key with
+ * read access to Events. The repair is printed, never performed.
+ */
+const API = &#x27;https://api.stripe.com/v1&#x27;;
+
+// A duplicate of any of these costs real money or real support time.
+export const MONEY_MOVING = [&#x27;payment_intent.created&#x27;, &#x27;charge.succeeded&#x27;,
+                             &#x27;refund.created&#x27;];
+const WATCHED = [...MONEY_MOVING, &#x27;customer.created&#x27;];
+
+/**
+ * What one event&#x27;s `request` field says about the call that caused it. Pure.
+ * Returns &#x27;stripe&#x27;, &#x27;unreported&#x27;, &#x27;keyed&#x27; or &#x27;unkeyed&#x27;.
+ */
+export function classify(request) {
+  if (request === null || request === undefined) return &#x27;stripe&#x27;;
+  if (typeof request === &#x27;string&#x27;) return request ? &#x27;unreported&#x27; : &#x27;stripe&#x27;;
+  if (!request.id) return &#x27;stripe&#x27;;
+  return request.idempotency_key ? &#x27;keyed&#x27; : &#x27;unkeyed&#x27;;
+}
+
+/** Classify one event type&#x27;s tally. Pure, so the thresholds can be tested. */
+export function verdict(eventType, apiRequests, unkeyed) {
+  if (!apiRequests) {
+    return [&#x27;stripe-only&#x27;,
+      &#x27;no API-originated events in the window: nothing here is yours to key&#x27;];
+  }
+  if (!unkeyed) return [&#x27;keyed&#x27;, `${apiRequests} API request(s), all carrying a key`];
+  const pct = ((100 * unkeyed) / apiRequests).toFixed(1);
+  if (MONEY_MOVING.includes(eventType)) {
+    return [&#x27;exposed&#x27;,
+      `${unkeyed} of ${apiRequests} API request(s) sent no key (${pct}%). ` +
+      &#x27;A retried timeout on any of these charges the customer twice.&#x27;];
+  }
+  return [&#x27;unkeyed&#x27;,
+    `${unkeyed} of ${apiRequests} API request(s) sent no key (${pct}%). ` +
+    &#x27;Retries create duplicate records rather than duplicate charges.&#x27;];
+}
+
+async function get(key, path, params = {}) {
+  const url = new URL(API + path);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
+  if (res.status === 401) {
+    throw new Error(&#x27;401 from Stripe: the key is wrong, or is for the other mode&#x27;);
+  }
+  if (!res.ok) throw new Error(`${res.status} from ${url.pathname}`);
+  return res.json();
+}
+
+export async function tally(key, since, limit = 5000) {
+  const counts = new Map(WATCHED.map((t) =&gt; [t, { api: 0, unkeyed: 0, unreported: 0 }]));
+  let total = 0;
+  const params = { limit: 100, &#x27;created[gte]&#x27;: Math.floor(since) };
+  WATCHED.forEach((t, i) =&gt; { params[`types[${i}]`] = t; });
+  for (;;) {
+    const page = await get(key, &#x27;/events&#x27;, params);
+    const data = page.data ?? [];
+    for (const ev of data) {
+      total += 1;
+      const row = counts.get(ev.type);
+      if (!row) continue;
+      const state = classify(ev.request);
+      if (state === &#x27;stripe&#x27;) continue;
+      if (state === &#x27;unreported&#x27;) { row.unreported += 1; continue; }
+      row.api += 1;
+      if (state === &#x27;unkeyed&#x27;) row.unkeyed += 1;
+    }
+    if (data.length === 0 || !page.has_more || total &gt;= limit) break;
+    params.starting_after = data[data.length - 1].id;
+  }
+  return { counts, total };
+}
+
+async function main() {
+  const key = process.env.STRIPE_API_KEY;
+  if (!key) {
+    console.error(&#x27;set STRIPE_API_KEY (use a restricted, read-only key)&#x27;);
+    process.exitCode = 2;
+    return;
+  }
+
+  const days = Number(process.env.DAYS ?? 30);
+  const since = Date.now() / 1000 - days * 86400;
+  const { counts, total } = await tally(key, since);
+  console.log(`sampled ${total} event(s) over ${days} day(s)`);
+
+  let bad = 0;
+  for (const t of WATCHED) {
+    const row = counts.get(t);
+    const [state, detail] = verdict(t, row.api, row.unkeyed);
+    const line = `${state.padEnd(11)} ${t.padEnd(24)} ${detail}`;
+    if (state === &#x27;keyed&#x27; || state === &#x27;stripe-only&#x27;) {
+      console.log(line);
+    } else {
+      bad += 1;
+      console.warn(line);
+    }
+    if (row.unreported) {
+      console.log(`  ${row.unreported} event(s) rendered at an API version that ` +
+                  &#x27;does not report the key; upgrade the endpoint pin to judge them&#x27;);
+    }
+  }
+
+  if (bad) {
+    console.warn(&#x27;  repair: send an Idempotency-Key header on every mutating &#x27; +
+                 &#x27;request, in the options argument rather than the params:&#x27;);
+    console.warn(&#x27;  node:   stripe.paymentIntents.create(params, { idempotencyKey })&#x27;);
+    console.warn(&#x27;  python: stripe.PaymentIntent.create(..., idempotency_key=key)&#x27;);
+    console.warn(&quot;  php:    $stripe-&gt;paymentIntents-&gt;create($params, &quot; +
+                 &quot;[&#x27;idempotency_key&#x27; =&gt; $key])&quot;);
+    console.warn(&#x27;  the key is a v4 uuid per logical operation, persisted with &#x27; +
+                 &#x27;the order and reused unchanged for every retry of it&#x27;);
+  }
+  process.exitCode = bad ? 1 : 0;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing key, and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) =&gt; { console.error(err.message); process.exitCode = 2; });
+}
+</code></pre>
+</div>
+</div>
+
+<h2>Add a test</h2>
+<p>The first test is the whole reason this check is worth writing carefully. Stripe-initiated events have a null <code>request.id</code> and a null <code>request.idempotency_key</code>, and on a Billing account they outnumber everything else. A check that reads only the key reports every renewal invoice as an unkeyed payment request, and the report gets ignored on its first run.</p>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">test_stripe_idempotency_keys.py</div>
+<pre><code class="language-python">from stripe_idempotency_keys import classify, verdict
+
+
+def test_stripe_initiated_events_are_not_findings():
+    # Both fields null. Stripe did this; there was never a key to send. Reading
+    # only idempotency_key here flags every renewal invoice on the account.
+    assert classify({&quot;id&quot;: None, &quot;idempotency_key&quot;: None}) == &quot;stripe&quot;
+    assert classify(None) == &quot;stripe&quot;
+
+
+def test_an_api_request_without_a_key_is_the_finding():
+    assert classify({&quot;id&quot;: &quot;req_123&quot;, &quot;idempotency_key&quot;: None}) == &quot;unkeyed&quot;
+
+
+def test_an_api_request_with_a_key_is_clean():
+    assert classify({&quot;id&quot;: &quot;req_123&quot;, &quot;idempotency_key&quot;: &quot;8f14e45f&quot;}) == &quot;keyed&quot;
+
+
+def test_a_bare_string_request_is_unreported_not_unkeyed():
+    # Old API versions rendered `request` as a bare id string. The key is
+    # unknown there, and counting it as absent invents a problem.
+    assert classify(&quot;req_123&quot;) == &quot;unreported&quot;
+
+
+def test_one_unkeyed_charge_is_already_exposed():
+    state, detail = verdict(&quot;payment_intent.created&quot;, 400, 1)
+    assert state == &quot;exposed&quot;
+    assert &quot;twice&quot; in detail
+    assert verdict(&quot;customer.created&quot;, 400, 1)[0] == &quot;unkeyed&quot;
+    assert verdict(&quot;payment_intent.created&quot;, 400, 0)[0] == &quot;keyed&quot;
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">stripe-idempotency-keys.test.mjs</div>
+<pre><code class="language-javascript">import { test } from &#x27;node:test&#x27;;
+import assert from &#x27;node:assert/strict&#x27;;
+import { classify, verdict } from &#x27;./stripe-idempotency-keys.mjs&#x27;;
+
+test(&#x27;stripe initiated events are not findings&#x27;, () =&gt; {
+  assert.equal(classify({ id: null, idempotency_key: null }), &#x27;stripe&#x27;);
+  assert.equal(classify(null), &#x27;stripe&#x27;);
+});
+
+test(&#x27;an api request without a key is the finding&#x27;, () =&gt; {
+  assert.equal(classify({ id: &#x27;req_123&#x27;, idempotency_key: null }), &#x27;unkeyed&#x27;);
+});
+
+test(&#x27;an api request with a key is clean&#x27;, () =&gt; {
+  assert.equal(classify({ id: &#x27;req_123&#x27;, idempotency_key: &#x27;8f14e45f&#x27; }), &#x27;keyed&#x27;);
+});
+
+test(&#x27;a bare string request is unreported not unkeyed&#x27;, () =&gt; {
+  assert.equal(classify(&#x27;req_123&#x27;), &#x27;unreported&#x27;);
+});
+
+test(&#x27;one unkeyed charge is already exposed&#x27;, () =&gt; {
+  const [state, detail] = verdict(&#x27;payment_intent.created&#x27;, 400, 1);
+  assert.equal(state, &#x27;exposed&#x27;);
+  assert.match(detail, /twice/);
+  assert.equal(verdict(&#x27;customer.created&#x27;, 400, 1)[0], &#x27;unkeyed&#x27;);
+  assert.equal(verdict(&#x27;payment_intent.created&#x27;, 400, 0)[0], &#x27;keyed&#x27;);
+});
+</code></pre>
+</div>
+</div>
+
+<h2>FAQ</h2>
+<details class="faq-item"><summary>Which requests need an idempotency key?</summary><p>Every mutating one. GETs are already idempotent and Stripe ignores the header on them. In practice the ones that matter are the requests that create something: PaymentIntents, charges, refunds, customers, subscriptions. Those are the operations where doing it twice is visible to a customer.</p></details>
+<details class="faq-item"><summary>Why does request.id have to be non-null in the check?</summary><p>Because Stripe-initiated events have both request fields null. Renewal invoices, trial_will_end, automatic payout events: none of them came from an API call of yours, so none of them could have carried a key. Without the guard those dominate the report and the real findings disappear into them.</p></details>
+<details class="faq-item"><summary>How long does Stripe remember an idempotency key?</summary><p>Results are saved for roughly 24 hours, after which the key is pruned. A retry inside that window replays the saved status code and body. A request reusing the same key after pruning is treated as brand new, which is one reason keys derived from something long-lived, like a customer ID, cause duplicates rather than preventing them.</p></details>
+<details class="faq-item"><summary>Can I use the order ID as the key?</summary><p>Only if it is unique per attempt at that specific request, and usually it is not. An order that is retried after a failed payment, or that creates both a customer and a PaymentIntent, reuses the value across different operations and different parameters, which returns an idempotency_error instead of protection. Derive the key from the operation and persist it.</p></details>
+<details class="faq-item"><summary>What does a 409 idempotency_key_in_use mean?</summary><p>Two requests carrying the same key arrived close enough together that neither result was saved yet. It is retryable, and the retry must use the same key. It is a signal that the key is shared across concurrent operations rather than unique to one.</p></details>
+
+<h2>Related field notes</h2>
+<ul>
+<li><a href="/stripe/duplicate-customers-same-email/">One customer has several Customer records</a></li>
+<li><a href="/stripe/duplicate-endpoints-same-url/">Two endpoints share one URL, so every event is handled twice</a></li>
+<li><a href="/stripe/refunds-failed-or-stuck/">Refunds fail or sit unresolved</a></li>
+</ul>
+
+<h3>Sources</h3>
+<p class="sources-note">Every figure in this note is traced to one of these. Prices are
+list rates and change &mdash; check them for your own region before acting.</p>
+<ul class="citations">
+<li><a href="https://docs.stripe.com/api/idempotent_requests" rel="noopener nofollow" target="_blank">Idempotent requests — Stripe API reference</a></li>
+<li><a href="https://docs.stripe.com/api/events/object" rel="noopener nofollow" target="_blank">The event object — Stripe API reference</a></li>
+<li><a href="https://docs.stripe.com/api/events/list" rel="noopener nofollow" target="_blank">List all events — Stripe API reference</a></li>
+<li><a href="https://docs.stripe.com/api/versioning" rel="noopener nofollow" target="_blank">Versioning — Stripe API reference</a></li>
+</ul>
+
+<div class="callout callout--cta">
+<div class="callout__title">Stuck on a tricky one?</div>
+<p>If your setup is misbehaving in a way this note does not cover, <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">message me on LinkedIn</a> with what you are seeing.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+<div class="container">
+<p>Field notes by <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">Allan Ni&ntilde;al</a> &middot; <a href="/">Portfolio</a> &middot; <a href="/dns/">DNS &amp; domains</a> &middot; <a href="/email/">Email &amp; SES</a> &middot; <a href="/aws/">AWS cost</a></p>
+<p class="site-footer__fine">Every script in this section is read only. They hold a credential to a live payments account, so none of them writes: they report what is wrong and print the repair for you to run. Use a restricted key with read access only &mdash; if it leaks, it cannot move money.</p>
+</div>
+</footer>
+<script src="/stripe/assets/stripe.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
+</body>
+</html>
