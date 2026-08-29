@@ -45,6 +45,7 @@ PLATFORM = [
 # bill, and a fifteen-item single list helps neither.
 APIS = [
     ("/stripe/", "Stripe"),
+    ("/twilio/", "Twilio"),
 ]
 
 WORK = [
@@ -72,6 +73,7 @@ SECTION_LABEL = {
     "dns": "/dns",
     "seo": "/seo",
     "stripe": "/stripe",
+    "twilio": "/twilio",
     "spreadsheets": "/spreadsheets",
     "build": "/build",
     "blog": "/blog",
