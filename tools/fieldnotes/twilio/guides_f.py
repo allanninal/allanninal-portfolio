@@ -1411,4 +1411,1461 @@ test('short bodies are fine', () => {
 "citations": [CITE_21617, CITE_ALERTS, CITE_MSG, CITE_SERVICES],
 },
 
+
+{
+"slug": "ucs2-segment-inflation",
+"title": "One smart quote triples your segment count and your bill",
+"description": "One smart quote forces UCS-2 for the whole body: 70 characters a segment instead of 160. Nothing errors, num_segments triples and so does the bill.",
+"h1": "one smart quote triples your segment count and your bill",
+"category": "Twilio",
+"pill": "Diagnostic",
+"chips": ["Read-only key", "Python and Node.js", "Tests included"],
+"keywords": ["twilio ucs-2 segments", "twilio smart encoding",
+             "sms 70 character segment", "twilio num_segments high",
+             "gsm-7 vs ucs-2 sms"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "Nothing failed. Every message says <code>delivered</code>, every customer got it, and the only thing that changed is the invoice: the SMS line is three times what it was on the same send volume. Somewhere in a template, an edit made in a rich text box replaced a straight apostrophe with a curly one. Every message that template renders now costs three segments instead of one, and there is no error code anywhere in the account to say so.",
+"short_answer": """<p>Page <code>GET /2010-04-01/Accounts/{AccountSid}/Messages.json?DateSent&gt;=YYYY-MM-DD&amp;PageSize=1000</code> and recompute the encoding from <code>body</code> yourself: GSM-7 if every character is in the GSM 03.38 alphabet, UCS-2 if even one is not. Compare your segment count against <code>num_segments</code>.</p>
+<p>UCS-2 fits <strong>70</strong> characters in a single segment and <strong>67</strong> in a concatenated one, against 160 and 153 for GSM-7. Then read <code>smart_encoding</code> on each Messaging Service to see whether the mitigation is even on.</p>""",
+"problem": """<p>SMS has two alphabets. GSM-7 packs 160 characters into one segment; UCS-2 packs 70. The choice is not per-character, it is per-message: a single character outside the GSM alphabet forces the entire body into UCS-2, and a 150 character message that used to be one segment becomes three.</p>
+<p>The characters that do it are not exotic. A curly apostrophe from a word processor, an en dash from a designer's copy deck, a non-breaking space pasted out of a spreadsheet, an emoji added to a campaign because it lifted click-through by two percent. None of them look different in the console. The message renders identically on the handset. Delivery is unaffected.</p>
+<p>So the failure is purely financial, and it shows up in the only place nobody wires an alert to: the monthly bill, six weeks later, as a number somebody explains away as growth.</p>""",
+"why": """<p><strong>One character decides the encoding for the whole body.</strong> There is no partial encoding and no per-character cost. The message is GSM-7 or it is not, and the cost of the sixty-ninth ordinary character is decided by one curly quote in the first line.</p>
+<p><strong>The arithmetic is a cliff, not a slope.</strong> Concatenated segments hold 153 GSM-7 characters or 67 UCS-2 characters, because the concatenation header eats part of each one. A 150 character body goes from one segment to three &mdash; a 200% increase for a character nobody typed deliberately.</p>
+<p><strong>Nothing errors.</strong> No <code>error_code</code>, status <code>delivered</code>, no alert, no Debugger entry. The single field that records what happened is <code>num_segments</code>, and it is an integer on a resource nobody reads after the send succeeds.</p>
+<p><strong>Smart Encoding is a per-service toggle.</strong> It transliterates the common offenders for you, and it is the correct fix &mdash; but it applies to the Messaging Service it is set on. A second service for a new tenant, a service cloned for staging, or a send with a bare <code>From</code> and no service at all has none of it.</p>""",
+"steps": [
+ {"h": "Page the Messages list over a window",
+  "body": """<p><code>GET /2010-04-01/Accounts/{AccountSid}/Messages.json?DateSent&gt;=YYYY-MM-DD&amp;PageSize=1000</code>, following <code>next_page_uri</code>. There is nothing to filter on here &mdash; no error code exists for this &mdash; so bound the sweep by days and by a hard message cap and read the bodies.</p>"""},
+ {"h": "Recompute the encoding from the body",
+  "body": """<p>GSM-7 if every character is in the GSM 03.38 basic set or its extension table; UCS-2 otherwise. The extension characters &mdash; <code>^ { } [ ] ~ | €</code> and backslash &mdash; are GSM-7 but cost <em>two</em> units each, which is the detail that makes a hand-rolled length check wrong by a segment.</p>"""},
+ {"h": "Count segments the way the carrier does",
+  "body": """<p>160 units in a single GSM-7 segment, 153 per segment once concatenated. 70 and 67 for UCS-2, counted in UTF-16 code units, so anything outside the Basic Multilingual Plane &mdash; every emoji &mdash; costs two.</p>"""},
+ {"h": "Compare your count with num_segments",
+  "body": """<p>If Twilio billed fewer segments than the raw body would cost, Smart Encoding already rewrote that message on the way out and the template is still wrong &mdash; it is just being paid for by a setting. If the counts match, nothing is mitigating anything.</p>"""},
+ {"h": "Turn on Smart Encoding, then fix the template",
+  "body": """<p><code>POST https://messaging.twilio.com/v1/Services/{ServiceSid}</code> with <code>SmartEncoding=true</code> (Console &rarr; Messaging &rarr; Services &rarr; Content Settings), and normalise curly quotes and dashes where the template is authored. Corroborate the saving afterwards with <code>GET /2010-04-01/Accounts/{AccountSid}/Usage/Records/Daily.json?Category=sms-outbound</code>, comparing <code>count</code> against <code>usage</code>.</p>"""},
+],
+"verify": """<p>Re-run over the same window after the change. The extra segment count should be zero, and anything still in UCS-2 should be there because it genuinely has to be.</p>
+<pre><code class="language-bash">python3 twilio_segment_audit.py --days 7
+# 3 sender(s) over 7 day(s), 0 extra segment(s) from avoidable UCS-2</code></pre>""",
+"code_intro": "The interesting half of this script never touches the network. Deciding GSM-7 against UCS-2, counting units with the extension table, and working out what the same body would have cost after transliteration is all arithmetic over a string &mdash; so it is a pure function with the alphabet written out in full, and the tests exercise it offline. The network half is one paginated <code>GET</code> over the Messages list and one over the Messaging Services.",
+"py_file": "twilio_segment_audit.py",
+"py": '''"""Report Twilio messages inflated into UCS-2 by a handful of characters.
+
+Read only. GET requests and nothing else: give this an API Key with read access
+rather than the account auth token. The repair is printed, never performed,
+because this script holds a credential to an account that can send messages and
+spend money.
+"""
+import argparse
+import datetime as dt
+import logging
+import os
+import sys
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("twilio_segment_audit")
+
+HOST = "https://api.twilio.com"
+BASE = HOST + "/2010-04-01"
+MESSAGING = "https://messaging.twilio.com/v1"
+
+# GSM 03.38, the alphabet a single segment of 160 characters is drawn from.
+GSM_BASIC = set(
+    "@£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !#¤%&()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà")
+# The four that cannot sit in the literal above without fighting the quoting:
+# double quote, apostrophe, newline, carriage return.
+GSM_BASIC.update({chr(34), chr(39), chr(10), chr(13)})
+
+# The extension table. These are GSM-7, but each one costs two units, which is
+# the detail that makes a naive len() check wrong by a whole segment.
+GSM_EXT = set("^{}[~]|€")
+GSM_EXT.add(chr(92))  # backslash
+
+GSM_SINGLE, GSM_MULTI = 160, 153
+UCS_SINGLE, UCS_MULTI = 70, 67
+
+# What Smart Encoding substitutes, near enough: the characters a rich text
+# editor inserts silently and that nobody meant to pay three times for.
+TRANSLITERATE = {
+    "‘": chr(39), "’": chr(39), "‚": chr(39), "‛": chr(39),
+    "′": chr(39), "´": chr(39), "ʼ": chr(39),
+    "“": chr(34), "”": chr(34), "„": chr(34),
+    "«": chr(34), "»": chr(34),
+    "–": "-", "—": "-", "−": "-",
+    "…": "...", " ": " ", "•": "*", "™": "TM",
+}
+
+
+def sms_encoding(body):
+    """GSM-7 if every character is in the GSM alphabet, UCS-2 otherwise. Pure.
+
+    The choice is per message, not per character: one character outside the
+    alphabet moves the entire body to UCS-2 and 70 characters a segment.
+    """
+    for c in str(body or ""):
+        if c not in GSM_BASIC and c not in GSM_EXT:
+            return "UCS-2"
+    return "GSM-7"
+
+
+def segments(body):
+    """Return (encoding, units, segment_count) for a body. Pure.
+
+    Units, not characters: an extension character costs two in GSM-7, and a
+    character outside the Basic Multilingual Plane (every emoji) costs two
+    UTF-16 code units in UCS-2.
+    """
+    text = str(body or "")
+    encoding = sms_encoding(text)
+    if encoding == "GSM-7":
+        units = sum(2 if c in GSM_EXT else 1 for c in text)
+        single, multi = GSM_SINGLE, GSM_MULTI
+    else:
+        units = sum(2 if ord(c) > 0xFFFF else 1 for c in text)
+        single, multi = UCS_SINGLE, UCS_MULTI
+    if units <= single:
+        return (encoding, units, 1)
+    return (encoding, units, -(-units // multi))
+
+
+def offenders(body):
+    """Every distinct character forcing UCS-2, with its substitute or None.
+
+    Pure. None means nothing can stand in for it: an emoji, or a script that is
+    simply not Latin, in which case UCS-2 is correct and the cost is real.
+    """
+    out, seen = [], set()
+    for c in str(body or ""):
+        if c in GSM_BASIC or c in GSM_EXT or c in seen:
+            continue
+        seen.add(c)
+        out.append((c, TRANSLITERATE.get(c)))
+    return out
+
+
+def transliterate(body):
+    """The body as Smart Encoding would rewrite it. Pure."""
+    return "".join(TRANSLITERATE.get(c, c) for c in str(body or ""))
+
+
+def describe(chars):
+    return ", ".join("%s (U+%04X)" % (c, ord(c)) for c in chars)
+
+
+def verdict(body, reported=None):
+    """Classify one message body. Pure, and the whole point of this script.
+
+    `reported` is num_segments as Twilio billed it. When it is lower than the
+    raw body would cost, Smart Encoding rewrote the message on the way out: the
+    template is still wrong, a setting is just paying for it.
+
+    Returns (state, detail).
+    """
+    text = str(body or "")
+    encoding, units, count = segments(text)
+    if encoding == "GSM-7":
+        return ("gsm-7", "%d segment(s), GSM-7, %d unit(s)" % (count, units))
+
+    if reported is not None:
+        try:
+            billed = int(reported)
+        except (TypeError, ValueError):
+            billed = None
+        if billed is not None and billed < count:
+            return ("smart-encoded",
+                    "billed %d segment(s), not the %d this body costs as UCS-2: "
+                    "Smart Encoding rewrote it on the way out, so the template "
+                    "is still wrong and a setting is paying for it."
+                    % (billed, count))
+
+    found = offenders(text)
+    fixable = [c for c, sub in found if sub is not None]
+    stuck = [c for c, sub in found if sub is None]
+
+    if stuck:
+        return ("ucs2-required",
+                "%d segment(s) as UCS-2, %d unit(s). Nothing to strip: %s cannot "
+                "be transliterated, so UCS-2 is correct here and the cost is "
+                "expected rather than accidental."
+                % (count, units, describe(stuck[:4])))
+
+    clean = segments(transliterate(text))[2]
+    return ("ucs2-avoidable",
+            "%d segment(s) as UCS-2 against %d after transliteration: %d extra "
+            "segment(s) on every send of this body, caused by %s."
+            % (count, clean, count - clean, describe(fixable[:4])))
+
+
+def tally(messages):
+    """Bucket outbound messages by sender and add up the avoidable segments.
+
+    Pure. Inbound messages are skipped: their encoding is the sender's problem
+    and you are not billed by the segment for receiving them.
+    """
+    rows = {}
+    for m in messages:
+        if str(m.get("direction") or "").startswith("inbound"):
+            continue
+        body = str(m.get("body") or "")
+        if not body.strip():
+            continue
+        key = m.get("messaging_service_sid") or m.get("from") or "unknown sender"
+        row = rows.setdefault(key, {"total": 0, "ucs2": 0, "extra": 0,
+                                    "chars": [], "sids": []})
+        row["total"] += 1
+        state, _ = verdict(body, m.get("num_segments"))
+        if state == "gsm-7":
+            continue
+        row["ucs2"] += 1
+        if state == "ucs2-avoidable":
+            row["extra"] += segments(body)[2] - segments(transliterate(body))[2]
+        for c, _sub in offenders(body):
+            if c not in row["chars"]:
+                row["chars"].append(c)
+        if len(row["sids"]) < 3:
+            row["sids"].append(m.get("sid"))
+    return rows
+
+
+def get(session, url, **params):
+    r = session.get(url, params=params, timeout=30)
+    if r.status_code in (401, 403):
+        raise SystemExit("%d from Twilio: check TWILIO_ACCOUNT_SID and that the "
+                         "API key belongs to that account with read access"
+                         % r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+
+def list_messages(session, account, since, limit):
+    """Page Messages.json. Nothing to filter on: this failure has no error
+    code, so the window and the cap are the only bounds there are."""
+    url = "%s/Accounts/%s/Messages.json" % (BASE, account)
+    params = {"PageSize": 1000, "DateSent>=": since}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("messages", []))
+        nxt = page.get("next_page_uri")
+        url, params = (HOST + nxt) if nxt else None, {}
+    return out[:limit]
+
+
+def smart_encoding_by_service(session):
+    """Map service sid to its smart_encoding flag. next_page_url is absolute on
+    this API, unlike the relative next_page_uri on the 2010 one."""
+    url = "%s/Services" % MESSAGING
+    params = {"PageSize": 50}
+    out = {}
+    while url:
+        page = get(session, url, **params)
+        for s in page.get("services", []):
+            out[s.get("sid")] = bool(s.get("smart_encoding"))
+        url = (page.get("meta") or {}).get("next_page_url")
+        params = {}
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=7,
+                    help="how far back to read the Messages list")
+    ap.add_argument("--max-messages", type=int, default=20000,
+                    help="stop paging after this many messages")
+    args = ap.parse_args()
+
+    account = os.environ.get("TWILIO_ACCOUNT_SID")
+    key = os.environ.get("TWILIO_API_KEY")
+    secret = os.environ.get("TWILIO_API_SECRET")
+    if not (account and key and secret):
+        log.error("set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET "
+                  "(an API Key with read access, not the auth token)")
+        return 2
+
+    session = requests.Session()
+    session.auth = (key, secret)
+
+    since = (dt.date.today() - dt.timedelta(days=args.days)).isoformat()
+    messages = list_messages(session, account, since, args.max_messages)
+    if not messages:
+        log.info("no messages sent since %s", since)
+        return 0
+
+    senders = tally(messages)
+    services = smart_encoding_by_service(session)
+
+    extra = 0
+    for sender, stats in sorted(senders.items()):
+        if not stats["ucs2"]:
+            log.info("%-15s %s  %d message(s), all GSM-7",
+                     "gsm-7", sender, stats["total"])
+            continue
+        extra += stats["extra"]
+        state = "inflated" if stats["extra"] else "ucs2"
+        log.warning("%-15s %s  %d of %d message(s) in UCS-2, %d extra "
+                    "segment(s) over the window, offenders: %s",
+                    state, sender, stats["ucs2"], stats["total"], stats["extra"],
+                    describe(stats["chars"][:6]))
+        log.warning("  message sids: %s", ", ".join(str(s) for s in stats["sids"]))
+        if str(sender).startswith("MG"):
+            if services.get(sender):
+                log.warning("  smart_encoding is already true on %s: what is "
+                            "left is genuinely non-GSM content, or a template "
+                            "using characters the substitution table misses.",
+                            sender)
+            else:
+                log.warning("  repair: POST %s/Services/%s SmartEncoding=true, "
+                            "and normalise curly quotes and dashes where the "
+                            "template is authored.", MESSAGING, sender)
+        else:
+            log.warning("  repair: this sent with a bare From, so no Messaging "
+                        "Service and no Smart Encoding to enable. Send through "
+                        "a service, or normalise the body before the call.")
+
+    log.info("%d sender(s) over %d day(s), %d extra segment(s) from avoidable "
+             "UCS-2", len(senders), args.days, extra)
+    return 1 if extra else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "twilio-segment-audit.mjs",
+"js": '''/**
+ * Report Twilio messages inflated into UCS-2 by a handful of characters.
+ *
+ * Read only. GET requests and nothing else: give this an API Key with read
+ * access rather than the account auth token. The repair is printed, never
+ * performed.
+ */
+const HOST = 'https://api.twilio.com';
+const BASE = `${HOST}/2010-04-01`;
+const MESSAGING = 'https://messaging.twilio.com/v1';
+
+// GSM 03.38, the alphabet a single segment of 160 characters is drawn from.
+const GSM_BASIC = new Set(
+  '@£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !#¤%&()*+,-./0123456789:;<=>?' +
+  '¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà');
+// Double quote, apostrophe, newline and carriage return, kept out of the
+// literal above so it does not fight the quoting.
+for (const code of [34, 39, 10, 13]) GSM_BASIC.add(String.fromCharCode(code));
+
+// The extension table: GSM-7, but two units each.
+const GSM_EXT = new Set('^{}[~]|€');
+GSM_EXT.add(String.fromCharCode(92)); // backslash
+
+const GSM_SINGLE = 160, GSM_MULTI = 153;
+const UCS_SINGLE = 70, UCS_MULTI = 67;
+
+// What Smart Encoding substitutes, near enough.
+const TRANSLITERATE = new Map(Object.entries({
+  '‘': "'", '’': "'", '‚': "'", '‛': "'",
+  '′': "'", '´': "'", 'ʼ': "'",
+  '“': '"', '”': '"', '„': '"', '«': '"', '»': '"',
+  '–': '-', '—': '-', '−': '-',
+  '…': '...', ' ': ' ', '•': '*', '™': 'TM',
+}));
+
+/**
+ * GSM-7 if every character is in the GSM alphabet, UCS-2 otherwise. Pure. The
+ * choice is per message: one character outside the alphabet moves the whole
+ * body to 70 characters a segment.
+ */
+export function smsEncoding(body) {
+  for (const c of String(body ?? '')) {
+    if (!GSM_BASIC.has(c) && !GSM_EXT.has(c)) return 'UCS-2';
+  }
+  return 'GSM-7';
+}
+
+/**
+ * Return [encoding, units, segmentCount]. Pure. Units, not characters: an
+ * extension character costs two in GSM-7, and anything outside the Basic
+ * Multilingual Plane costs two UTF-16 code units in UCS-2.
+ */
+export function segments(body) {
+  const text = String(body ?? '');
+  const encoding = smsEncoding(text);
+  let units = 0;
+  for (const c of text) {
+    if (encoding === 'GSM-7') units += GSM_EXT.has(c) ? 2 : 1;
+    else units += c.codePointAt(0) > 0xFFFF ? 2 : 1;
+  }
+  const single = encoding === 'GSM-7' ? GSM_SINGLE : UCS_SINGLE;
+  const multi = encoding === 'GSM-7' ? GSM_MULTI : UCS_MULTI;
+  return [encoding, units, units <= single ? 1 : Math.ceil(units / multi)];
+}
+
+/**
+ * Every distinct character forcing UCS-2, with its substitute or null. Pure.
+ * null means nothing can stand in for it, and UCS-2 is correct.
+ */
+export function offenders(body) {
+  const out = [];
+  const seen = new Set();
+  for (const c of String(body ?? '')) {
+    if (GSM_BASIC.has(c) || GSM_EXT.has(c) || seen.has(c)) continue;
+    seen.add(c);
+    out.push([c, TRANSLITERATE.get(c) ?? null]);
+  }
+  return out;
+}
+
+/** The body as Smart Encoding would rewrite it. Pure. */
+export function transliterate(body) {
+  return [...String(body ?? '')].map((c) => TRANSLITERATE.get(c) ?? c).join('');
+}
+
+export function describe(chars) {
+  return chars.map((c) =>
+    `${c} (U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')})`)
+    .join(', ');
+}
+
+/**
+ * Classify one message body. Pure, and the whole point of this script.
+ * `reported` is num_segments as Twilio billed it; lower than the raw cost means
+ * Smart Encoding rewrote the message on the way out. Returns [state, detail].
+ */
+export function verdict(body, reported = null) {
+  const text = String(body ?? '');
+  const [encoding, units, count] = segments(text);
+  if (encoding === 'GSM-7') {
+    return ['gsm-7', `${count} segment(s), GSM-7, ${units} unit(s)`];
+  }
+
+  if (reported !== null && reported !== undefined) {
+    const billed = Number(reported);
+    if (Number.isFinite(billed) && billed < count) {
+      return ['smart-encoded',
+        `billed ${billed} segment(s), not the ${count} this body costs as ` +
+        'UCS-2: Smart Encoding rewrote it on the way out, so the template is ' +
+        'still wrong and a setting is paying for it.'];
+    }
+  }
+
+  const found = offenders(text);
+  const fixable = found.filter(([, sub]) => sub !== null).map(([c]) => c);
+  const stuck = found.filter(([, sub]) => sub === null).map(([c]) => c);
+
+  if (stuck.length) {
+    return ['ucs2-required',
+      `${count} segment(s) as UCS-2, ${units} unit(s). Nothing to strip: ` +
+      `${describe(stuck.slice(0, 4))} cannot be transliterated, so UCS-2 is ` +
+      'correct here and the cost is expected rather than accidental.'];
+  }
+
+  const clean = segments(transliterate(text))[2];
+  return ['ucs2-avoidable',
+    `${count} segment(s) as UCS-2 against ${clean} after transliteration: ` +
+    `${count - clean} extra segment(s) on every send of this body, caused by ` +
+    `${describe(fixable.slice(0, 4))}.`];
+}
+
+/**
+ * Bucket outbound messages by sender and add up the avoidable segments. Pure.
+ */
+export function tally(messages) {
+  const rows = new Map();
+  for (const m of messages) {
+    if (String(m.direction ?? '').startsWith('inbound')) continue;
+    const body = String(m.body ?? '');
+    if (!body.trim()) continue;
+    const key = m.messaging_service_sid || m.from || 'unknown sender';
+    if (!rows.has(key)) rows.set(key, { total: 0, ucs2: 0, extra: 0, chars: [], sids: [] });
+    const row = rows.get(key);
+    row.total += 1;
+    const [state] = verdict(body, m.num_segments ?? null);
+    if (state === 'gsm-7') continue;
+    row.ucs2 += 1;
+    if (state === 'ucs2-avoidable') {
+      row.extra += segments(body)[2] - segments(transliterate(body))[2];
+    }
+    for (const [c] of offenders(body)) if (!row.chars.includes(c)) row.chars.push(c);
+    if (row.sids.length < 3) row.sids.push(m.sid);
+  }
+  return rows;
+}
+
+function authHeader(key, secret) {
+  return `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}`;
+}
+
+async function get(auth, url, params = {}) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  const res = await fetch(u, { headers: { Authorization: auth } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${res.status} from Twilio: check TWILIO_ACCOUNT_SID and ` +
+                    'that the API key belongs to that account with read access');
+  }
+  if (!res.ok) throw new Error(`${res.status} from ${u.pathname}`);
+  return res.json();
+}
+
+async function listMessages(auth, account, since, limit) {
+  let url = `${BASE}/Accounts/${account}/Messages.json`;
+  let params = { PageSize: 1000, 'DateSent>=': since };
+  const out = [];
+  while (url && out.length < limit) {
+    const page = await get(auth, url, params);
+    out.push(...(page.messages ?? []));
+    url = page.next_page_uri ? HOST + page.next_page_uri : null;
+    params = {};
+  }
+  return out.slice(0, limit);
+}
+
+async function smartEncodingByService(auth) {
+  let url = `${MESSAGING}/Services`;
+  let params = { PageSize: 50 };
+  const out = new Map();
+  while (url) {
+    const page = await get(auth, url, params);
+    for (const s of page.services ?? []) out.set(s.sid, Boolean(s.smart_encoding));
+    url = page.meta?.next_page_url ?? null;
+    params = {};
+  }
+  return out;
+}
+
+function flag(name, fallback) {
+  const i = process.argv.indexOf(name);
+  return i === -1 ? fallback : Number(process.argv[i + 1]);
+}
+
+async function main() {
+  const account = process.env.TWILIO_ACCOUNT_SID;
+  const key = process.env.TWILIO_API_KEY;
+  const secret = process.env.TWILIO_API_SECRET;
+  if (!account || !key || !secret) {
+    console.error('set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET ' +
+                  '(an API Key with read access, not the auth token)');
+    process.exitCode = 2;
+    return;
+  }
+  const auth = authHeader(key, secret);
+  const days = flag('--days', 7);
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+  const messages = await listMessages(auth, account, since, flag('--max-messages', 20000));
+  if (messages.length === 0) {
+    console.log(`no messages sent since ${since}`);
+    return;
+  }
+
+  const senders = tally(messages);
+  const services = await smartEncodingByService(auth);
+
+  let extra = 0;
+  for (const sender of [...senders.keys()].sort()) {
+    const stats = senders.get(sender);
+    if (!stats.ucs2) {
+      console.log(`gsm-7           ${sender}  ${stats.total} message(s), all GSM-7`);
+      continue;
+    }
+    extra += stats.extra;
+    const state = stats.extra ? 'inflated' : 'ucs2';
+    console.warn(`${state.padEnd(15)} ${sender}  ${stats.ucs2} of ${stats.total} ` +
+                 `message(s) in UCS-2, ${stats.extra} extra segment(s) over the ` +
+                 `window, offenders: ${describe(stats.chars.slice(0, 6))}`);
+    console.warn(`  message sids: ${stats.sids.join(', ')}`);
+    if (String(sender).startsWith('MG')) {
+      if (services.get(sender)) {
+        console.warn(`  smart_encoding is already true on ${sender}: what is left ` +
+                     'is genuinely non-GSM content, or characters the ' +
+                     'substitution table misses.');
+      } else {
+        console.warn(`  repair: POST ${MESSAGING}/Services/${sender} ` +
+                     'SmartEncoding=true, and normalise curly quotes and dashes ' +
+                     'where the template is authored.');
+      }
+    } else {
+      console.warn('  repair: this sent with a bare From, so no Messaging Service ' +
+                   'and no Smart Encoding to enable. Send through a service, or ' +
+                   'normalise the body before the call.');
+    }
+  }
+
+  console.log(`${senders.size} sender(s) over ${days} day(s), ${extra} extra ` +
+              'segment(s) from avoidable UCS-2');
+  process.exitCode = extra ? 1 : 0;
+}
+
+// Only run when invoked directly, so importing this module in the tests does not
+// run main(), fail on the missing credentials and set a non-zero exit code.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "This is the classifier worth testing hardest, because every number it produces is money. The cases below pin the boundaries the arithmetic turns on: 160 characters against 161, an extension character costing two units, a 150 character body going from one segment to three on one curly apostrophe, and an emoji correctly reported as something no transliteration can rescue.",
+"test_py_file": "test_twilio_segment_audit.py",
+"test_py": '''from twilio_segment_audit import (offenders, segments, sms_encoding, tally,
+                                  transliterate, verdict)
+
+CURLY = "’"     # right single quotation mark, the usual culprit
+PARTY = "\U0001F389"  # an emoji, outside the Basic Multilingual Plane
+
+
+def test_plain_ascii_is_gsm7():
+    assert sms_encoding("Your code is 123456") == "GSM-7"
+
+
+def test_one_curly_apostrophe_moves_the_whole_body_to_ucs2():
+    assert sms_encoding("It%ss ready" % CURLY) == "UCS-2"
+
+
+def test_gsm7_segment_boundary_is_160_then_153():
+    assert segments("a" * 160) == ("GSM-7", 160, 1)
+    assert segments("a" * 161)[2] == 2
+    assert segments("a" * 306)[2] == 2
+    assert segments("a" * 307)[2] == 3
+
+
+def test_extension_characters_cost_two_units():
+    # 80 euro signs is 160 units: still one segment, but at half the characters.
+    assert segments("€" * 80) == ("GSM-7", 160, 1)
+    assert segments("€" * 81)[2] == 2
+
+
+def test_ucs2_segment_boundary_is_70_then_67():
+    body = "а" * 70  # Cyrillic
+    assert segments(body) == ("UCS-2", 70, 1)
+    assert segments("а" * 71)[2] == 2
+
+
+def test_an_emoji_costs_two_utf16_units():
+    encoding, units, count = segments(PARTY * 40)
+    assert encoding == "UCS-2"
+    assert units == 80
+    assert count == 2
+
+
+def test_one_smart_quote_turns_one_segment_into_three():
+    body = "a" * 149 + CURLY
+    state, detail = verdict(body)
+    assert state == "ucs2-avoidable"
+    assert segments(body)[2] == 3
+    assert segments(transliterate(body))[2] == 1
+    assert "2 extra segment(s)" in detail
+
+
+def test_an_emoji_is_ucs2_that_nothing_can_fix():
+    state, detail = verdict("Sale today " + PARTY)
+    assert state == "ucs2-required"
+    assert "cannot be transliterated" in detail
+
+
+def test_billing_fewer_segments_means_smart_encoding_already_ran():
+    state, detail = verdict("a" * 149 + CURLY, reported=1)
+    assert state == "smart-encoded"
+    assert "still wrong" in detail
+
+
+def test_offenders_are_deduplicated_and_carry_their_substitute():
+    found = offenders("%s%s ok %s" % (CURLY, CURLY, PARTY))
+    assert [c for c, _ in found] == [CURLY, PARTY]
+    assert found[0][1] == chr(39)
+    assert found[1][1] is None
+
+
+def test_tally_adds_up_the_avoidable_segments_per_sender():
+    body = "a" * 149 + CURLY
+    rows = tally([
+        {"sid": "SM1", "messaging_service_sid": "MG1", "body": body},
+        {"sid": "SM2", "messaging_service_sid": "MG1", "body": body},
+        {"sid": "SM3", "messaging_service_sid": "MG1", "body": "plain text"},
+        {"sid": "SM4", "from": "+15550001111", "direction": "inbound", "body": body},
+    ])
+    assert list(rows) == ["MG1"]
+    assert rows["MG1"] == {"total": 3, "ucs2": 2, "extra": 4,
+                           "chars": [CURLY], "sids": ["SM1", "SM2"]}
+''',
+"test_js_file": "twilio-segment-audit.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { offenders, segments, smsEncoding, tally, transliterate, verdict }
+  from './twilio-segment-audit.mjs';
+
+const CURLY = '’';       // right single quotation mark, the usual culprit
+const PARTY = '🎉'; // an emoji, outside the Basic Multilingual Plane
+
+test('plain ascii is gsm-7', () => {
+  assert.equal(smsEncoding('Your code is 123456'), 'GSM-7');
+});
+
+test('one curly apostrophe moves the whole body to ucs-2', () => {
+  assert.equal(smsEncoding(`It${CURLY}s ready`), 'UCS-2');
+});
+
+test('gsm-7 segment boundary is 160 then 153', () => {
+  assert.deepEqual(segments('a'.repeat(160)), ['GSM-7', 160, 1]);
+  assert.equal(segments('a'.repeat(161))[2], 2);
+  assert.equal(segments('a'.repeat(306))[2], 2);
+  assert.equal(segments('a'.repeat(307))[2], 3);
+});
+
+test('extension characters cost two units', () => {
+  assert.deepEqual(segments('€'.repeat(80)), ['GSM-7', 160, 1]);
+  assert.equal(segments('€'.repeat(81))[2], 2);
+});
+
+test('ucs-2 segment boundary is 70 then 67', () => {
+  assert.deepEqual(segments('а'.repeat(70)), ['UCS-2', 70, 1]);
+  assert.equal(segments('а'.repeat(71))[2], 2);
+});
+
+test('an emoji costs two utf-16 units', () => {
+  assert.deepEqual(segments(PARTY.repeat(40)), ['UCS-2', 80, 2]);
+});
+
+test('one smart quote turns one segment into three', () => {
+  const body = 'a'.repeat(149) + CURLY;
+  const [state, detail] = verdict(body);
+  assert.equal(state, 'ucs2-avoidable');
+  assert.equal(segments(body)[2], 3);
+  assert.equal(segments(transliterate(body))[2], 1);
+  assert.match(detail, /2 extra segment\\(s\\)/);
+});
+
+test('an emoji is ucs-2 that nothing can fix', () => {
+  const [state, detail] = verdict(`Sale today ${PARTY}`);
+  assert.equal(state, 'ucs2-required');
+  assert.match(detail, /cannot be transliterated/);
+});
+
+test('billing fewer segments means smart encoding already ran', () => {
+  const [state, detail] = verdict('a'.repeat(149) + CURLY, 1);
+  assert.equal(state, 'smart-encoded');
+  assert.match(detail, /still wrong/);
+});
+
+test('offenders are deduplicated and carry their substitute', () => {
+  const found = offenders(`${CURLY}${CURLY} ok ${PARTY}`);
+  assert.deepEqual(found.map(([c]) => c), [CURLY, PARTY]);
+  assert.equal(found[0][1], "'");
+  assert.equal(found[1][1], null);
+});
+
+test('tally adds up the avoidable segments per sender', () => {
+  const body = 'a'.repeat(149) + CURLY;
+  const rows = tally([
+    { sid: 'SM1', messaging_service_sid: 'MG1', body },
+    { sid: 'SM2', messaging_service_sid: 'MG1', body },
+    { sid: 'SM3', messaging_service_sid: 'MG1', body: 'plain text' },
+    { sid: 'SM4', from: '+15550001111', direction: 'inbound', body },
+  ]);
+  assert.deepEqual([...rows.keys()], ['MG1']);
+  assert.deepEqual(rows.get('MG1'), { total: 3, ucs2: 2, extra: 4,
+                                      chars: [CURLY], sids: ['SM1', 'SM2'] });
+});
+''',
+"faq": [
+ ("Which characters actually force UCS-2?",
+  "Anything outside the GSM 03.38 alphabet. In practice: curly quotes and apostrophes, en and em dashes, the ellipsis character, non-breaking spaces, bullets, most accented letters beyond the handful GSM includes, every emoji, and every non-Latin script. The GSM set does include à, ä, é, ö, ñ, ü, £, ¥ and €, which is why some accented copy stays cheap and some does not."),
+ ("Why does one character cost so much?",
+  "Because the encoding is chosen for the whole message. GSM-7 fits 160 characters in a single segment and 153 in each concatenated one; UCS-2 fits 70 and 67. A 150 character body is one segment as GSM-7 and three as UCS-2, so a single curly apostrophe is a 200% price rise on every send of that template."),
+ ("Does Smart Encoding fix all of it?",
+  "It fixes the accidental part. Smart Encoding substitutes look-alike GSM characters for the common offenders, which is exactly right for a curly quote that a rich text editor inserted. It cannot help an emoji or a Cyrillic word, and it should not: those messages need UCS-2, and the script reports them separately so you are not chasing a saving that does not exist."),
+ ("Why recompute the encoding when num_segments is right there?",
+  "Because num_segments tells you the cost and not the cause. Recomputing from the body names the character responsible and says what the same message would have cost without it. Comparing the two numbers is also the only way to notice that Smart Encoding is quietly rescuing a template that is still wrong."),
+ ("Can the script enable Smart Encoding itself?",
+  "No. Everything in this section is read-only, and this one holds a credential to an account that can spend money. It prints the exact POST against the Messaging Service, with the service SID, for you to run."),
+],
+"related": [
+ ("/twilio/body-exceeds-1600-chars-21617/", "Rendered bodies that blow past the 1600 character limit"),
+ ("/twilio/messaging-queue-overflow-30001/", "A send loop that overflows one sender's queue"),
+ ("/twilio/carrier-filtered-messages-30007/", "Carrier filtering drops SMS with error 30007"),
+],
+"citations": [CITE_SERVICE, CITE_SERVICES, CITE_MSG, CITE_USAGE],
+},
+
+
+{
+"slug": "messaging-queue-overflow-30001",
+"title": "Queue overflow 30001: a send loop outruns one long code",
+"description": "Bulk sends through one long code fail with error_code 30001. The queue holds about ten hours of segments at 1 MPS, and the producer outruns it.",
+"h1": "queue overflow 30001: a send loop outruns one long code",
+"category": "Twilio",
+"pill": "Diagnostic",
+"chips": ["Read-only key", "Python and Node.js", "Tests included"],
+"keywords": ["twilio error 30001", "twilio queue overflow",
+             "twilio error 21611", "twilio messages per second",
+             "twilio long code throughput"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "The nightly job dispatched forty thousand messages in about eleven minutes, the way it always has. This time six thousand of them came back with <code>error_code</code> <code>30001</code>, some of the rest were rejected at request time with <code>21611</code>, and the ones that survived arrived the following afternoon. Nothing in the code changed. The list got longer, and a single long code can only send about one message a second.",
+"short_answer": """<p>Page <code>GET /2010-04-01/Accounts/{AccountSid}/Messages.json?DateSent&gt;=YYYY-MM-DD&amp;PageSize=1000</code>, keep rows where <code>error_code</code> is <code>30001</code> or <code>21611</code>, and group them by <code>from</code> &mdash; the queue belongs to the sender, not to the account.</p>
+<p>Then do the arithmetic that predicts the next failure: total the <code>num_segments</code> you pushed at each sender and divide by that sender's throughput. A US long code is around 1 MPS, and its queue holds roughly ten hours of segments. Forty thousand segments at 1 MPS is eleven hours, and eleven does not fit into ten.</p>""",
+"problem": """<p>Throughput in SMS is a property of the sender, not of your account or your plan. A US long code sends about one message segment per second. A toll-free number is faster, a short code faster again. Twilio accepts everything you hand it and queues it against that sender, and the queue is finite: roughly ten hours of segments at that sender's rate.</p>
+<p>Below the ceiling this is invisible &mdash; you send in a burst, Twilio drains at 1 MPS, everything arrives, nobody notices there was a queue. Above it, two failures appear at once. Messages already queued start expiring or being rejected with <code>30001</code>, and new requests come back at the API with <code>21611</code>, the request-time version of the same wall.</p>
+<p>What makes it a Tuesday-night incident rather than a capacity plan is that the list grows gradually and the wall does not move. The job that took eight hours to drain last month takes eleven this month, and eleven is on the wrong side of the line.</p>""",
+"why": """<p><strong>The queue is per sender.</strong> One long code has one queue. Adding a second application server, a bigger worker pool or more parallel requests changes nothing at all &mdash; it only fills the same queue faster.</p>
+<p><strong>Segments are the unit, not messages.</strong> A three-segment message occupies three slots. A campaign that drifted into UCS-2 tripled its segment count without changing its message count, which is how a job that fit last month stops fitting without anybody sending more.</p>
+<p><strong>30001 and 21611 are the same wall from two sides.</strong> 21611 rejects the request because the queue for that <code>From</code> is already full; 30001 fails a message that got in and could not be drained in time. An audit that reads only one of them reports half an incident.</p>
+<p><strong>The Messages list has no error filter.</strong> No <code>Status</code> parameter, no <code>ErrorCode</code> parameter &mdash; only <code>To</code>, <code>From</code>, <code>DateSent</code> and paging. Both codes have to be found by paging the window and filtering client-side, which is also the only way to total the segments per sender.</p>""",
+"steps": [
+ {"h": "Page the Messages list over the window that contains the job",
+  "body": """<p><code>GET /2010-04-01/Accounts/{AccountSid}/Messages.json?DateSent&gt;=YYYY-MM-DD&amp;PageSize=1000</code>, following <code>next_page_uri</code>. A bulk run is exactly the case where the message cap matters, so bound it and say so in the output rather than paging a hundred thousand rows to reach the same conclusion.</p>"""},
+ {"h": "Keep 30001 and 21611 together, grouped by sender",
+  "body": """<p>Group on <code>from</code>, because that is what owns the queue. Read <code>error_code</code> as an integer: it is <code>null</code> on healthy messages and comparing it to the string <code>"30001"</code> silently matches nothing.</p>"""},
+ {"h": "Total the segments, not the messages",
+  "body": """<p>Sum <code>num_segments</code> per sender. That number, divided by the sender's messages-per-second, is how many hours of sending you queued. Compare it with the ten hours or so of depth the queue has, and you have the answer before the next run rather than after it.</p>"""},
+ {"h": "Check how wide the pool actually is",
+  "body": """<p><code>GET https://messaging.twilio.com/v1/Services/{ServiceSid}/PhoneNumbers</code> counts the senders in the Messaging Service pool. A service with one number in it has exactly the throughput of one number, whatever the code sending through it believes.</p>"""},
+ {"h": "Spread the load, then rate-limit the producer",
+  "body": """<p>Send through a Messaging Service (<code>MessagingServiceSid=MG…</code>) rather than a bare <code>From</code>, add senders with <code>POST https://messaging.twilio.com/v1/Services/{ServiceSid}/PhoneNumbers</code>, and cap the producer at what the pool can physically drain. For genuine bulk volume, escalate to toll-free or a short code rather than adding long codes one at a time.</p>"""},
+],
+"verify": """<p>Re-run over the window covering the next bulk run. Every sender should report <code>clean</code> or <code>draining</code>, and no sender should be over capacity.</p>
+<pre><code class="language-bash">python3 twilio_queue_overflow_audit.py --days 2 --mps 1
+# 6 sender(s) over 2 day(s), 0 over capacity</code></pre>""",
+"code_intro": "One paginated <code>GET</code> over the Messages list, plus one per Messaging Service to count its pool. The arithmetic is where the value is &mdash; segments divided by throughput against the depth of the queue &mdash; so it is a pure function taking the sender's MPS as an argument, because 1 MPS is right for a US long code and wrong for everything else.",
+"py_file": "twilio_queue_overflow_audit.py",
+"py": '''"""Report Twilio senders whose queue is overflowing with 30001 or 21611.
+
+Read only. GET requests and nothing else: give this an API Key with read access
+rather than the account auth token. The repair is printed, never performed,
+because this script holds a credential to an account that can send messages and
+spend money.
+"""
+import argparse
+import datetime as dt
+import logging
+import os
+import sys
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("twilio_queue_overflow_audit")
+
+HOST = "https://api.twilio.com"
+BASE = HOST + "/2010-04-01"
+MESSAGING = "https://messaging.twilio.com/v1"
+
+# The same wall from two sides: 21611 rejects the request because the queue for
+# that From is full, 30001 fails a message that got in and never drained.
+OVERFLOW = (30001, 21611)
+WAITING = ("queued", "accepted", "scheduled", "sending")
+
+
+def error_code(message):
+    """Read error_code as an integer, or None.
+
+    It is null on every healthy message. Comparing the raw value against 30001
+    is the mistake that reports a clean account the morning after an overflow.
+    """
+    raw = message.get("error_code")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def queue_hours(segments, mps):
+    """How many hours of sending a pile of segments represents. Pure.
+
+    Segments, not messages: a three-segment body occupies three slots in the
+    sender's queue.
+    """
+    rate = max(float(mps or 0), 0.01)
+    return segments / (rate * 3600.0)
+
+
+def tally(messages):
+    """Bucket outbound messages by the sender that owns the queue. Pure.
+
+    The key is `from`, because throughput and the queue behind it belong to the
+    sending number. The Messaging Service is kept alongside, since that is what
+    you would widen to fix it.
+    """
+    rows = {}
+    for m in messages:
+        if str(m.get("direction") or "").startswith("inbound"):
+            continue
+        key = m.get("from") or m.get("messaging_service_sid") or "unknown sender"
+        row = rows.setdefault(key, {"total": 0, "overflow": 0, "queued": 0,
+                                    "segments": 0, "service": None, "sids": []})
+        row["total"] += 1
+        try:
+            row["segments"] += max(int(m.get("num_segments") or 1), 1)
+        except (TypeError, ValueError):
+            row["segments"] += 1
+        if m.get("messaging_service_sid"):
+            row["service"] = m.get("messaging_service_sid")
+        if str(m.get("status") or "").lower() in WAITING:
+            row["queued"] += 1
+        if error_code(m) in OVERFLOW:
+            row["overflow"] += 1
+            if len(row["sids"]) < 3:
+                row["sids"].append(m.get("sid"))
+    return rows
+
+
+def verdict(stats, mps=1.0, capacity_hours=10.0):
+    """Classify one sender against what it can physically drain. Pure, so the
+    throughput assumption is an argument rather than a hidden constant.
+
+    Returns (state, detail).
+    """
+    total = int(stats.get("total") or 0)
+    overflow = int(stats.get("overflow") or 0)
+    waiting = int(stats.get("queued") or 0)
+    segments = int(stats.get("segments") or 0) or total
+    hours = queue_hours(segments, mps)
+    tail = ("" if stats.get("service") else
+            " Sent with a bare From, so there is one queue and no pool to spread "
+            "it over.")
+
+    if overflow:
+        return ("overflow",
+                "%d of %d rejected with 30001 or 21611. %d segment(s) is %.1f "
+                "hours of sending at %.2f MPS, against a queue that holds about "
+                "%.0f.%s" % (overflow, total, segments, hours, mps,
+                             capacity_hours, tail))
+
+    if hours >= capacity_hours:
+        return ("over-capacity",
+                "%d segment(s) is %.1f hours at %.2f MPS, past the roughly %.0f "
+                "hour queue. Nothing failed yet, and the next run this size "
+                "overflows.%s" % (segments, hours, mps, capacity_hours, tail))
+
+    if hours >= capacity_hours / 2:
+        return ("near-capacity",
+                "%d segment(s) is %.1f hours at %.2f MPS against a queue of "
+                "about %.0f. One retry storm, one duplicate batch or one "
+                "template drifting into UCS-2 away from 30001.%s"
+                % (segments, hours, mps, capacity_hours, tail))
+
+    if waiting:
+        return ("draining",
+                "%d message(s) still queued or accepted; %d segment(s) is %.1f "
+                "hours at %.2f MPS.%s" % (waiting, segments, hours, mps, tail))
+
+    return ("clean", "%d message(s), %d segment(s), about %.1f hours at %.2f MPS"
+            % (total, segments, hours, mps))
+
+
+def get(session, url, **params):
+    r = session.get(url, params=params, timeout=30)
+    if r.status_code in (401, 403):
+        raise SystemExit("%d from Twilio: check TWILIO_ACCOUNT_SID and that the "
+                         "API key belongs to that account with read access"
+                         % r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+
+def list_messages(session, account, since, limit):
+    """Page Messages.json. There is no Status or ErrorCode filter here, so both
+    error codes have to be found client-side."""
+    url = "%s/Accounts/%s/Messages.json" % (BASE, account)
+    params = {"PageSize": 1000, "DateSent>=": since}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("messages", []))
+        nxt = page.get("next_page_uri")
+        url, params = (HOST + nxt) if nxt else None, {}
+    return out[:limit]
+
+
+def pool_size(session, service_sid):
+    """Count the senders in a Messaging Service pool. A service with one number
+    has the throughput of one number."""
+    url = "%s/Services/%s/PhoneNumbers" % (MESSAGING, service_sid)
+    params = {"PageSize": 100}
+    count = 0
+    while url:
+        page = get(session, url, **params)
+        count += len(page.get("phone_numbers", []))
+        url = (page.get("meta") or {}).get("next_page_url")
+        params = {}
+    return count
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=2,
+                    help="how far back to read the Messages list")
+    ap.add_argument("--max-messages", type=int, default=50000,
+                    help="stop paging after this many messages")
+    ap.add_argument("--mps", type=float, default=1.0,
+                    help="segments per second for these senders: about 1 for a "
+                         "US long code, higher for toll-free or a short code")
+    ap.add_argument("--capacity-hours", type=float, default=10.0,
+                    help="how many hours of segments the sender queue holds")
+    args = ap.parse_args()
+
+    account = os.environ.get("TWILIO_ACCOUNT_SID")
+    key = os.environ.get("TWILIO_API_KEY")
+    secret = os.environ.get("TWILIO_API_SECRET")
+    if not (account and key and secret):
+        log.error("set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET "
+                  "(an API Key with read access, not the auth token)")
+        return 2
+
+    session = requests.Session()
+    session.auth = (key, secret)
+
+    since = (dt.date.today() - dt.timedelta(days=args.days)).isoformat()
+    messages = list_messages(session, account, since, args.max_messages)
+    if not messages:
+        log.info("no messages sent since %s", since)
+        return 0
+
+    senders = tally(messages)
+    pools = {}
+    bad = 0
+    for sender, stats in sorted(senders.items()):
+        state, detail = verdict(stats, args.mps, args.capacity_hours)
+        line = "%-14s %s  %s" % (state, sender, detail)
+        if state in ("clean", "draining"):
+            log.info(line)
+            continue
+        bad += 1
+        log.warning(line)
+        if stats["sids"]:
+            log.warning("  message sids: %s",
+                        ", ".join(str(s) for s in stats["sids"]))
+        service = stats.get("service")
+        if service:
+            if service not in pools:
+                pools[service] = pool_size(session, service)
+            log.warning("  %s has %d sender(s) in its pool: that is the "
+                        "throughput you actually have.", service, pools[service])
+            log.warning("  repair: POST %s/Services/%s/PhoneNumbers "
+                        "PhoneNumberSid=PN... to widen the pool, and rate-limit "
+                        "the producer to what the pool can drain.",
+                        MESSAGING, service)
+        else:
+            log.warning("  repair: send through a Messaging Service "
+                        "(MessagingServiceSid=MG...) instead of a bare From, add "
+                        "senders to its pool, and rate-limit the producer. For "
+                        "volume at this scale, toll-free or a short code.")
+
+    log.info("%d sender(s) over %d day(s), %d over capacity",
+             len(senders), args.days, bad)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "twilio-queue-overflow-audit.mjs",
+"js": '''/**
+ * Report Twilio senders whose queue is overflowing with 30001 or 21611.
+ *
+ * Read only. GET requests and nothing else: give this an API Key with read
+ * access rather than the account auth token. The repair is printed, never
+ * performed.
+ */
+const HOST = 'https://api.twilio.com';
+const BASE = `${HOST}/2010-04-01`;
+const MESSAGING = 'https://messaging.twilio.com/v1';
+
+// The same wall from two sides: 21611 rejects the request because the queue for
+// that From is full, 30001 fails a message that got in and never drained.
+const OVERFLOW = new Set([30001, 21611]);
+const WAITING = new Set(['queued', 'accepted', 'scheduled', 'sending']);
+
+/**
+ * Read error_code as a number, or null. It is null on healthy messages, and
+ * comparing the raw value is how the audit reports a clean account the morning
+ * after an overflow.
+ */
+export function errorCode(message) {
+  const raw = message.error_code;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * How many hours of sending a pile of segments represents. Pure. Segments, not
+ * messages: a three-segment body occupies three slots in the queue.
+ */
+export function queueHours(segments, mps) {
+  const rate = Math.max(Number(mps) || 0, 0.01);
+  return segments / (rate * 3600);
+}
+
+/**
+ * Bucket outbound messages by the sender that owns the queue. Pure. The key is
+ * `from`, because throughput belongs to the sending number.
+ */
+export function tally(messages) {
+  const rows = new Map();
+  for (const m of messages) {
+    if (String(m.direction ?? '').startsWith('inbound')) continue;
+    const key = m.from || m.messaging_service_sid || 'unknown sender';
+    if (!rows.has(key)) {
+      rows.set(key, { total: 0, overflow: 0, queued: 0, segments: 0,
+                      service: null, sids: [] });
+    }
+    const row = rows.get(key);
+    row.total += 1;
+    row.segments += Math.max(Number(m.num_segments ?? 1) || 1, 1);
+    if (m.messaging_service_sid) row.service = m.messaging_service_sid;
+    if (WAITING.has(String(m.status ?? '').toLowerCase())) row.queued += 1;
+    if (OVERFLOW.has(errorCode(m))) {
+      row.overflow += 1;
+      if (row.sids.length < 3) row.sids.push(m.sid);
+    }
+  }
+  return rows;
+}
+
+/**
+ * Classify one sender against what it can physically drain. Pure, so the
+ * throughput assumption is an argument. Returns [state, detail].
+ */
+export function verdict(stats, mps = 1.0, capacityHours = 10.0) {
+  const total = Number(stats.total ?? 0);
+  const overflow = Number(stats.overflow ?? 0);
+  const waiting = Number(stats.queued ?? 0);
+  const segments = Number(stats.segments ?? 0) || total;
+  const hours = queueHours(segments, mps);
+  const h = hours.toFixed(1);
+  const rate = Number(mps).toFixed(2);
+  const cap = capacityHours.toFixed(0);
+  const tail = stats.service ? ''
+    : ' Sent with a bare From, so there is one queue and no pool to spread it over.';
+
+  if (overflow) {
+    return ['overflow',
+      `${overflow} of ${total} rejected with 30001 or 21611. ${segments} ` +
+      `segment(s) is ${h} hours of sending at ${rate} MPS, against a queue ` +
+      `that holds about ${cap}.${tail}`];
+  }
+
+  if (hours >= capacityHours) {
+    return ['over-capacity',
+      `${segments} segment(s) is ${h} hours at ${rate} MPS, past the roughly ` +
+      `${cap} hour queue. Nothing failed yet, and the next run this size ` +
+      `overflows.${tail}`];
+  }
+
+  if (hours >= capacityHours / 2) {
+    return ['near-capacity',
+      `${segments} segment(s) is ${h} hours at ${rate} MPS against a queue of ` +
+      `about ${cap}. One retry storm, one duplicate batch or one template ` +
+      `drifting into UCS-2 away from 30001.${tail}`];
+  }
+
+  if (waiting) {
+    return ['draining',
+      `${waiting} message(s) still queued or accepted; ${segments} segment(s) ` +
+      `is ${h} hours at ${rate} MPS.${tail}`];
+  }
+
+  return ['clean',
+    `${total} message(s), ${segments} segment(s), about ${h} hours at ${rate} MPS`];
+}
+
+function authHeader(key, secret) {
+  return `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}`;
+}
+
+async function get(auth, url, params = {}) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  const res = await fetch(u, { headers: { Authorization: auth } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${res.status} from Twilio: check TWILIO_ACCOUNT_SID and ` +
+                    'that the API key belongs to that account with read access');
+  }
+  if (!res.ok) throw new Error(`${res.status} from ${u.pathname}`);
+  return res.json();
+}
+
+async function listMessages(auth, account, since, limit) {
+  let url = `${BASE}/Accounts/${account}/Messages.json`;
+  let params = { PageSize: 1000, 'DateSent>=': since };
+  const out = [];
+  while (url && out.length < limit) {
+    const page = await get(auth, url, params);
+    out.push(...(page.messages ?? []));
+    url = page.next_page_uri ? HOST + page.next_page_uri : null;
+    params = {};
+  }
+  return out.slice(0, limit);
+}
+
+async function poolSize(auth, serviceSid) {
+  let url = `${MESSAGING}/Services/${serviceSid}/PhoneNumbers`;
+  let params = { PageSize: 100 };
+  let count = 0;
+  while (url) {
+    const page = await get(auth, url, params);
+    count += (page.phone_numbers ?? []).length;
+    url = page.meta?.next_page_url ?? null;
+    params = {};
+  }
+  return count;
+}
+
+function flag(name, fallback) {
+  const i = process.argv.indexOf(name);
+  return i === -1 ? fallback : Number(process.argv[i + 1]);
+}
+
+async function main() {
+  const account = process.env.TWILIO_ACCOUNT_SID;
+  const key = process.env.TWILIO_API_KEY;
+  const secret = process.env.TWILIO_API_SECRET;
+  if (!account || !key || !secret) {
+    console.error('set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET ' +
+                  '(an API Key with read access, not the auth token)');
+    process.exitCode = 2;
+    return;
+  }
+  const auth = authHeader(key, secret);
+  const days = flag('--days', 2);
+  const mps = flag('--mps', 1.0);
+  const capacityHours = flag('--capacity-hours', 10.0);
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+  const messages = await listMessages(auth, account, since, flag('--max-messages', 50000));
+  if (messages.length === 0) {
+    console.log(`no messages sent since ${since}`);
+    return;
+  }
+
+  const senders = tally(messages);
+  const pools = new Map();
+  let bad = 0;
+  for (const sender of [...senders.keys()].sort()) {
+    const stats = senders.get(sender);
+    const [state, detail] = verdict(stats, mps, capacityHours);
+    const line = `${state.padEnd(14)} ${sender}  ${detail}`;
+    if (state === 'clean' || state === 'draining') { console.log(line); continue; }
+    bad += 1;
+    console.warn(line);
+    if (stats.sids.length) console.warn(`  message sids: ${stats.sids.join(', ')}`);
+    if (stats.service) {
+      if (!pools.has(stats.service)) {
+        pools.set(stats.service, await poolSize(auth, stats.service));
+      }
+      console.warn(`  ${stats.service} has ${pools.get(stats.service)} sender(s) ` +
+                   'in its pool: that is the throughput you actually have.');
+      console.warn(`  repair: POST ${MESSAGING}/Services/${stats.service}` +
+                   '/PhoneNumbers PhoneNumberSid=PN... to widen the pool, and ' +
+                   'rate-limit the producer to what the pool can drain.');
+    } else {
+      console.warn('  repair: send through a Messaging Service ' +
+                   '(MessagingServiceSid=MG...) instead of a bare From, add ' +
+                   'senders to its pool, and rate-limit the producer. For volume ' +
+                   'at this scale, toll-free or a short code.');
+    }
+  }
+
+  console.log(`${senders.size} sender(s) over ${days} day(s), ${bad} over capacity`);
+  process.exitCode = bad ? 1 : 0;
+}
+
+// Only run when invoked directly, so importing this module in the tests does not
+// run main(), fail on the missing credentials and set a non-zero exit code.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "The tests pin the arithmetic and the one grouping decision that changes the answer: segments rather than messages, <code>from</code> rather than the Messaging Service, and both error codes counted as one wall. The last case is the useful one &mdash; a sender with no failures at all that is already past ten hours of queue, which is the report you want the week before the incident.",
+"test_py_file": "test_twilio_queue_overflow_audit.py",
+"test_py": '''from twilio_queue_overflow_audit import queue_hours, tally, verdict
+
+
+def sent(sid, sender, **extra):
+    row = {"sid": sid, "from": sender, "status": "delivered", "num_segments": 1}
+    row.update(extra)
+    return row
+
+
+def test_ten_hours_is_thirty_six_thousand_segments_at_one_mps():
+    assert queue_hours(36000, 1) == 10.0
+    assert round(queue_hours(3600, 0.5), 1) == 2.0
+
+
+def test_a_zero_rate_does_not_divide_by_zero():
+    assert queue_hours(100, 0) > 0
+
+
+def test_tally_groups_by_sending_number_and_counts_segments():
+    rows = tally([
+        sent("SM1", "+15550001111", num_segments="3"),
+        sent("SM2", "+15550001111", status="queued"),
+        sent("SM3", "+15550002222", messaging_service_sid="MG1"),
+        {"sid": "SM4", "from": "+15550001111", "direction": "inbound"},
+    ])
+    assert sorted(rows) == ["+15550001111", "+15550002222"]
+    assert rows["+15550001111"]["segments"] == 4
+    assert rows["+15550001111"]["queued"] == 1
+    assert rows["+15550001111"]["service"] is None
+    assert rows["+15550002222"]["service"] == "MG1"
+
+
+def test_both_error_codes_count_as_the_same_wall():
+    rows = tally([
+        sent("SM1", "+1555", error_code=30001, status="failed"),
+        sent("SM2", "+1555", error_code="21611", status="failed"),
+        sent("SM3", "+1555"),
+    ])
+    assert rows["+1555"]["overflow"] == 2
+    assert rows["+1555"]["sids"] == ["SM1", "SM2"]
+
+
+def test_overflow_errors_are_the_headline():
+    state, detail = verdict({"total": 40000, "overflow": 6000, "segments": 40000,
+                             "service": "MG1"})
+    assert state == "overflow"
+    assert "11.1 hours" in detail
+
+
+def test_a_sender_past_the_queue_depth_is_flagged_before_it_fails():
+    state, detail = verdict({"total": 40000, "segments": 40000, "service": "MG1"})
+    assert state == "over-capacity"
+    assert "Nothing failed yet" in detail
+
+
+def test_half_the_queue_is_already_worth_saying():
+    state, detail = verdict({"total": 20000, "segments": 20000, "service": "MG1"})
+    assert state == "near-capacity"
+    assert "UCS-2" in detail
+
+
+def test_a_bare_from_says_so():
+    _, detail = verdict({"total": 40000, "segments": 40000})
+    assert "bare From" in detail
+
+
+def test_messages_still_waiting_are_draining_not_broken():
+    state, detail = verdict({"total": 900, "segments": 900, "queued": 40,
+                             "service": "MG1"})
+    assert state == "draining"
+    assert "40 message(s)" in detail
+
+
+def test_a_small_run_is_clean():
+    state, detail = verdict({"total": 100, "segments": 100, "service": "MG1"})
+    assert state == "clean"
+    assert "100 segment(s)" in detail
+
+
+def test_three_segment_bodies_fill_the_queue_three_times_faster():
+    # The same 18,000 messages, one segment each and then three each.
+    assert verdict({"total": 18000, "segments": 18000, "service": "MG1"})[0] == "near-capacity"
+    assert verdict({"total": 18000, "segments": 54000, "service": "MG1"})[0] == "over-capacity"
+''',
+"test_js_file": "twilio-queue-overflow-audit.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { queueHours, tally, verdict } from './twilio-queue-overflow-audit.mjs';
+
+const sent = (sid, from, extra = {}) => ({
+  sid, from, status: 'delivered', num_segments: 1, ...extra,
+});
+
+test('ten hours is thirty six thousand segments at one MPS', () => {
+  assert.equal(queueHours(36000, 1), 10);
+  assert.equal(Number(queueHours(3600, 0.5).toFixed(1)), 2);
+});
+
+test('a zero rate does not divide by zero', () => {
+  assert.ok(Number.isFinite(queueHours(100, 0)));
+});
+
+test('tally groups by sending number and counts segments', () => {
+  const rows = tally([
+    sent('SM1', '+15550001111', { num_segments: '3' }),
+    sent('SM2', '+15550001111', { status: 'queued' }),
+    sent('SM3', '+15550002222', { messaging_service_sid: 'MG1' }),
+    { sid: 'SM4', from: '+15550001111', direction: 'inbound' },
+  ]);
+  assert.deepEqual([...rows.keys()].sort(), ['+15550001111', '+15550002222']);
+  assert.equal(rows.get('+15550001111').segments, 4);
+  assert.equal(rows.get('+15550001111').queued, 1);
+  assert.equal(rows.get('+15550001111').service, null);
+  assert.equal(rows.get('+15550002222').service, 'MG1');
+});
+
+test('both error codes count as the same wall', () => {
+  const rows = tally([
+    sent('SM1', '+1555', { error_code: 30001, status: 'failed' }),
+    sent('SM2', '+1555', { error_code: '21611', status: 'failed' }),
+    sent('SM3', '+1555'),
+  ]);
+  assert.equal(rows.get('+1555').overflow, 2);
+  assert.deepEqual(rows.get('+1555').sids, ['SM1', 'SM2']);
+});
+
+test('overflow errors are the headline', () => {
+  const [state, detail] = verdict({ total: 40000, overflow: 6000, segments: 40000,
+                                    service: 'MG1' });
+  assert.equal(state, 'overflow');
+  assert.match(detail, /11\\.1 hours/);
+});
+
+test('a sender past the queue depth is flagged before it fails', () => {
+  const [state, detail] = verdict({ total: 40000, segments: 40000, service: 'MG1' });
+  assert.equal(state, 'over-capacity');
+  assert.match(detail, /Nothing failed yet/);
+});
+
+test('half the queue is already worth saying', () => {
+  const [state, detail] = verdict({ total: 20000, segments: 20000, service: 'MG1' });
+  assert.equal(state, 'near-capacity');
+  assert.match(detail, /UCS-2/);
+});
+
+test('a bare From says so', () => {
+  const [, detail] = verdict({ total: 40000, segments: 40000 });
+  assert.match(detail, /bare From/);
+});
+
+test('messages still waiting are draining, not broken', () => {
+  const [state, detail] = verdict({ total: 900, segments: 900, queued: 40,
+                                    service: 'MG1' });
+  assert.equal(state, 'draining');
+  assert.match(detail, /40 message\\(s\\)/);
+});
+
+test('a small run is clean', () => {
+  const [state, detail] = verdict({ total: 100, segments: 100, service: 'MG1' });
+  assert.equal(state, 'clean');
+  assert.match(detail, /100 segment\\(s\\)/);
+});
+
+test('three segment bodies fill the queue three times faster', () => {
+  assert.equal(verdict({ total: 18000, segments: 18000, service: 'MG1' })[0],
+               'near-capacity');
+  assert.equal(verdict({ total: 18000, segments: 54000, service: 'MG1' })[0],
+               'over-capacity');
+});
+''',
+"faq": [
+ ("What exactly is the queue, and how deep is it?",
+  "Each sender has its own queue, and it holds roughly ten hours of message segments at that sender's throughput. A US long code sends about one segment per second, so about 36,000 segments. A short code drains a hundred times faster and effectively never overflows on this kind of volume."),
+ ("Is 21611 the same problem as 30001?",
+  "It is the same wall from the other side. 21611 is returned at request time because the queue for that From is already full, so no Message is created. 30001 fails a message that made it into the queue and could not be drained. Counting only one of them reports half the incident, so the script keeps both."),
+ ("Will sending through a Messaging Service make it faster?",
+  "Only if the pool has more than one sender in it. A Messaging Service spreads traffic across the numbers it holds, so its throughput is the sum of theirs — which is why the script counts the pool. A service with one long code in it has exactly the throughput of one long code."),
+ ("Why count segments instead of messages?",
+  "Because the queue is measured in segments, and a three-segment body takes three slots. This is the mechanism behind jobs that stop fitting without anyone sending more: a template drifts into UCS-2, every message becomes three segments, and the run that took eight hours now needs twenty-four."),
+ ("Should the producer just retry the failures?",
+  "Not into the same sender. Retrying an overflow refills the queue that just overflowed, and the retries compete with the messages already waiting. Rate-limit the producer to what the pool can drain, widen the pool, or move the volume to toll-free or a short code."),
+],
+"related": [
+ ("/twilio/messages-stuck-queued-or-accepted/", "Messages that never leave queued or accepted"),
+ ("/twilio/ucs2-segment-inflation/", "One smart quote triples the segment count"),
+ ("/twilio/carrier-filtered-messages-30007/", "Carrier filtering drops SMS with error 30007"),
+],
+"citations": [CITE_30001, CITE_21611, CITE_QUEUEING, CITE_SERVICE_PN],
+},
+
 ]
