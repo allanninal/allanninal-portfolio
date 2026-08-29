@@ -199,10 +199,12 @@ def render(cfg: dict, g: dict) -> str:
 
 <h2>{esc(g["problem_h"])}</h2>
 {g["problem"]}
+{g.get("diagram_problem", "")}
 
 {g.get("symptoms", "")}
 
 <h2>{esc(g["howto_name"])}</h2>
+{g.get("diagram_fix", "")}
 {steps}
 {extra}
 

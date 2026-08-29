@@ -27,6 +27,17 @@ GUIDES = PRODUCTS_A + PRODUCTS_B + PRODUCTS_C
 # rendered by build_guide. See that module for why it is not a flag on the product page.
 ARTICLES = GUIDES_A + GUIDES_B + GUIDES_C
 
+# Attach the problem/fix diagrams. Kept out of the guide dicts so the prose and the
+# pictures can be edited without stepping on each other, and so a guide with no diagram
+# yet is a visible gap rather than a silent one.
+from guide_visuals import V as _V
+_missing = [a["slug"] for a in ARTICLES if a["slug"] not in _V]
+if _missing:
+    raise SystemExit(f"no diagrams for: {', '.join(_missing)} — see guide_visuals.py")
+for _a in ARTICLES:
+    _a["diagram_problem"] = _V[_a["slug"]]["problem"]
+    _a["diagram_fix"] = _V[_a["slug"]]["fix"]
+
 CFG = {
     "date": "2026-08-29",
 
