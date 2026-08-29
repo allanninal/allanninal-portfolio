@@ -1616,3 +1616,1552 @@ test('retrieval failures alone are not this report', () => {
 ],
 "citations": [CITE_11205, CITE_11200, CITE_ALERTS, CITE_WEBHOOKS],
 },
+
+{
+"slug": "webhook-tls-certificate-expired-11236",
+"title": "An expired webhook certificate fails every request with 11236",
+"description": "11236 arrives at a sharp timestamp boundary and every number on that hostname breaks at once. Alerts are kept 30 days, which bounds what you can see.",
+"h1": "an expired webhook certificate fails every request with 11236",
+"category": "Twilio",
+"pill": "Diagnostic",
+"chips": ["Read-only key", "Python and Node.js", "Tests included"],
+"keywords": ["twilio error 11236", "twilio certificate expired",
+             "twilio webhook ssl certificate invalid", "twilio tls webhook failure",
+             "twilio certificate invalid certificate expired"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "At 14:07 UTC everything was fine. At 14:08 every webhook on one hostname started failing with <code>11236 Certificate Invalid - Certificate Expired</code>, and it has not stopped since. No deploy went out. No configuration changed. A renewal job stopped working ninety days ago and nobody noticed, because a certificate does not degrade &mdash; it works perfectly until the second it does not.",
+"short_answer": """<p>Sweep <code>GET https://monitor.twilio.com/v1/Alerts?LogLevel=error&amp;StartDate=YYYY-MM-DD</code>, keep <code>error_code</code> <code>11236</code>, and group by the host <em>and port</em> in <code>request_url</code>. The <code>date_generated</code> of the first alert is the expiry moment; the last one tells you whether it is still broken.</p>
+<p>Then read <code>GET /2010-04-01/Accounts/{AccountSid}/IncomingPhoneNumbers.json</code> and list every number whose <code>voice_url</code>, <code>sms_url</code>, <code>status_callback</code> or either fallback points at that host. A certificate covers a hostname, so all of them broke in the same second &mdash; and if a fallback is on the same host, it expired too.</p>""",
+"problem": """<p>Twilio validates the certificate chain before it sends anything. An expired leaf fails validation, so the request is never made and your server never sees a connection. That is why this failure has no gradient: it is not slower, not flaky, not partial. Every HTTPS webhook to that hostname stops at the same instant, and every one of them keeps stopping until somebody renews.</p>
+<p>The reason it survives long enough to become an outage is that certificates are usually somebody else's job. Renewal is automated, the automation is invisible, and the failure mode of the automation is silence. A renewal hook that broke when a package was upgraded, a certificate that lives on a failover node that never runs the renewal, an internal CA nobody documented &mdash; all of them look identical until the expiry date arrives.</p>""",
+"why": """<p><strong>A certificate is presented by a listener, not by a domain.</strong> Two ports on the same hostname can serve two different certificates, and only one of them may be the stale one. Grouping by hostname alone merges a healthy <code>:443</code> with a broken <code>:8443</code> and produces a report that says the host is half broken, which is not a state anyone can act on.</p>
+<p><strong>The first alert is the expiry moment, unless it is not.</strong> <code>date_generated</code> on the earliest 11236 is normally the second the certificate lapsed. But alerts are retained 30 days, so if the earliest alert sits right at the start of your window, the real expiry is older than the window and the timestamp you are reading is the retention boundary, not the event. Those two look identical and mean very different things.</p>
+<p><strong>Failures spread thinly over days are not one expiry.</strong> A truly expired certificate fails everything, continuously. A handful of 11236s scattered over a week means most requests succeeded, which means most requests reached a different machine &mdash; one node behind a load balancer still serving an old certificate, or a failover host nobody renewed.</p>
+<p><strong>The blast radius is every number on that hostname.</strong> Certificates are per hostname, so voice, messaging and status callbacks pointing at it all failed together. The worst version is a fallback URL on the same host as the primary: the fallback was supposed to be the safety net and it expired at exactly the same instant.</p>""",
+"steps": [
+ {"h": "Sweep the alerts for 11236",
+  "body": """<p><code>GET https://monitor.twilio.com/v1/Alerts?LogLevel=error&amp;StartDate=YYYY-MM-DD&amp;PageSize=1000</code>, following <code>meta.next_page_url</code>. Read <code>error_code</code> as an integer &mdash; the Monitor API returns it as a string. Keep <code>date_generated</code> for every alert; the timestamps are the entire diagnosis here.</p>"""},
+ {"h": "Group by host and port, not by hostname",
+  "body": """<p>Keep the port when the URL carries a non-default one. A certificate belongs to whatever is terminating TLS on that port, and one hostname can front several listeners with independent renewal stories.</p>"""},
+ {"h": "Find the cliff, and check it is not the retention edge",
+  "body": """<p>The first <code>date_generated</code> is the expiry moment. If it lands within an hour of the start of your window, treat it as unknown instead: alerts stop at 30 days, so an old expiry produces an oldest-alert timestamp that is really just the edge of what Twilio still remembers.</p>"""},
+ {"h": "Separate a hard expiry from one stale node",
+  "body": """<p>Compare the number of alerts against the span they cover. Thousands of failures over two days is an expired certificate. Twelve failures spread over five days is one machine in a pool: most requests succeeded, which is impossible if the certificate the hostname serves is expired.</p>"""},
+ {"h": "Measure the blast radius, then renew",
+  "body": """<p><code>GET /2010-04-01/Accounts/{AccountSid}/IncomingPhoneNumbers.json</code> and list every number with any URL field on that host. Renew the certificate and reload the terminating server or load balancer &mdash; there is no Twilio-side setting for this. Then move any fallback URL onto a different hostname, because a fallback that shares a certificate with the primary is not a fallback.</p>"""},
+],
+"verify": """<p>Re-run over a window that starts after the renewal. The host should disappear from the report entirely.</p>
+<pre><code class="language-bash">python3 twilio_webhook_cert_audit.py --days 1
+# 0 host(s) failing certificate validation</code></pre>""",
+"code_intro": "One alerts sweep, one numbers list, and a classifier built entirely out of timestamps. The pure parts are the host-and-port key, the timestamp parsing, and the verdict &mdash; the last one because deciding that an oldest alert is the retention boundary rather than an expiry is a judgement call, and judgement calls belong somewhere a test can hold them still.",
+"py_file": "twilio_webhook_cert_audit.py",
+"py": '''"""Report webhook hosts whose TLS certificate has expired (error 11236).
+
+Read only. GET requests and nothing else: give this an API Key with read access
+rather than the account auth token. The repair is printed, never performed,
+because this script holds a credential to an account that can place calls and
+spend money.
+"""
+import argparse
+import datetime as dt
+import logging
+import os
+import sys
+from urllib.parse import urlsplit
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("twilio_webhook_cert_audit")
+
+HOST = "https://api.twilio.com"
+BASE = HOST + "/2010-04-01"
+MONITOR = "https://monitor.twilio.com/v1"
+
+CERT_EXPIRED = 11236
+
+# Alerts are retained 30 days. An expiry older than that cannot be dated from
+# this API at all, which the verdict has to say out loud rather than guess.
+MAX_DAYS = 30
+
+# Every field on a phone number that can carry a URL. A certificate covers the
+# hostname, so all of these broke at the same second.
+URL_FIELDS = ("voice_url", "voice_fallback_url", "sms_url", "sms_fallback_url",
+              "status_callback")
+DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def code_of(alert):
+    """Read error_code off an alert as an integer, or None.
+
+    The Monitor API returns this as a string. Comparing the raw value against
+    11236 is the mistake that makes the sweep report a healthy account.
+    """
+    raw = alert.get("error_code")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def cert_host(url):
+    """Host, plus the port when it is not the default for the scheme.
+
+    A certificate is presented by whatever terminates TLS on a port, not by a
+    domain. Two listeners on one hostname can serve two certificates with two
+    different renewal stories, and merging them produces a report that says a
+    host is half broken.
+    """
+    if not url:
+        return ""
+    parts = urlsplit(str(url).strip())
+    host = (parts.hostname or "").lower()
+    if not host:
+        return ""
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    if port and port != DEFAULT_PORTS.get((parts.scheme or "").lower()):
+        return "%s:%d" % (host, port)
+    return host
+
+
+def at(iso):
+    """Epoch seconds for a Monitor timestamp, or None.
+
+    date_generated is ISO 8601 in UTC. Fractional seconds and the trailing Z are
+    trimmed rather than parsed, and a value with no offset is read as UTC, so
+    this behaves identically on a machine whose clock is not.
+    """
+    if not iso:
+        return None
+    s = str(iso).strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    s = s[:19]
+    try:
+        naive = dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+def sweep(alerts):
+    """Group certificate failures by host and port.
+
+    Pure, so the grouping can be tested without a network. ISO 8601 UTC strings
+    order correctly as strings, so the ends of each run need no parsing here.
+    """
+    out = {}
+    for a in alerts:
+        if code_of(a) != CERT_EXPIRED:
+            continue
+        key = cert_host(a.get("request_url"))
+        row = out.setdefault(key, {"alerts": 0, "sids": [], "first": None,
+                                   "last": None, "url": ""})
+        row["alerts"] += 1
+        if len(row["sids"]) < 3:
+            row["sids"].append(a.get("sid"))
+        row["url"] = row["url"] or (a.get("request_url") or "")
+        when = a.get("date_generated") or ""
+        if when:
+            row["first"] = when if row["first"] is None else min(row["first"], when)
+            row["last"] = when if row["last"] is None else max(row["last"], when)
+    return out
+
+
+def verdict(row, window_start, window_end, edge_minutes=60, quiet_minutes=180):
+    """Classify one host from its timestamps alone. Pure.
+
+    The order is deliberate. A host that stopped failing needs no repair
+    whatever its history, so recovery is checked first. An oldest alert sitting
+    on the edge of the retention window is reported as undatable rather than
+    dated, because those two are indistinguishable and only one of them is true.
+
+    Returns (state, detail).
+    """
+    n = int(row.get("alerts") or 0)
+    if not n:
+        return ("clean", "no 11236 in the window")
+
+    first, last = at(row.get("first")), at(row.get("last"))
+    start, end = at(window_start), at(window_end)
+    if first is None or last is None or start is None or end is None:
+        return ("undated", "%d x 11236 with unreadable timestamps" % n)
+
+    if last <= end - quiet_minutes * 60:
+        down = (last - first) / 3600.0
+        return ("recovered",
+                "%d x 11236, none in the last %d minutes. The certificate was "
+                "replaced; the outage ran about %.1f hour(s) from %s."
+                % (n, quiet_minutes, down, row.get("first")))
+
+    if first <= start + edge_minutes * 60:
+        return ("at-retention-edge",
+                "%d x 11236, the oldest right at the start of the window. "
+                "Alerts are kept %d days, so the expiry is older than that and "
+                "this timestamp is the retention boundary, not the event."
+                % (n, MAX_DAYS))
+
+    span = (last - first) / 3600.0
+    if n >= 2 and span >= 24 and n < span:
+        return ("sporadic",
+                "%d x 11236 spread over %.0f hour(s). An expired certificate "
+                "fails everything, so most requests reaching this host "
+                "succeeded: one node behind the balancer is still serving a "
+                "stale certificate." % (n, span))
+
+    return ("expired",
+            "%d x 11236, first at %s and still failing. Every HTTPS webhook to "
+            "this host has been refused since that moment, before any request "
+            "was sent." % (n, row.get("first")))
+
+
+def exposure(numbers, host):
+    """Which numbers point at this host, and on which fields. Pure.
+
+    The field list matters more than the count. When a fallback URL sits on the
+    same host as the primary, the fallback was covered by the same certificate
+    and expired in the same second, so there was never a second chance.
+    """
+    out = []
+    for n in numbers or []:
+        fields = [f for f in URL_FIELDS if cert_host(n.get(f)) == host]
+        if not fields:
+            continue
+        primary = [f for f in fields if f in ("voice_url", "sms_url")]
+        fallback = [f for f in fields if f.endswith("fallback_url")]
+        out.append({
+            "number": n.get("phone_number") or n.get("sid") or "?",
+            "fields": fields,
+            "fallback_shares_host": bool(primary and fallback),
+        })
+    return out
+
+
+def get(session, url, **params):
+    r = session.get(url, params=params, timeout=30)
+    if r.status_code in (401, 403):
+        raise SystemExit("%d from Twilio: check TWILIO_ACCOUNT_SID and that the "
+                         "API key belongs to that account with read access"
+                         % r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+
+def list_alerts(session, since, limit, log_level="error"):
+    """Page the Monitor alerts. next_page_url is absolute on this API."""
+    url = MONITOR + "/Alerts"
+    params = {"LogLevel": log_level, "StartDate": since, "PageSize": 1000}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("alerts", []))
+        url = (page.get("meta") or {}).get("next_page_url")
+        params = {}
+    return out[:limit]
+
+
+def list_numbers(session, account, limit=2000):
+    url = "%s/Accounts/%s/IncomingPhoneNumbers.json" % (BASE, account)
+    params = {"PageSize": 1000}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("incoming_phone_numbers", []))
+        nxt = page.get("next_page_uri")
+        url, params = (HOST + nxt) if nxt else None, {}
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=7,
+                    help="how far back to read alerts (Twilio keeps 30 days)")
+    ap.add_argument("--max-alerts", type=int, default=10000,
+                    help="stop paging alerts after this many")
+    ap.add_argument("--quiet-minutes", type=int, default=180,
+                    help="silence for this long counts as recovered")
+    args = ap.parse_args()
+
+    account = os.environ.get("TWILIO_ACCOUNT_SID")
+    key = os.environ.get("TWILIO_API_KEY")
+    secret = os.environ.get("TWILIO_API_SECRET")
+    if not (account and key and secret):
+        log.error("set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET "
+                  "(an API Key with read access, not the auth token)")
+        return 2
+
+    days = args.days
+    if days > MAX_DAYS:
+        log.warning("alerts are retained %d days; reading %d instead of %d",
+                    MAX_DAYS, MAX_DAYS, days)
+        days = MAX_DAYS
+
+    session = requests.Session()
+    session.auth = (key, secret)
+
+    now = dt.datetime.now(dt.timezone.utc)
+    since = (now - dt.timedelta(days=days)).date().isoformat()
+    window_start = since + "T00:00:00Z"
+    window_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    alerts = list_alerts(session, since, args.max_alerts)
+    rows = sweep(alerts)
+    if not rows:
+        log.info("no 11236 since %s across %d alert(s)", since, len(alerts))
+        return 0
+
+    numbers = list_numbers(session, account)
+    bad = 0
+    for host, row in sorted(rows.items()):
+        state, detail = verdict(row, window_start, window_end,
+                                quiet_minutes=args.quiet_minutes)
+        line = "%-18s %s  %s" % (state, host or "(no host)", detail)
+        if state in ("clean", "recovered"):
+            log.info(line)
+            continue
+        bad += 1
+        log.warning(line)
+        log.warning("  sample %s, alert sids: %s", row["url"] or "(none)",
+                    ", ".join(str(s) for s in row["sids"]))
+        hit = exposure(numbers, host)
+        for row2 in hit:
+            log.warning("  %s uses it on %s%s", row2["number"],
+                        ", ".join(row2["fields"]),
+                        "  <- the fallback is on the same certificate"
+                        if row2["fallback_shares_host"] else "")
+        log.warning("  %d number(s) affected", len(hit))
+        log.warning("  repair: renew the certificate and reload the terminating "
+                    "server or load balancer. There is no Twilio-side setting "
+                    "for this. Then move fallback URLs onto a hostname with a "
+                    "separate certificate.")
+
+    log.info("%d host(s) failing certificate validation", bad)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "twilio-webhook-cert-audit.mjs",
+"js": '''/**
+ * Report webhook hosts whose TLS certificate has expired (error 11236).
+ *
+ * Read only. GET requests and nothing else: give this an API Key with read
+ * access rather than the account auth token. The repair is printed, never
+ * performed.
+ */
+const HOST = 'https://api.twilio.com';
+const BASE = `${HOST}/2010-04-01`;
+const MONITOR = 'https://monitor.twilio.com/v1';
+
+const CERT_EXPIRED = 11236;
+
+// Alerts are retained 30 days. An older expiry cannot be dated from this API.
+const MAX_DAYS = 30;
+
+// Every field on a phone number that can carry a URL.
+const URL_FIELDS = ['voice_url', 'voice_fallback_url', 'sms_url',
+  'sms_fallback_url', 'status_callback'];
+const DEFAULT_PORTS = { 'http:': '80', 'https:': '443' };
+
+/**
+ * Read error_code off an alert as a number, or null. The Monitor API returns it
+ * as a string, and a raw comparison reports a healthy account.
+ */
+export function codeOf(alert) {
+  const raw = alert.error_code;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Host, plus the port when it is not the default for the scheme. A certificate
+ * is presented by whatever terminates TLS on a port, not by a domain.
+ */
+export function certHost(url) {
+  if (!url) return '';
+  let u;
+  try {
+    u = new URL(String(url).trim());
+  } catch {
+    return '';
+  }
+  const host = u.hostname.toLowerCase();
+  if (!host) return '';
+  if (u.port && u.port !== DEFAULT_PORTS[u.protocol]) return `${host}:${u.port}`;
+  return host;
+}
+
+/**
+ * Epoch seconds for a Monitor timestamp, or null. A value with no offset is
+ * read as UTC, so this behaves the same on a machine whose clock is not.
+ */
+export function at(iso) {
+  if (!iso) return null;
+  let s = String(iso).trim();
+  if (s.endsWith('Z')) s = s.slice(0, -1);
+  s = `${s.slice(0, 19)}Z`;
+  const ms = Date.parse(s);
+  return Number.isFinite(ms) ? ms / 1000 : null;
+}
+
+/**
+ * Group certificate failures by host and port. Pure. ISO 8601 UTC strings order
+ * correctly as strings, so the ends of each run need no parsing here.
+ */
+export function sweep(alerts) {
+  const out = new Map();
+  for (const a of alerts) {
+    if (codeOf(a) !== CERT_EXPIRED) continue;
+    const key = certHost(a.request_url);
+    if (!out.has(key)) {
+      out.set(key, { alerts: 0, sids: [], first: null, last: null, url: '' });
+    }
+    const row = out.get(key);
+    row.alerts += 1;
+    if (row.sids.length < 3) row.sids.push(a.sid);
+    row.url = row.url || (a.request_url ?? '');
+    const when = a.date_generated ?? '';
+    if (when) {
+      row.first = row.first === null || when < row.first ? when : row.first;
+      row.last = row.last === null || when > row.last ? when : row.last;
+    }
+  }
+  return out;
+}
+
+/**
+ * Classify one host from its timestamps alone. Pure. Recovery is checked first
+ * because a host that stopped failing needs no repair whatever its history, and
+ * an oldest alert on the edge of the retention window is reported as undatable
+ * rather than dated. Returns [state, detail].
+ */
+export function verdict(row, windowStart, windowEnd, edgeMinutes = 60, quietMinutes = 180) {
+  const n = Number(row.alerts ?? 0);
+  if (!n) return ['clean', 'no 11236 in the window'];
+
+  const first = at(row.first);
+  const last = at(row.last);
+  const start = at(windowStart);
+  const end = at(windowEnd);
+  if (first === null || last === null || start === null || end === null) {
+    return ['undated', `${n} x 11236 with unreadable timestamps`];
+  }
+
+  if (last <= end - quietMinutes * 60) {
+    const down = ((last - first) / 3600).toFixed(1);
+    return ['recovered',
+      `${n} x 11236, none in the last ${quietMinutes} minutes. The certificate ` +
+      `was replaced; the outage ran about ${down} hour(s) from ${row.first}.`];
+  }
+
+  if (first <= start + edgeMinutes * 60) {
+    return ['at-retention-edge',
+      `${n} x 11236, the oldest right at the start of the window. Alerts are ` +
+      `kept ${MAX_DAYS} days, so the expiry is older than that and this ` +
+      'timestamp is the retention boundary, not the event.'];
+  }
+
+  const span = (last - first) / 3600;
+  if (n >= 2 && span >= 24 && n < span) {
+    return ['sporadic',
+      `${n} x 11236 spread over ${span.toFixed(0)} hour(s). An expired ` +
+      'certificate fails everything, so most requests reaching this host ' +
+      'succeeded: one node behind the balancer is still serving a stale ' +
+      'certificate.'];
+  }
+
+  return ['expired',
+    `${n} x 11236, first at ${row.first} and still failing. Every HTTPS webhook ` +
+    'to this host has been refused since that moment, before any request was sent.'];
+}
+
+/**
+ * Which numbers point at this host, and on which fields. Pure. A fallback on the
+ * same host was covered by the same certificate and expired in the same second.
+ */
+export function exposure(numbers, host) {
+  const out = [];
+  for (const n of numbers ?? []) {
+    const fields = URL_FIELDS.filter((f) => certHost(n[f]) === host);
+    if (!fields.length) continue;
+    const primary = fields.some((f) => f === 'voice_url' || f === 'sms_url');
+    const fallback = fields.some((f) => f.endsWith('fallback_url'));
+    out.push({
+      number: n.phone_number ?? n.sid ?? '?',
+      fields,
+      fallback_shares_host: primary && fallback,
+    });
+  }
+  return out;
+}
+
+function authHeader(key, secret) {
+  return `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}`;
+}
+
+async function get(auth, url, params = {}) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  const res = await fetch(u, { headers: { Authorization: auth } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${res.status} from Twilio: check TWILIO_ACCOUNT_SID and ` +
+                    'that the API key belongs to that account with read access');
+  }
+  if (!res.ok) throw new Error(`${res.status} from ${u.pathname}`);
+  return res.json();
+}
+
+export async function listAlerts(auth, since, limit = 10000, logLevel = 'error') {
+  let url = `${MONITOR}/Alerts`;
+  let params = { LogLevel: logLevel, StartDate: since, PageSize: 1000 };
+  const out = [];
+  while (url && out.length < limit) {
+    const page = await get(auth, url, params);
+    out.push(...(page.alerts ?? []));
+    url = page.meta?.next_page_url ?? null;
+    params = {};
+  }
+  return out.slice(0, limit);
+}
+
+async function listNumbers(auth, account) {
+  let url = `${BASE}/Accounts/${account}/IncomingPhoneNumbers.json`;
+  let params = { PageSize: 1000 };
+  const out = [];
+  while (url) {
+    const page = await get(auth, url, params);
+    out.push(...(page.incoming_phone_numbers ?? []));
+    url = page.next_page_uri ? HOST + page.next_page_uri : null;
+    params = {};
+  }
+  return out;
+}
+
+async function main() {
+  const account = process.env.TWILIO_ACCOUNT_SID;
+  const key = process.env.TWILIO_API_KEY;
+  const secret = process.env.TWILIO_API_SECRET;
+  if (!account || !key || !secret) {
+    console.error('set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET ' +
+                  '(an API Key with read access, not the auth token)');
+    process.exitCode = 2;
+    return;
+  }
+  const auth = authHeader(key, secret);
+
+  let days = Number(process.argv.includes('--days')
+    ? process.argv[process.argv.indexOf('--days') + 1] : 7) || 7;
+  if (days > MAX_DAYS) {
+    console.warn(`alerts are retained ${MAX_DAYS} days; reading ${MAX_DAYS} instead`);
+    days = MAX_DAYS;
+  }
+
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  const windowStart = `${since}T00:00:00Z`;
+  const windowEnd = new Date().toISOString();
+
+  const alerts = await listAlerts(auth, since);
+  const rows = sweep(alerts);
+  if (rows.size === 0) {
+    console.log(`no 11236 since ${since} across ${alerts.length} alert(s)`);
+    return;
+  }
+
+  const numbers = await listNumbers(auth, account);
+  let bad = 0;
+  for (const [host, row] of [...rows.entries()].sort()) {
+    const [state, detail] = verdict(row, windowStart, windowEnd);
+    const line = `${state.padEnd(18)} ${host || '(no host)'}  ${detail}`;
+    if (state === 'clean' || state === 'recovered') { console.log(line); continue; }
+    bad += 1;
+    console.warn(line);
+    console.warn(`  sample ${row.url || '(none)'}, alert sids: ${row.sids.join(', ')}`);
+    const hit = exposure(numbers, host);
+    for (const e of hit) {
+      console.warn(`  ${e.number} uses it on ${e.fields.join(', ')}` +
+        (e.fallback_shares_host ? '  <- the fallback is on the same certificate' : ''));
+    }
+    console.warn(`  ${hit.length} number(s) affected`);
+    console.warn('  repair: renew the certificate and reload the terminating ' +
+                 'server or load balancer. There is no Twilio-side setting for ' +
+                 'this. Then move fallback URLs onto a hostname with a separate ' +
+                 'certificate.');
+  }
+
+  console.log(`${bad} host(s) failing certificate validation`);
+  process.exitCode = bad ? 1 : 0;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing credentials and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "Three judgements are worth freezing. An oldest alert sitting on the edge of the 30 day window is <em>not</em> an expiry timestamp, and a report that presents it as one invents a story about a certificate that lapsed weeks earlier. Twelve failures over five days is not an expiry either. And a number whose fallback shares the hostname has to be flagged, because that is the case where the safety net expired too.",
+"test_py_file": "test_twilio_webhook_cert_audit.py",
+"test_py": '''from twilio_webhook_cert_audit import (at, cert_host, exposure, sweep, verdict)
+
+START = "2026-05-01T00:00:00Z"
+END = "2026-05-08T00:00:00Z"
+
+
+def alert(sid, url, code="11236", when="2026-05-05T14:08:00Z"):
+    return {"sid": sid, "request_url": url, "error_code": code,
+            "date_generated": when, "log_level": "error"}
+
+
+def test_cert_host_keeps_a_non_default_port():
+    assert cert_host("https://hooks.example.com/voice") == "hooks.example.com"
+    assert cert_host("https://hooks.example.com:443/voice") == "hooks.example.com"
+    assert cert_host("https://Hooks.Example.com:8443/voice") == \\
+        "hooks.example.com:8443"
+    assert cert_host("http://hooks.example.com:80/voice") == "hooks.example.com"
+    assert cert_host(None) == ""
+
+
+def test_at_reads_the_monitor_timestamp_as_utc():
+    assert at("2026-05-05T14:08:00Z") == at("2026-05-05T14:08:00")
+    assert at("2026-05-05T14:08:00Z") + 60 == at("2026-05-05T14:09:00Z")
+    assert at("not a date") is None
+    assert at(None) is None
+
+
+def test_sweep_keeps_only_certificate_failures():
+    rows = sweep([alert("NO1", "https://a.example.com/voice"),
+                  alert("NO2", "https://a.example.com/sms", code="11220"),
+                  alert("NO3", "https://a.example.com:8443/sms")])
+    assert sorted(rows) == ["a.example.com", "a.example.com:8443"]
+    assert rows["a.example.com"]["alerts"] == 1
+
+
+def test_an_oldest_alert_on_the_window_edge_is_not_an_expiry_time():
+    # Alerts stop at 30 days. A certificate that expired six weeks ago produces
+    # an oldest alert at the edge of retention, which is a fact about Twilio's
+    # storage rather than about the certificate.
+    row = {"alerts": 5000, "first": "2026-05-01T00:10:00Z",
+           "last": "2026-05-07T23:00:00Z"}
+    state, detail = verdict(row, START, END)
+    assert state == "at-retention-edge"
+    assert "retention boundary" in detail
+
+
+def test_a_clean_cliff_inside_the_window_is_an_expiry():
+    row = {"alerts": 4000, "first": "2026-05-05T14:08:00Z",
+           "last": "2026-05-07T23:30:00Z"}
+    state, detail = verdict(row, START, END)
+    assert state == "expired"
+    assert "2026-05-05T14:08:00Z" in detail
+
+
+def test_a_dozen_failures_over_five_days_is_one_stale_node():
+    row = {"alerts": 12, "first": "2026-05-02T00:00:00Z",
+           "last": "2026-05-07T23:30:00Z"}
+    state, detail = verdict(row, START, END)
+    assert state == "sporadic"
+    assert "balancer" in detail
+
+
+def test_silence_since_the_renewal_is_reported_as_recovered():
+    row = {"alerts": 900, "first": "2026-05-02T00:00:00Z",
+           "last": "2026-05-02T06:00:00Z"}
+    state, detail = verdict(row, START, END)
+    assert state == "recovered"
+    assert "6.0 hour(s)" in detail
+
+
+def test_no_alerts_is_clean():
+    assert verdict({"alerts": 0}, START, END)[0] == "clean"
+
+
+def test_exposure_flags_a_fallback_on_the_same_certificate():
+    numbers = [
+        {"phone_number": "+15550001111",
+         "voice_url": "https://hooks.example.com/voice",
+         "voice_fallback_url": "https://hooks.example.com/fallback",
+         "sms_url": "https://other.example.net/sms"},
+        {"phone_number": "+15550002222",
+         "voice_url": "https://hooks.example.com/voice",
+         "voice_fallback_url": "https://backup.example.net/fallback"},
+        {"phone_number": "+15550003333",
+         "voice_url": "https://elsewhere.example.net/voice"},
+    ]
+    hit = exposure(numbers, "hooks.example.com")
+    assert [h["number"] for h in hit] == ["+15550001111", "+15550002222"]
+    assert hit[0]["fields"] == ["voice_url", "voice_fallback_url"]
+    assert hit[0]["fallback_shares_host"] is True
+    assert hit[1]["fallback_shares_host"] is False
+''',
+"test_js_file": "twilio-webhook-cert-audit.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  at, certHost, exposure, sweep, verdict,
+} from './twilio-webhook-cert-audit.mjs';
+
+const START = '2026-05-01T00:00:00Z';
+const END = '2026-05-08T00:00:00Z';
+
+const alert = (sid, url, code = '11236', when = '2026-05-05T14:08:00Z') => ({
+  sid, request_url: url, error_code: code, date_generated: when, log_level: 'error',
+});
+
+test('certHost keeps a non-default port', () => {
+  assert.equal(certHost('https://hooks.example.com/voice'), 'hooks.example.com');
+  assert.equal(certHost('https://hooks.example.com:443/voice'), 'hooks.example.com');
+  assert.equal(certHost('https://Hooks.Example.com:8443/voice'), 'hooks.example.com:8443');
+  assert.equal(certHost('http://hooks.example.com:80/voice'), 'hooks.example.com');
+  assert.equal(certHost(null), '');
+});
+
+test('at reads the Monitor timestamp as UTC', () => {
+  assert.equal(at('2026-05-05T14:08:00Z'), at('2026-05-05T14:08:00'));
+  assert.equal(at('2026-05-05T14:08:00Z') + 60, at('2026-05-05T14:09:00Z'));
+  assert.equal(at('not a date'), null);
+  assert.equal(at(null), null);
+});
+
+test('sweep keeps only certificate failures', () => {
+  const rows = sweep([
+    alert('NO1', 'https://a.example.com/voice'),
+    alert('NO2', 'https://a.example.com/sms', '11220'),
+    alert('NO3', 'https://a.example.com:8443/sms'),
+  ]);
+  assert.deepEqual([...rows.keys()].sort(), ['a.example.com', 'a.example.com:8443']);
+  assert.equal(rows.get('a.example.com').alerts, 1);
+});
+
+test('an oldest alert on the window edge is not an expiry time', () => {
+  const row = { alerts: 5000, first: '2026-05-01T00:10:00Z', last: '2026-05-07T23:00:00Z' };
+  const [state, detail] = verdict(row, START, END);
+  assert.equal(state, 'at-retention-edge');
+  assert.match(detail, /retention boundary/);
+});
+
+test('a clean cliff inside the window is an expiry', () => {
+  const row = { alerts: 4000, first: '2026-05-05T14:08:00Z', last: '2026-05-07T23:30:00Z' };
+  const [state, detail] = verdict(row, START, END);
+  assert.equal(state, 'expired');
+  assert.match(detail, /2026-05-05T14:08:00Z/);
+});
+
+test('a dozen failures over five days is one stale node', () => {
+  const row = { alerts: 12, first: '2026-05-02T00:00:00Z', last: '2026-05-07T23:30:00Z' };
+  const [state, detail] = verdict(row, START, END);
+  assert.equal(state, 'sporadic');
+  assert.match(detail, /balancer/);
+});
+
+test('silence since the renewal is reported as recovered', () => {
+  const row = { alerts: 900, first: '2026-05-02T00:00:00Z', last: '2026-05-02T06:00:00Z' };
+  const [state, detail] = verdict(row, START, END);
+  assert.equal(state, 'recovered');
+  assert.match(detail, /6.0 hour\\(s\\)/);
+});
+
+test('no alerts is clean', () => {
+  assert.equal(verdict({ alerts: 0 }, START, END)[0], 'clean');
+});
+
+test('exposure flags a fallback on the same certificate', () => {
+  const numbers = [
+    { phone_number: '+15550001111',
+      voice_url: 'https://hooks.example.com/voice',
+      voice_fallback_url: 'https://hooks.example.com/fallback',
+      sms_url: 'https://other.example.net/sms' },
+    { phone_number: '+15550002222',
+      voice_url: 'https://hooks.example.com/voice',
+      voice_fallback_url: 'https://backup.example.net/fallback' },
+    { phone_number: '+15550003333', voice_url: 'https://elsewhere.example.net/voice' },
+  ];
+  const hit = exposure(numbers, 'hooks.example.com');
+  assert.deepEqual(hit.map((h) => h.number), ['+15550001111', '+15550002222']);
+  assert.deepEqual(hit[0].fields, ['voice_url', 'voice_fallback_url']);
+  assert.equal(hit[0].fallback_shares_host, true);
+  assert.equal(hit[1].fallback_shares_host, false);
+});
+''',
+"faq": [
+ ("Why does every webhook to the host fail at exactly the same second?",
+  "Because Twilio validates the certificate chain before it sends the request. An expired leaf fails validation, so nothing is sent at all. There is no partial state and no degradation: the certificate is valid until its notAfter timestamp and refused immediately afterwards."),
+ ("Is the first alert always the moment the certificate expired?",
+  "Only if it sits comfortably inside your window. Alerts are retained 30 days, so a certificate that lapsed six weeks ago produces an oldest alert at the edge of retention, which tells you about Twilio's storage rather than about the certificate. The script reports that case as undatable instead of inventing a date."),
+ ("I get a few 11236s a day and most webhooks work. Is the certificate expired?",
+  "No. An expired certificate fails everything. Scattered failures mean most requests reached a machine with a valid certificate and a few reached one without - a node behind a load balancer, or a failover host that the renewal job never touches."),
+ ("Why does the script group by host and port?",
+  "Because a certificate is served by a listener. One hostname can front 443 and 8443 with two different certificates and two different renewal stories, and merging them produces a verdict that is half true, which is worse than either half."),
+ ("Can Twilio be told to ignore the expired certificate?",
+  "No. There is no setting for skipping certificate validation on webhooks, which is the correct design: the signature on the request protects the payload, and TLS protects everything else. The repair is entirely on your endpoint - renew, reload, and check the chain is complete."),
+],
+"related": [
+ ("/twilio/webhook-connection-timeout-11205/", "Twilio cannot open a connection to your webhook"),
+ ("/twilio/phone-number-missing-fallback-url/", "A number with no fallback URL"),
+ ("/twilio/inbound-webhook-black-hole/", "Inbound messages that go nowhere"),
+],
+"citations": [CITE_11236, CITE_ALERTS, CITE_PN, CITE_WEBHOOKS],
+},
+
+{
+"slug": "webhook-dns-resolution-failure-11210",
+"title": "A webhook hostname with no public DNS record fails with 11210",
+"description": "11210 is a name Twilio cannot resolve from the public internet: an internal zone, a dead developer tunnel, or a record that was never published.",
+"h1": "a webhook hostname with no public DNS record fails with 11210",
+"category": "Twilio",
+"pill": "Diagnostic",
+"chips": ["Read-only key", "Python and Node.js", "Tests included"],
+"keywords": ["twilio error 11210", "twilio http bad host name",
+             "twilio webhook dns failure", "twilio cannot resolve webhook host",
+             "twilio ngrok url in production"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "It worked on the laptop it was written on. It worked in staging. It reached production and every inbound call to that number now produces <code>11210 HTTP bad host name</code>, because the hostname in the webhook resolves through an <code>/etc/hosts</code> line, an internal zone, or a tunnel that died when someone closed a terminal. Twilio resolves from the public internet and gets nothing back.",
+"short_answer": """<p>Sweep <code>GET https://monitor.twilio.com/v1/Alerts?LogLevel=error&amp;StartDate=YYYY-MM-DD</code>, keep <code>error_code</code> <code>11210</code>, and pull the hostname out of <code>request_url</code>. The shape of the name is usually the diagnosis: a reserved suffix like <code>.internal</code> or <code>.local</code>, a single label with no dot, or an ephemeral tunnel domain.</p>
+<p>Then scan the configuration itself. <code>GET /2010-04-01/Accounts/{AccountSid}/IncomingPhoneNumbers.json</code> and check every URL field on every number, because a number that has not been called in 30 days produces no alerts at all and is still broken.</p>""",
+"problem": """<p>DNS is the one dependency a webhook has that nobody thinks of as a dependency. The URL is a string in a settings screen; it looks like configuration, not infrastructure. So it gets copied between environments, filled in from a tunnel during a demo, or pointed at a name that only exists inside a VPC, and every one of those passes review because the person reviewing it can resolve the name.</p>
+<p>What makes 11210 worse than the other webhook failures is that there is nothing to retry into. There is no connection, no response, no timeout to tune. Twilio asks the public DNS system for a name, gets <code>NXDOMAIN</code>, and the call or the message ends there. Any fallback URL on the same dead hostname fails identically, which is the usual reason a fallback did not help.</p>""",
+"why": """<p><strong>Twilio resolves from outside your network.</strong> A split-horizon zone, a search domain, a VPC-private zone or an <code>/etc/hosts</code> entry are all invisible from the public internet. The name resolves for you, for CI, and for the load balancer, and not for the one resolver that matters.</p>
+<p><strong>Reserved suffixes never resolve publicly, by design.</strong> <code>.local</code>, <code>.internal</code>, <code>.test</code>, <code>.invalid</code>, <code>.example</code>, <code>.lan</code> and friends are reserved precisely so they cannot collide with public names. A webhook on one of those is not a DNS outage, it is a URL that could never have worked.</p>
+<p><strong>Tunnel hostnames are ephemeral and end up in production anyway.</strong> A free ngrok or Cloudflare quick tunnel gets a new hostname on every restart. It is the fastest way to receive a webhook during development and the easiest thing in the world to leave in a settings field, where it works until the tunnel drops and then fails forever.</p>
+<p><strong>Silence in the alerts is not evidence of health.</strong> An alert only exists if Twilio tried. A number nobody dialled, or a Messaging Service with no inbound traffic this month, generates nothing, and alerts age out after 30 days regardless. That is why the script reads the configuration as well as the alerts: the configuration is the part that is true even when nothing has been attempted.</p>""",
+"steps": [
+ {"h": "Sweep the alerts for 11210",
+  "body": """<p><code>GET https://monitor.twilio.com/v1/Alerts?LogLevel=error&amp;StartDate=YYYY-MM-DD&amp;PageSize=1000</code>, following <code>meta.next_page_url</code>. Read <code>error_code</code> as an integer; the Monitor API returns it as a string. Group by hostname, because the path is irrelevant when the name never resolved.</p>"""},
+ {"h": "Classify the name before you blame the resolver",
+  "body": """<p>Check the last label against the reserved suffixes, check for a single label with no dot at all, and check for the known ephemeral tunnel domains. Most 11210s are answered by the shape of the name alone, and the ones that are not &mdash; an ordinary public-looking hostname &mdash; are the ones worth a real DNS investigation.</p>"""},
+ {"h": "Scan the configuration, not just the alerts",
+  "body": """<p><code>GET /2010-04-01/Accounts/{AccountSid}/IncomingPhoneNumbers.json</code> and check <code>voice_url</code>, <code>sms_url</code>, <code>status_callback</code> and both fallback fields on every number. A number that was never dialled produces no alert and is still broken; this is the only way to find it before a customer does.</p>"""},
+ {"h": "Check whether the fallback shares the fate of the primary",
+  "body": """<p>A fallback URL on the same unresolvable hostname is not a fallback. If the primary and the fallback both point at the dead tunnel, the number had no second chance at any point, which is worth knowing before you conclude the fallback mechanism is broken.</p>"""},
+ {"h": "Publish a record or repoint, then re-check",
+  "body": """<p>Either publish a public A, AAAA or CNAME record for that hostname, or repoint the webhook at a host that already has one. There is nothing to fix on the Twilio side; the repair is a DNS record or a settings change, and the script prints which number and which field to change.</p>"""},
+],
+"verify": """<p>Re-run after the change. Both halves of the report should be empty: no 11210 in the window, and no configured hostname that cannot resolve publicly.</p>
+<pre><code class="language-bash">python3 twilio_webhook_dns_audit.py --days 7
+# 0 host(s) failing to resolve, 0 configured hostname(s) that never can</code></pre>""",
+"code_intro": "Two reads that answer two different questions: the alerts say what has already failed, the numbers list says what will fail the next time it is used. The pure part is the name classifier, and the case it exists for is <code>hooks.example.com</code> versus <code>hooks.example</code> &mdash; one is an ordinary public hostname and the other is a reserved suffix that can never resolve, and only the last label separates them.",
+"py_file": "twilio_webhook_dns_audit.py",
+"py": '''"""Report webhook hostnames Twilio cannot resolve (error 11210).
+
+Reads the alerts for names that have already failed, and the phone number
+configuration for names that will fail the first time they are used.
+
+Read only. GET requests and nothing else: give this an API Key with read access
+rather than the account auth token. The repair is printed, never performed,
+because this script holds a credential to an account that can place calls and
+spend money.
+"""
+import argparse
+import datetime as dt
+import logging
+import os
+import sys
+from urllib.parse import urlsplit
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("twilio_webhook_dns_audit")
+
+HOST = "https://api.twilio.com"
+BASE = HOST + "/2010-04-01"
+MONITOR = "https://monitor.twilio.com/v1"
+
+BAD_HOST_NAME = 11210
+MAX_DAYS = 30
+
+URL_FIELDS = ("voice_url", "voice_fallback_url", "sms_url", "sms_fallback_url",
+              "status_callback")
+
+# Reserved and private-use top-level labels. These exist so they cannot collide
+# with public names, which means they can never resolve from Twilio's side.
+RESERVED = {"local", "localhost", "internal", "intranet", "lan", "home", "corp",
+            "test", "example", "invalid", "localdomain"}
+
+# Tunnel hostnames are handed out per session and die with the process. They are
+# the fastest way to receive a webhook in development and the easiest thing to
+# leave behind in a production settings field.
+TUNNELS = ("ngrok.io", "ngrok-free.app", "ngrok.app", "ngrok.dev",
+           "trycloudflare.com", "loca.lt", "localtunnel.me", "serveo.net",
+           "lhr.life", "pagekite.me", "bore.pub")
+
+
+def code_of(alert):
+    """Read error_code off an alert as an integer, or None.
+
+    The Monitor API returns this as a string, and a raw comparison against
+    11210 quietly matches nothing at all.
+    """
+    raw = alert.get("error_code")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def hostname(url):
+    """Lowercase hostname from a URL, without port or trailing dot.
+
+    The path is irrelevant when the name never resolved, so everything after the
+    host is discarded and ten endpoints on one dead name become one finding.
+    """
+    if not url:
+        return ""
+    parts = urlsplit(str(url).strip())
+    host = (parts.hostname or "").lower()
+    if not host:
+        host = str(url).strip().lower()
+    while host.endswith("."):
+        host = host[:-1]
+    return host
+
+
+def name_class(host):
+    """What kind of name this is. Pure, and the whole diagnosis for most 11210s.
+
+    The case this function exists for is hooks.example.com against
+    hooks.example. Only the last label separates an ordinary public hostname
+    from a reserved suffix that can never resolve, and a check written against
+    the whole string gets both of them wrong.
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return "empty"
+
+    labels = h.split(".")
+    if ":" in h or (len(labels) == 4
+                    and all(l.isdigit() and len(l) <= 3 for l in labels)):
+        return "ip-literal"
+
+    for suffix in TUNNELS:
+        if h == suffix or h.endswith("." + suffix):
+            return "ephemeral-tunnel"
+
+    if labels[-1] in RESERVED:
+        return "reserved-suffix"
+
+    if len(labels) == 1:
+        return "single-label"
+
+    return "public"
+
+
+def tally(alerts):
+    """Group name resolution failures by hostname. Pure."""
+    out = {}
+    for a in alerts:
+        if code_of(a) != BAD_HOST_NAME:
+            continue
+        h = hostname(a.get("request_url"))
+        row = out.setdefault(h, {"alerts": 0, "sids": [], "first": None,
+                                 "last": None, "url": ""})
+        row["alerts"] += 1
+        if len(row["sids"]) < 3:
+            row["sids"].append(a.get("sid"))
+        row["url"] = row["url"] or (a.get("request_url") or "")
+        when = a.get("date_generated") or ""
+        if when:
+            row["first"] = when if row["first"] is None else min(row["first"], when)
+            row["last"] = when if row["last"] is None else max(row["last"], when)
+    return out
+
+
+def verdict(host, row):
+    """Classify one failing hostname. Pure, so the repair follows from the name.
+
+    Returns (state, detail).
+    """
+    n = int(row.get("alerts") or 0)
+    if not n:
+        return ("clean", "no 11210 in the window")
+
+    kind = name_class(host)
+    if kind == "ephemeral-tunnel":
+        return ("dev-tunnel",
+                "%d x 11210 on a tunnel hostname. Those are handed out per "
+                "session and die with the process, so this one was wired into "
+                "production configuration during development and has been dead "
+                "ever since." % n)
+
+    if kind in ("reserved-suffix", "single-label"):
+        return ("private-name",
+                "%d x 11210 on a name that resolves only inside your own "
+                "network. An /etc/hosts line, a search domain or a split "
+                "horizon zone: this URL could never have worked from outside." % n)
+
+    if kind == "ip-literal":
+        return ("malformed",
+                "%d x 11210 against something that needs no DNS at all. Twilio "
+                "could not parse a usable host out of this URL, so the URL "
+                "itself is the defect." % n)
+
+    return ("unpublished",
+            "%d x 11210 on an ordinary public name. Either the record was never "
+            "published or the registration lapsed; Twilio asked the public DNS "
+            "system and got nothing back." % n)
+
+
+def scan_numbers(numbers):
+    """Configured hostnames that can never resolve, whether or not they failed yet.
+
+    Pure. An alert only exists if Twilio tried, so a number nobody has dialled
+    this month produces no alert and is broken all the same. This half of the
+    report is the one that finds a problem before a customer does.
+    """
+    out = []
+    for n in numbers or []:
+        for field in URL_FIELDS:
+            host = hostname(n.get(field))
+            if not host:
+                continue
+            kind = name_class(host)
+            if kind in ("public", "empty"):
+                continue
+            out.append({"number": n.get("phone_number") or n.get("sid") or "?",
+                        "field": field, "host": host, "class": kind})
+    return out
+
+
+def get(session, url, **params):
+    r = session.get(url, params=params, timeout=30)
+    if r.status_code in (401, 403):
+        raise SystemExit("%d from Twilio: check TWILIO_ACCOUNT_SID and that the "
+                         "API key belongs to that account with read access"
+                         % r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+
+def list_alerts(session, since, limit, log_level="error"):
+    """Page the Monitor alerts. next_page_url is absolute on this API."""
+    url = MONITOR + "/Alerts"
+    params = {"LogLevel": log_level, "StartDate": since, "PageSize": 1000}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("alerts", []))
+        url = (page.get("meta") or {}).get("next_page_url")
+        params = {}
+    return out[:limit]
+
+
+def list_numbers(session, account, limit=2000):
+    url = "%s/Accounts/%s/IncomingPhoneNumbers.json" % (BASE, account)
+    params = {"PageSize": 1000}
+    out = []
+    while url and len(out) < limit:
+        page = get(session, url, **params)
+        out.extend(page.get("incoming_phone_numbers", []))
+        nxt = page.get("next_page_uri")
+        url, params = (HOST + nxt) if nxt else None, {}
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=7,
+                    help="how far back to read alerts (Twilio keeps 30 days)")
+    ap.add_argument("--max-alerts", type=int, default=10000,
+                    help="stop paging alerts after this many")
+    args = ap.parse_args()
+
+    account = os.environ.get("TWILIO_ACCOUNT_SID")
+    key = os.environ.get("TWILIO_API_KEY")
+    secret = os.environ.get("TWILIO_API_SECRET")
+    if not (account and key and secret):
+        log.error("set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET "
+                  "(an API Key with read access, not the auth token)")
+        return 2
+
+    days = args.days
+    if days > MAX_DAYS:
+        log.warning("alerts are retained %d days; reading %d instead of %d",
+                    MAX_DAYS, MAX_DAYS, days)
+        days = MAX_DAYS
+
+    session = requests.Session()
+    session.auth = (key, secret)
+
+    since = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    rows = tally(list_alerts(session, since, args.max_alerts))
+    numbers = list_numbers(session, account)
+
+    failing = 0
+    for host, row in sorted(rows.items()):
+        state, detail = verdict(host, row)
+        line = "%-13s %s  %s" % (state, host or "(no host)", detail)
+        if state == "clean":
+            log.info(line)
+            continue
+        failing += 1
+        log.warning(line)
+        log.warning("  first %s, last %s, sample %s", row["first"], row["last"],
+                    row["url"] or "(none)")
+        log.warning("  alert sids: %s", ", ".join(str(s) for s in row["sids"]))
+        log.warning("  repair: publish a public A, AAAA or CNAME record for "
+                    "this name, or repoint the webhook at a host that already "
+                    "has one. Nothing on the Twilio side can be changed to make "
+                    "an unresolvable name resolve.")
+
+    latent = [f for f in scan_numbers(numbers) if f["host"] not in rows]
+    for f in latent:
+        log.warning("latent        %s %s = %s (%s). No alert yet only because "
+                    "nothing has used it; it cannot resolve publicly.",
+                    f["number"], f["field"], f["host"], f["class"])
+
+    log.info("%d host(s) failing to resolve, %d configured hostname(s) that "
+             "never can", failing, len(latent))
+    return 1 if (failing or latent) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "twilio-webhook-dns-audit.mjs",
+"js": '''/**
+ * Report webhook hostnames Twilio cannot resolve (error 11210).
+ *
+ * Reads the alerts for names that have already failed, and the phone number
+ * configuration for names that will fail the first time they are used.
+ *
+ * Read only. GET requests and nothing else: give this an API Key with read
+ * access rather than the account auth token. The repair is printed, never
+ * performed.
+ */
+const HOST = 'https://api.twilio.com';
+const BASE = `${HOST}/2010-04-01`;
+const MONITOR = 'https://monitor.twilio.com/v1';
+
+const BAD_HOST_NAME = 11210;
+const MAX_DAYS = 30;
+
+const URL_FIELDS = ['voice_url', 'voice_fallback_url', 'sms_url',
+  'sms_fallback_url', 'status_callback'];
+
+// Reserved and private-use top-level labels: they exist so they cannot collide
+// with public names, which means they can never resolve from Twilio's side.
+const RESERVED = new Set(['local', 'localhost', 'internal', 'intranet', 'lan',
+  'home', 'corp', 'test', 'example', 'invalid', 'localdomain']);
+
+// Tunnel hostnames are handed out per session and die with the process.
+const TUNNELS = ['ngrok.io', 'ngrok-free.app', 'ngrok.app', 'ngrok.dev',
+  'trycloudflare.com', 'loca.lt', 'localtunnel.me', 'serveo.net', 'lhr.life',
+  'pagekite.me', 'bore.pub'];
+
+/**
+ * Read error_code off an alert as a number, or null. The Monitor API returns it
+ * as a string, and a raw comparison against 11210 matches nothing.
+ */
+export function codeOf(alert) {
+  const raw = alert.error_code;
+  if (raw === null || raw === undefined || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Lowercase hostname from a URL, without port or trailing dot. */
+export function hostname(url) {
+  if (!url) return '';
+  const raw = String(url).trim();
+  let host = '';
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    host = raw.toLowerCase();
+  }
+  if (!host) host = raw.toLowerCase();
+  while (host.endsWith('.')) host = host.slice(0, -1);
+  return host;
+}
+
+/**
+ * What kind of name this is. Pure, and the whole diagnosis for most 11210s.
+ *
+ * The case this exists for is hooks.example.com against hooks.example: only the
+ * last label separates an ordinary public hostname from a reserved suffix that
+ * can never resolve.
+ */
+export function nameClass(host) {
+  const h = String(host ?? '').trim().toLowerCase();
+  if (!h) return 'empty';
+
+  const labels = h.split('.');
+  const numeric = labels.length === 4
+    && labels.every((l) => l.length > 0 && l.length <= 3
+      && [...l].every((c) => c >= '0' && c <= '9'));
+  if (h.includes(':') || numeric) return 'ip-literal';
+
+  for (const suffix of TUNNELS) {
+    if (h === suffix || h.endsWith(`.${suffix}`)) return 'ephemeral-tunnel';
+  }
+
+  if (RESERVED.has(labels[labels.length - 1])) return 'reserved-suffix';
+  if (labels.length === 1) return 'single-label';
+  return 'public';
+}
+
+/** Group name resolution failures by hostname. Pure. */
+export function tally(alerts) {
+  const out = new Map();
+  for (const a of alerts) {
+    if (codeOf(a) !== BAD_HOST_NAME) continue;
+    const h = hostname(a.request_url);
+    if (!out.has(h)) {
+      out.set(h, { alerts: 0, sids: [], first: null, last: null, url: '' });
+    }
+    const row = out.get(h);
+    row.alerts += 1;
+    if (row.sids.length < 3) row.sids.push(a.sid);
+    row.url = row.url || (a.request_url ?? '');
+    const when = a.date_generated ?? '';
+    if (when) {
+      row.first = row.first === null || when < row.first ? when : row.first;
+      row.last = row.last === null || when > row.last ? when : row.last;
+    }
+  }
+  return out;
+}
+
+/** Classify one failing hostname. Pure. Returns [state, detail]. */
+export function verdict(host, row) {
+  const n = Number(row.alerts ?? 0);
+  if (!n) return ['clean', 'no 11210 in the window'];
+
+  const kind = nameClass(host);
+  if (kind === 'ephemeral-tunnel') {
+    return ['dev-tunnel',
+      `${n} x 11210 on a tunnel hostname. Those are handed out per session and ` +
+      'die with the process, so this one was wired into production ' +
+      'configuration during development and has been dead ever since.'];
+  }
+
+  if (kind === 'reserved-suffix' || kind === 'single-label') {
+    return ['private-name',
+      `${n} x 11210 on a name that resolves only inside your own network. An ` +
+      '/etc/hosts line, a search domain or a split horizon zone: this URL ' +
+      'could never have worked from outside.'];
+  }
+
+  if (kind === 'ip-literal') {
+    return ['malformed',
+      `${n} x 11210 against something that needs no DNS at all. Twilio could ` +
+      'not parse a usable host out of this URL, so the URL itself is the defect.'];
+  }
+
+  return ['unpublished',
+    `${n} x 11210 on an ordinary public name. Either the record was never ` +
+    'published or the registration lapsed; Twilio asked the public DNS system ' +
+    'and got nothing back.'];
+}
+
+/**
+ * Configured hostnames that can never resolve, whether or not they have failed
+ * yet. Pure. An alert exists only if Twilio tried, so a number nobody dialled
+ * this month is broken and silent at the same time.
+ */
+export function scanNumbers(numbers) {
+  const out = [];
+  for (const n of numbers ?? []) {
+    for (const field of URL_FIELDS) {
+      const host = hostname(n[field]);
+      if (!host) continue;
+      const kind = nameClass(host);
+      if (kind === 'public' || kind === 'empty') continue;
+      out.push({ number: n.phone_number ?? n.sid ?? '?', field, host, class: kind });
+    }
+  }
+  return out;
+}
+
+function authHeader(key, secret) {
+  return `Basic ${Buffer.from(`${key}:${secret}`).toString('base64')}`;
+}
+
+async function get(auth, url, params = {}) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  const res = await fetch(u, { headers: { Authorization: auth } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${res.status} from Twilio: check TWILIO_ACCOUNT_SID and ` +
+                    'that the API key belongs to that account with read access');
+  }
+  if (!res.ok) throw new Error(`${res.status} from ${u.pathname}`);
+  return res.json();
+}
+
+export async function listAlerts(auth, since, limit = 10000, logLevel = 'error') {
+  let url = `${MONITOR}/Alerts`;
+  let params = { LogLevel: logLevel, StartDate: since, PageSize: 1000 };
+  const out = [];
+  while (url && out.length < limit) {
+    const page = await get(auth, url, params);
+    out.push(...(page.alerts ?? []));
+    url = page.meta?.next_page_url ?? null;
+    params = {};
+  }
+  return out.slice(0, limit);
+}
+
+async function listNumbers(auth, account) {
+  let url = `${BASE}/Accounts/${account}/IncomingPhoneNumbers.json`;
+  let params = { PageSize: 1000 };
+  const out = [];
+  while (url) {
+    const page = await get(auth, url, params);
+    out.push(...(page.incoming_phone_numbers ?? []));
+    url = page.next_page_uri ? HOST + page.next_page_uri : null;
+    params = {};
+  }
+  return out;
+}
+
+async function main() {
+  const account = process.env.TWILIO_ACCOUNT_SID;
+  const key = process.env.TWILIO_API_KEY;
+  const secret = process.env.TWILIO_API_SECRET;
+  if (!account || !key || !secret) {
+    console.error('set TWILIO_ACCOUNT_SID, TWILIO_API_KEY and TWILIO_API_SECRET ' +
+                  '(an API Key with read access, not the auth token)');
+    process.exitCode = 2;
+    return;
+  }
+  const auth = authHeader(key, secret);
+
+  let days = Number(process.argv.includes('--days')
+    ? process.argv[process.argv.indexOf('--days') + 1] : 7) || 7;
+  if (days > MAX_DAYS) {
+    console.warn(`alerts are retained ${MAX_DAYS} days; reading ${MAX_DAYS} instead`);
+    days = MAX_DAYS;
+  }
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+  const rows = tally(await listAlerts(auth, since));
+  const numbers = await listNumbers(auth, account);
+
+  let failing = 0;
+  for (const [host, row] of [...rows.entries()].sort()) {
+    const [state, detail] = verdict(host, row);
+    const line = `${state.padEnd(13)} ${host || '(no host)'}  ${detail}`;
+    if (state === 'clean') { console.log(line); continue; }
+    failing += 1;
+    console.warn(line);
+    console.warn(`  first ${row.first}, last ${row.last}, sample ${row.url || '(none)'}`);
+    console.warn(`  alert sids: ${row.sids.join(', ')}`);
+    console.warn('  repair: publish a public A, AAAA or CNAME record for this ' +
+                 'name, or repoint the webhook at a host that already has one. ' +
+                 'Nothing on the Twilio side can be changed to make an ' +
+                 'unresolvable name resolve.');
+  }
+
+  const latent = scanNumbers(numbers).filter((f) => !rows.has(f.host));
+  for (const f of latent) {
+    console.warn(`latent        ${f.number} ${f.field} = ${f.host} (${f.class}). ` +
+                 'No alert yet only because nothing has used it; it cannot ' +
+                 'resolve publicly.');
+  }
+
+  console.log(`${failing} host(s) failing to resolve, ${latent.length} configured ` +
+              'hostname(s) that never can');
+  process.exitCode = (failing || latent.length) ? 1 : 0;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing credentials and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "The last label is the whole game. <code>hooks.example.com</code> is an ordinary public hostname and <code>hooks.example</code> is a reserved suffix that can never resolve, and a classifier that matches on substrings gets both wrong. The rest pins down the half of the report that has no alerts behind it: a number nobody has dialled still has a broken URL, and silence is not the same as health.",
+"test_py_file": "test_twilio_webhook_dns_audit.py",
+"test_py": '''from twilio_webhook_dns_audit import (code_of, hostname, name_class,
+                                       scan_numbers, tally, verdict)
+
+
+def alert(sid, url, code="11210", when="2026-06-02T08:00:00Z"):
+    return {"sid": sid, "request_url": url, "error_code": code,
+            "date_generated": when, "log_level": "error"}
+
+
+def test_code_of_reads_the_string_the_monitor_api_returns():
+    assert code_of({"error_code": "11210"}) == 11210
+    assert code_of({"error_code": 11210}) == 11210
+    assert code_of({}) is None
+
+
+def test_hostname_drops_the_port_the_path_and_a_trailing_dot():
+    assert hostname("https://Hooks.Example.com:8443/voice?CallSid=CA1") == \\
+        "hooks.example.com"
+    assert hostname("https://hooks.example.com./voice") == "hooks.example.com"
+    assert hostname(None) == ""
+
+
+def test_only_the_last_label_decides_a_reserved_suffix():
+    # hooks.example.com is a perfectly ordinary public name; hooks.example is a
+    # reserved suffix that cannot resolve. A substring match gets both wrong.
+    assert name_class("hooks.example.com") == "public"
+    assert name_class("hooks.example") == "reserved-suffix"
+    assert name_class("api.internal") == "reserved-suffix"
+    assert name_class("printer.local") == "reserved-suffix"
+    assert name_class("localhost") == "reserved-suffix"
+
+
+def test_the_other_shapes_a_name_can_take():
+    assert name_class("webhooks") == "single-label"
+    assert name_class("10.0.0.5") == "ip-literal"
+    assert name_class("a1b2c3d4.ngrok.io") == "ephemeral-tunnel"
+    assert name_class("wandering-cat.trycloudflare.com") == "ephemeral-tunnel"
+    assert name_class("") == "empty"
+
+
+def test_tally_groups_by_name_and_ignores_other_codes():
+    rows = tally([alert("NO1", "https://api.internal/voice"),
+                  alert("NO2", "https://api.internal/sms"),
+                  alert("NO3", "https://api.internal/sms", code="11205")])
+    assert list(rows) == ["api.internal"]
+    assert rows["api.internal"]["alerts"] == 2
+    assert rows["api.internal"]["sids"] == ["NO1", "NO2"]
+
+
+def test_a_dead_tunnel_is_reported_as_a_development_leftover():
+    state, detail = verdict("a1b2c3d4.ngrok.io", {"alerts": 60})
+    assert state == "dev-tunnel"
+    assert "per session" in detail
+
+
+def test_an_internal_name_is_reported_as_never_having_worked():
+    state, detail = verdict("api.internal", {"alerts": 9})
+    assert state == "private-name"
+    assert "outside" in detail
+
+
+def test_a_public_looking_name_is_the_one_worth_investigating():
+    state, detail = verdict("hooks.example.com", {"alerts": 9})
+    assert state == "unpublished"
+    assert "registration lapsed" in detail
+
+
+def test_the_config_scan_finds_numbers_that_have_produced_no_alerts():
+    findings = scan_numbers([
+        {"phone_number": "+15550001111",
+         "voice_url": "https://a1b2c3d4.ngrok.io/voice",
+         "voice_fallback_url": "https://a1b2c3d4.ngrok.io/fallback",
+         "sms_url": "https://hooks.example.com/sms"},
+        {"phone_number": "+15550002222",
+         "voice_url": "https://hooks.example.com/voice"},
+    ])
+    assert [(f["number"], f["field"]) for f in findings] == [
+        ("+15550001111", "voice_url"), ("+15550001111", "voice_fallback_url")]
+    assert all(f["class"] == "ephemeral-tunnel" for f in findings)
+''',
+"test_js_file": "twilio-webhook-dns-audit.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  codeOf, hostname, nameClass, scanNumbers, tally, verdict,
+} from './twilio-webhook-dns-audit.mjs';
+
+const alert = (sid, url, code = '11210', when = '2026-06-02T08:00:00Z') => ({
+  sid, request_url: url, error_code: code, date_generated: when, log_level: 'error',
+});
+
+test('codeOf reads the string the Monitor API returns', () => {
+  assert.equal(codeOf({ error_code: '11210' }), 11210);
+  assert.equal(codeOf({ error_code: 11210 }), 11210);
+  assert.equal(codeOf({}), null);
+});
+
+test('hostname drops the port, the path and a trailing dot', () => {
+  assert.equal(hostname('https://Hooks.Example.com:8443/voice?CallSid=CA1'),
+    'hooks.example.com');
+  assert.equal(hostname('https://hooks.example.com./voice'), 'hooks.example.com');
+  assert.equal(hostname(null), '');
+});
+
+test('only the last label decides a reserved suffix', () => {
+  assert.equal(nameClass('hooks.example.com'), 'public');
+  assert.equal(nameClass('hooks.example'), 'reserved-suffix');
+  assert.equal(nameClass('api.internal'), 'reserved-suffix');
+  assert.equal(nameClass('printer.local'), 'reserved-suffix');
+  assert.equal(nameClass('localhost'), 'reserved-suffix');
+});
+
+test('the other shapes a name can take', () => {
+  assert.equal(nameClass('webhooks'), 'single-label');
+  assert.equal(nameClass('10.0.0.5'), 'ip-literal');
+  assert.equal(nameClass('a1b2c3d4.ngrok.io'), 'ephemeral-tunnel');
+  assert.equal(nameClass('wandering-cat.trycloudflare.com'), 'ephemeral-tunnel');
+  assert.equal(nameClass(''), 'empty');
+});
+
+test('tally groups by name and ignores other codes', () => {
+  const rows = tally([
+    alert('NO1', 'https://api.internal/voice'),
+    alert('NO2', 'https://api.internal/sms'),
+    alert('NO3', 'https://api.internal/sms', '11205'),
+  ]);
+  assert.deepEqual([...rows.keys()], ['api.internal']);
+  assert.equal(rows.get('api.internal').alerts, 2);
+  assert.deepEqual(rows.get('api.internal').sids, ['NO1', 'NO2']);
+});
+
+test('a dead tunnel is reported as a development leftover', () => {
+  const [state, detail] = verdict('a1b2c3d4.ngrok.io', { alerts: 60 });
+  assert.equal(state, 'dev-tunnel');
+  assert.match(detail, /per session/);
+});
+
+test('an internal name is reported as never having worked', () => {
+  const [state, detail] = verdict('api.internal', { alerts: 9 });
+  assert.equal(state, 'private-name');
+  assert.match(detail, /outside/);
+});
+
+test('a public-looking name is the one worth investigating', () => {
+  const [state, detail] = verdict('hooks.example.com', { alerts: 9 });
+  assert.equal(state, 'unpublished');
+  assert.match(detail, /registration lapsed/);
+});
+
+test('the config scan finds numbers that have produced no alerts', () => {
+  const findings = scanNumbers([
+    { phone_number: '+15550001111',
+      voice_url: 'https://a1b2c3d4.ngrok.io/voice',
+      voice_fallback_url: 'https://a1b2c3d4.ngrok.io/fallback',
+      sms_url: 'https://hooks.example.com/sms' },
+    { phone_number: '+15550002222', voice_url: 'https://hooks.example.com/voice' },
+  ]);
+  assert.deepEqual(findings.map((f) => [f.number, f.field]),
+    [['+15550001111', 'voice_url'], ['+15550001111', 'voice_fallback_url']]);
+  assert.ok(findings.every((f) => f.class === 'ephemeral-tunnel'));
+});
+''',
+"faq": [
+ ("The URL works in my browser. Why does Twilio say bad host name?",
+  "Because your resolver is not Twilio's. A split-horizon zone, a VPC-private zone, a search domain or an /etc/hosts entry all make a name resolve for you and for nobody on the public internet. Twilio asks public DNS and gets NXDOMAIN, so no connection is ever attempted."),
+ ("Why does the script look at phone number configuration as well as alerts?",
+  "Because an alert only exists if Twilio tried. A number nobody has dialled in a month produces no alerts and is broken all the same, and alerts age out after 30 days regardless. The configuration is true whether or not anything has been attempted, so both halves are needed."),
+ ("What is wrong with using an ngrok URL in a real account?",
+  "Nothing, until the tunnel restarts. Free tunnel hostnames are handed out per session, so the URL is correct for hours and dead forever after. It is the single most common source of 11210 in accounts that used to work, which is why those domains get their own verdict."),
+ ("Did my fallback URL not save the call?",
+  "Not if it is on the same hostname. A fallback that shares an unresolvable name fails in exactly the same way at exactly the same moment. Fallbacks are only worth having on infrastructure that can fail independently of the primary."),
+ ("Is there anything to change on the Twilio side?",
+  "No. The repair is a DNS record or a different URL, both of which live with you. Everything the script does is a GET, so it names the number and the field and stops there; a script holding a credential that can place calls has no business editing routing."),
+],
+"related": [
+ ("/twilio/webhook-connection-timeout-11205/", "Twilio cannot open a connection to your webhook"),
+ ("/twilio/webhook-tls-certificate-expired-11236/", "An expired webhook certificate"),
+ ("/twilio/phone-number-still-on-demo-twiml/", "A number still answering with demo TwiML"),
+],
+"citations": [CITE_11210, CITE_ALERTS, CITE_PN, CITE_WEBHOOKS],
+},
+
+]
