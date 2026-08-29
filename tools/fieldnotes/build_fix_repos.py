@@ -91,27 +91,10 @@ def deps_for(dest: Path) -> tuple[set[str], set[str]]:
     return pip, npm
 
 
-WORKFLOW = """name: tests
-on: [push, pull_request]
-jobs:
-  python:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install {pip}
-      - run: pytest -q
-  node:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-{npm_step}      - run: node --test
-"""
+# No CI workflow is generated. Every one of the fourteen published repos had the
+# one this script used to emit deleted by hand straight afterwards — see
+# `aws-cost-fixes` commit 0b053b6 "Drop the CI workflow and the Tests badge". The
+# tests are meant to be run by a reader who has cloned the repo, not by a runner.
 
 GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n.env\n.DS_Store\n"
 
@@ -217,8 +200,6 @@ def build(section: str) -> tuple[int, int]:
             f"**[allanninal.dev/{section}](https://www.allanninal.dev/{section}/)**.\n\n"
             f"[![Follow on GitHub](https://img.shields.io/github/followers/allanninal?"
             f"label=Follow%20%40allanninal&style=social)](https://github.com/allanninal)\n"
-            f"[![Tests](https://github.com/allanninal/{repo_name}/actions/workflows/tests.yml/"
-            f"badge.svg)](https://github.com/allanninal/{repo_name}/actions/workflows/tests.yml)\n\n"
             f"## The fixes\n\n{lines}\n\n"
             f"## How to run one\n\n"
             f"Each folder holds the same script in Python and in Node.js, plus its test. "
@@ -236,24 +217,60 @@ def build(section: str) -> tuple[int, int]:
         if npm:
             pkg["dependencies"] = {m: "*" for m in sorted(npm)}
         (dest / "package.json").write_text(json.dumps(pkg, indent=2) + "\n", encoding="utf-8")
-        (dest / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
-        (dest / ".github" / "workflows" / "tests.yml").write_text(
-            WORKFLOW.format(pip=" ".join(sorted(pip)),
-                            npm_step="      - run: npm install\n" if npm else ""),
-            encoding="utf-8")
         if LICENSE.exists():
             (dest / "LICENSE").write_text(LICENSE.read_text(encoding="utf-8"), encoding="utf-8")
     return made, skipped
 
 
+def publish(dest: Path, repo_name: str, description: str) -> str:
+    """Create the public repo and push it, or push an update if it already exists.
+
+    This was the one manual step left in the pipeline: the builder wrote the folder
+    and then somebody ran git and gh by hand. With several sections landing at once
+    that is several chances to push the wrong thing, so it happens here where the
+    repo name and description are already known to be right.
+    """
+    import subprocess
+
+    def run(*args, **kw):
+        return subprocess.run(args, cwd=dest, capture_output=True, text=True, **kw)
+
+    if not (dest / ".git").is_dir():
+        run("git", "init", "-q", "-b", "main")
+    run("git", "add", "-A")
+    if not run("git", "diff", "--cached", "--quiet").returncode:
+        return "no changes"
+    msg = "Add the scripts" if not (dest / ".git" / "refs" / "heads").exists() else "Update the scripts"
+    run("git", "commit", "-q", "-m", msg)
+
+    exists = subprocess.run(["gh", "repo", "view", f"allanninal/{repo_name}"],
+                            capture_output=True, text=True).returncode == 0
+    if not exists:
+        r = subprocess.run(
+            ["gh", "repo", "create", f"allanninal/{repo_name}", "--public",
+             "--source", str(dest), "--remote", "origin", "--push",
+             "--description", description],
+            capture_output=True, text=True)
+        return "created" if r.returncode == 0 else f"gh failed: {r.stderr.strip()[:120]}"
+
+    if not run("git", "remote", "get-url", "origin").stdout.strip():
+        run("git", "remote", "add", "origin", f"git@github.com:allanninal/{repo_name}.git")
+    r = run("git", "push", "-u", "origin", "main")
+    return "pushed" if r.returncode == 0 else f"push failed: {r.stderr.strip()[:120]}"
+
+
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)
+    PUBLISH = "--publish" in sys.argv
     tm = ts = 0
     for s in want:
         repo_name = SECTIONS[s][0]
         m, k = build(s)
         tm += m; ts += k
-        print(f"  {s:<11} -> {repo_name:<22} {m} fixes extracted"
-              + (f", {k} skipped" if k else ""))
+        line = (f"  {s:<11} -> {repo_name:<22} {m} fixes extracted"
+                + (f", {k} skipped" if k else ""))
+        if PUBLISH and APPLY:
+            line += f"  [{publish(OUT / repo_name, repo_name, SECTIONS[s][2])}]"
+        print(line)
     print(f"\n  {tm} fix folder(s), {ts} skipped")
     print("APPLIED" if APPLY else "DRY RUN — pass --apply to write")
