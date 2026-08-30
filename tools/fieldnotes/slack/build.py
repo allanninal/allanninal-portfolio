@@ -16,7 +16,7 @@ for _m in sorted(q.stem for q in Path(__file__).resolve().parent.glob("guides*.p
 
 CFG = {
   "section": "slack",
-  "date": "2026-08-30",
+  "date": "2026-08-31",
   "nav": [("/", "Portfolio"), ("/github/", "GitHub API"), ("/twilio/", "Twilio")],
   "footer_note": "Every script in this section is read only. They hold a token that can post "
                  "into your workspace, so none of them writes: they report what is wrong and "
