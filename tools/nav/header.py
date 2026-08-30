@@ -46,6 +46,9 @@ PLATFORM = [
 APIS = [
     ("/stripe/", "Stripe"),
     ("/twilio/", "Twilio"),
+    ("/github/", "GitHub API"),
+    ("/slack/", "Slack"),
+    ("/llm/", "LLM APIs"),
 ]
 
 WORK = [
@@ -74,6 +77,9 @@ SECTION_LABEL = {
     "seo": "/seo",
     "stripe": "/stripe",
     "twilio": "/twilio",
+    "github": "/github",
+    "slack": "/slack",
+    "llm": "/llm",
     "spreadsheets": "/spreadsheets",
     "build": "/build",
     "blog": "/blog",

@@ -30,7 +30,7 @@ KEYS = [
 
 # Sections whose scripts hold a live payments or messaging credential and must
 # never write. Keep in step with READ_ONLY in add_repo_links.py.
-READ_ONLY = {"stripe", "twilio"}
+READ_ONLY = {"stripe", "twilio", "llm", "slack", "github"}
 WRITE_CALLS = re.compile(r'"(POST|PUT|PATCH|DELETE)"|\bmethod:\s*[\'"](POST|PUT|PATCH|DELETE)|--apply')
 
 

@@ -53,6 +53,14 @@ BLURB = {
     "twilio": "Most Twilio failures are a setting, not a bug. A number still points at "
               "the demo TwiML URL, a campaign never finished registering, a webhook has "
               "no fallback. Every script here is read only.",
+    "llm": "An LLM API bills you whether or not the answer was any good, and most of the "
+           "ways it goes wrong do not raise an exception. Every script here is read only.",
+    "slack": "Slack answers almost everything with HTTP 200 and puts the failure in the body "
+             "as ok: false, so a bot that never posted looks like one that did. Every script "
+             "here is read only.",
+    "github": "The GitHub API stops working quietly: a list that returns thirty items, a "
+              "webhook failing for a month, a 403 with no Retry-After. Every script here is "
+              "read only.",
 }
 
 

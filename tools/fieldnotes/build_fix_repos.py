@@ -65,6 +65,21 @@ SECTIONS = {
                "the API — numbers left on demo TwiML, unregistered 10DLC campaigns, "
                "webhooks pointing nowhere and messages filtered by carriers. They report "
                "and print the repair; they never write. Guides: allanninal.dev/twilio"),
+    "llm": ("llm-api-fixes", "LLM API",
+            "Read-only Python and Node.js scripts that find OpenAI and Anthropic problems "
+            "through the API — retired models, runaway spend, quota exhaustion misread as "
+            "a rate limit, and prompt caching that never pays back. They report and print "
+            "the repair; they never write. Guides: allanninal.dev/llm"),
+    "slack": ("slack-fixes", "Slack",
+              "Read-only Python and Node.js scripts that find Slack app problems through "
+              "the API — ok:false behind an HTTP 200, missing scopes, a bot outside the "
+              "channel it posts to, and pagination nobody followed. They report and print "
+              "the repair; they never write. Guides: allanninal.dev/slack"),
+    "github": ("github-api-fixes", "GitHub API",
+               "Read-only Python and Node.js scripts that find GitHub API problems — "
+               "pagination that stops at the first page, 404s masking 403s, webhooks "
+               "failing unnoticed and Apps missing a permission. They report and print the "
+               "repair; they never write. Guides: allanninal.dev/github"),
 }
 
 # Dependencies are DERIVED from what the extracted files actually import, not typed.
@@ -111,7 +126,7 @@ GITIGNORE = "__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n.env\n.DS_Store
 LICENSE = (Path.home() / "Projects/dns-fixes/LICENSE")
 
 # Sections whose scripts never write; see add_repo_links.READ_ONLY.
-READ_ONLY = {"stripe", "twilio"}
+READ_ONLY = {"stripe", "twilio", "llm", "slack", "github"}
 
 # Make the module importable without real credentials, the way the existing repos do.
 ENV_PY = re.compile(r'os\.environ\[(["\'])([A-Z0-9_]+)\1\]')

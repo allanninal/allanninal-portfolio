@@ -27,7 +27,7 @@ SECTIONS = {
     for d in [
         "woocommerce", "shopify", "bigcommerce", "medusa", "shopware", "saleor",
         "prestashop", "magento", "aws", "cloudflare", "ci", "email", "dns",
-        "seo", "stripe", "twilio", "spreadsheets", "build",
+        "seo", "stripe", "twilio", "github", "slack", "llm", "spreadsheets", "build",
     ]
 }
 # The two hand-written sections predate the generators and carry three

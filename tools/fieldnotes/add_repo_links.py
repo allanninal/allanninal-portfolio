@@ -38,13 +38,15 @@ REPO = {"woocommerce": "woocommerce-fixes", "shopify": "shopify-fixes",
         "dns": "dns-fixes", "seo": "technical-seo-fixes",
         "cloudflare": "cloudflare-fixes", "ci": "github-actions-fixes",
         "aws": "aws-cost-fixes", "email": "email-ses-fixes",
-        "stripe": "stripe-fixes", "twilio": "twilio-fixes"}
+        "stripe": "stripe-fixes", "twilio": "twilio-fixes",
+        "llm": "llm-api-fixes", "slack": "slack-fixes",
+        "github": "github-api-fixes"}
 PLATFORMS = list(REPO)
 
 # Sections whose scripts hold a credential to a live payments or messaging account.
 # Those never write at all, so "dry run by default" would understate it — there is
 # no second mode to be careful about.
-READ_ONLY = {"stripe", "twilio"}
+READ_ONLY = {"stripe", "twilio", "llm", "slack", "github"}
 APPLY = "--apply" in sys.argv
 
 # The `.repo-cta` rule in every one of the nine stylesheets styles a WRAPPER whose <a>
@@ -119,7 +121,8 @@ LABEL = {"woocommerce": "WooCommerce", "shopify": "Shopify", "bigcommerce": "Big
          "medusa": "Medusa", "shopware": "Shopware", "saleor": "Saleor",
          "prestashop": "PrestaShop", "magento": "Magento", "dns": "DNS and domain",
          "seo": "technical SEO", "cloudflare": "Cloudflare", "ci": "GitHub Actions",
-         "aws": "AWS cost", "email": "email and SES", "stripe": "Stripe", "twilio": "Twilio"}
+         "aws": "AWS cost", "email": "email and SES", "stripe": "Stripe", "twilio": "Twilio", "llm": "LLM API",
+         "slack": "Slack", "github": "GitHub API"}
 
 
 def folders(plat: str) -> set[str]:

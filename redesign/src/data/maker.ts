@@ -152,4 +152,7 @@ export const fieldNotes = [
   { href: '/dns/', name: 'DNS & Domains', detail: 'DNS records, email auth, DNSSEC, and certificate fixes' },
   { href: '/stripe/', name: 'Stripe', detail: 'Disabled webhooks, undelivered events, stalled subscriptions and blocked payouts' },
   { href: '/twilio/', name: 'Twilio', detail: 'Numbers on demo TwiML, unregistered 10DLC campaigns and webhooks pointing nowhere' },
+  { href: '/github/', name: 'GitHub API', detail: 'Secondary rate limits, pagination that stops at 30, and webhooks failing unnoticed' },
+  { href: '/slack/', name: 'Slack', detail: 'ok:false behind an HTTP 200, missing scopes, and a bot outside the channel it posts to' },
+  { href: '/llm/', name: 'LLM APIs', detail: 'Retired models, runaway spend, and quota exhaustion misread as a rate limit' },
 ];
