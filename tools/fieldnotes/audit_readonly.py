@@ -35,6 +35,21 @@ CHECKS = (("python write call", REQUEST_PY),
           ("curl write", CURL_WRITE),
           ("--apply flag", APPLY_FLAG))
 
+# The one permitted non-GET in the estate: Anthropic's token counter. It
+# generates nothing and bills nothing, and the /llm/ pre-flight notes cannot
+# answer their question without it. Exempted by proximity to the endpoint name,
+# so a write to any other path is still caught.
+COUNT_TOKENS = re.compile(r"count_tokens")
+
+
+def real_hit(text: str, rx):
+    """First match that is not the count_tokens pre-flight."""
+    for m in rx.finditer(text):
+        if COUNT_TOKENS.search(text[max(0, m.start() - 400):m.end() + 400]):
+            continue
+        return m
+    return None
+
 
 def main() -> int:
     problems = 0
@@ -49,7 +64,7 @@ def main() -> int:
         for f in scripts:
             text = f.read_text(encoding="utf-8", errors="ignore")
             for label, rx in CHECKS:
-                m = rx.search(text)
+                m = real_hit(text, rx)
                 if m:
                     bad.append(f"{f.relative_to(root)}  [{label}: {m.group(0)!r}]")
         problems += len(bad)

@@ -31,7 +31,28 @@ KEYS = [
 # Sections whose scripts hold a live payments or messaging credential and must
 # never write. Keep in step with READ_ONLY in add_repo_links.py.
 READ_ONLY = {"stripe", "twilio", "llm", "slack", "github"}
-WRITE_CALLS = re.compile(r'"(POST|PUT|PATCH|DELETE)"|\bmethod:\s*[\'"](POST|PUT|PATCH|DELETE)|--apply')
+# Also matches a bare assignment, so a verb cannot be smuggled past the guard by
+# hiding it in a named constant and interpolating it at the call site.
+WRITE_CALLS = re.compile(
+    r'"(POST|PUT|PATCH|DELETE)"'
+    r'|\bmethod:\s*[\'"](POST|PUT|PATCH|DELETE)'
+    r'|=\s*[\'"](POST|PUT|PATCH|DELETE)[\'"]'
+    r'|--apply')
+
+# The one permitted non-GET in the whole read-only estate: Anthropic's token
+# counter. It generates nothing, bills nothing and answers a question a
+# pre-flight note cannot answer any other way. Permitted by proximity to the
+# endpoint name, so a POST to any other path is still caught, and renaming the
+# verb no longer helps because the assignment form is matched too.
+COUNT_TOKENS = re.compile(r"count_tokens")
+
+
+def write_call_hits(body: str):
+    """Yield write-verb matches, skipping the count_tokens pre-flight."""
+    for m in WRITE_CALLS.finditer(body):
+        if COUNT_TOKENS.search(body[max(0, m.start() - 400):m.end() + 400]):
+            continue
+        yield m
 
 
 def load(section: str) -> list[dict]:
@@ -79,7 +100,7 @@ def check(section: str, run_tests: bool) -> int:
 
         if section in READ_ONLY:
             for field in ("py", "js"):
-                hit = WRITE_CALLS.search(g.get(field, ""))
+                hit = next(write_call_hits(g.get(field, "")), None)
                 if hit:
                     problems.append(
                         f"{slug}: {field} contains {hit.group(0)!r} but /{section}/ "
