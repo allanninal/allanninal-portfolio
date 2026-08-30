@@ -1392,4 +1392,1312 @@ test('no activity is quiet rather than clear', () => {
 "citations": [CITE_REST_LIMITS, CITE_BEST, CITE_ISSUES, CITE_ISSUE_COMMENTS],
 },
 
+
+{
+"slug": "retry-after-ignored",
+"title": "The client ignores retry-after and keeps hammering the API",
+"description": "GitHub tells you exactly how long to wait. A fixed one-second backoff spends 60 refused requests inside that window and extends the throttle.",
+"h1": "the client ignores retry-after and keeps hammering the API",
+"category": "GitHub API",
+"pill": "Diagnostic",
+"chips": ["Read-only token", "Python and Node.js", "Tests included"],
+"keywords": ["github retry-after header", "github api 429 backoff",
+             "github x-ratelimit-reset", "github api exponential backoff",
+             "github rate limit retry strategy"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "The log shows four hundred consecutive <code>403</code>s, one second apart, for eleven minutes. The retry logic is working perfectly: it catches the error, waits, tries again, never gives up. GitHub said <code>retry-after: 120</code> on the very first one, and the client threw that header away along with the rest of the response.",
+"short_answer": """<p>Throttled responses carry the answer. On a secondary limit you get <code>retry-after</code> in seconds; on a primary exhaustion you get <code>x-ratelimit-remaining: 0</code> and <code>x-ratelimit-reset</code> as an epoch timestamp. Branch on those two in that order, and only fall back to exponential backoff when neither is present.</p>
+<p>What that saves is measurable. A client retrying every second inside a 120-second window issues 120 requests that were refused before they were sent, each one keeping the limit engaged. The script below reads the headers from a live probe or from a response you paste in from your logs, computes the exact wait, and reports how many of your retries land inside it.</p>""",
+"problem": """<p>Retry logic is usually written once, early, against a generic HTTP client, and it is written for the failure everyone has seen: a transient connection reset that clears in a moment. So the shape is <code>except: sleep(1); retry</code>, and it is correct for that failure. Applied to a rate limit it is not just useless, it is actively harmful, because the requests it sends during the penalty window are themselves the thing being penalised.</p>
+<p>The result is a failure mode that looks like persistence. The process is running. It is making requests. The logs are full. Nothing has crashed, no alert has a threshold for "same status code four hundred times", and the job that should have paused for two minutes and finished is now eleven minutes in and no closer.</p>
+<p>And the two throttles want different waits, which is where the half-fixed version goes wrong. A team adds <code>retry-after</code> handling, the secondary-limit case gets better, and then a primary exhaustion arrives with no <code>retry-after</code> at all &mdash; that one is signalled by <code>x-ratelimit-reset</code>, up to an hour away &mdash; and the client falls straight back to hammering.</p>""",
+"why": """<p><strong>Two throttles, two headers, one status code.</strong> A secondary limit answers <code>403</code> or <code>429</code> with <code>retry-after</code> and usually a wait measured in minutes. A primary exhaustion answers <code>403</code> with <code>x-ratelimit-remaining: 0</code> and <code>x-ratelimit-reset</code>, and the wait is however much of the hour is left. Reading only one of the two headers handles half the cases and looks like it handles all of them.</p>
+<p><strong><code>retry-after</code> is not always a number.</strong> The HTTP specification allows either a delay in seconds or an HTTP-date. GitHub sends seconds, but a proxy in front of your client can rewrite it, and a parser that does <code>int(value)</code> and swallows the exception silently falls through to the default. Parse both forms and compute the delay against the current time.</p>
+<p><strong>Retrying inside the window extends the window.</strong> Secondary limits are throttles on burst behaviour. Requests made while one is engaged are burst behaviour, so a client that keeps trying keeps supplying the evidence. This is why the observed pause is so often much longer than the <code>retry-after</code> value the first response contained.</p>
+<p><strong>Exponential backoff is the fallback, not the strategy.</strong> It is what you use when the server told you nothing. When the server told you exactly how long to wait, backing off exponentially from one second is a worse guess than the answer you were handed, and it is a guess that starts by being wrong 119 times.</p>
+<p><strong>The client's behaviour is a blind spot from the API side.</strong> Nothing GitHub exposes can tell you whether your code honours these headers; that lives in your code and in your request timestamps. What a read-only script can do is take a throttled response and show you the correct wait next to the wait your current settings would produce, which turns an argument about retry policy into a number.</p>""",
+"steps": [
+ {"h": "Capture a real throttled response, headers and all",
+  "body": """<p>The next time a job is throttled, log the full response headers, not just the status. <code>retry-after</code>, <code>x-ratelimit-remaining</code>, <code>x-ratelimit-reset</code>, <code>x-ratelimit-resource</code> and <code>x-github-request-id</code> are the five that matter. The script accepts them on the command line so you can evaluate an incident after the fact, offline.</p>"""},
+ {"h": "Branch on retry-after first",
+  "body": """<p>If <code>retry-after</code> is present, that is the wait. Sleep exactly that long &mdash; not a fraction, not a capped version of it &mdash; and parse the HTTP-date form as well as the integer form. This branch has to come first because a secondary limit can arrive while the primary bucket is perfectly healthy, and the reset timestamp then tells you nothing useful.</p>"""},
+ {"h": "Fall back to x-ratelimit-reset when the bucket is empty",
+  "body": """<p><code>x-ratelimit-remaining: 0</code> means the hourly quota is gone and <code>x-ratelimit-reset</code> is the epoch second it returns. Sleep until then. It can be most of an hour, which is unpleasant and is still shorter than an hour of refused retries followed by the same wait.</p>"""},
+ {"h": "Only then back off exponentially, with jitter and a cap",
+  "body": """<p>No headers means no information, so guess: one second, two, four, eight, capped at a minute, with random jitter so that a fleet of workers does not synchronise into a thundering herd, and with a maximum attempt count so a permanent failure eventually surfaces as one.</p>"""},
+ {"h": "Pause the whole client, and count what you would have wasted",
+  "body": """<p>A throttle applies to the credential, not the request, so every other worker holding that token is about to be refused too. Sleep the shared client rather than the one call. Then run the script against the captured response: the number of retries your current interval fits inside the required wait is the size of the problem, stated plainly.</p>"""},
+],
+"verify": """<p>Feed the script the headers from a throttled response and confirm the wait it computes matches what you now sleep, with no requests scheduled inside the window.</p>
+<pre><code class="language-bash">python3 github_backoff_plan.py --status 403 --header 'retry-after: 120' \\
+    --header 'x-ratelimit-remaining: 4870' --interval 1
+# hammering: wait 120s from retry-after; a 1.0s interval sends 120 refused requests</code></pre>""",
+"code_intro": "The interesting code here has no network in it at all. Everything that decides how long to wait is pure and takes <code>now</code> as an argument, because the whole point is that the decision is a function of five header values and nothing else. The script's one live request exists only to fetch a real set of headers; <code>--status</code> and <code>--header</code> let you run the same analysis over a response you already captured.",
+"py_file": "github_backoff_plan.py",
+"py": '''"""Compute the wait a throttled GitHub response asks for, and cost your retries.
+
+Read only. The single live request is a GET against /rate_limit, which does not
+count against the primary rate limit. Everything that decides the wait is a pure
+function of the response headers, so a response captured during an incident can
+be analysed later with --status and --header.
+
+Whether your client honours these headers is not visible through the API: it
+lives in your code. What is visible is the contract, and what it costs to ignore.
+"""
+import argparse
+import logging
+import os
+import sys
+import time
+from email.utils import parsedate_to_datetime
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("github_backoff_plan")
+
+API = "https://api.github.com"
+UA = "github-backoff-plan/1.0"
+
+# Where a secondary limit sends no retry-after, the documented advice is to wait
+# at least a minute before trying again.
+SECONDARY_FLOOR_SECONDS = 60.0
+
+
+def retry_after_seconds(value, now):
+    """Parse a retry-after header into seconds from now, or None. Pure.
+
+    HTTP allows either a delay in seconds or an HTTP-date. GitHub sends seconds,
+    but a proxy in front of the client is free to rewrite it into the other form,
+    and a parser that only does int() treats that as absent and falls through to
+    a default that is usually far too short.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(int(text)))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    return max(0.0, when.timestamp() - float(now))
+
+
+def required_wait(status, headers, now):
+    """How long a correct client sleeps before its next request. Pure.
+
+    Returns (seconds, source, detail). The order is not arbitrary: a secondary
+    limit can fire while the primary bucket is untouched, so retry-after has to
+    win over the reset timestamp, which in that case is describing an hour that
+    has nothing to do with why this request was refused.
+    """
+    lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+
+    if status not in (403, 429):
+        return (0.0, "none",
+                "%d is not a throttled response, so there is nothing to wait for"
+                % status)
+
+    seconds = retry_after_seconds(lowered.get("retry-after"), now)
+    if seconds is not None:
+        return (seconds, "retry-after",
+                "the response asked for %.0f second(s). Sleep exactly that, not "
+                "a capped or scaled version of it." % seconds)
+
+    try:
+        remaining = int(lowered.get("x-ratelimit-remaining"))
+    except (TypeError, ValueError):
+        remaining = None
+    try:
+        reset = float(lowered.get("x-ratelimit-reset"))
+    except (TypeError, ValueError):
+        reset = None
+
+    if remaining == 0 and reset is not None:
+        return (max(0.0, reset - float(now)), "x-ratelimit-reset",
+                "the hourly quota is spent and returns at the reset timestamp, "
+                "%.0f second(s) from now" % max(0.0, reset - float(now)))
+
+    return (SECONDARY_FLOOR_SECONDS, "floor",
+            "no retry-after and the primary bucket is not empty, so this is a "
+            "secondary limit that sent no wait. Treat %.0f seconds as the floor "
+            "and back off exponentially from there."
+            % SECONDARY_FLOOR_SECONDS)
+
+
+def backoff(attempt, base=1.0, cap=60.0):
+    """Exponential delay for a given attempt number. Pure, and unjittered.
+
+    The fallback for when the server said nothing at all. Jitter is applied by the
+    caller rather than in here, so that the schedule this returns is something the
+    tests can assert on and a reader can predict.
+    """
+    attempt = max(0, int(attempt))
+    return min(float(cap), float(base) * (2 ** attempt))
+
+
+def wasted_requests(seconds, interval):
+    """How many refused requests a fixed-interval retrier fits in the wait. Pure.
+
+    This is the number that makes the argument. Every one of these is sent into a
+    limit that is already engaged, and on a secondary limit each one is fresh
+    evidence of the burst behaviour being throttled.
+    """
+    seconds = max(0.0, float(seconds))
+    interval = float(interval)
+    if interval <= 0:
+        return 0
+    return int(seconds // interval)
+
+
+def plan(status, headers, now, interval=1.0):
+    """Turn a throttled response into a finding. Pure. Returns (state, report)."""
+    seconds, source, detail = required_wait(status, headers, now)
+    wasted = wasted_requests(seconds, interval)
+    report = {"wait_seconds": round(seconds, 1), "source": source,
+              "detail": detail, "wasted_requests": wasted,
+              "retry_interval": interval,
+              "fallback_schedule": [backoff(i) for i in range(5)]}
+
+    if source == "none":
+        return ("not-throttled", report)
+    if wasted >= 60:
+        return ("hammering", report)
+    if wasted > 0:
+        return ("impatient", report)
+    return ("honoured", report)
+
+
+def parse_header(text):
+    """'Name: value' from the command line into a (name, value) pair."""
+    name, _, value = str(text).partition(":")
+    return (name.strip(), value.strip())
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--status", type=int, default=None,
+                    help="analyse a captured response with this status instead "
+                         "of probing the API")
+    ap.add_argument("--header", action="append", default=[],
+                    help="'name: value' from a captured response; repeatable")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="the retry interval your client currently uses")
+    args = ap.parse_args()
+
+    now = time.time()
+
+    if args.status is not None:
+        status = args.status
+        headers = dict(parse_header(h) for h in args.header)
+        log.info("analysing a captured %d with %d header(s)", status, len(headers))
+    else:
+        token = os.environ.get("GITHUB_TOKEN")
+        if not token:
+            log.error("set GITHUB_TOKEN (a read-only token is enough), or pass "
+                      "--status and --header to analyse a captured response")
+            return 2
+        r = requests.get(API + "/rate_limit", timeout=30, headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": UA,
+        })
+        status, headers = r.status_code, dict(r.headers)
+        log.info("probed GET /rate_limit: %d (this endpoint does not consume "
+                 "quota)", status)
+
+    state, report = plan(status, headers, now, args.interval)
+    log.info("%s: wait %.0fs from %s", state, report["wait_seconds"],
+             report["source"])
+    log.info("  %s", report["detail"])
+
+    if state == "not-throttled":
+        log.info("  nothing is throttled right now. Re-run with --status and "
+                 "--header against a response captured during an incident to "
+                 "cost your current retry policy.")
+        return 0
+
+    log.warning("  a %.1fs retry interval sends %d refused request(s) inside "
+                "that window", report["retry_interval"], report["wasted_requests"])
+    log.warning("  repair: sleep the whole client for %.0f second(s) before the "
+                "next request, not one call.", report["wait_seconds"])
+    log.warning("  repair: branch on retry-after first, then on "
+                "x-ratelimit-remaining being 0 plus x-ratelimit-reset, and only "
+                "then on a jittered exponential schedule such as %s",
+                ", ".join("%.0fs" % s for s in report["fallback_schedule"]))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "github-backoff-plan.mjs",
+"js": '''/**
+ * Compute the wait a throttled GitHub response asks for, and cost your retries.
+ *
+ * Read only. The single live request is a GET against /rate_limit, which does
+ * not count against the primary rate limit. Everything that decides the wait is
+ * a pure function of the response headers.
+ */
+const API = 'https://api.github.com';
+const UA = 'github-backoff-plan/1.0';
+
+// Where a secondary limit sends no retry-after, the documented advice is to
+// wait at least a minute before trying again.
+export const SECONDARY_FLOOR_SECONDS = 60;
+
+/**
+ * Parse a retry-after header into seconds from now, or null. Pure.
+ * HTTP allows either a delay in seconds or an HTTP-date, and a parser that only
+ * handles the integer form treats the other as absent.
+ */
+export function retryAfterSeconds(value, now) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  if (/^\\d+$/.test(text)) return Math.max(0, Number.parseInt(text, 10));
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) return null;
+  return Math.max(0, ms / 1000 - Number(now));
+}
+
+/**
+ * How long a correct client sleeps before its next request. Pure.
+ * Returns [seconds, source, detail]. retry-after wins over the reset timestamp
+ * because a secondary limit can fire while the primary bucket is untouched.
+ */
+export function requiredWait(status, headers, now) {
+  const lowered = {};
+  for (const [k, v] of Object.entries(headers ?? {})) lowered[k.toLowerCase()] = v;
+  const code = Number.parseInt(status, 10) || 0;
+
+  if (code !== 403 && code !== 429) {
+    return [0, 'none',
+      `${code} is not a throttled response, so there is nothing to wait for`];
+  }
+
+  const seconds = retryAfterSeconds(lowered['retry-after'], now);
+  if (seconds !== null) {
+    return [seconds, 'retry-after',
+      `the response asked for ${Math.round(seconds)} second(s). Sleep exactly ` +
+      'that, not a capped or scaled version of it.'];
+  }
+
+  const remainingRaw = Number.parseInt(lowered['x-ratelimit-remaining'], 10);
+  const remaining = Number.isFinite(remainingRaw) ? remainingRaw : null;
+  const resetRaw = Number.parseFloat(lowered['x-ratelimit-reset']);
+  const reset = Number.isFinite(resetRaw) ? resetRaw : null;
+
+  if (remaining === 0 && reset !== null) {
+    const wait = Math.max(0, reset - Number(now));
+    return [wait, 'x-ratelimit-reset',
+      'the hourly quota is spent and returns at the reset timestamp, ' +
+      `${Math.round(wait)} second(s) from now`];
+  }
+
+  return [SECONDARY_FLOOR_SECONDS, 'floor',
+    'no retry-after and the primary bucket is not empty, so this is a secondary ' +
+    `limit that sent no wait. Treat ${SECONDARY_FLOOR_SECONDS} seconds as the ` +
+    'floor and back off exponentially from there.'];
+}
+
+/**
+ * Exponential delay for a given attempt number. Pure, and unjittered.
+ * Jitter belongs to the caller so this schedule stays predictable.
+ */
+export function backoff(attempt, base = 1, cap = 60) {
+  const n = Math.max(0, Math.trunc(attempt));
+  return Math.min(cap, base * (2 ** n));
+}
+
+/**
+ * How many refused requests a fixed-interval retrier fits in the wait. Pure.
+ * Every one of these is sent into a limit that is already engaged.
+ */
+export function wastedRequests(seconds, interval) {
+  const wait = Math.max(0, Number(seconds));
+  const gap = Number(interval);
+  if (!(gap > 0)) return 0;
+  return Math.floor(wait / gap);
+}
+
+/** Turn a throttled response into a finding. Pure. Returns [state, report]. */
+export function plan(status, headers, now, interval = 1) {
+  const [seconds, source, detail] = requiredWait(status, headers, now);
+  const wasted = wastedRequests(seconds, interval);
+  const report = {
+    wait_seconds: Math.round(seconds * 10) / 10,
+    source,
+    detail,
+    wasted_requests: wasted,
+    retry_interval: interval,
+    fallback_schedule: [0, 1, 2, 3, 4].map((i) => backoff(i)),
+  };
+  if (source === 'none') return ['not-throttled', report];
+  if (wasted >= 60) return ['hammering', report];
+  if (wasted > 0) return ['impatient', report];
+  return ['honoured', report];
+}
+
+function parseHeader(text) {
+  const at = String(text).indexOf(':');
+  if (at < 0) return [String(text).trim(), ''];
+  return [String(text).slice(0, at).trim(), String(text).slice(at + 1).trim()];
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const now = Date.now() / 1000;
+
+  let status = null;
+  let interval = 1;
+  const headers = {};
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '--status') { status = Number.parseInt(args[i + 1], 10); i += 1; }
+    else if (args[i] === '--interval') { interval = Number.parseFloat(args[i + 1]); i += 1; }
+    else if (args[i] === '--header') {
+      const [name, value] = parseHeader(args[i + 1]);
+      headers[name] = value;
+      i += 1;
+    }
+  }
+
+  let live = headers;
+  if (status === null) {
+    const token = process.env.GITHUB_TOKEN;
+    if (!token) {
+      console.error('set GITHUB_TOKEN (a read-only token is enough), or pass ' +
+        '--status and --header to analyse a captured response');
+      process.exitCode = 2;
+      return;
+    }
+    const res = await fetch(`${API}/rate_limit`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': UA,
+      },
+    });
+    status = res.status;
+    live = Object.fromEntries(res.headers.entries());
+    console.log(`probed GET /rate_limit: ${status} (this endpoint does not consume quota)`);
+  } else {
+    console.log(`analysing a captured ${status} with ${Object.keys(headers).length} header(s)`);
+  }
+
+  const [state, report] = plan(status, live, now, interval);
+  console.log(`${state}: wait ${Math.round(report.wait_seconds)}s from ${report.source}`);
+  console.log(`  ${report.detail}`);
+
+  if (state === 'not-throttled') {
+    console.log('  nothing is throttled right now. Re-run with --status and ' +
+      '--header against a response captured during an incident to cost your ' +
+      'current retry policy.');
+    return;
+  }
+
+  console.warn(`  a ${report.retry_interval}s retry interval sends ` +
+    `${report.wasted_requests} refused request(s) inside that window`);
+  console.warn(`  repair: sleep the whole client for ${Math.round(report.wait_seconds)} ` +
+    'second(s) before the next request, not one call.');
+  console.warn('  repair: branch on retry-after first, then on ' +
+    'x-ratelimit-remaining being 0 plus x-ratelimit-reset, and only then on a ' +
+    `jittered exponential schedule such as ${report.fallback_schedule.join('s, ')}s`);
+  process.exitCode = 1;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing token, and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "Every case here is a set of headers and a fixed <code>now</code>, which is the whole reason the wait calculation was written as a pure function: a throttled response is not something you can produce on demand, and a test that needed one would never run. The cases that matter are the precedence between the two headers, the HTTP-date form of <code>retry-after</code> that a proxy can introduce, and the difference between a bucket at zero and a bucket that was never read.",
+"test_py_file": "test_github_backoff_plan.py",
+"test_py": '''from github_backoff_plan import (backoff, plan, required_wait,
+                                 retry_after_seconds, wasted_requests)
+
+NOW = 1756512000.0  # 2025-08-30T00:00:00Z
+
+
+def test_retry_after_reads_the_integer_form():
+    assert retry_after_seconds("120", NOW) == 120.0
+    assert retry_after_seconds(" 60 ", NOW) == 60.0
+
+
+def test_retry_after_reads_the_http_date_form_a_proxy_may_substitute():
+    assert retry_after_seconds("Sat, 30 Aug 2025 00:02:00 GMT", NOW) == 120.0
+
+
+def test_a_retry_after_already_in_the_past_is_zero_not_negative():
+    assert retry_after_seconds("Fri, 29 Aug 2025 23:00:00 GMT", NOW) == 0.0
+
+
+def test_an_unparseable_retry_after_is_absent_rather_than_zero():
+    assert retry_after_seconds("soon", NOW) is None
+    assert retry_after_seconds(None, NOW) is None
+    assert retry_after_seconds("", NOW) is None
+
+
+def test_retry_after_wins_over_the_reset_timestamp():
+    # A secondary limit fires with the hourly bucket untouched, so the reset
+    # timestamp is describing an hour that has nothing to do with this refusal.
+    seconds, source, _ = required_wait(403, {
+        "Retry-After": "120",
+        "X-RateLimit-Remaining": "4870",
+        "X-RateLimit-Reset": str(int(NOW + 3000)),
+    }, NOW)
+    assert source == "retry-after"
+    assert seconds == 120.0
+
+
+def test_an_empty_bucket_falls_through_to_the_reset_timestamp():
+    seconds, source, detail = required_wait(403, {
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": str(int(NOW + 1800)),
+    }, NOW)
+    assert source == "x-ratelimit-reset"
+    assert seconds == 1800.0
+    assert "hourly quota" in detail
+
+
+def test_a_bucket_with_headroom_and_no_retry_after_uses_the_floor():
+    seconds, source, _ = required_wait(429, {"x-ratelimit-remaining": "4900"}, NOW)
+    assert source == "floor"
+    assert seconds == 60.0
+
+
+def test_a_response_that_is_not_throttled_asks_for_no_wait():
+    seconds, source, _ = required_wait(200, {"retry-after": "120"}, NOW)
+    assert source == "none"
+    assert seconds == 0.0
+
+
+def test_backoff_doubles_and_then_stops_at_the_cap():
+    assert [backoff(i) for i in range(5)] == [1.0, 2.0, 4.0, 8.0, 16.0]
+    assert backoff(20) == 60.0
+    assert backoff(-3) == 1.0
+
+
+def test_wasted_requests_counts_what_fits_inside_the_wait():
+    assert wasted_requests(120, 1) == 120
+    assert wasted_requests(120, 30) == 4
+    assert wasted_requests(0, 1) == 0
+
+
+def test_wasted_requests_survives_a_nonsense_interval():
+    assert wasted_requests(120, 0) == 0
+    assert wasted_requests(120, -5) == 0
+
+
+def test_a_one_second_retry_inside_a_two_minute_wait_is_hammering():
+    state, report = plan(403, {"retry-after": "120"}, NOW, 1.0)
+    assert state == "hammering"
+    assert report["wasted_requests"] == 120
+    assert report["source"] == "retry-after"
+
+
+def test_a_client_that_waits_longer_than_asked_has_honoured_it():
+    state, report = plan(403, {"retry-after": "120"}, NOW, 300.0)
+    assert state == "honoured"
+    assert report["wasted_requests"] == 0
+
+
+def test_a_few_retries_inside_the_window_are_impatient_not_hammering():
+    state, _ = plan(429, {"retry-after": "120"}, NOW, 30.0)
+    assert state == "impatient"
+
+
+def test_an_untroubled_response_reports_nothing_to_do():
+    state, report = plan(200, {}, NOW, 1.0)
+    assert state == "not-throttled"
+    assert report["wait_seconds"] == 0.0
+''',
+"test_js_file": "github-backoff-plan.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  backoff, plan, requiredWait, retryAfterSeconds, wastedRequests,
+} from './github-backoff-plan.mjs';
+
+const NOW = 1756512000; // 2025-08-30T00:00:00Z
+
+test('retry-after reads the integer form', () => {
+  assert.equal(retryAfterSeconds('120', NOW), 120);
+  assert.equal(retryAfterSeconds(' 60 ', NOW), 60);
+});
+
+test('retry-after reads the HTTP-date form a proxy may substitute', () => {
+  assert.equal(retryAfterSeconds('Sat, 30 Aug 2025 00:02:00 GMT', NOW), 120);
+});
+
+test('a retry-after already in the past is zero, not negative', () => {
+  assert.equal(retryAfterSeconds('Fri, 29 Aug 2025 23:00:00 GMT', NOW), 0);
+});
+
+test('an unparseable retry-after is absent rather than zero', () => {
+  assert.equal(retryAfterSeconds('soon', NOW), null);
+  assert.equal(retryAfterSeconds(null, NOW), null);
+  assert.equal(retryAfterSeconds('', NOW), null);
+});
+
+test('retry-after wins over the reset timestamp', () => {
+  const [seconds, source] = requiredWait(403, {
+    'Retry-After': '120',
+    'X-RateLimit-Remaining': '4870',
+    'X-RateLimit-Reset': String(NOW + 3000),
+  }, NOW);
+  assert.equal(source, 'retry-after');
+  assert.equal(seconds, 120);
+});
+
+test('an empty bucket falls through to the reset timestamp', () => {
+  const [seconds, source, detail] = requiredWait(403, {
+    'x-ratelimit-remaining': '0',
+    'x-ratelimit-reset': String(NOW + 1800),
+  }, NOW);
+  assert.equal(source, 'x-ratelimit-reset');
+  assert.equal(seconds, 1800);
+  assert.match(detail, /hourly quota/);
+});
+
+test('a bucket with headroom and no retry-after uses the floor', () => {
+  const [seconds, source] = requiredWait(429, { 'x-ratelimit-remaining': '4900' }, NOW);
+  assert.equal(source, 'floor');
+  assert.equal(seconds, 60);
+});
+
+test('a response that is not throttled asks for no wait', () => {
+  const [seconds, source] = requiredWait(200, { 'retry-after': '120' }, NOW);
+  assert.equal(source, 'none');
+  assert.equal(seconds, 0);
+});
+
+test('backoff doubles and then stops at the cap', () => {
+  assert.deepEqual([0, 1, 2, 3, 4].map((i) => backoff(i)), [1, 2, 4, 8, 16]);
+  assert.equal(backoff(20), 60);
+  assert.equal(backoff(-3), 1);
+});
+
+test('wastedRequests counts what fits inside the wait', () => {
+  assert.equal(wastedRequests(120, 1), 120);
+  assert.equal(wastedRequests(120, 30), 4);
+  assert.equal(wastedRequests(0, 1), 0);
+});
+
+test('wastedRequests survives a nonsense interval', () => {
+  assert.equal(wastedRequests(120, 0), 0);
+  assert.equal(wastedRequests(120, -5), 0);
+});
+
+test('a one-second retry inside a two-minute wait is hammering', () => {
+  const [state, report] = plan(403, { 'retry-after': '120' }, NOW, 1);
+  assert.equal(state, 'hammering');
+  assert.equal(report.wasted_requests, 120);
+  assert.equal(report.source, 'retry-after');
+});
+
+test('a client that waits longer than asked has honoured it', () => {
+  const [state, report] = plan(403, { 'retry-after': '120' }, NOW, 300);
+  assert.equal(state, 'honoured');
+  assert.equal(report.wasted_requests, 0);
+});
+
+test('a few retries inside the window are impatient, not hammering', () => {
+  assert.equal(plan(429, { 'retry-after': '120' }, NOW, 30)[0], 'impatient');
+});
+
+test('an untroubled response reports nothing to do', () => {
+  const [state, report] = plan(200, {}, NOW, 1);
+  assert.equal(state, 'not-throttled');
+  assert.equal(report.wait_seconds, 0);
+});
+''',
+"faq": [
+ ("Does GitHub always send retry-after when it throttles me?",
+  "No. Secondary limits normally carry it; primary exhaustion normally does not, and signals the wait through x-ratelimit-remaining being 0 plus x-ratelimit-reset instead. That is why the branch order matters and why a client that reads only one of the two headers handles half its throttles well and the other half not at all."),
+ ("Can a script tell whether my client honours retry-after?",
+  "Not through the API. GitHub sees your requests, not your code, and exposes nothing about your retry behaviour; that is a genuine blind spot for a read-only observer. What the script does instead is take a throttled response you captured and put the required wait next to the number of retries your current interval would fit inside it, which is the same argument made with a number."),
+ ("Is it safe to just sleep for an hour whenever I see a 403?",
+  "Safe, and usually far more than you need. A secondary limit often clears in a couple of minutes, so an unconditional hour turns a small pause into an outage. Read the headers: they distinguish a two-minute wait from a fifty-minute one, and the whole point is that you do not have to guess."),
+ ("Why does the throttle last longer than the retry-after value said?",
+  "Because the requests you sent while waiting counted. Secondary limits throttle burst behaviour, and retries during the penalty window are burst behaviour, so a client that keeps trying keeps re-arming the limit. Honouring the header exactly is not politeness; it is the shortest path back to working."),
+ ("Should I add jitter even when I have a retry-after value?",
+  "Not to that value; sleep it exactly. Jitter belongs to the fallback schedule, where several workers would otherwise wake at identical moments and re-create the burst that was throttled. A retry-after is a specific instruction and every worker obeying it lands at the same time by design, which is fine because that time is one GitHub chose."),
+],
+"related": [
+ ("/github/secondary-limit-concurrency/", "Over 100 concurrent requests trips a limit"),
+ ("/github/secondary-limit-content-creation/", "Bulk creation exceeds 80 a minute"),
+ ("/github/no-conditional-requests/", "Polling without ETags spends full quota"),
+],
+"citations": [CITE_BEST, CITE_REST_LIMITS, CITE_TROUBLESHOOT, CITE_RATE_ENDPOINT],
+},
+
+
+{
+"slug": "no-conditional-requests",
+"title": "Polling without ETags spends full quota on unchanged data",
+"description": "A 304 Not Modified does not count against the rate limit. Measure x-ratelimit-used before and after an If-None-Match request and the saving is exact.",
+"h1": "polling without ETags spends full quota on unchanged data",
+"category": "GitHub API",
+"pill": "Diagnostic",
+"chips": ["Read-only token", "Python and Node.js", "Tests included"],
+"keywords": ["github api etag", "github if-none-match 304",
+             "github conditional requests rate limit", "github 304 not modified quota",
+             "github api reduce rate limit usage"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "The dashboard polls eight endpoints every thirty seconds and burns through 5,000 requests before lunch. Almost nothing it fetches has changed. GitHub has been sending an <code>etag</code> on every one of those responses, and every response that comes back <code>304 Not Modified</code> is free &mdash; it does not count against the rate limit at all. This is the one problem in this section where the fix pays for itself in a number you can print.",
+"short_answer": """<p>Every response carries an <code>etag</code>. Send it back as <code>If-None-Match</code> and an unchanged resource answers <code>304 Not Modified</code> with an empty body, and <strong>that response does not count against your primary rate limit</strong>.</p>
+<p>You do not have to take that on trust. <code>x-ratelimit-used</code> comes back on every response, so make the request twice &mdash; once plain, once conditional &mdash; and compare the two values. If the second call returned <code>304</code> and <code>used</code> did not move, the saving is proven for that endpoint, and multiplying it by your poll rate turns it into requests an hour.</p>""",
+"problem": """<p>Quota exhaustion is usually blamed on volume, so the first fix attempted is always to poll less often. That is a real cost: the dashboard gets staler, the bot reacts later, and the quota problem comes back the next time someone adds a repository. The requests were never the problem. Paying full price for answers that say "nothing changed" was.</p>
+<p>What hides it is that the wasteful version works perfectly. There is no error, no warning header, no degraded response. A poller with no conditional requests and a poller with them return identical data; the only difference is a counter neither one reads. So this survives code review indefinitely, and it is discovered when the quota runs out and every call starts returning 403 &mdash; at which point it looks like a rate-limit incident rather than a caching one.</p>
+<p>It also scales in the wrong direction. Add a repository and the poll cost grows linearly; add a repository to a conditional poller and the cost stays near zero as long as nothing changes in it. Two integrations with the same shape end up in completely different places six months later.</p>""",
+"why": """<p><strong>A 304 is free, and that is the whole mechanism.</strong> GitHub documents conditional requests as not counting against the primary rate limit. The request is still made, the round trip still happens, the bandwidth is still tiny, and <code>x-ratelimit-remaining</code> does not move. Nothing else in the API offers a discount like this.</p>
+<p><strong>The evidence is on the response you already have.</strong> <code>etag</code> comes back on essentially every GET, and <code>x-ratelimit-used</code> comes back next to it. A script can therefore measure the saving rather than assert it, which is unusual: for most of the problems in these notes the fix has to be argued for.</p>
+<p><strong>The cache key is the full request, not the path.</strong> An ETag belongs to a URL including its query string, its <code>Accept</code> header and the credential that fetched it. Change <code>per_page</code>, change the sort order, rotate the token, and the stored ETag stops matching &mdash; the request is billed again and nobody notices, because a <code>200</code> is not an error. Keeping request parameters stable is part of the fix, not an optimisation on top of it.</p>
+<p><strong><code>304</code> is not a failure and clients keep treating it as one.</strong> Some HTTP libraries raise on any non-2xx, and a wrapper written for that behaviour turns the cheapest response in the API into an exception. The handling is one branch: on 304, keep what you already have.</p>
+<p><strong>Some endpoints support <code>last-modified</code> instead or as well.</strong> Where an <code>etag</code> is absent, <code>if-modified-since</code> against the <code>last-modified</code> value does the same job. Where both are present, the ETag is the stronger validator and is what you should send.</p>""",
+"steps": [
+ {"h": "Fetch the endpoint once and keep two numbers",
+  "body": """<p>Make the request your integration already makes and record <code>etag</code> and <code>x-ratelimit-used</code> from the response. If there is no <code>etag</code>, look for <code>last-modified</code>; if neither is present, this endpoint cannot be cached and the saving does not apply to it.</p>"""},
+ {"h": "Repeat it with If-None-Match and read x-ratelimit-used again",
+  "body": """<p>Send the exact ETag string back, quotes and any <code>W/</code> prefix included. An unchanged resource answers <code>304</code> with no body. Subtract the two <code>used</code> values: a difference of zero is the measurement this whole note exists to produce.</p>"""},
+ {"h": "Multiply by your real poll rate",
+  "body": """<p>Eight endpoints every thirty seconds is 960 requests an hour, roughly a fifth of a 5,000-request budget, spent almost entirely on unchanged data. The same schedule with conditional requests costs close to nothing until something actually changes. That is the number to put in the pull request.</p>"""},
+ {"h": "Store the ETag per URL and per credential",
+  "body": """<p>Key the cache on the full request &mdash; path plus query string plus <code>Accept</code> &mdash; and on the token that fetched it, because ETags are scoped to the credential. A rotation that silently invalidates the whole cache produces a quota spike with no error to explain it.</p>"""},
+ {"h": "Treat 304 as data, not as an error",
+  "body": """<p>On <code>304</code>, return the previously stored representation and do nothing else. Check that your HTTP client is not configured to raise on non-2xx, and that nothing between you and GitHub is stripping or rewriting the header: a proxy that drops <code>If-None-Match</code> turns every conditional request back into a billed one, which the measurement above will show as a <code>200</code> where a <code>304</code> was expected.</p>"""},
+],
+"verify": """<p>Run the script against an endpoint your integration polls. A confirmed saving reports the conditional request as free and prices the current poll rate against the quota.</p>
+<pre><code class="language-bash">python3 github_etag_saving.py --repo acme/api --path /issues --poll-seconds 30 --endpoints 8
+# free: the 304 cost 0 request(s); 960/hour becomes 0/hour, 19.2% of quota returned</code></pre>""",
+"code_intro": "Two GETs, three header values, one subtraction. The measurement is the point, so <code>measure()</code> takes the two responses already reduced to <code>status</code>, <code>etag</code> and <code>used</code> and returns a verdict without touching the network &mdash; which lets the tests cover the cases you cannot arrange on demand, including the awkward one where the endpoint answers <code>200</code> to a conditional request because a proxy dropped the header.",
+"py_file": "github_etag_saving.py",
+"py": '''"""Measure what conditional requests would save against the GitHub rate limit.
+
+Read only. Two GETs against one endpoint: the second sends If-None-Match with the
+ETag the first returned. A 304 Not Modified does not count against the primary
+rate limit, and x-ratelimit-used on both responses proves it rather than
+asserting it.
+"""
+import argparse
+import logging
+import os
+import sys
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("github_etag_saving")
+
+API = "https://api.github.com"
+UA = "github-etag-saving/1.0"
+
+DEFAULT_LIMIT = 5000
+
+
+def measure(first, second):
+    """Compare a plain response with the conditional one that followed. Pure.
+
+    Each argument is {"status": int, "etag": str|None, "used": int|None}. Returns
+    (state, report). The states are deliberately separate because they have
+    nothing in common: an endpoint that sends no ETag cannot be cached at all, an
+    endpoint that answers 200 to a conditional request is being interfered with,
+    and a 304 that still increments used would mean the documented discount did
+    not apply.
+    """
+    etag = (first or {}).get("etag")
+    before = (first or {}).get("used")
+    after = (second or {}).get("used")
+    status = (second or {}).get("status")
+
+    try:
+        delta = int(after) - int(before)
+    except (TypeError, ValueError):
+        delta = None
+
+    report = {"etag": etag, "used_before": before, "used_after": after,
+              "cost_of_unchanged_poll": delta,
+              "first_status": (first or {}).get("status"), "second_status": status}
+
+    if not etag:
+        return ("no-etag", report)
+    if status != 304:
+        return ("not-honoured", report)
+    if delta is None:
+        return ("unmeasured", report)
+    if delta > 0:
+        return ("billed", report)
+    return ("free", report)
+
+
+def project(poll_seconds, endpoints, limit=DEFAULT_LIMIT, unchanged_fraction=1.0):
+    """Price a polling schedule with and without conditional requests. Pure.
+
+    unchanged_fraction is how much of what you poll is typically unchanged. At
+    1.0 every poll is a 304 and costs nothing; at 0.0 nothing is cacheable and
+    conditional requests save nothing, which is the honest end of the range.
+    """
+    poll_seconds = max(1.0, float(poll_seconds))
+    endpoints = max(1, int(endpoints))
+    limit = max(1, int(limit))
+    fraction = min(1.0, max(0.0, float(unchanged_fraction)))
+
+    without = (3600.0 / poll_seconds) * endpoints
+    with_etags = without * (1.0 - fraction)
+    return {"per_hour_without": round(without, 1),
+            "per_hour_with": round(with_etags, 1),
+            "saved_per_hour": round(without - with_etags, 1),
+            "percent_without": round(100.0 * without / limit, 1),
+            "percent_with": round(100.0 * with_etags / limit, 1),
+            "limit": limit}
+
+
+def verdict(state, projection):
+    """Turn the measurement and the projection into one line. Pure."""
+    saved = (projection or {}).get("saved_per_hour", 0)
+    percent = (projection or {}).get("percent_without", 0)
+
+    if state == "no-etag":
+        return ("unavailable",
+                "the response carried no etag, so this endpoint cannot be polled "
+                "conditionally. Check last-modified and use if-modified-since "
+                "where it is present.")
+    if state == "not-honoured":
+        return ("ignored",
+                "the conditional request came back 200 rather than 304. Either "
+                "the resource genuinely changed between the two calls, or "
+                "something between this client and GitHub is dropping the "
+                "If-None-Match header, which silently reinstates the full cost.")
+    if state == "billed":
+        return ("billed",
+                "the 304 arrived and x-ratelimit-used still moved, which is not "
+                "how conditional requests are documented to behave. Re-run "
+                "before acting on it: another process sharing this token spends "
+                "the same counter.")
+    if state == "unmeasured":
+        return ("unmeasured",
+                "the 304 arrived but x-ratelimit-used was missing from one of "
+                "the responses, so the saving is real and its size is not "
+                "measured here.")
+    return ("saving" if percent < 25 else "large-saving",
+            "the 304 cost 0 request(s). At this poll rate that is %.0f request(s) "
+            "an hour, %.1f%% of the quota, currently spent on data that did not "
+            "change." % (saved, percent))
+
+
+def read(response):
+    """Reduce a response to the three fields the measurement needs."""
+    headers = {k.lower(): v for k, v in response.headers.items()}
+    try:
+        used = int(headers.get("x-ratelimit-used"))
+    except (TypeError, ValueError):
+        used = None
+    return {"status": response.status_code, "etag": headers.get("etag"),
+            "used": used, "last_modified": headers.get("last-modified"),
+            "limit": headers.get("x-ratelimit-limit")}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repo", required=True, help="owner/name")
+    ap.add_argument("--path", default="/issues",
+                    help="path under the repository to probe, e.g. /issues")
+    ap.add_argument("--poll-seconds", type=float, default=60.0,
+                    help="how often your integration polls this endpoint")
+    ap.add_argument("--endpoints", type=int, default=1,
+                    help="how many endpoints are polled on that schedule")
+    ap.add_argument("--unchanged", type=float, default=1.0,
+                    help="fraction of polls that find nothing changed (0 to 1)")
+    args = ap.parse_args()
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        log.error("set GITHUB_TOKEN (a read-only token is enough)")
+        return 2
+
+    owner, _, name = args.repo.partition("/")
+    if not (owner and name):
+        log.error("--repo takes owner/name, for example acme/api")
+        return 2
+
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": UA,
+    })
+
+    url = "%s/repos/%s/%s%s" % (API, owner, name, args.path)
+    log.info("probing %s twice: once plain, once with If-None-Match", url)
+
+    plain = session.get(url, timeout=30)
+    if plain.status_code == 401:
+        log.error("401 from GitHub: GITHUB_TOKEN is missing, expired or malformed")
+        return 2
+    if plain.status_code in (403, 404):
+        log.error("%d from %s: this token cannot read that endpoint. GitHub "
+                  "answers 404 rather than 403 when a token cannot see a "
+                  "resource at all.", plain.status_code, url)
+        return 2
+    first = read(plain)
+    log.info("  plain:       %d, etag %s, x-ratelimit-used %s",
+             first["status"], first["etag"], first["used"])
+
+    second = first
+    if first["etag"]:
+        conditional = session.get(url, timeout=30,
+                                  headers={"If-None-Match": first["etag"]})
+        second = read(conditional)
+        log.info("  conditional: %d, x-ratelimit-used %s",
+                 second["status"], second["used"])
+    elif first["last_modified"]:
+        log.warning("  no etag, but last-modified is %s: use if-modified-since "
+                    "on this endpoint instead", first["last_modified"])
+
+    state, report = measure(first, second)
+    limit = DEFAULT_LIMIT
+    try:
+        limit = int(first["limit"])
+    except (TypeError, ValueError):
+        pass
+
+    projection = project(args.poll_seconds, args.endpoints, limit, args.unchanged)
+    level, detail = verdict(state, projection)
+    log.info("%s: %s", level, detail)
+    log.info("  %.0f request(s)/hour now (%.1f%% of %d), %.0f/hour with "
+             "conditional requests (%.1f%%)",
+             projection["per_hour_without"], projection["percent_without"],
+             projection["limit"], projection["per_hour_with"],
+             projection["percent_with"])
+
+    if level in ("saving", "large-saving"):
+        log.info("  repair: store %s against this exact URL and credential, send "
+                 "it back as If-None-Match, and treat 304 as 'keep what you "
+                 "have' rather than as an error.", report["etag"])
+        log.info("  repair: keep per_page, sort and Accept stable, and key the "
+                 "cache by token: an ETag is scoped to the credential that "
+                 "fetched it, so a rotation invalidates every entry at once.")
+    return 0 if level in ("saving", "large-saving", "unavailable") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "github-etag-saving.mjs",
+"js": '''/**
+ * Measure what conditional requests would save against the GitHub rate limit.
+ *
+ * Read only. Two GETs against one endpoint: the second sends If-None-Match with
+ * the ETag the first returned. A 304 Not Modified does not count against the
+ * primary rate limit, and x-ratelimit-used on both responses proves it.
+ */
+const API = 'https://api.github.com';
+const UA = 'github-etag-saving/1.0';
+
+export const DEFAULT_LIMIT = 5000;
+
+/**
+ * Compare a plain response with the conditional one that followed. Pure.
+ * Each argument is { status, etag, used }. Returns [state, report].
+ */
+export function measure(first, second) {
+  const etag = first?.etag ?? null;
+  const before = first?.used;
+  const after = second?.used;
+  const status = second?.status;
+
+  const parsedBefore = Number.parseInt(before, 10);
+  const parsedAfter = Number.parseInt(after, 10);
+  const delta = (Number.isFinite(parsedBefore) && Number.isFinite(parsedAfter))
+    ? parsedAfter - parsedBefore : null;
+
+  const report = {
+    etag,
+    used_before: before ?? null,
+    used_after: after ?? null,
+    cost_of_unchanged_poll: delta,
+    first_status: first?.status ?? null,
+    second_status: status ?? null,
+  };
+
+  if (!etag) return ['no-etag', report];
+  if (status !== 304) return ['not-honoured', report];
+  if (delta === null) return ['unmeasured', report];
+  if (delta > 0) return ['billed', report];
+  return ['free', report];
+}
+
+/**
+ * Price a polling schedule with and without conditional requests. Pure.
+ * unchangedFraction is how much of what you poll is typically unchanged.
+ */
+export function project(pollSeconds, endpoints, limit = DEFAULT_LIMIT, unchangedFraction = 1) {
+  const seconds = Math.max(1, Number(pollSeconds));
+  const count = Math.max(1, Math.trunc(endpoints));
+  const cap = Math.max(1, Math.trunc(limit));
+  const fraction = Math.min(1, Math.max(0, Number(unchangedFraction)));
+
+  const without = (3600 / seconds) * count;
+  const withEtags = without * (1 - fraction);
+  const round = (n) => Math.round(n * 10) / 10;
+  return {
+    per_hour_without: round(without),
+    per_hour_with: round(withEtags),
+    saved_per_hour: round(without - withEtags),
+    percent_without: round(100 * without / cap),
+    percent_with: round(100 * withEtags / cap),
+    limit: cap,
+  };
+}
+
+/** Turn the measurement and the projection into one line. Pure. */
+export function verdict(state, projection) {
+  const saved = projection?.saved_per_hour ?? 0;
+  const percent = projection?.percent_without ?? 0;
+
+  if (state === 'no-etag') {
+    return ['unavailable',
+      'the response carried no etag, so this endpoint cannot be polled ' +
+      'conditionally. Check last-modified and use if-modified-since where it ' +
+      'is present.'];
+  }
+  if (state === 'not-honoured') {
+    return ['ignored',
+      'the conditional request came back 200 rather than 304. Either the ' +
+      'resource genuinely changed between the two calls, or something between ' +
+      'this client and GitHub is dropping the If-None-Match header, which ' +
+      'silently reinstates the full cost.'];
+  }
+  if (state === 'billed') {
+    return ['billed',
+      'the 304 arrived and x-ratelimit-used still moved, which is not how ' +
+      'conditional requests are documented to behave. Re-run before acting on ' +
+      'it: another process sharing this token spends the same counter.'];
+  }
+  if (state === 'unmeasured') {
+    return ['unmeasured',
+      'the 304 arrived but x-ratelimit-used was missing from one of the ' +
+      'responses, so the saving is real and its size is not measured here.'];
+  }
+  return [percent < 25 ? 'saving' : 'large-saving',
+    `the 304 cost 0 request(s). At this poll rate that is ${Math.round(saved)} ` +
+    `request(s) an hour, ${percent}% of the quota, currently spent on data that ` +
+    'did not change.'];
+}
+
+function read(res) {
+  const headers = {};
+  for (const [k, v] of res.headers.entries()) headers[k.toLowerCase()] = v;
+  const used = Number.parseInt(headers['x-ratelimit-used'], 10);
+  return {
+    status: res.status,
+    etag: headers.etag ?? null,
+    used: Number.isFinite(used) ? used : null,
+    last_modified: headers['last-modified'] ?? null,
+    limit: headers['x-ratelimit-limit'] ?? null,
+  };
+}
+
+function head(token, extra = {}) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': UA,
+    ...extra,
+  };
+}
+
+async function main() {
+  const repo = process.argv[2];
+  const path = process.argv[3] ?? '/issues';
+  const pollSeconds = Number.parseFloat(process.argv[4] ?? '60') || 60;
+  const endpoints = Number.parseInt(process.argv[5] ?? '1', 10) || 1;
+  const token = process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    console.error('set GITHUB_TOKEN (a read-only token is enough)');
+    process.exitCode = 2;
+    return;
+  }
+  if (!repo || !repo.includes('/')) {
+    console.error('usage: node github-etag-saving.mjs owner/name [/path] ' +
+      '[pollSeconds] [endpoints]');
+    process.exitCode = 2;
+    return;
+  }
+
+  const url = `${API}/repos/${repo}${path}`;
+  console.log(`probing ${url} twice: once plain, once with If-None-Match`);
+
+  const plain = await fetch(url, { headers: head(token) });
+  if (plain.status === 401) {
+    console.error('401 from GitHub: GITHUB_TOKEN is missing, expired or malformed');
+    process.exitCode = 2;
+    return;
+  }
+  if (plain.status === 403 || plain.status === 404) {
+    console.error(`${plain.status} from ${url}: this token cannot read that ` +
+      'endpoint. GitHub answers 404 rather than 403 when a token cannot see a ' +
+      'resource at all.');
+    process.exitCode = 2;
+    return;
+  }
+  const first = read(plain);
+  console.log(`  plain:       ${first.status}, etag ${first.etag}, ` +
+    `x-ratelimit-used ${first.used}`);
+
+  let second = first;
+  if (first.etag) {
+    const conditional = await fetch(url, {
+      headers: head(token, { 'If-None-Match': first.etag }),
+    });
+    second = read(conditional);
+    console.log(`  conditional: ${second.status}, x-ratelimit-used ${second.used}`);
+  } else if (first.last_modified) {
+    console.warn(`  no etag, but last-modified is ${first.last_modified}: use ` +
+      'if-modified-since on this endpoint instead');
+  }
+
+  const [state, report] = measure(first, second);
+  const limit = Number.parseInt(first.limit, 10) || DEFAULT_LIMIT;
+  const projection = project(pollSeconds, endpoints, limit, 1);
+  const [level, detail] = verdict(state, projection);
+  console.log(`${level}: ${detail}`);
+  console.log(`  ${projection.per_hour_without} request(s)/hour now ` +
+    `(${projection.percent_without}% of ${projection.limit}), ` +
+    `${projection.per_hour_with}/hour with conditional requests ` +
+    `(${projection.percent_with}%)`);
+
+  if (level === 'saving' || level === 'large-saving') {
+    console.log(`  repair: store ${report.etag} against this exact URL and ` +
+      "credential, send it back as If-None-Match, and treat 304 as 'keep what " +
+      "you have' rather than as an error.");
+    console.log('  repair: keep per_page, sort and Accept stable, and key the ' +
+      'cache by token: an ETag is scoped to the credential that fetched it, so ' +
+      'a rotation invalidates every entry at once.');
+  }
+  process.exitCode = ['saving', 'large-saving', 'unavailable'].includes(level) ? 0 : 1;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing token, and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "The measurement has one honest outcome and three dishonest ones, and the tests exist to keep them apart. A <code>200</code> where a <code>304</code> was expected is not a saving that failed to materialise, it is a header that did not arrive. A missing <code>etag</code> is not a bug in the endpoint. And a <code>304</code> whose <code>used</code> counter moved anyway is most likely another process spending the same shared quota, which the report has to say rather than quietly reporting a smaller saving.",
+"test_py_file": "test_github_etag_saving.py",
+"test_py": '''from github_etag_saving import measure, project, verdict
+
+ETAG = 'W/"6c1a2f9e0b7d4a3c"'
+
+
+def response(status, etag=ETAG, used=None):
+    return {"status": status, "etag": etag, "used": used}
+
+
+def test_a_304_that_did_not_move_the_counter_is_the_finding():
+    state, report = measure(response(200, used=101), response(304, used=101))
+    assert state == "free"
+    assert report["cost_of_unchanged_poll"] == 0
+    assert report["etag"] == ETAG
+
+
+def test_an_endpoint_with_no_etag_cannot_be_polled_conditionally():
+    state, _ = measure(response(200, etag=None, used=10), response(200, used=11))
+    assert state == "no-etag"
+
+
+def test_a_200_answer_to_a_conditional_request_is_its_own_finding():
+    # A proxy that strips If-None-Match reinstates the full cost silently.
+    state, report = measure(response(200, used=10), response(200, used=11))
+    assert state == "not-honoured"
+    assert report["cost_of_unchanged_poll"] == 1
+
+
+def test_a_304_that_still_billed_is_reported_rather_than_smoothed_over():
+    state, report = measure(response(200, used=10), response(304, used=12))
+    assert state == "billed"
+    assert report["cost_of_unchanged_poll"] == 2
+
+
+def test_a_missing_used_header_leaves_the_saving_unmeasured():
+    state, report = measure(response(200, used=None), response(304, used=None))
+    assert state == "unmeasured"
+    assert report["cost_of_unchanged_poll"] is None
+
+
+def test_the_projection_prices_a_real_polling_schedule():
+    p = project(30, 8, 5000, 1.0)
+    assert p["per_hour_without"] == 960.0
+    assert p["per_hour_with"] == 0.0
+    assert p["saved_per_hour"] == 960.0
+    assert p["percent_without"] == 19.2
+
+
+def test_a_partly_changing_workload_saves_only_part_of_it():
+    p = project(60, 1, 5000, 0.75)
+    assert p["per_hour_without"] == 60.0
+    assert p["per_hour_with"] == 15.0
+    assert p["saved_per_hour"] == 45.0
+
+
+def test_nothing_unchanged_means_nothing_saved():
+    p = project(60, 1, 5000, 0.0)
+    assert p["saved_per_hour"] == 0.0
+
+
+def test_the_projection_refuses_nonsense_inputs_instead_of_dividing_by_zero():
+    p = project(0, 0, 0, 5.0)
+    assert p["limit"] == 1
+    assert p["per_hour_without"] == 3600.0
+    assert p["per_hour_with"] == 0.0
+
+
+def test_a_large_share_of_quota_is_called_out_as_such():
+    level, detail = verdict("free", project(30, 8, 5000, 1.0))
+    assert level == "saving"
+    assert "19.2%" in detail
+    assert verdict("free", project(10, 8, 5000, 1.0))[0] == "large-saving"
+
+
+def test_each_unhappy_state_names_a_different_repair():
+    assert verdict("no-etag", project(60, 1))[0] == "unavailable"
+    assert verdict("not-honoured", project(60, 1))[0] == "ignored"
+    assert verdict("billed", project(60, 1))[0] == "billed"
+    assert verdict("unmeasured", project(60, 1))[0] == "unmeasured"
+
+
+def test_the_ignored_state_blames_the_header_not_the_quota():
+    _, detail = verdict("not-honoured", project(60, 1))
+    assert "If-None-Match" in detail
+
+
+def test_the_billed_state_points_at_the_shared_counter():
+    _, detail = verdict("billed", project(60, 1))
+    assert "shares" in detail or "sharing" in detail
+''',
+"test_js_file": "github-etag-saving.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { measure, project, verdict } from './github-etag-saving.mjs';
+
+const ETAG = 'W/"6c1a2f9e0b7d4a3c"';
+
+const response = (status, etag = ETAG, used = null) => ({ status, etag, used });
+
+test('a 304 that did not move the counter is the finding', () => {
+  const [state, report] = measure(response(200, ETAG, 101), response(304, ETAG, 101));
+  assert.equal(state, 'free');
+  assert.equal(report.cost_of_unchanged_poll, 0);
+  assert.equal(report.etag, ETAG);
+});
+
+test('an endpoint with no etag cannot be polled conditionally', () => {
+  const [state] = measure(response(200, null, 10), response(200, ETAG, 11));
+  assert.equal(state, 'no-etag');
+});
+
+test('a 200 answer to a conditional request is its own finding', () => {
+  const [state, report] = measure(response(200, ETAG, 10), response(200, ETAG, 11));
+  assert.equal(state, 'not-honoured');
+  assert.equal(report.cost_of_unchanged_poll, 1);
+});
+
+test('a 304 that still billed is reported rather than smoothed over', () => {
+  const [state, report] = measure(response(200, ETAG, 10), response(304, ETAG, 12));
+  assert.equal(state, 'billed');
+  assert.equal(report.cost_of_unchanged_poll, 2);
+});
+
+test('a missing used header leaves the saving unmeasured', () => {
+  const [state, report] = measure(response(200, ETAG, null), response(304, ETAG, null));
+  assert.equal(state, 'unmeasured');
+  assert.equal(report.cost_of_unchanged_poll, null);
+});
+
+test('the projection prices a real polling schedule', () => {
+  const p = project(30, 8, 5000, 1);
+  assert.equal(p.per_hour_without, 960);
+  assert.equal(p.per_hour_with, 0);
+  assert.equal(p.saved_per_hour, 960);
+  assert.equal(p.percent_without, 19.2);
+});
+
+test('a partly changing workload saves only part of it', () => {
+  const p = project(60, 1, 5000, 0.75);
+  assert.equal(p.per_hour_without, 60);
+  assert.equal(p.per_hour_with, 15);
+  assert.equal(p.saved_per_hour, 45);
+});
+
+test('nothing unchanged means nothing saved', () => {
+  assert.equal(project(60, 1, 5000, 0).saved_per_hour, 0);
+});
+
+test('the projection refuses nonsense inputs instead of dividing by zero', () => {
+  const p = project(0, 0, 0, 5);
+  assert.equal(p.limit, 1);
+  assert.equal(p.per_hour_without, 3600);
+  assert.equal(p.per_hour_with, 0);
+});
+
+test('a large share of quota is called out as such', () => {
+  const [level, detail] = verdict('free', project(30, 8, 5000, 1));
+  assert.equal(level, 'saving');
+  assert.match(detail, /19\\.2%/);
+  assert.equal(verdict('free', project(10, 8, 5000, 1))[0], 'large-saving');
+});
+
+test('each unhappy state names a different repair', () => {
+  assert.equal(verdict('no-etag', project(60, 1))[0], 'unavailable');
+  assert.equal(verdict('not-honoured', project(60, 1))[0], 'ignored');
+  assert.equal(verdict('billed', project(60, 1))[0], 'billed');
+  assert.equal(verdict('unmeasured', project(60, 1))[0], 'unmeasured');
+});
+
+test('the ignored state blames the header, not the quota', () => {
+  assert.match(verdict('not-honoured', project(60, 1))[1], /If-None-Match/);
+});
+
+test('the billed state points at the shared counter', () => {
+  assert.match(verdict('billed', project(60, 1))[1], /shar/);
+});
+''',
+"faq": [
+ ("Does a 304 really cost nothing against the rate limit?",
+  "Yes, and you do not have to believe it on principle. x-ratelimit-used comes back on the 304 exactly as it does on the 200, so make the plain request, note the number, repeat with If-None-Match, and compare. A difference of zero is the measurement. That is what the script does and why its output is a number rather than a recommendation."),
+ ("Why did my conditional request come back 200 instead of 304?",
+  "Either the resource changed between the two calls, which on a busy repository is entirely possible, or the If-None-Match header did not arrive. Proxies and some HTTP client wrappers strip or rewrite conditional headers. Re-run against a quiet endpoint to tell the two apart: if a repository's metadata still answers 200 to its own ETag, something in the path is removing the header."),
+ ("Do ETags survive a token rotation?",
+  "No. An ETag is scoped to the credential that fetched it, so rotating a personal access token or minting a new installation token invalidates every cached entry at once. The symptom is a quota spike on a fixed schedule with no error attached to it, which is why the cache should be keyed by token as well as by URL."),
+ ("What about endpoints that send no etag?",
+  "Look for last-modified and send if-modified-since instead; the discount is the same. A few endpoints support neither, and for those the answer is not caching but asking less often, or replacing the poll with a webhook so GitHub tells you when something changed instead of you asking."),
+ ("Should I use conditional requests or webhooks?",
+  "Webhooks where you can, conditional requests everywhere else. A webhook removes the poll entirely; a conditional request makes the poll free. They are not alternatives so much as layers, and most integrations end up with both because there is always some state that no event describes."),
+],
+"related": [
+ ("/github/retry-after-ignored/", "Ignoring retry-after extends the throttle"),
+ ("/github/secondary-limit-concurrency/", "Over 100 concurrent requests trips a limit"),
+ ("/github/per-page-default-30/", "per_page is unset so every list costs more"),
+],
+"citations": [CITE_BEST, CITE_GETTING_STARTED, CITE_REST_LIMITS, CITE_RATE_ENDPOINT],
+},
+
 ]

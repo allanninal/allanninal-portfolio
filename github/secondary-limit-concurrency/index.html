@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Over 100 concurrent requests trips a secondary rate limit</title>
+<meta name="description" content="A fan-out of parallel GETs returns 403 while x-ratelimit-remaining still shows thousands left. That combination is the whole diagnosis.">
+<link rel="canonical" href="https://www.allanninal.dev/github/secondary-limit-concurrency/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Ni&ntilde;al">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Over 100 concurrent requests trips a secondary rate limit">
+<meta property="og:description" content="A fan-out of parallel GETs returns 403 while x-ratelimit-remaining still shows thousands left. That combination is the whole diagnosis.">
+<meta property="og:url" content="https://www.allanninal.dev/github/secondary-limit-concurrency/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Over 100 concurrent requests trips a secondary rate limit">
+<meta name="twitter:description" content="A fan-out of parallel GETs returns 403 while x-ratelimit-remaining still shows thousands left. That combination is the whole diagnosis.">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/github/assets/github.css">
+<link rel="stylesheet" href="/assets/site-nav.css">
+<link rel="stylesheet" href="/assets/site-mobile.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/github/secondary-limit-concurrency/#article","headline":"Over 100 concurrent requests trips a secondary rate limit","description":"A fan-out of parallel GETs returns 403 while x-ratelimit-remaining still shows thousands left. That combination is the whole diagnosis.","url":"https://www.allanninal.dev/github/secondary-limit-concurrency/","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.allanninal.dev/github/secondary-limit-concurrency/"},"datePublished":"2026-08-30","dateModified":"2026-08-30","inLanguage":"en","articleSection":"GitHub API","keywords":"github secondary rate limit, you have exceeded a secondary rate limit, github api 403 concurrent requests, github api concurrency limit, github api 429 retry-after","author":{"@id":"https://www.allanninal.dev/#person"},"publisher":{"@id":"https://www.allanninal.dev/#person"},"proficiencyLevel":"Intermediate","dependencies":"Python 3.9+ with requests, or Node.js 18+","citation":["https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api","https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api","https://docs.github.com/en/rest/rate-limit/rate-limit","https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api"]},{"@type":"Person","@id":"https://www.allanninal.dev/#person","name":"Allan Niñal","jobTitle":"AI and Software Engineer","url":"https://www.allanninal.dev/","sameAs":["https://www.linkedin.com/in/allanninal/","https://github.com/allanninal"]},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/github/"},{"@type":"ListItem","position":2,"name":"GitHub API","item":"https://www.allanninal.dev/github/"},{"@type":"ListItem","position":3,"name":"Over 100 concurrent requests trips a secondary rate limit","item":"https://www.allanninal.dev/github/secondary-limit-concurrency/"}]},{"@type":"FAQPage","@id":"https://www.allanninal.dev/github/secondary-limit-concurrency/#faq","mainEntity":[{"@type":"Question","name":"Can I check how close I am to a secondary rate limit before I hit one?","acceptedAnswer":{"@type":"Answer","text":"No, and this is worth being blunt about. There is no x-ratelimit-* header for secondary limits and GET /rate_limit documents itself as reporting primary quota only. A secondary limit becomes observable at the moment you exceed it, in the body of the 403 or 429 and in the retry-after header on it. Anything that claims to show you secondary headroom is inferring from your own request pattern, not reading a number GitHub published."}},{"@type":"Question","name":"Why does x-ratelimit-remaining still show thousands when I am being refused?","acceptedAnswer":{"@type":"Answer","text":"Because it is describing a different limit. The hourly bucket counts requests over an hour; the secondary limits count bursts, concurrency and CPU time. You can spend two hundred requests in one second and still hold 4,800 of your 5,000. That mismatch is not a bug in the headers, it is the single most reliable way to tell the two failures apart, which is why the classifier branches on it."}},{"@type":"Question","name":"Does GraphQL have its own concurrency allowance?","acceptedAnswer":{"@type":"Answer","text":"No. The 100-concurrent-request ceiling is shared across REST and GraphQL, even though the two have entirely separate primary buckets. A job that runs REST calls and GraphQL queries in parallel is spending one concurrency budget from two places, which is a common way to trip this while both point counters look healthy."}},{"@type":"Question","name":"Is the probe safe to run against production credentials?","acceptedAnswer":{"@type":"Answer","text":"It only issues GETs, and its default endpoint is GET /rate_limit, which does not count against the primary rate limit. The concurrency argument is clamped at the documented ceiling, because deliberately exceeding it spends a quota that is shared with every other process using that token in order to learn something the documentation already states."}},{"@type":"Question","name":"What concurrency should I actually use?","acceptedAnswer":{"@type":"Answer","text":"Lower than you think, and fixed rather than derived from the input. Five to ten in flight is comfortable for reads and leaves room for whatever else holds the same token; anything that creates content should be serialised to one at a time with a pause between items. The important change is not the number, it is that the number stops being repos.length."}}]}]}</script>
+</head>
+<body>
+<div class="anx-root">
+<a class="anx-skip" href="#main">Skip to content</a>
+<header class="anx-header">
+  <div class="anx-bar">
+    <a class="anx-brand" href="/" aria-label="Allan Ni&ntilde;al &mdash; home">
+      <span class="anx-brand__mark"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 7 5 12l4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 7 19 12l-4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/></svg></span>
+      <span class="anx-brand__text">allanninal<span class="anx-brand__dim">.dev</span><span class="anx-brand__section">/github</span></span>
+    </a>
+
+    <nav class="anx-nav" aria-label="Primary">
+      <a class="anx-link" href="/">Home</a>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-work" aria-haspopup="true">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel" id="anx-work" hidden><p class="anx-panel__title">What I build</p><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+      </div>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-guides" aria-haspopup="true">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel anx-panel--wide" id="anx-guides" hidden><div class="anx-panel__group"><p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/" aria-current="page">GitHub API<span class="anx-item__note">16</span></a><a class="anx-item" href="/slack/">Slack<span class="anx-item__note">12</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">16</span></a></div></div>
+      </div>
+      <a class="anx-link" href="/blog/">Blog</a>
+      <a class="anx-link" href="/#about">About</a>
+    </nav>
+
+    <div class="anx-actions">
+      <a class="anx-icon" href="https://github.com/allanninal" rel="me noopener" target="_blank" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg></a>
+      <a class="anx-cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Collaborate</a>
+      <button class="anx-burger" type="button" aria-expanded="false" aria-controls="anx-drawer" aria-label="Open menu">
+        <span class="anx-burger__box" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="anx-drawer" id="anx-drawer" hidden>
+    <a class="anx-drawer__cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Open for collaboration</a>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/">Home</a></div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-work">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-work" hidden><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+    </div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-guides">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-guides" hidden>
+        <p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a>
+        <p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a>
+        <p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/" aria-current="page">GitHub API<span class="anx-item__note">16</span></a><a class="anx-item" href="/slack/">Slack<span class="anx-item__note">12</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">16</span></a>
+      </div>
+    </div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/blog/">Blog</a></div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/#about">About</a></div>
+    <div class="anx-drawer__foot">
+      <a href="https://github.com/allanninal" rel="me noopener" target="_blank"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg>GitHub</a>
+      <a href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">LinkedIn</a>
+      <a href="https://ko-fi.com/allanninal" rel="noopener" target="_blank">Ko-fi</a>
+    </div>
+  </div>
+</header>
+</div>
+<main id="main">
+<section class="hero">
+<div class="container prose">
+<p class="breadcrumbs"><a href="/github/">Field notes</a> / GitHub API</p>
+<p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> GitHub API</p>
+<h1>over 100 concurrent requests trips a secondary rate limit</h1>
+<p class="lead">Someone replaces a <code>for</code> loop with a <code>Promise.all</code> and the job goes from nine minutes to forty seconds, once. The next run returns <code>403</code> on two thirds of the requests. You check the quota, because a 403 from GitHub means the quota, and the quota says four thousand eight hundred requests left. Both numbers are true. They are about different limits.</p>
+<div class="meta">
+<span class="chip">Read-only token</span>
+<span class="chip">Python and Node.js</span>
+<span class="chip">Tests included</span>
+</div>
+</div>
+</section>
+
+<div class="container prose">
+<figure class="feature-img">
+<img src="/github/assets/img/secondary-limit-concurrency/feature.jpg" alt="Grey shopping cart" width="1200" height="630" loading="eager" decoding="async">
+<figcaption>Photo by <a href="https://unsplash.com/@bruno_kelzer?utm_source=allanninal_dev?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Bruno Kelzer</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+</figure>
+<div class="callout callout--note" id="short-answer">
+<div class="callout__title">The short answer</div>
+<p>Read the body, not just the status. A <code>403</code> or <code>429</code> whose JSON message contains <code>"You have exceeded a secondary rate limit"</code> <strong>while <code>x-ratelimit-remaining</code> is still non-zero</strong> is a secondary limit. GitHub caps you at 100 concurrent requests across REST and GraphQL, and that cap is entirely separate from the hourly bucket.</p>
+<p>There is no header for it. No <code>x-ratelimit-*</code> field tracks secondary limits and <code>GET /rate_limit</code> reports primary quota only, so nothing can tell you how close you are before you arrive. What a script <em>can</em> do is measure the concurrency your own client actually achieved, which is usually not the number you configured, and classify a throttled response correctly when one comes back.</p>
+</div>
+
+<h2>The problem in plain words</h2>
+<p>The parallel version works in development and fails in production, and the difference is not the code. It is that development ran it against six repositories and production runs it against six hundred, so the fan-out that peaked at six in flight now peaks at two hundred. Nothing in the code changed; the shape of the input did.</p>
+<p>What makes this expensive to diagnose is that the error looks exactly like the one you already know how to fix. A <code>403</code> from GitHub with the word "rate" in it sends everyone to <code>GET /rate_limit</code>, which reports a healthy bucket, which makes the 403 look like a permissions problem instead, which sends the next hour into checking token scopes. The quota is fine. The scopes are fine. The client sent 200 requests at once.</p>
+<p>And the failure is partial, which is worse than total. Some requests in the batch succeed, so the job completes and writes a result. The result is missing whatever the throttled requests would have contributed, and nothing marks it as incomplete.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 168" role="img" aria-label="A fan-out that borrows its concurrency from the length of a list"><defs><marker id="ghconc-p-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55616f"/></marker><marker id="ghconc-p-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="ghconc-p-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="ghconc-p-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0969da"/></marker></defs><rect x="10.0" y="51.0" width="111.2" height="66" rx="10" fill="#eef4fa" stroke="#c8d9ec"/><text x="66" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">Loop becomes</text><text x="66" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">parallel</text><text x="66" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">one call per repo</text><rect x="167.2" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#c8d9ec"/><text x="223" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">List grows to</text><text x="223" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">600</text><text x="223" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">600 in flight</text><rect x="324.4" y="51.0" width="111.2" height="66" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="380" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">Past 100</text><text x="380" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">concurrent</text><text x="380" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">secondary limit</text><text x="380" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">fires</text><rect x="481.59999999999997" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#c8d9ec"/><text x="537" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">403 on most</text><text x="537" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">calls</text><text x="537" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">quota untouched</text><rect x="638.8" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#c8d9ec"/><text x="694" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">Partial result</text><text x="694" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">written</text><text x="694" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">nothing marks it</text><text x="694" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">short</text><line x1="124" y1="84" x2="161" y2="84" stroke="#55616f" stroke-width="2" marker-end="url(#ghconc-p-plain)"/><line x1="281" y1="84" x2="318" y2="84" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ghconc-p-bad)"/><line x1="439" y1="84" x2="476" y2="84" stroke="#55616f" stroke-width="2" marker-end="url(#ghconc-p-plain)"/><line x1="596" y1="84" x2="633" y2="84" stroke="#55616f" stroke-width="2" marker-end="url(#ghconc-p-plain)"/></svg>
+<figcaption>Nothing in the code changed between the run that worked and the run that did not. The input grew.</figcaption>
+</figure>
+
+<h2>Why it happens</h2>
+<p><strong>Secondary limits protect burst behaviour, not volume.</strong> The hourly bucket is about how much you ask for over an hour. Secondary limits are about how hard you ask at any instant: no more than 100 concurrent requests, no more than 900 points per minute on a single endpoint, no more than 90 seconds of CPU per 60 seconds of wall clock. A script can spend two hundred requests in one second and still have 4,800 of its 5,000 left.</p>
+<p><strong>There is no headroom API, and that is the honest answer.</strong> This is the one place in these notes where detection genuinely cannot come first. No <code>x-ratelimit-*</code> header reports a secondary bucket, and <code>GET /rate_limit</code> documents itself as covering primary quota. A secondary limit becomes observable at the moment you exceed it and not one request before, so any tool that claims to warn you in advance is inferring, not measuring.</p>
+<p><strong>The two limits are told apart by one field.</strong> On a primary exhaustion, <code>x-ratelimit-remaining</code> is <code>0</code>: that is what exhausted means. On a secondary limit it is whatever it was, usually thousands. So <em>403 with headroom</em> is the signature, and it is reliable enough to branch on even when the message wording changes.</p>
+<p><strong>Your configured concurrency is not your actual concurrency.</strong> A pool of 50 workers against an endpoint that answers in 40 ms rarely has 50 requests in flight; a pool of 20 against an endpoint that answers in four seconds reliably does. The number that matters is the peak overlap of the request spans, and it is measurable from timestamps the client already has.</p>
+<p><strong>Retrying immediately extends the window.</strong> The response carries <code>retry-after</code>. A client that treats the 403 as a generic transient error and retries in a second keeps the limit engaged, which is how a two-minute pause turns into a twenty-minute one.</p>
+
+<h2>The fix, as a flow</h2>
+<p>The script measures the overlap of its own request spans rather than trusting the pool size, because the pool size is a ceiling and the overlap is what actually happened. Then it classifies any refusal on the one field that separates the two limits.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 296" role="img" aria-label="Telling a secondary limit apart from the hourly quota on one field"><defs><marker id="ghconc-f-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#55616f"/></marker><marker id="ghconc-f-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="ghconc-f-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="ghconc-f-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#0969da"/></marker></defs><rect x="10" y="113.0" width="216" height="70" rx="10" fill="#eef4fa" stroke="#c8d9ec"/><text x="118" y="139.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">403 or 429 received</text><text x="118" y="156.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">read body and headers</text><rect x="300" y="22.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="48.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">Body names a secondary limit</text><text x="525" y="65.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">burst, not volume</text><path d="M229,148 C260,148 260,49 294,49" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ghconc-f-bad)"/><rect x="300" y="88.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="114.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">Headroom left, no wording</text><text x="525" y="131.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">still a secondary limit</text><path d="M229,148 C260,148 260,115 294,115" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#ghconc-f-bad)"/><rect x="300" y="154.0" width="450" height="54" rx="10" fill="#fff" stroke="#c8d9ec"/><text x="525" y="180.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">Remaining is 0</text><text x="525" y="197.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">hourly quota, wait for reset</text><path d="M229,148 C260,148 260,181 294,181" fill="none" stroke="#55616f" stroke-width="2" marker-end="url(#ghconc-f-plain)"/><rect x="300" y="220.0" width="450" height="54" rx="10" fill="#fff" stroke="#c8d9ec"/><text x="525" y="246.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#1f2a37">No rate headers at all</text><text x="525" y="263.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#55616f">permissions, not throttling</text><path d="M229,148 C260,148 260,247 294,247" fill="none" stroke="#55616f" stroke-width="2" marker-end="url(#ghconc-f-plain)"/></svg>
+<figcaption>A refusal with headroom left did not come from the bucket those headers describe, whatever the message wording happens to be.</figcaption>
+</figure>
+
+<h2>How to fix it</h2>
+<h3>Read the body of the 403 before you read anything else</h3>
+<p>GitHub returns JSON on every error. <code>{"message": "You have exceeded a secondary rate limit..."}</code> settles it immediately. A permissions 403 says <code>"Resource not accessible by integration"</code> or names a missing scope, and a primary exhaustion says <code>"API rate limit exceeded for user ID ..."</code>. Three different repairs, one status code.</p>
+<h3>Cross-check x-ratelimit-remaining on the same response</h3>
+<p>The throttled response still carries the primary headers. If <code>x-ratelimit-remaining</code> is a large number and you were refused anyway, the refusal did not come from the bucket those headers describe. This check works even when the message wording is one you have not seen, which matters because the wording has changed before.</p>
+<h3>Measure the peak overlap your client actually reaches</h3>
+<p>Record a start and end timestamp for every request and sweep them: the peak number of spans open at once is your real concurrency. Run this against a cheap endpoint at your production settings. <code>GET /rate_limit</code> is the right probe because it does not consume primary quota, so the measurement costs nothing except the requests themselves.</p>
+<h3>Bound the pool instead of fanning out over the input</h3>
+<p><code>Promise.all(repos.map(fetch))</code> has a concurrency equal to <code>repos.length</code>, which is an input, not a setting. Replace it with a worker pool of a fixed small size &mdash; five to ten for reads is plenty, one for anything that writes &mdash; so the ceiling belongs to your code rather than to whoever added the six hundredth repository.</p>
+<h3>Honour retry-after and pause the whole pool, not one request</h3>
+<p>When one request in a batch is throttled, every other request in that batch is about to be. Sleep <code>retry-after</code> seconds before resuming <em>anything</em>; where the header is absent, wait at least 60 seconds and then back off exponentially. Retrying the single failed item while the other 99 keep going is why the window never closes.</p>
+
+<h2>How to check it worked</h2>
+<p>Re-run the probe at your production concurrency. The peak overlap should sit well under the ceiling and no response should classify as a secondary limit.</p>
+<pre><code class="language-bash">python3 github_concurrency_probe.py --requests 24 --concurrency 6
+# peak overlap 6 of a 100 ceiling, 0 throttled: clear</code></pre>
+
+<h2>The full code</h2>
+<p>The probe defaults to <code>GET /rate_limit</code>, which is the only endpoint in the API that does not spend what it measures. Two pure functions carry the diagnosis: one classifies a response into primary, secondary, permission or fine, and one sweeps request spans into a peak overlap. Neither touches the network, because both need to be exercised against responses you cannot conveniently produce on demand.</p>
+<div class="repo-cta" data-repo-cta>
+<a href="https://github.com/allanninal/github-api-fixes/tree/main/secondary-limit-concurrency" rel="noopener" target="_blank">Get this script on GitHub</a>
+<a href="https://github.com/allanninal" rel="noopener" target="_blank">Follow @allanninal</a>
+<span>Python and Node.js, with tests. Read only, it never writes. One of 16 GitHub API fixes, free and open source.</span>
+</div>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">github_concurrency_probe.py</div>
+<pre><code class="language-python">&quot;&quot;&quot;Measure the concurrency a client actually reaches, and classify any throttling.
+
+Read only. Every request is a GET, and the default probe endpoint is
+GET /rate_limit, which does not count against the primary rate limit.
+
+There is no API for secondary-limit headroom: no x-ratelimit-* field tracks one
+and GET /rate_limit covers primary quota only. So this script does not predict a
+secondary limit. It measures the fan-out this client reaches and reports
+correctly if one fires.
+&quot;&quot;&quot;
+import argparse
+import concurrent.futures
+import json
+import logging
+import os
+import sys
+import time
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+log = logging.getLogger(&quot;github_concurrency_probe&quot;)
+
+API = &quot;https://api.github.com&quot;
+UA = &quot;github-concurrency-probe/1.0&quot;
+
+# Documented ceiling on requests in flight at once, across REST and GraphQL.
+CONCURRENCY_CEILING = 100
+
+# The wording has changed over the years, so match on the stable part of both
+# the current phrasing and the one that predates it.
+SECONDARY_MARKERS = (&quot;secondary rate limit&quot;, &quot;abuse detection&quot;)
+
+
+def classify(status, body, headers):
+    &quot;&quot;&quot;Sort one response into primary, secondary, permission or fine. Pure.
+
+    Returns (state, detail). The distinguishing field is x-ratelimit-remaining on
+    the refused response itself: a primary exhaustion reports 0 there because that
+    is what exhausted means, while a secondary limit leaves the primary bucket
+    untouched. So &quot;403 with headroom left&quot; is the signature, and it still holds
+    when the message wording is one this code has never seen.
+    &quot;&quot;&quot;
+    lowered = {str(k).lower(): v for k, v in (headers or {}).items()}
+    text = str(body or &quot;&quot;).lower()
+    try:
+        remaining = int(lowered.get(&quot;x-ratelimit-remaining&quot;))
+    except (TypeError, ValueError):
+        remaining = None
+
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+
+    if 200 &lt;= status &lt; 400:
+        seen = &quot;unknown&quot; if remaining is None else str(remaining)
+        return (&quot;ok&quot;, &quot;%d, primary bucket reports %s left&quot; % (status, seen))
+    if status not in (403, 429):
+        return (&quot;other&quot;, &quot;%d is not a throttle at all&quot; % status)
+
+    if any(marker in text for marker in SECONDARY_MARKERS):
+        return (&quot;secondary&quot;,
+                &quot;%d and the body names a secondary rate limit. The hourly quota &quot;
+                &quot;is not involved: it still reports %s remaining.&quot;
+                % (status, &quot;an unknown number&quot; if remaining is None else remaining))
+    if remaining == 0:
+        return (&quot;primary&quot;,
+                &quot;%d with x-ratelimit-remaining at 0. This is the hourly quota, &quot;
+                &quot;not a secondary limit, and it clears at x-ratelimit-reset.&quot;
+                % status)
+    if remaining is not None and remaining &gt; 0:
+        return (&quot;secondary-suspected&quot;,
+                &quot;%d while %d request(s) remain in the primary bucket. The body &quot;
+                &quot;does not say secondary, but a refusal with headroom left did &quot;
+                &quot;not come from the bucket these headers describe.&quot;
+                % (status, remaining))
+    return (&quot;forbidden&quot;,
+            &quot;%d with no rate-limit headers to read. Treat this as permissions &quot;
+            &quot;until something proves otherwise.&quot; % status)
+
+
+def peak_overlap(spans):
+    &quot;&quot;&quot;Peak number of requests in flight at once, from (start, end) pairs. Pure.
+
+    A sweep rather than a max of the pool size, because the pool size is a
+    ceiling and this is the number that was actually reached. Twenty workers
+    against a 40 ms endpoint rarely overlap; six against a four-second one
+    always do.
+    &quot;&quot;&quot;
+    events = []
+    for span in spans or []:
+        start, end = float(span[0]), float(span[1])
+        if end &lt; start:
+            start, end = end, start
+        events.append((start, 1))
+        events.append((end, -1))
+    # A request that ended at the exact instant another began was never beside
+    # it, so ends are ordered before starts at an equal timestamp.
+    events.sort(key=lambda e: (e[0], e[1]))
+    peak = current = 0
+    for _, delta in events:
+        current += delta
+        if current &gt; peak:
+            peak = current
+    return peak
+
+
+def verdict(peak, states, ceiling=CONCURRENCY_CEILING):
+    &quot;&quot;&quot;Turn a peak overlap and a list of response states into a finding. Pure.
+
+    &quot;clear&quot; deliberately does not say the client is safe. Nothing can say that:
+    the limit has no headroom API, so a probe that did not trip it has shown
+    only that this run, at this moment, did not trip it.
+    &quot;&quot;&quot;
+    throttled = [s for s in (states or []) if s in (&quot;secondary&quot;, &quot;secondary-suspected&quot;)]
+    if throttled:
+        return (&quot;tripped&quot;,
+                &quot;%d of %d response(s) were refused with the primary bucket still &quot;
+                &quot;healthy. Peak overlap was %d. Bound the pool and honour &quot;
+                &quot;retry-after.&quot; % (len(throttled), len(states or []), peak))
+    if peak &gt;= ceiling:
+        return (&quot;over-ceiling&quot;,
+                &quot;peak overlap %d at or above the documented ceiling of %d. This &quot;
+                &quot;run happened not to be refused; a slower endpoint or a busier &quot;
+                &quot;moment will be.&quot; % (peak, ceiling))
+    if peak &gt;= ceiling * 0.8:
+        return (&quot;near-ceiling&quot;,
+                &quot;peak overlap %d against a ceiling of %d. One more worker or one &quot;
+                &quot;slow response is the difference.&quot; % (peak, ceiling))
+    return (&quot;clear&quot;,
+            &quot;peak overlap %d of a %d ceiling, nothing throttled. This proves the &quot;
+            &quot;run was fine, not that the client is: secondary limits have no &quot;
+            &quot;headroom API to check against.&quot; % (peak, ceiling))
+
+
+def probe(session, url, index):
+    &quot;&quot;&quot;One timed GET. Returns a record; never raises, because a failed request
+    is data here rather than an error.&quot;&quot;&quot;
+    start = time.monotonic()
+    try:
+        r = session.get(url, timeout=30)
+        end = time.monotonic()
+        return {&quot;i&quot;: index, &quot;start&quot;: start, &quot;end&quot;: end, &quot;status&quot;: r.status_code,
+                &quot;body&quot;: r.text[:400], &quot;headers&quot;: dict(r.headers)}
+    except requests.RequestException as exc:
+        return {&quot;i&quot;: index, &quot;start&quot;: start, &quot;end&quot;: time.monotonic(), &quot;status&quot;: 0,
+                &quot;body&quot;: str(exc), &quot;headers&quot;: {}}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(&quot;--endpoint&quot;, default=&quot;/rate_limit&quot;,
+                    help=&quot;path to probe (default /rate_limit, which is free)&quot;)
+    ap.add_argument(&quot;--requests&quot;, type=int, default=12,
+                    help=&quot;how many GETs to issue in total&quot;)
+    ap.add_argument(&quot;--concurrency&quot;, type=int, default=6,
+                    help=&quot;worker pool size; the ceiling, not the achieved peak&quot;)
+    args = ap.parse_args()
+
+    token = os.environ.get(&quot;GITHUB_TOKEN&quot;)
+    if not token:
+        log.error(&quot;set GITHUB_TOKEN (a read-only token is enough)&quot;)
+        return 2
+
+    workers = max(1, min(args.concurrency, CONCURRENCY_CEILING))
+    if workers != args.concurrency:
+        log.warning(&quot;clamping concurrency to %d: going past the documented &quot;
+                    &quot;ceiling on purpose spends a shared quota to learn nothing &quot;
+                    &quot;new&quot;, workers)
+
+    session = requests.Session()
+    session.headers.update({
+        &quot;Authorization&quot;: &quot;Bearer &quot; + token,
+        &quot;Accept&quot;: &quot;application/vnd.github+json&quot;,
+        &quot;X-GitHub-Api-Version&quot;: &quot;2022-11-28&quot;,
+        &quot;User-Agent&quot;: UA,
+    })
+
+    url = API + args.endpoint if args.endpoint.startswith(&quot;/&quot;) else args.endpoint
+    log.info(&quot;probing %s: %d request(s), pool of %d&quot;, url, args.requests, workers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda i: probe(session, url, i),
+                                range(max(1, args.requests))))
+
+    states = []
+    for r in sorted(results, key=lambda r: r[&quot;i&quot;]):
+        state, detail = classify(r[&quot;status&quot;], r[&quot;body&quot;], r[&quot;headers&quot;])
+        states.append(state)
+        if state in (&quot;ok&quot;, &quot;other&quot;):
+            log.debug(&quot;request %d: %s %s&quot;, r[&quot;i&quot;], state, detail)
+        else:
+            log.warning(&quot;request %d: %-20s %s&quot;, r[&quot;i&quot;], state, detail)
+            retry_after = {k.lower(): v for k, v in r[&quot;headers&quot;].items()}.get(&quot;retry-after&quot;)
+            if retry_after:
+                log.warning(&quot;  retry-after: %s second(s). Pause the whole pool &quot;
+                            &quot;for that long, not just this request.&quot;, retry_after)
+
+    peak = peak_overlap([(r[&quot;start&quot;], r[&quot;end&quot;]) for r in results])
+    state, detail = verdict(peak, states)
+    log.info(&quot;%s: %s&quot;, state, detail)
+
+    if state != &quot;clear&quot;:
+        log.info(&quot;repair: replace the fan-out with a bounded pool. Python: &quot;
+                 &quot;ThreadPoolExecutor(max_workers=6). Node: a queue of 6 rather &quot;
+                 &quot;than Promise.all over the whole input list.&quot;)
+        log.info(&quot;repair: on a throttled response sleep retry-after seconds &quot;
+                 &quot;before resuming any worker, and where the header is absent &quot;
+                 &quot;wait 60 seconds and then back off exponentially.&quot;)
+
+    print(json.dumps({&quot;peak_overlap&quot;: peak, &quot;ceiling&quot;: CONCURRENCY_CEILING,
+                      &quot;requests&quot;: len(results), &quot;state&quot;: state,
+                      &quot;states&quot;: states}, indent=2))
+    return 1 if state in (&quot;tripped&quot;, &quot;over-ceiling&quot;) else 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">github-concurrency-probe.mjs</div>
+<pre><code class="language-javascript">/**
+ * Measure the concurrency a client actually reaches, and classify any throttling.
+ *
+ * Read only. Every request is a GET, and the default probe endpoint is
+ * GET /rate_limit, which does not count against the primary rate limit.
+ *
+ * Secondary limits have no headroom API, so nothing here predicts one.
+ */
+const API = &#x27;https://api.github.com&#x27;;
+const UA = &#x27;github-concurrency-probe/1.0&#x27;;
+
+// Documented ceiling on requests in flight at once, across REST and GraphQL.
+export const CONCURRENCY_CEILING = 100;
+
+// The wording has changed over the years; match the stable part of both forms.
+const SECONDARY_MARKERS = [&#x27;secondary rate limit&#x27;, &#x27;abuse detection&#x27;];
+
+/**
+ * Sort one response into primary, secondary, permission or fine. Pure.
+ * The distinguishing field is x-ratelimit-remaining on the refused response:
+ * a primary exhaustion reports 0, a secondary limit leaves the bucket alone.
+ */
+export function classify(status, body, headers) {
+  const lowered = {};
+  for (const [k, v] of Object.entries(headers ?? {})) lowered[k.toLowerCase()] = v;
+  const text = String(body ?? &#x27;&#x27;).toLowerCase();
+  const rawRemaining = lowered[&#x27;x-ratelimit-remaining&#x27;];
+  const parsed = Number.parseInt(rawRemaining, 10);
+  const remaining = Number.isFinite(parsed) ? parsed : null;
+  const code = Number.parseInt(status, 10) || 0;
+
+  if (code &gt;= 200 &amp;&amp; code &lt; 400) {
+    return [&#x27;ok&#x27;, `${code}, primary bucket reports ${remaining ?? &#x27;unknown&#x27;} left`];
+  }
+  if (code !== 403 &amp;&amp; code !== 429) return [&#x27;other&#x27;, `${code} is not a throttle at all`];
+
+  if (SECONDARY_MARKERS.some((m) =&gt; text.includes(m))) {
+    return [&#x27;secondary&#x27;,
+      `${code} and the body names a secondary rate limit. The hourly quota is ` +
+      `not involved: it still reports ${remaining ?? &#x27;an unknown number&#x27;} remaining.`];
+  }
+  if (remaining === 0) {
+    return [&#x27;primary&#x27;,
+      `${code} with x-ratelimit-remaining at 0. This is the hourly quota, not a ` +
+      &#x27;secondary limit, and it clears at x-ratelimit-reset.&#x27;];
+  }
+  if (remaining !== null &amp;&amp; remaining &gt; 0) {
+    return [&#x27;secondary-suspected&#x27;,
+      `${code} while ${remaining} request(s) remain in the primary bucket. The ` +
+      &#x27;body does not say secondary, but a refusal with headroom left did not &#x27; +
+      &#x27;come from the bucket these headers describe.&#x27;];
+  }
+  return [&#x27;forbidden&#x27;,
+    `${code} with no rate-limit headers to read. Treat this as permissions ` +
+    &#x27;until something proves otherwise.&#x27;];
+}
+
+/**
+ * Peak number of requests in flight at once, from [start, end] pairs. Pure.
+ * A sweep, because the pool size is a ceiling and this is what was reached.
+ */
+export function peakOverlap(spans) {
+  const events = [];
+  for (const span of spans ?? []) {
+    let start = Number(span[0]);
+    let end = Number(span[1]);
+    if (end &lt; start) [start, end] = [end, start];
+    events.push([start, 1], [end, -1]);
+  }
+  // Ends sort before starts at an equal timestamp: a request that ended as
+  // another began was never beside it.
+  events.sort((a, b) =&gt; (a[0] - b[0]) || (a[1] - b[1]));
+  let peak = 0;
+  let current = 0;
+  for (const [, delta] of events) {
+    current += delta;
+    if (current &gt; peak) peak = current;
+  }
+  return peak;
+}
+
+/**
+ * Turn a peak overlap and a list of response states into a finding. Pure.
+ * &quot;clear&quot; says this run was fine, never that the client is: the limit has no
+ * headroom API to check against.
+ */
+export function verdict(peak, states, ceiling = CONCURRENCY_CEILING) {
+  const list = states ?? [];
+  const throttled = list.filter((s) =&gt; s === &#x27;secondary&#x27; || s === &#x27;secondary-suspected&#x27;);
+  if (throttled.length) {
+    return [&#x27;tripped&#x27;,
+      `${throttled.length} of ${list.length} response(s) were refused with the ` +
+      `primary bucket still healthy. Peak overlap was ${peak}. Bound the pool ` +
+      &#x27;and honour retry-after.&#x27;];
+  }
+  if (peak &gt;= ceiling) {
+    return [&#x27;over-ceiling&#x27;,
+      `peak overlap ${peak} at or above the documented ceiling of ${ceiling}. ` +
+      &#x27;This run happened not to be refused; a slower endpoint or a busier &#x27; +
+      &#x27;moment will be.&#x27;];
+  }
+  if (peak &gt;= ceiling * 0.8) {
+    return [&#x27;near-ceiling&#x27;,
+      `peak overlap ${peak} against a ceiling of ${ceiling}. One more worker or ` +
+      &#x27;one slow response is the difference.&#x27;];
+  }
+  return [&#x27;clear&#x27;,
+    `peak overlap ${peak} of a ${ceiling} ceiling, nothing throttled. This ` +
+    &#x27;proves the run was fine, not that the client is: secondary limits have no &#x27; +
+    &#x27;headroom API to check against.&#x27;];
+}
+
+async function probe(token, url, index) {
+  const start = performance.now() / 1000;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: &#x27;application/vnd.github+json&#x27;,
+        &#x27;X-GitHub-Api-Version&#x27;: &#x27;2022-11-28&#x27;,
+        &#x27;User-Agent&#x27;: UA,
+      },
+    });
+    const body = (await res.text()).slice(0, 400);
+    const headers = Object.fromEntries(res.headers.entries());
+    return { i: index, start, end: performance.now() / 1000, status: res.status, body, headers };
+  } catch (err) {
+    return {
+      i: index, start, end: performance.now() / 1000, status: 0,
+      body: err.message, headers: {},
+    };
+  }
+}
+
+async function main() {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) {
+    console.error(&#x27;set GITHUB_TOKEN (a read-only token is enough)&#x27;);
+    process.exitCode = 2;
+    return;
+  }
+  const endpoint = process.argv[2] ?? &#x27;/rate_limit&#x27;;
+  const total = Math.max(1, Number.parseInt(process.argv[3] ?? &#x27;12&#x27;, 10) || 12);
+  const wanted = Number.parseInt(process.argv[4] ?? &#x27;6&#x27;, 10) || 6;
+  const workers = Math.max(1, Math.min(wanted, CONCURRENCY_CEILING));
+  const url = endpoint.startsWith(&#x27;/&#x27;) ? API + endpoint : endpoint;
+
+  console.log(`probing ${url}: ${total} request(s), pool of ${workers}`);
+
+  // A queue, not Promise.all over the input: the whole point of the note is
+  // that Promise.all borrows its concurrency from the length of the list.
+  const results = [];
+  let next = 0;
+  await Promise.all(Array.from({ length: workers }, async () =&gt; {
+    while (next &lt; total) {
+      const index = next;
+      next += 1;
+      results.push(await probe(token, url, index));
+    }
+  }));
+
+  const states = [];
+  for (const r of results.sort((a, b) =&gt; a.i - b.i)) {
+    const [state, detail] = classify(r.status, r.body, r.headers);
+    states.push(state);
+    if (state !== &#x27;ok&#x27; &amp;&amp; state !== &#x27;other&#x27;) {
+      console.warn(`request ${r.i}: ${state.padEnd(20)} ${detail}`);
+      const lowered = {};
+      for (const [k, v] of Object.entries(r.headers)) lowered[k.toLowerCase()] = v;
+      if (lowered[&#x27;retry-after&#x27;]) {
+        console.warn(`  retry-after: ${lowered[&#x27;retry-after&#x27;]} second(s). Pause ` +
+          &#x27;the whole pool for that long, not just this request.&#x27;);
+      }
+    }
+  }
+
+  const peak = peakOverlap(results.map((r) =&gt; [r.start, r.end]));
+  const [state, detail] = verdict(peak, states);
+  console.log(`${state}: ${detail}`);
+
+  if (state !== &#x27;clear&#x27;) {
+    console.log(&#x27;repair: replace the fan-out with a bounded queue of 6 rather &#x27; +
+      &#x27;than Promise.all over the whole input list.&#x27;);
+    console.log(&#x27;repair: on a throttled response sleep retry-after seconds &#x27; +
+      &#x27;before resuming any worker; where the header is absent wait 60 seconds &#x27; +
+      &#x27;and then back off exponentially.&#x27;);
+  }
+
+  console.log(JSON.stringify({
+    peak_overlap: peak, ceiling: CONCURRENCY_CEILING,
+    requests: results.length, state, states,
+  }, null, 2));
+  process.exitCode = (state === &#x27;tripped&#x27; || state === &#x27;over-ceiling&#x27;) ? 1 : 0;
+}
+
+// Only run when invoked directly. The test file imports this module, and without
+// the guard main() would run there too, fail on the missing token, and set a
+// non-zero exit code that fails the whole test file even as every test passes.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) =&gt; { console.error(err.message); process.exitCode = 2; });
+}
+</code></pre>
+</div>
+</div>
+
+<h2>Add a test</h2>
+<p>The cases worth pinning are the ones the API deliberately makes ambiguous. A 403 with headroom left and a 403 with an empty bucket are the same status code and opposite repairs. A 403 with no rate-limit headers at all is neither, and calling it a secondary limit sends someone to add backoff to a permissions problem. And the overlap sweep has one edge that decides whether the number means anything: a request that ends exactly when the next begins was never in flight beside it.</p>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">test_github_concurrency_probe.py</div>
+<pre><code class="language-python">from github_concurrency_probe import classify, peak_overlap, verdict
+
+SECONDARY = (&#x27;{&quot;message&quot;:&quot;You have exceeded a secondary rate limit. &#x27;
+             &#x27;Please wait a few minutes before you try again.&quot;}&#x27;)
+PRIMARY = &#x27;{&quot;message&quot;:&quot;API rate limit exceeded for user ID 12345.&quot;}&#x27;
+DENIED = &#x27;{&quot;message&quot;:&quot;Resource not accessible by integration&quot;}&#x27;
+
+
+def headers(remaining=4800, **extra):
+    h = {&quot;X-RateLimit-Limit&quot;: &quot;5000&quot;, &quot;X-RateLimit-Used&quot;: str(5000 - remaining)}
+    if remaining is not None:
+        h[&quot;X-RateLimit-Remaining&quot;] = str(remaining)
+    h.update(extra)
+    return h
+
+
+def test_a_secondary_limit_is_named_in_the_body():
+    state, detail = classify(403, SECONDARY, headers(4800))
+    assert state == &quot;secondary&quot;
+    assert &quot;4800&quot; in detail
+
+
+def test_the_same_message_on_a_429_classifies_identically():
+    assert classify(429, SECONDARY, headers(4800))[0] == &quot;secondary&quot;
+
+
+def test_an_empty_bucket_is_the_primary_quota_not_a_secondary_limit():
+    state, detail = classify(403, PRIMARY, headers(0))
+    assert state == &quot;primary&quot;
+    assert &quot;x-ratelimit-reset&quot; in detail
+
+
+def test_headroom_left_is_enough_to_suspect_a_secondary_limit():
+    # The wording has changed before, so the fallback must not need it.
+    state, detail = classify(403, &#x27;{&quot;message&quot;:&quot;Something new&quot;}&#x27;, headers(4321))
+    assert state == &quot;secondary-suspected&quot;
+    assert &quot;4321&quot; in detail
+
+
+def test_a_403_with_no_rate_limit_headers_is_a_permissions_problem():
+    state, _ = classify(403, DENIED, {})
+    assert state == &quot;forbidden&quot;
+
+
+def test_header_case_does_not_change_the_verdict():
+    lower = {&quot;x-ratelimit-remaining&quot;: &quot;0&quot;}
+    assert classify(403, PRIMARY, lower)[0] == &quot;primary&quot;
+
+
+def test_a_404_is_not_a_throttle():
+    assert classify(404, &#x27;{&quot;message&quot;:&quot;Not Found&quot;}&#x27;, headers())[0] == &quot;other&quot;
+
+
+def test_a_success_is_reported_with_its_headroom():
+    state, detail = classify(200, &quot;{}&quot;, headers(4999))
+    assert state == &quot;ok&quot;
+    assert &quot;4999&quot; in detail
+
+
+def test_overlap_of_sequential_requests_is_one():
+    assert peak_overlap([(0.0, 1.0), (1.0, 2.0), (2.0, 3.0)]) == 1
+
+
+def test_overlap_counts_only_spans_open_at_the_same_instant():
+    assert peak_overlap([(0.0, 3.0), (1.0, 2.0), (1.5, 4.0)]) == 3
+    assert peak_overlap([(0.0, 1.0), (0.5, 2.0)]) == 2
+
+
+def test_an_empty_probe_has_no_overlap():
+    assert peak_overlap([]) == 0
+    assert peak_overlap(None) == 0
+
+
+def test_a_reversed_span_is_still_measured():
+    assert peak_overlap([(2.0, 0.0), (1.0, 1.5)]) == 2
+
+
+def test_any_throttled_response_beats_a_low_peak():
+    state, detail = verdict(3, [&quot;ok&quot;, &quot;secondary&quot;, &quot;ok&quot;])
+    assert state == &quot;tripped&quot;
+    assert &quot;1 of 3&quot; in detail
+
+
+def test_a_peak_at_the_ceiling_is_reported_even_when_nothing_failed():
+    state, _ = verdict(100, [&quot;ok&quot;] * 100)
+    assert state == &quot;over-ceiling&quot;
+    assert verdict(85, [&quot;ok&quot;])[0] == &quot;near-ceiling&quot;
+
+
+def test_clear_does_not_claim_the_client_is_safe():
+    state, detail = verdict(6, [&quot;ok&quot;, &quot;ok&quot;])
+    assert state == &quot;clear&quot;
+    assert &quot;headroom API&quot; in detail
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">github-concurrency-probe.test.mjs</div>
+<pre><code class="language-javascript">import { test } from &#x27;node:test&#x27;;
+import assert from &#x27;node:assert/strict&#x27;;
+import { classify, peakOverlap, verdict } from &#x27;./github-concurrency-probe.mjs&#x27;;
+
+const SECONDARY = &#x27;{&quot;message&quot;:&quot;You have exceeded a secondary rate limit. &#x27; +
+  &#x27;Please wait a few minutes before you try again.&quot;}&#x27;;
+const PRIMARY = &#x27;{&quot;message&quot;:&quot;API rate limit exceeded for user ID 12345.&quot;}&#x27;;
+const DENIED = &#x27;{&quot;message&quot;:&quot;Resource not accessible by integration&quot;}&#x27;;
+
+const headers = (remaining = 4800, extra = {}) =&gt; ({
+  &#x27;X-RateLimit-Limit&#x27;: &#x27;5000&#x27;,
+  &#x27;X-RateLimit-Used&#x27;: String(5000 - remaining),
+  &#x27;X-RateLimit-Remaining&#x27;: String(remaining),
+  ...extra,
+});
+
+test(&#x27;a secondary limit is named in the body&#x27;, () =&gt; {
+  const [state, detail] = classify(403, SECONDARY, headers(4800));
+  assert.equal(state, &#x27;secondary&#x27;);
+  assert.match(detail, /4800/);
+});
+
+test(&#x27;the same message on a 429 classifies identically&#x27;, () =&gt; {
+  assert.equal(classify(429, SECONDARY, headers(4800))[0], &#x27;secondary&#x27;);
+});
+
+test(&#x27;an empty bucket is the primary quota, not a secondary limit&#x27;, () =&gt; {
+  const [state, detail] = classify(403, PRIMARY, headers(0));
+  assert.equal(state, &#x27;primary&#x27;);
+  assert.match(detail, /x-ratelimit-reset/);
+});
+
+test(&#x27;headroom left is enough to suspect a secondary limit&#x27;, () =&gt; {
+  const [state, detail] = classify(403, &#x27;{&quot;message&quot;:&quot;Something new&quot;}&#x27;, headers(4321));
+  assert.equal(state, &#x27;secondary-suspected&#x27;);
+  assert.match(detail, /4321/);
+});
+
+test(&#x27;a 403 with no rate-limit headers is a permissions problem&#x27;, () =&gt; {
+  assert.equal(classify(403, DENIED, {})[0], &#x27;forbidden&#x27;);
+});
+
+test(&#x27;header case does not change the verdict&#x27;, () =&gt; {
+  assert.equal(classify(403, PRIMARY, { &#x27;x-ratelimit-remaining&#x27;: &#x27;0&#x27; })[0], &#x27;primary&#x27;);
+});
+
+test(&#x27;a 404 is not a throttle&#x27;, () =&gt; {
+  assert.equal(classify(404, &#x27;{&quot;message&quot;:&quot;Not Found&quot;}&#x27;, headers())[0], &#x27;other&#x27;);
+});
+
+test(&#x27;a success is reported with its headroom&#x27;, () =&gt; {
+  const [state, detail] = classify(200, &#x27;{}&#x27;, headers(4999));
+  assert.equal(state, &#x27;ok&#x27;);
+  assert.match(detail, /4999/);
+});
+
+test(&#x27;overlap of sequential requests is one&#x27;, () =&gt; {
+  assert.equal(peakOverlap([[0, 1], [1, 2], [2, 3]]), 1);
+});
+
+test(&#x27;overlap counts only spans open at the same instant&#x27;, () =&gt; {
+  assert.equal(peakOverlap([[0, 3], [1, 2], [1.5, 4]]), 3);
+  assert.equal(peakOverlap([[0, 1], [0.5, 2]]), 2);
+});
+
+test(&#x27;an empty probe has no overlap&#x27;, () =&gt; {
+  assert.equal(peakOverlap([]), 0);
+  assert.equal(peakOverlap(null), 0);
+});
+
+test(&#x27;a reversed span is still measured&#x27;, () =&gt; {
+  assert.equal(peakOverlap([[2, 0], [1, 1.5]]), 2);
+});
+
+test(&#x27;any throttled response beats a low peak&#x27;, () =&gt; {
+  const [state, detail] = verdict(3, [&#x27;ok&#x27;, &#x27;secondary&#x27;, &#x27;ok&#x27;]);
+  assert.equal(state, &#x27;tripped&#x27;);
+  assert.match(detail, /1 of 3/);
+});
+
+test(&#x27;a peak at the ceiling is reported even when nothing failed&#x27;, () =&gt; {
+  assert.equal(verdict(100, new Array(100).fill(&#x27;ok&#x27;))[0], &#x27;over-ceiling&#x27;);
+  assert.equal(verdict(85, [&#x27;ok&#x27;])[0], &#x27;near-ceiling&#x27;);
+});
+
+test(&#x27;clear does not claim the client is safe&#x27;, () =&gt; {
+  const [state, detail] = verdict(6, [&#x27;ok&#x27;, &#x27;ok&#x27;]);
+  assert.equal(state, &#x27;clear&#x27;);
+  assert.match(detail, /headroom API/);
+});
+</code></pre>
+</div>
+</div>
+
+<h2>FAQ</h2>
+<details class="faq-item"><summary>Can I check how close I am to a secondary rate limit before I hit one?</summary><p>No, and this is worth being blunt about. There is no x-ratelimit-* header for secondary limits and GET /rate_limit documents itself as reporting primary quota only. A secondary limit becomes observable at the moment you exceed it, in the body of the 403 or 429 and in the retry-after header on it. Anything that claims to show you secondary headroom is inferring from your own request pattern, not reading a number GitHub published.</p></details>
+<details class="faq-item"><summary>Why does x-ratelimit-remaining still show thousands when I am being refused?</summary><p>Because it is describing a different limit. The hourly bucket counts requests over an hour; the secondary limits count bursts, concurrency and CPU time. You can spend two hundred requests in one second and still hold 4,800 of your 5,000. That mismatch is not a bug in the headers, it is the single most reliable way to tell the two failures apart, which is why the classifier branches on it.</p></details>
+<details class="faq-item"><summary>Does GraphQL have its own concurrency allowance?</summary><p>No. The 100-concurrent-request ceiling is shared across REST and GraphQL, even though the two have entirely separate primary buckets. A job that runs REST calls and GraphQL queries in parallel is spending one concurrency budget from two places, which is a common way to trip this while both point counters look healthy.</p></details>
+<details class="faq-item"><summary>Is the probe safe to run against production credentials?</summary><p>It only issues GETs, and its default endpoint is GET /rate_limit, which does not count against the primary rate limit. The concurrency argument is clamped at the documented ceiling, because deliberately exceeding it spends a quota that is shared with every other process using that token in order to learn something the documentation already states.</p></details>
+<details class="faq-item"><summary>What concurrency should I actually use?</summary><p>Lower than you think, and fixed rather than derived from the input. Five to ten in flight is comfortable for reads and leaves room for whatever else holds the same token; anything that creates content should be serialised to one at a time with a pause between items. The important change is not the number, it is that the number stops being repos.length.</p></details>
+
+<h2>Related field notes</h2>
+<ul>
+<li><a href="/github/retry-after-ignored/">Ignoring retry-after extends the throttle</a></li>
+<li><a href="/github/secondary-limit-content-creation/">Bulk creation exceeds 80 a minute</a></li>
+<li><a href="/github/per-page-default-30/">per_page is unset so every list costs more</a></li>
+</ul>
+
+<h3>Sources</h3>
+<p class="sources-note">Every figure in this note is traced to one of these. Prices are
+list rates and change &mdash; check them for your own region before acting.</p>
+<ul class="citations">
+<li><a href="https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api" rel="noopener nofollow" target="_blank">Rate limits for the REST API — GitHub Docs</a></li>
+<li><a href="https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api" rel="noopener nofollow" target="_blank">Best practices for using the REST API — GitHub Docs</a></li>
+<li><a href="https://docs.github.com/en/rest/rate-limit/rate-limit" rel="noopener nofollow" target="_blank">Rate limit — GitHub REST API</a></li>
+<li><a href="https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api" rel="noopener nofollow" target="_blank">Troubleshooting the REST API — GitHub Docs</a></li>
+</ul>
+
+<div class="callout callout--cta">
+<div class="callout__title">Stuck on a tricky one?</div>
+<p>If your setup is misbehaving in a way this note does not cover, <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">message me on LinkedIn</a> with what you are seeing.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+<div class="container">
+<p>Field notes by <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">Allan Ni&ntilde;al</a> &middot; <a href="/">Portfolio</a> &middot; <a href="/dns/">DNS &amp; domains</a> &middot; <a href="/email/">Email &amp; SES</a> &middot; <a href="/aws/">AWS cost</a></p>
+<p class="site-footer__fine">Every script in this section is read only. They hold a token that can reach your repositories, so none of them writes: they report what is wrong and print the repair for you to run. A read-only token is enough, and GET /rate_limit does not consume quota.</p>
+</div>
+</footer>
+<script src="/github/assets/github.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
+</body>
+</html>
