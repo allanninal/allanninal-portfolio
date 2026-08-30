@@ -2968,6 +2968,11 @@ UNASSESSABLE_ERRORS = ("missing_scope", "not_allowed_token_type", "invalid_auth"
 # spans workspaces, because a token that can see forty of them has to be told
 # which one you meant. This is the set the script knows about; a method outside
 # it is reported as unknown rather than guessed at.
+#
+# It is a working subset, not the authority. Slack publishes the full table on
+# its Enterprise Grid apps page, and that page is what to check before an
+# org-wide install -- a name absent from here means this script has not been
+# told about it, never that the parameter is unnecessary.
 REQUIRES_TEAM_ID = ("conversations.list", "users.list", "usergroups.list",
                     "users.conversations", "emoji.list", "dnd.teamInfo",
                     "team.profile.get", "chat.scheduledMessages.list",
@@ -3094,7 +3099,9 @@ def team_id_requirement(method, org_wide):
                                "or not")
     if name in REQUIRES_TEAM_ID:
         return ("required", "required once the token is org-wide; without it the "
-                            "call has forty workspaces to choose from")
+                            "call has forty workspaces to choose from. Confirm "
+                            "against Slack's own table, which is the authority "
+                            "this list is only a subset of")
     return ("optional", "accepted once the token is org-wide, and worth sending so "
                         "the call cannot answer for the wrong workspace")
 
