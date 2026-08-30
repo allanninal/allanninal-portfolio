@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The dedupe key that does not survive the retry</title>
+<meta name="description" content="event_id is stable across all three retries. client_msg_id is missing from a third of your events, and a 60 second TTL expires before the last one.">
+<link rel="canonical" href="https://www.allanninal.dev/slack/duplicate-processing-on-retry/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Ni&ntilde;al">
+<meta property="og:type" content="article">
+<meta property="og:title" content="The dedupe key that does not survive the retry">
+<meta property="og:description" content="event_id is stable across all three retries. client_msg_id is missing from a third of your events, and a 60 second TTL expires before the last one.">
+<meta property="og:url" content="https://www.allanninal.dev/slack/duplicate-processing-on-retry/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="The dedupe key that does not survive the retry">
+<meta name="twitter:description" content="event_id is stable across all three retries. client_msg_id is missing from a third of your events, and a 60 second TTL expires before the last one.">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/slack/assets/slack.css">
+<link rel="stylesheet" href="/assets/site-nav.css">
+<link rel="stylesheet" href="/assets/site-mobile.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/slack/duplicate-processing-on-retry/#article","headline":"The dedupe key that does not survive the retry","description":"event_id is stable across all three retries. client_msg_id is missing from a third of your events, and a 60 second TTL expires before the last one.","url":"https://www.allanninal.dev/slack/duplicate-processing-on-retry/","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.allanninal.dev/slack/duplicate-processing-on-retry/"},"datePublished":"2026-08-31","dateModified":"2026-08-31","inLanguage":"en","articleSection":"Slack","keywords":"slack event_id idempotency, x-slack-retry-num duplicate, slack dedupe event retries, slack client_msg_id missing, slack socket mode retry header","author":{"@id":"https://www.allanninal.dev/#person"},"publisher":{"@id":"https://www.allanninal.dev/#person"},"proficiencyLevel":"Intermediate","dependencies":"Python 3.9+ with requests, or Node.js 18+","citation":["https://docs.slack.dev/apis/events-api/","https://docs.slack.dev/reference/events/message","https://docs.slack.dev/apis/events-api/using-socket-mode","https://docs.slack.dev/reference/methods/conversations.history"]},{"@type":"Person","@id":"https://www.allanninal.dev/#person","name":"Allan Niñal","jobTitle":"AI and Software Engineer","url":"https://www.allanninal.dev/","sameAs":["https://www.linkedin.com/in/allanninal/","https://github.com/allanninal"]},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/slack/"},{"@type":"ListItem","position":2,"name":"Slack","item":"https://www.allanninal.dev/slack/"},{"@type":"ListItem","position":3,"name":"The dedupe key that does not survive the retry","item":"https://www.allanninal.dev/slack/duplicate-processing-on-retry/"}]},{"@type":"FAQPage","@id":"https://www.allanninal.dev/slack/duplicate-processing-on-retry/#faq","mainEntity":[{"@type":"Question","name":"Why event_id rather than the message timestamp?","acceptedAnswer":{"@type":"Answer","text":"Because the timestamp identifies the message and the event id identifies the event. A message being posted, reacted to and then edited produces three events that a timestamp-keyed set will treat as one, so two of the three are dropped as duplicates when neither is. The event id is different for each of them and identical across the retries of each, which is exactly the pair of properties the guard needs."}},{"@type":"Question","name":"Is ten minutes not excessive for a TTL?","acceptedAnswer":{"@type":"Answer","text":"It is two entries per event in a set of short strings, for ten minutes. The alternative failure is worse than the memory: at sixty seconds the guard catches the retry at sixty and misses the one at three hundred, so the bug survives your testing and reappears only under the load that produced the slow deliveries in the first place. Three hundred seconds is the floor and six hundred is the number to use."}},{"@type":"Question","name":"We moved to Socket Mode and started seeing duplicates again. Why?","acceptedAnswer":{"@type":"Answer","text":"Because the retry headers are an HTTP transport feature and Socket Mode does not carry them. Any guard written as &ldquo;if the retry header is present, skip&rdquo; silently becomes a no-op on the socket path. The event id is in the event payload itself and arrives identically over both transports, which is one more reason to key on it rather than on delivery metadata."}},{"@type":"Question","name":"Should I short-circuit on X-Slack-Retry-Reason?","acceptedAnswer":{"@type":"Answer","text":"As a refinement, yes, and never as the guard. A reason of http_timeout means Slack sent the payload, your service accepted it, and the response was late, so the work has probably already been done. connection_failed and ssl_error suggest it has not. Reading that improves your odds on the cases the dedupe store missed; it does not replace the store, and it is unavailable over Socket Mode."}},{"@type":"Question","name":"The dedupe check is right and duplicates still appear.","acceptedAnswer":{"@type":"Answer","text":"Then the duplicates are probably not retries, and the spacing will tell you: sub-second copies mean two delivery paths or two replicas handling the same event, hours apart means a scheduler running twice. Retry duplicates land at roughly sixty and three hundred seconds and nowhere else. Measuring that spacing is a different script, linked below, and it is the right one to run before changing any of this."}}]}]}</script>
+</head>
+<body>
+<div class="anx-root">
+<a class="anx-skip" href="#main">Skip to content</a>
+<header class="anx-header">
+  <div class="anx-bar">
+    <a class="anx-brand" href="/" aria-label="Allan Ni&ntilde;al &mdash; home">
+      <span class="anx-brand__mark"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 7 5 12l4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 7 19 12l-4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/></svg></span>
+      <span class="anx-brand__text">allanninal<span class="anx-brand__dim">.dev</span><span class="anx-brand__section">/slack</span></span>
+    </a>
+
+    <nav class="anx-nav" aria-label="Primary">
+      <a class="anx-link" href="/">Home</a>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-work" aria-haspopup="true">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel" id="anx-work" hidden><p class="anx-panel__title">What I build</p><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+      </div>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-guides" aria-haspopup="true">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel anx-panel--wide" id="anx-guides" hidden><div class="anx-panel__group"><p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/">GitHub API<span class="anx-item__note">56</span></a><a class="anx-item" href="/slack/" aria-current="page">Slack<span class="anx-item__note">52</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">40</span></a></div></div>
+      </div>
+      <a class="anx-link" href="/blog/">Blog</a>
+      <a class="anx-link" href="/#about">About</a>
+    </nav>
+
+    <div class="anx-actions">
+      <a class="anx-icon" href="https://github.com/allanninal" rel="me noopener" target="_blank" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg></a>
+      <a class="anx-cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Collaborate</a>
+      <button class="anx-burger" type="button" aria-expanded="false" aria-controls="anx-drawer" aria-label="Open menu">
+        <span class="anx-burger__box" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="anx-drawer" id="anx-drawer" hidden>
+    <a class="anx-drawer__cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Open for collaboration</a>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/">Home</a></div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-work">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-work" hidden><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+    </div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-guides">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-guides" hidden>
+        <p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a>
+        <p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a>
+        <p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/">GitHub API<span class="anx-item__note">56</span></a><a class="anx-item" href="/slack/" aria-current="page">Slack<span class="anx-item__note">52</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">40</span></a>
+      </div>
+    </div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/blog/">Blog</a></div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/#about">About</a></div>
+    <div class="anx-drawer__foot">
+      <a href="https://github.com/allanninal" rel="me noopener" target="_blank"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg>GitHub</a>
+      <a href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">LinkedIn</a>
+      <a href="https://ko-fi.com/allanninal" rel="noopener" target="_blank">Ko-fi</a>
+    </div>
+  </div>
+</header>
+</div>
+<main id="main">
+<section class="hero">
+<div class="container prose">
+<p class="breadcrumbs"><a href="/slack/">Field notes</a> / Slack</p>
+<p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Slack</p>
+<h1>The dedupe key that does not survive the retry</h1>
+<p class="lead">There is a dedupe check in the handler. Somebody added it after the last incident, it has a Redis set behind it and a TTL and a test, and there are still three Jira tickets for one Slack message.</p><p>This note is not about whether you deduplicate. It assumes you do. It is about the two properties the key has to have and the one property the store has to have, and about the fact that a key can fail all three while looking completely reasonable in a code review.</p>
+<div class="meta">
+<span class="chip">Read-only token</span>
+<span class="chip">Python and Node.js</span>
+<span class="chip">Tests included</span>
+</div>
+</div>
+</section>
+
+<div class="container prose">
+<figure class="feature-img">
+<img src="/slack/assets/img/duplicate-processing-on-retry/feature.jpg" alt="White and blue magnetic card" width="1200" height="630" loading="eager" decoding="async">
+<figcaption>Photo by <a href="https://unsplash.com/@averye457?utm_source=allanninal_dev?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Avery Evans</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+</figure>
+<div class="callout callout--note" id="short-answer">
+<div class="callout__title">The short answer</div>
+<p>An idempotency key for Slack event retries has to be <strong>stable</strong> (identical on the retry and on the original) and <strong>unique</strong> (different for two events you genuinely want processed separately). <code>event.event_id</code> is both. Most of the things people reach for instead fail one of them: the request signature is recomputed per delivery with a fresh timestamp, so it is never stable; <code>event.ts</code> is stable but is shared by every event about the same message; <code>client_msg_id</code> is stable and unique and simply is not there on bot messages, on subtyped messages, or on anything that is not a message at all.</p>
+<p>Then there is the store. Slack's retry schedule ends at about five minutes, so a TTL under three hundred seconds is a key that survives the first retry and expires before the last one &mdash; which is why the bug reproduces only on the delivery that arrives five minutes late, and only sometimes. The script below audits the key expression against those two properties, audits the TTL against the schedule, and then measures the one thing a read token can measure directly: how often the field you chose is actually present in your workspace's real messages.</p>
+</div>
+
+<h2>The problem in plain words</h2>
+<p>The duplicates themselves are easy to see and there is <a href="/slack/duplicate-messages-no-dedupe/">a note about seeing them</a>. This one deliberately never counts a duplicate, because by the time you are reading this you have already counted them and have already written the guard that was supposed to stop them. The interesting failure is downstream of that decision: the guard is there, it runs, and it does not fire.</p>
+<p>The most common reason is a key that is not stable. A retry is a fresh HTTP request: new <code>X-Slack-Request-Timestamp</code>, new <code>X-Slack-Signature</code>, new arrival time at your load balancer. Anything derived from the delivery rather than from the event changes on every attempt, so a set keyed on it accumulates one entry per delivery and rejects nothing. The code looks like deduplication. It is a log with an eviction policy.</p>
+<p>The second reason is a key that is not always there. <code>client_msg_id</code> is a genuinely good identifier when it exists, and it exists only on messages a person typed into a Slack client. Bot messages do not carry it. Subtyped messages generally do not. Reactions, channel joins and app mentions of the non-message kind never did. So the expression <code>event.client_msg_id</code> evaluates to nothing for a substantial share of real traffic, and now the behaviour depends entirely on what your code does with a missing key: store it and every keyless event collides with every other keyless event, so the first one is processed and the rest are silently dropped; skip the check and every keyless event is processed once per delivery. One of those loses work and the other duplicates it, and neither is what the guard was for.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 168" role="img" aria-label="A dedupe guard keyed on the delivery instead of the event"><defs><marker id="skdpr-p-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#695a6a"/></marker><marker id="skdpr-p-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="skdpr-p-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="skdpr-p-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a154b"/></marker></defs><rect x="10.0" y="51.0" width="111.2" height="66" rx="10" fill="#f7f1f7" stroke="#e4cfe5"/><text x="66" y="77.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Retry arrives</text><text x="66" y="94.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">same event, new</text><text x="66" y="107.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">request</text><rect x="167.2" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="223" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Dedupe check</text><text x="223" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">runs</text><text x="223" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">keyed on the</text><text x="223" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">signature</text><rect x="324.4" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="380" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">The signature</text><text x="380" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">is new</text><text x="380" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">the set has not</text><text x="380" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">seen it</text><rect x="481.59999999999997" y="51.0" width="111.2" height="66" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="537" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">The work runs</text><text x="537" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">again</text><text x="537" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">a third ticket is</text><text x="537" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">created</text><rect x="638.8" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="694" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Guard blamed</text><text x="694" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">for not firing</text><text x="694" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">it fired every</text><text x="694" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">time</text><line x1="124" y1="84" x2="161" y2="84" stroke="#695a6a" stroke-width="2" marker-end="url(#skdpr-p-plain)"/><line x1="281" y1="84" x2="318" y2="84" stroke="#695a6a" stroke-width="2" marker-end="url(#skdpr-p-plain)"/><line x1="439" y1="84" x2="476" y2="84" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skdpr-p-bad)"/><line x1="596" y1="84" x2="633" y2="84" stroke="#695a6a" stroke-width="2" marker-end="url(#skdpr-p-plain)"/></svg>
+<figcaption>A retry is a fresh HTTP request with a new timestamp and a new signature. A set keyed on either of those accumulates one entry per delivery and turns nothing away.</figcaption>
+</figure>
+
+<h2>Why it happens</h2>
+<p><strong><code>event_id</code> is the only field designed for this.</strong> It identifies the event, not the delivery, and Slack sends the same one on every retry of it. It is present on every event type, it is opaque, and it needs no parsing. Almost every other candidate is something that happens to be unique often enough to pass a test.</p>
+<p><strong>Stable and unique are separate properties and most wrong keys fail exactly one.</strong> A key that fails stability dedupes nothing, which shows up as duplicates. A key that fails uniqueness dedupes too much, which shows up as missing work and is far harder to notice, because nobody files a ticket about the ticket that was not created.</p>
+<p><strong>The TTL is not a tuning parameter, it is a deadline set by Slack.</strong> Retries land at roughly zero, sixty and three hundred seconds. Anything under three hundred is arithmetically incapable of catching the last one. Sixty seconds is the value people pick because the first retry is at sixty, and it produces a system that deduplicates the retries you tested and not the ones that happen at load.</p>
+<p><strong>Under Socket Mode there is no retry header at all.</strong> The <code>X-Slack-Retry-Num</code> and <code>X-Slack-Retry-Reason</code> headers are an HTTP transport thing. An app that guards by checking whether the retry header is present has no guard when it moves to Socket Mode, and the move is usually made for unrelated reasons by somebody who has never read the dedupe code. Guard on the event id, which arrives the same way over both transports.</p>
+<p><strong>The retry reason tells you whether the original probably succeeded.</strong> <code>http_timeout</code> means Slack sent it, your service took the payload and then answered late, so the work very likely happened. <code>connection_failed</code> and <code>ssl_error</code> mean it probably did not. That distinction is worth reading when it is available, and it is a refinement on top of an event id check, never a replacement for one.</p>
+
+<h2>The fix, as a flow</h2>
+<p>The box that goes red here is the guard, which is the one box a reader arrives expecting to be the fix. It ran on every delivery and it rejected none of them, because the value it was keyed on is a property of the request rather than of the event. The fix branch asks three questions rather than one, and its two failing key rows fail in opposite directions.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 362" role="img" aria-label="Auditing the key for stability and uniqueness, the ttl against the schedule, and the field against real traffic"><defs><marker id="skdpr-f-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#695a6a"/></marker><marker id="skdpr-f-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="skdpr-f-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="skdpr-f-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a154b"/></marker></defs><rect x="10" y="146.0" width="216" height="70" rx="10" fill="#f7f1f7" stroke="#e4cfe5"/><text x="118" y="172.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Key, ttl, and field coverage</text><text x="118" y="189.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">three separate questions</text><rect x="300" y="22.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="48.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Keyed on the delivery</text><text x="525" y="65.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">never stable, rejects nothing</text><path d="M229,181 C260,181 260,49 294,49" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skdpr-f-bad)"/><rect x="300" y="88.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="114.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Keyed on the message ts</text><text x="525" y="131.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">collides, so work is lost</text><path d="M229,181 C260,181 260,115 294,115" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skdpr-f-bad)"/><rect x="300" y="154.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="180.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">A ttl of sixty seconds</text><text x="525" y="197.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">expires before the 300s retry</text><path d="M229,181 C260,181 260,181 294,181" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skdpr-f-bad)"/><rect x="300" y="220.0" width="450" height="54" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="525" y="246.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">client_msg_id on half</text><text x="525" y="263.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">the rest are unkeyed</text><path d="M229,181 C260,181 260,247 294,247" fill="none" stroke="#695a6a" stroke-width="2" marker-end="url(#skdpr-f-plain)"/><rect x="300" y="286.0" width="450" height="54" rx="10" fill="#eef7ea" stroke="#bfdcb1"/><text x="525" y="312.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">event_id with a 600s ttl</text><text x="525" y="329.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">stable, unique, always there</text><path d="M229,181 C260,181 260,313 294,313" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#skdpr-f-good)"/></svg>
+<figcaption>Stable and unique are separate properties and most wrong keys fail exactly one. Failing stability produces duplicates that somebody reports; failing uniqueness produces missing work that nobody does.</figcaption>
+</figure>
+
+<h2>How to fix it</h2>
+<h3>Write down the key expression exactly as the code computes it</h3>
+<p>Not "we dedupe on the event", the actual expression: <code>event.event_id</code>, <code>body.event.client_msg_id</code>, <code>sha256(raw_body)</code>, <code>headers['x-slack-signature']</code>. The whole audit turns on which of those it is, and the four are indistinguishable in a design document.</p>
+<h3>Check it for stability first</h3>
+<p>Does the retry carry the same value? Anything computed from the request rather than read out of the event fails here, and the failure is total: the guard runs on every delivery and rejects none of them. The script names which side of that line each known expression falls on.</p>
+<h3>Then check it for uniqueness</h3>
+<p>Do two events you want handled separately get different values? A message timestamp is stable and is shared by the message event, the reaction on it, and the edit of it, so a single set keyed on it will swallow two of the three. This is the failure that loses work rather than duplicating it.</p>
+<h3>Measure how often the field is actually there</h3>
+<p>This is the half a read token answers directly. Sample real messages from the workspace and count how many carry the field you chose. A key present on sixty percent of messages is not a key, it is a key and a coin flip, and the script reports the rate rather than the opinion.</p>
+<h3>Hold the TTL against the retry schedule, not against your intuition</h3>
+<p>Three hundred seconds is the floor and ten minutes is the number to use. Below three hundred the guard cannot see the last retry; the resulting bug appears minutes after the event, under load, on a delivery nobody is watching.</p>
+<h3>Make the downstream operation idempotent as well</h3>
+<p>A dedupe set is a cache and caches are lost. Putting the event id on the created record as an external key means that even a cold Redis cannot double-create, which turns a correctness property into a database constraint rather than a timing one.</p>
+
+<h2>How to check it worked</h2>
+<p>Re-run after moving to the event id and lengthening the TTL. The coverage line is the one that should change most, because it stops being a measurement of your traffic and starts being a constant.</p>
+<pre><code class="language-bash">python3 slack_dedupe_key_audit.py --key event_id --ttl 600 --channels 5
+# key        stable-unique  event_id identifies the event, not the delivery
+# ttl        sufficient     600s covers the last retry at 300s with margin
+# schedule   retries        0, 60, 300 seconds after the original
+# coverage   always-present ts on 412 of 412 sampled message(s), 100.0%
+# verdict    ok             the key is stable, unique and always present</code></pre>
+
+<h2>The full code</h2>
+<p>Three pure functions and one page of history per sampled channel. <code>key_stability</code> is a table of the expressions people actually write, each placed against the two properties a key needs, and the entries that fail are more instructive than the one that passes. <code>ttl_verdict</code> holds the store against Slack's schedule, where three hundred seconds is a fact rather than a preference. <code>key_coverage</code> is the part only a token can answer: how often the field you chose exists in this workspace's real messages.</p>
+<div class="repo-cta" data-repo-cta>
+<a href="https://github.com/allanninal/slack-fixes/tree/main/duplicate-processing-on-retry" rel="noopener" target="_blank">Get this script on GitHub</a>
+<a href="https://github.com/allanninal" rel="noopener" target="_blank">Follow @allanninal</a>
+<span>Python and Node.js, with tests. Read only, it never writes. One of 52 Slack fixes, free and open source.</span>
+</div>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">slack_dedupe_key_audit.py</div>
+<pre><code class="language-python">&quot;&quot;&quot;Audit the idempotency key a Slack event handler dedupes on.
+
+Read only. This script never counts duplicate messages; that is a different
+question with a different script. It takes the key expression and TTL the
+handler uses, places them against the two properties an idempotency key needs
+and against Slack&#x27;s retry schedule, and then samples history to measure how
+often the chosen field is actually present in real traffic.
+&quot;&quot;&quot;
+import argparse
+import logging
+import os
+import sys
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+log = logging.getLogger(&quot;slack_dedupe_key_audit&quot;)
+
+API = &quot;https://slack.com/api/&quot;
+
+# Retries land at roughly these offsets, so the last one a store has to
+# remember is five minutes old. A TTL under 300 cannot catch it, whatever else
+# is right about the key.
+RETRY_SCHEDULE_SECONDS = (0, 60, 300)
+LAST_RETRY_SECONDS = 300
+COMFORTABLE_TTL_SECONDS = 600
+
+# The expressions people actually write, against the two properties a key
+# needs: stable means the retry carries the same value, unique means two
+# events you want handled separately get different ones. Failing stability
+# dedupes nothing. Failing uniqueness dedupes too much, which loses work and
+# is much harder to notice.
+KEY_TABLE = {
+    &quot;event_id&quot;: (True, True,
+                 &quot;identifies the event, not the delivery, and Slack sends the &quot;
+                 &quot;same one on every retry of it. Present on every event type.&quot;),
+    &quot;event.event_id&quot;: (True, True, &quot;the same field, spelled with its envelope&quot;),
+    &quot;event_time&quot;: (True, False,
+                   &quot;stable, and only second granularity: two events in the same &quot;
+                   &quot;second collide and one of them is silently dropped&quot;),
+    &quot;event.ts&quot;: (True, False,
+                 &quot;stable for one message and shared by every event about that &quot;
+                 &quot;message, so the reaction and the edit collide with it&quot;),
+    &quot;ts&quot;: (True, False, &quot;the same field without its envelope&quot;),
+    &quot;client_msg_id&quot;: (True, True,
+                      &quot;stable and unique where it exists, and it exists only on &quot;
+                      &quot;messages a person typed into a Slack client. Check the &quot;
+                      &quot;coverage line before trusting it.&quot;),
+    &quot;x-slack-signature&quot;: (False, True,
+                          &quot;recomputed per delivery over a fresh request &quot;
+                          &quot;timestamp, so the retry never matches the original. &quot;
+                          &quot;A set keyed on this rejects nothing.&quot;),
+    &quot;x-slack-request-timestamp&quot;: (False, True,
+                                  &quot;the delivery&#x27;s clock, not the event&#x27;s&quot;),
+    &quot;received_at&quot;: (False, True, &quot;your clock, which moves&quot;),
+    &quot;uuid&quot;: (False, True, &quot;generated per delivery, so every delivery is new&quot;),
+    &quot;x-slack-retry-num&quot;: (False, False,
+                          &quot;a flag, not a key: it says whether this is a retry &quot;
+                          &quot;and not which event it is. It is also absent under &quot;
+                          &quot;Socket Mode, so a guard built on it disappears when &quot;
+                          &quot;the transport changes.&quot;),
+    &quot;body_hash&quot;: (True, True,
+                  &quot;identical across retries in practice, and brittle: it covers &quot;
+                  &quot;envelope fields you do not control, and re-wrapping the &quot;
+                  &quot;payload through your own queue changes it&quot;),
+}
+
+
+def key_stability(expression):
+    &quot;&quot;&quot;Place a key expression against stability and uniqueness. Pure.
+
+    Returns a dict. The two properties are separate on purpose: a key that
+    fails stability produces duplicates, and a key that fails uniqueness
+    produces missing work, which nobody files a ticket about.
+    &quot;&quot;&quot;
+    name = str(expression or &quot;&quot;).strip().lower().lstrip(&quot;$&quot;)
+    row = KEY_TABLE.get(name)
+    if row is None:
+        return {&quot;verdict&quot;: &quot;unrecognised&quot;, &quot;stable&quot;: None, &quot;unique&quot;: None,
+                &quot;detail&quot;: &quot;not an expression this script knows. Check it by &quot;
+                          &quot;hand: does the retry carry the same value, and do &quot;
+                          &quot;two different events get different ones?&quot;}
+    stable, unique, detail = row
+    if stable and unique:
+        verdict = &quot;stable-unique&quot;
+    elif not stable and not unique:
+        verdict = &quot;flag-not-key&quot;
+    elif not stable:
+        verdict = &quot;not-stable&quot;
+    else:
+        verdict = &quot;stable-collides&quot;
+    if name == &quot;client_msg_id&quot;:
+        verdict = &quot;sparse&quot;
+    return {&quot;verdict&quot;: verdict, &quot;stable&quot;: stable, &quot;unique&quot;: unique,
+            &quot;detail&quot;: detail}
+
+
+def ttl_verdict(ttl_seconds):
+    &quot;&quot;&quot;Hold the dedupe store&#x27;s TTL against Slack&#x27;s retry schedule. Pure.
+
+    Three hundred seconds is not a preference. It is where the last retry
+    lands, and a shorter TTL is arithmetically incapable of catching it.
+    &quot;&quot;&quot;
+    if ttl_seconds is None:
+        return (&quot;unbounded&quot;,
+                &quot;nothing expires. Correct for deduplication and a memory leak &quot;
+                &quot;with a long fuse; ten minutes is enough and bounded.&quot;)
+    try:
+        ttl = float(ttl_seconds)
+    except (TypeError, ValueError):
+        return (&quot;unreadable&quot;, &quot;the ttl is not a number of seconds&quot;)
+    if ttl &lt;= 0:
+        return (&quot;no-ttl&quot;,
+                &quot;nothing is remembered, so every delivery is the first one this &quot;
+                &quot;store has seen&quot;)
+    if ttl &lt; LAST_RETRY_SECONDS:
+        return (&quot;too-short&quot;,
+                &quot;%ds expires before the last retry at %ds. This guard catches &quot;
+                &quot;the retry you tested and misses the one that arrives five &quot;
+                &quot;minutes later under load.&quot; % (int(ttl), LAST_RETRY_SECONDS))
+    if ttl &lt; COMFORTABLE_TTL_SECONDS:
+        return (&quot;no-margin&quot;,
+                &quot;%ds covers the schedule exactly and leaves nothing for clock &quot;
+                &quot;skew or a slow queue&quot; % int(ttl))
+    return (&quot;sufficient&quot;,
+            &quot;%ds covers the last retry at %ds with margin&quot;
+            % (int(ttl), LAST_RETRY_SECONDS))
+
+
+def key_coverage(messages, field):
+    &quot;&quot;&quot;Count how often the chosen field is present in real messages. Pure.
+
+    The half a read token answers directly. A key present on sixty percent of
+    traffic is not a key, and what happens to the other forty percent depends
+    on how the handler treats a missing value: store it and they all collide
+    with each other, skip the check and they are all processed per delivery.
+    &quot;&quot;&quot;
+    rows = list(messages or [])
+    name = str(field or &quot;&quot;).strip()
+    if not rows:
+        return {&quot;present&quot;: 0, &quot;total&quot;: 0, &quot;rate&quot;: 0.0, &quot;verdict&quot;: &quot;no-sample&quot;,
+                &quot;detail&quot;: &quot;no messages were sampled, so coverage is unmeasured&quot;}
+    present = sum(1 for m in rows if isinstance(m, dict) and m.get(name))
+    total = len(rows)
+    rate = round(present * 100.0 / total, 1)
+    if present == 0:
+        return {&quot;present&quot;: present, &quot;total&quot;: total, &quot;rate&quot;: rate, &quot;verdict&quot;: &quot;never&quot;,
+                &quot;detail&quot;: &quot;%s is on none of the %d sampled message(s); a key that &quot;
+                          &quot;is always absent is not a key&quot; % (name, total)}
+    if rate &gt;= 99.5:
+        return {&quot;present&quot;: present, &quot;total&quot;: total, &quot;rate&quot;: rate,
+                &quot;verdict&quot;: &quot;always-present&quot;,
+                &quot;detail&quot;: &quot;%s on %d of %d sampled message(s), %.1f%%&quot;
+                          % (name, present, total, rate)}
+    return {&quot;present&quot;: present, &quot;total&quot;: total, &quot;rate&quot;: rate, &quot;verdict&quot;: &quot;sparse&quot;,
+            &quot;detail&quot;: &quot;%s is missing from %d of %d sampled message(s). Those &quot;
+                      &quot;events either all collide on the empty key, losing work, &quot;
+                      &quot;or all skip the guard, duplicating it.&quot;
+                      % (name, total - present, total)}
+
+
+def get(session, method, **params):
+    r = session.get(API + method, params=params, timeout=30)
+    try:
+        return r.json()
+    except ValueError:
+        return {&quot;ok&quot;: False, &quot;error&quot;: &quot;unparseable_body&quot;}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(&quot;--token-env&quot;, default=&quot;SLACK_BOT_TOKEN&quot;)
+    ap.add_argument(&quot;--key&quot;, default=&quot;event_id&quot;,
+                    help=&quot;the key expression the handler dedupes on&quot;)
+    ap.add_argument(&quot;--ttl&quot;, default=&quot;600&quot;,
+                    help=&quot;the dedupe store&#x27;s ttl in seconds, or none&quot;)
+    ap.add_argument(&quot;--field&quot;, action=&quot;append&quot;, default=[],
+                    help=&quot;message field to measure coverage for; repeatable&quot;)
+    ap.add_argument(&quot;--channels&quot;, type=int, default=5,
+                    help=&quot;how many of the bot&#x27;s channels to sample&quot;)
+    args = ap.parse_args()
+
+    findings = 0
+    key = key_stability(args.key)
+    good_key = key[&quot;verdict&quot;] == &quot;stable-unique&quot;
+    (log.info if good_key else log.warning)(
+        &quot;key        %-14s %s %s&quot;, key[&quot;verdict&quot;], args.key, key[&quot;detail&quot;])
+    if not good_key:
+        findings += 1
+
+    ttl = None if str(args.ttl).strip().lower() in (&quot;none&quot;, &quot;&quot;) else args.ttl
+    state, detail = ttl_verdict(ttl)
+    (log.info if state == &quot;sufficient&quot; else log.warning)(
+        &quot;ttl        %-14s %s&quot;, state, detail)
+    log.info(&quot;schedule   retries        %s seconds after the original, so the &quot;
+             &quot;last one to remember is %ds old&quot;,
+             &quot;, &quot;.join(str(x) for x in RETRY_SCHEDULE_SECONDS), LAST_RETRY_SECONDS)
+    if state != &quot;sufficient&quot;:
+        findings += 1
+
+    fields = args.field or [&quot;ts&quot;, &quot;client_msg_id&quot;]
+    token = os.environ.get(args.token_env)
+    if not token:
+        log.info(&quot;coverage   skipped        set %s to measure how often each &quot;
+                 &quot;field is present&quot;, args.token_env)
+    else:
+        s = requests.Session()
+        s.headers.update({&quot;Authorization&quot;: &quot;Bearer &quot; + token})
+        who = get(s, &quot;auth.test&quot;)
+        if who.get(&quot;ok&quot;) is not True:
+            log.error(&quot;auth.test answered 200 with ok: false, error=%s&quot;, who.get(&quot;error&quot;))
+            return 2
+        mine = get(s, &quot;users.conversations&quot;, user=who.get(&quot;user_id&quot;, &quot;&quot;),
+                   types=&quot;public_channel,private_channel&quot;, limit=200)
+        ids = [c.get(&quot;id&quot;) for c in (mine.get(&quot;channels&quot;) or [])][:max(args.channels, 1)]
+        sample = []
+        for cid in ids:
+            page = get(s, &quot;conversations.history&quot;, channel=cid, limit=200)
+            if page.get(&quot;ok&quot;) is not True:
+                log.warning(&quot;coverage   skipped        %s on %s&quot;, page.get(&quot;error&quot;), cid)
+                continue
+            sample.extend(page.get(&quot;messages&quot;) or [])
+        for name in fields:
+            cov = key_coverage(sample, name)
+            (log.info if cov[&quot;verdict&quot;] == &quot;always-present&quot; else log.warning)(
+                &quot;coverage   %-14s %s&quot;, cov[&quot;verdict&quot;], cov[&quot;detail&quot;])
+            if cov[&quot;verdict&quot;] == &quot;sparse&quot; and name == args.key:
+                findings += 1
+
+    if findings:
+        log.warning(&quot;  repair: dedupe on event.event_id, which identifies the &quot;
+                    &quot;event rather than the delivery and arrives identically over &quot;
+                    &quot;http and Socket Mode&quot;)
+        log.warning(&quot;  repair: give the store a ten minute ttl so the retry at &quot;
+                    &quot;300 seconds is still remembered when it lands&quot;)
+        log.warning(&quot;  repair: put the event id on the created record as an &quot;
+                    &quot;external key, so a cold dedupe cache cannot double-create&quot;)
+        return 1
+    log.info(&quot;verdict    %-14s the key is stable, unique and always present&quot;, &quot;ok&quot;)
+    return 0
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">slack-dedupe-key-audit.mjs</div>
+<pre><code class="language-javascript">/**
+ * Audit the idempotency key a Slack event handler dedupes on.
+ *
+ * Read only. This script never counts duplicate messages; that is a different
+ * question with a different script. It takes the key expression and TTL the
+ * handler uses, places them against the two properties an idempotency key
+ * needs and against Slack&#x27;s retry schedule, and then samples history to
+ * measure how often the chosen field is actually present in real traffic.
+ */
+
+const API = &#x27;https://slack.com/api/&#x27;;
+
+// The last retry a store has to remember is five minutes old.
+const RETRY_SCHEDULE_SECONDS = [0, 60, 300];
+const LAST_RETRY_SECONDS = 300;
+const COMFORTABLE_TTL_SECONDS = 600;
+
+// The expressions people actually write, against the two properties a key
+// needs. Failing stability dedupes nothing; failing uniqueness dedupes too
+// much, which loses work and is much harder to notice.
+const KEY_TABLE = new Map([
+  [&#x27;event_id&#x27;, [true, true,
+    &#x27;identifies the event, not the delivery, and Slack sends the same one on &#x27; +
+    &#x27;every retry of it. Present on every event type.&#x27;]],
+  [&#x27;event.event_id&#x27;, [true, true, &#x27;the same field, spelled with its envelope&#x27;]],
+  [&#x27;event_time&#x27;, [true, false,
+    &#x27;stable, and only second granularity: two events in the same second &#x27; +
+    &#x27;collide and one of them is silently dropped&#x27;]],
+  [&#x27;event.ts&#x27;, [true, false,
+    &#x27;stable for one message and shared by every event about that message, so &#x27; +
+    &#x27;the reaction and the edit collide with it&#x27;]],
+  [&#x27;ts&#x27;, [true, false, &#x27;the same field without its envelope&#x27;]],
+  [&#x27;client_msg_id&#x27;, [true, true,
+    &#x27;stable and unique where it exists, and it exists only on messages a &#x27; +
+    &#x27;person typed into a Slack client. Check the coverage line before &#x27; +
+    &#x27;trusting it.&#x27;]],
+  [&#x27;x-slack-signature&#x27;, [false, true,
+    &#x27;recomputed per delivery over a fresh request timestamp, so the retry &#x27; +
+    &#x27;never matches the original. A set keyed on this rejects nothing.&#x27;]],
+  [&#x27;x-slack-request-timestamp&#x27;, [false, true, &quot;the delivery&#x27;s clock, not the event&#x27;s&quot;]],
+  [&#x27;received_at&#x27;, [false, true, &#x27;your clock, which moves&#x27;]],
+  [&#x27;uuid&#x27;, [false, true, &#x27;generated per delivery, so every delivery is new&#x27;]],
+  [&#x27;x-slack-retry-num&#x27;, [false, false,
+    &#x27;a flag, not a key: it says whether this is a retry and not which event it &#x27; +
+    &#x27;is. It is also absent under Socket Mode, so a guard built on it &#x27; +
+    &#x27;disappears when the transport changes.&#x27;]],
+  [&#x27;body_hash&#x27;, [true, true,
+    &#x27;identical across retries in practice, and brittle: it covers envelope &#x27; +
+    &#x27;fields you do not control, and re-wrapping the payload through your own &#x27; +
+    &#x27;queue changes it&#x27;]],
+]);
+
+/**
+ * Place a key expression against stability and uniqueness. Pure.
+ * The two properties are separate on purpose: failing stability produces
+ * duplicates, failing uniqueness produces missing work.
+ */
+export function keyStability(expression) {
+  const name = String(expression ?? &#x27;&#x27;).trim().toLowerCase().replace(/^\$+/, &#x27;&#x27;);
+  const row = KEY_TABLE.get(name);
+  if (!row) {
+    return {
+      verdict: &#x27;unrecognised&#x27;,
+      stable: null,
+      unique: null,
+      detail: &#x27;not an expression this script knows. Check it by hand: does the &#x27; +
+        &#x27;retry carry the same value, and do two different events get different ones?&#x27;,
+    };
+  }
+  const [stable, unique, detail] = row;
+  let verdict = &#x27;stable-collides&#x27;;
+  if (stable &amp;&amp; unique) verdict = &#x27;stable-unique&#x27;;
+  else if (!stable &amp;&amp; !unique) verdict = &#x27;flag-not-key&#x27;;
+  else if (!stable) verdict = &#x27;not-stable&#x27;;
+  if (name === &#x27;client_msg_id&#x27;) verdict = &#x27;sparse&#x27;;
+  return { verdict, stable, unique, detail };
+}
+
+/**
+ * Hold the dedupe store&#x27;s TTL against Slack&#x27;s retry schedule. Pure.
+ * Three hundred seconds is where the last retry lands, not a preference.
+ */
+export function ttlVerdict(ttlSeconds) {
+  if (ttlSeconds === null || ttlSeconds === undefined) {
+    return [&#x27;unbounded&#x27;,
+      &#x27;nothing expires. Correct for deduplication and a memory leak with a &#x27; +
+      &#x27;long fuse; ten minutes is enough and bounded.&#x27;];
+  }
+  const ttl = Number(ttlSeconds);
+  if (!Number.isFinite(ttl)) return [&#x27;unreadable&#x27;, &#x27;the ttl is not a number of seconds&#x27;];
+  if (ttl &lt;= 0) {
+    return [&#x27;no-ttl&#x27;,
+      &#x27;nothing is remembered, so every delivery is the first one this store has seen&#x27;];
+  }
+  if (ttl &lt; LAST_RETRY_SECONDS) {
+    return [&#x27;too-short&#x27;,
+      `${Math.trunc(ttl)}s expires before the last retry at ${LAST_RETRY_SECONDS}s. ` +
+      &#x27;This guard catches the retry you tested and misses the one that arrives &#x27; +
+      &#x27;five minutes later under load.&#x27;];
+  }
+  if (ttl &lt; COMFORTABLE_TTL_SECONDS) {
+    return [&#x27;no-margin&#x27;,
+      `${Math.trunc(ttl)}s covers the schedule exactly and leaves nothing for ` +
+      &#x27;clock skew or a slow queue&#x27;];
+  }
+  return [&#x27;sufficient&#x27;,
+    `${Math.trunc(ttl)}s covers the last retry at ${LAST_RETRY_SECONDS}s with margin`];
+}
+
+/**
+ * Count how often the chosen field is present in real messages. Pure.
+ * A key present on sixty percent of traffic is not a key, and what happens to
+ * the other forty percent depends on how the handler treats a missing value.
+ */
+export function keyCoverage(messages, field) {
+  const rows = [...(messages ?? [])];
+  const name = String(field ?? &#x27;&#x27;).trim();
+  if (rows.length === 0) {
+    return {
+      present: 0, total: 0, rate: 0, verdict: &#x27;no-sample&#x27;,
+      detail: &#x27;no messages were sampled, so coverage is unmeasured&#x27;,
+    };
+  }
+  const present = rows.filter((m) =&gt; m &amp;&amp; typeof m === &#x27;object&#x27; &amp;&amp; m[name]).length;
+  const total = rows.length;
+  const rate = Math.round((present * 1000.0) / total) / 10;
+  if (present === 0) {
+    return {
+      present, total, rate, verdict: &#x27;never&#x27;,
+      detail: `${name} is on none of the ${total} sampled message(s); a key that ` +
+        &#x27;is always absent is not a key&#x27;,
+    };
+  }
+  if (rate &gt;= 99.5) {
+    return {
+      present, total, rate, verdict: &#x27;always-present&#x27;,
+      detail: `${name} on ${present} of ${total} sampled message(s), ${rate}%`,
+    };
+  }
+  return {
+    present, total, rate, verdict: &#x27;sparse&#x27;,
+    detail: `${name} is missing from ${total - present} of ${total} sampled ` +
+      &#x27;message(s). Those events either all collide on the empty key, losing &#x27; +
+      &#x27;work, or all skip the guard, duplicating it.&#x27;,
+  };
+}
+
+async function get(token, method, params) {
+  const qs = new URLSearchParams(params);
+  const res = await fetch(`${API}${method}?${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  try { return await res.json(); } catch { return { ok: false, error: &#x27;unparseable_body&#x27; }; }
+}
+
+function arg(args, name, fallback = &#x27;&#x27;) {
+  const i = args.indexOf(name);
+  return i === -1 ? fallback : args[i + 1];
+}
+
+function argAll(args, name) {
+  const out = [];
+  for (let i = 0; i &lt; args.length; i += 1) {
+    if (args[i] === name &amp;&amp; args[i + 1] !== undefined) out.push(args[i + 1]);
+  }
+  return out;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const keyExpr = arg(args, &#x27;--key&#x27;, &#x27;event_id&#x27;);
+  const ttlArg = arg(args, &#x27;--ttl&#x27;, &#x27;600&#x27;);
+  const channels = Number(arg(args, &#x27;--channels&#x27;, 5));
+  let findings = 0;
+
+  const key = keyStability(keyExpr);
+  const goodKey = key.verdict === &#x27;stable-unique&#x27;;
+  (goodKey ? console.log : console.warn)(
+    `key        ${key.verdict.padEnd(14)} ${keyExpr} ${key.detail}`);
+  if (!goodKey) findings += 1;
+
+  const ttl = [&#x27;none&#x27;, &#x27;&#x27;].includes(String(ttlArg).trim().toLowerCase()) ? null : ttlArg;
+  const [state, detail] = ttlVerdict(ttl);
+  (state === &#x27;sufficient&#x27; ? console.log : console.warn)(
+    `ttl        ${state.padEnd(14)} ${detail}`);
+  console.log(`schedule   retries        ${RETRY_SCHEDULE_SECONDS.join(&#x27;, &#x27;)} seconds ` +
+    `after the original, so the last one to remember is ${LAST_RETRY_SECONDS}s old`);
+  if (state !== &#x27;sufficient&#x27;) findings += 1;
+
+  const fields = argAll(args, &#x27;--field&#x27;);
+  const wanted = fields.length ? fields : [&#x27;ts&#x27;, &#x27;client_msg_id&#x27;];
+  const tokenEnv = arg(args, &#x27;--token-env&#x27;, &#x27;SLACK_BOT_TOKEN&#x27;);
+  const token = process.env[tokenEnv];
+  if (!token) {
+    console.log(`coverage   skipped        set ${tokenEnv} to measure how often ` +
+      &#x27;each field is present&#x27;);
+  } else {
+    const who = await get(token, &#x27;auth.test&#x27;, {});
+    if (who.ok !== true) {
+      console.error(`auth.test answered 200 with ok: false, error=${who.error}`);
+      process.exitCode = 2;
+      return;
+    }
+    const mine = await get(token, &#x27;users.conversations&#x27;, {
+      user: who.user_id ?? &#x27;&#x27;, types: &#x27;public_channel,private_channel&#x27;, limit: &#x27;200&#x27;,
+    });
+    const ids = (mine.channels ?? []).map((c) =&gt; c.id).slice(0, Math.max(channels, 1));
+    const sample = [];
+    for (const cid of ids) {
+      // eslint-disable-next-line no-await-in-loop
+      const page = await get(token, &#x27;conversations.history&#x27;, { channel: cid, limit: &#x27;200&#x27; });
+      if (page.ok !== true) {
+        console.warn(`coverage   skipped        ${page.error} on ${cid}`);
+        continue;
+      }
+      sample.push(...(page.messages ?? []));
+    }
+    for (const name of wanted) {
+      const cov = keyCoverage(sample, name);
+      (cov.verdict === &#x27;always-present&#x27; ? console.log : console.warn)(
+        `coverage   ${cov.verdict.padEnd(14)} ${cov.detail}`);
+      if (cov.verdict === &#x27;sparse&#x27; &amp;&amp; name === keyExpr) findings += 1;
+    }
+  }
+
+  if (findings) {
+    console.warn(&#x27;  repair: dedupe on event.event_id, which identifies the event &#x27; +
+      &#x27;rather than the delivery and arrives identically over http and Socket Mode&#x27;);
+    console.warn(`  repair: give the store a ten minute ttl so the retry at ` +
+      `${LAST_RETRY_SECONDS} seconds is still remembered when it lands`);
+    console.warn(&#x27;  repair: put the event id on the created record as an external &#x27; +
+      &#x27;key, so a cold dedupe cache cannot double-create&#x27;);
+    process.exitCode = 1;
+  } else {
+    console.log(&#x27;verdict    ok             the key is stable, unique and always present&#x27;);
+  }
+}
+
+// Only run when invoked directly, so importing this module in the tests does
+// not execute main() and fail the file on a missing token.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) =&gt; { console.error(err.message); process.exitCode = 2; });
+}
+</code></pre>
+</div>
+</div>
+
+<h2>Add a test</h2>
+<p>The tests pin the two properties apart, because collapsing them is the mistake the whole note is about. The request signature is asserted to be unique and not stable, which is a guard that rejects nothing; the message timestamp is asserted to be stable and not unique, which is a guard that rejects too much and quietly loses work. The TTL boundary is pinned at exactly three hundred seconds in both directions, since that is Slack's number rather than anybody's preference, and coverage is asserted against a sample containing the message shapes that have no <code>client_msg_id</code>.</p>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">test_slack_dedupe_key_audit.py</div>
+<pre><code class="language-python">from slack_dedupe_key_audit import key_coverage, key_stability, ttl_verdict
+
+SAMPLE = [
+    {&quot;ts&quot;: &quot;1735689600.000100&quot;, &quot;user&quot;: &quot;U01&quot;, &quot;client_msg_id&quot;: &quot;aaa-1&quot;},
+    {&quot;ts&quot;: &quot;1735689601.000100&quot;, &quot;user&quot;: &quot;U01&quot;, &quot;client_msg_id&quot;: &quot;aaa-2&quot;},
+    {&quot;ts&quot;: &quot;1735689602.000100&quot;, &quot;user&quot;: &quot;U02&quot;, &quot;client_msg_id&quot;: &quot;aaa-3&quot;},
+    {&quot;ts&quot;: &quot;1735689603.000100&quot;, &quot;bot_id&quot;: &quot;B01&quot;},
+    {&quot;ts&quot;: &quot;1735689604.000100&quot;, &quot;bot_id&quot;: &quot;B01&quot;},
+    {&quot;ts&quot;: &quot;1735689605.000100&quot;, &quot;subtype&quot;: &quot;channel_join&quot;, &quot;user&quot;: &quot;U03&quot;},
+]
+
+
+def test_the_event_id_is_the_only_expression_that_passes_both_properties():
+    row = key_stability(&quot;event_id&quot;)
+    assert row[&quot;verdict&quot;] == &quot;stable-unique&quot;
+    assert row[&quot;stable&quot;] is True and row[&quot;unique&quot;] is True
+    assert key_stability(&quot;event.event_id&quot;)[&quot;verdict&quot;] == &quot;stable-unique&quot;
+
+
+def test_a_signature_is_unique_and_not_stable_so_it_rejects_nothing():
+    row = key_stability(&quot;x-slack-signature&quot;)
+    assert row[&quot;stable&quot;] is False
+    assert row[&quot;unique&quot;] is True
+    assert row[&quot;verdict&quot;] == &quot;not-stable&quot;
+
+
+def test_a_message_timestamp_is_stable_and_not_unique_so_it_rejects_too_much():
+    row = key_stability(&quot;event.ts&quot;)
+    assert row[&quot;stable&quot;] is True
+    assert row[&quot;unique&quot;] is False
+    assert row[&quot;verdict&quot;] == &quot;stable-collides&quot;
+    assert key_stability(&quot;ts&quot;)[&quot;verdict&quot;] == &quot;stable-collides&quot;
+
+
+def test_the_retry_header_is_reported_as_a_flag_rather_than_a_key():
+    row = key_stability(&quot;x-slack-retry-num&quot;)
+    assert row[&quot;verdict&quot;] == &quot;flag-not-key&quot;
+    assert &quot;Socket Mode&quot; in row[&quot;detail&quot;]
+
+
+def test_client_msg_id_is_kept_apart_from_the_keys_that_always_exist():
+    row = key_stability(&quot;client_msg_id&quot;)
+    assert row[&quot;verdict&quot;] == &quot;sparse&quot;
+    assert row[&quot;stable&quot;] is True and row[&quot;unique&quot;] is True
+
+
+def test_an_unknown_expression_is_never_guessed_at():
+    row = key_stability(&quot;some_field_we_invented&quot;)
+    assert row[&quot;verdict&quot;] == &quot;unrecognised&quot;
+    assert row[&quot;stable&quot;] is None
+
+
+def test_the_ttl_boundary_is_the_last_retry_and_not_a_preference():
+    assert ttl_verdict(299)[0] == &quot;too-short&quot;
+    assert ttl_verdict(300)[0] == &quot;no-margin&quot;
+    assert ttl_verdict(599)[0] == &quot;no-margin&quot;
+    assert ttl_verdict(600)[0] == &quot;sufficient&quot;
+
+
+def test_a_sixty_second_ttl_is_named_for_the_retry_it_misses():
+    state, detail = ttl_verdict(60)
+    assert state == &quot;too-short&quot;
+    assert &quot;300s&quot; in detail
+
+
+def test_no_ttl_and_no_expiry_are_different_findings():
+    assert ttl_verdict(0)[0] == &quot;no-ttl&quot;
+    assert ttl_verdict(None)[0] == &quot;unbounded&quot;
+    assert ttl_verdict(&quot;soon&quot;)[0] == &quot;unreadable&quot;
+
+
+def test_a_field_on_every_message_and_a_field_on_half_of_them():
+    assert key_coverage(SAMPLE, &quot;ts&quot;)[&quot;verdict&quot;] == &quot;always-present&quot;
+    cov = key_coverage(SAMPLE, &quot;client_msg_id&quot;)
+    assert cov[&quot;verdict&quot;] == &quot;sparse&quot;
+    assert cov[&quot;present&quot;] == 3
+    assert cov[&quot;rate&quot;] == 50.0
+
+
+def test_a_missing_field_is_reported_as_never_rather_than_as_sparse():
+    cov = key_coverage(SAMPLE, &quot;event_id&quot;)
+    assert cov[&quot;verdict&quot;] == &quot;never&quot;
+    assert &quot;not a key&quot; in cov[&quot;detail&quot;]
+
+
+def test_an_empty_sample_is_unmeasured_rather_than_clean():
+    cov = key_coverage([], &quot;ts&quot;)
+    assert cov[&quot;verdict&quot;] == &quot;no-sample&quot;
+    assert cov[&quot;rate&quot;] == 0.0
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">slack-dedupe-key-audit.test.mjs</div>
+<pre><code class="language-javascript">import { test } from &#x27;node:test&#x27;;
+import assert from &#x27;node:assert/strict&#x27;;
+import { keyCoverage, keyStability, ttlVerdict } from &#x27;./slack-dedupe-key-audit.mjs&#x27;;
+
+const SAMPLE = [
+  { ts: &#x27;1735689600.000100&#x27;, user: &#x27;U01&#x27;, client_msg_id: &#x27;aaa-1&#x27; },
+  { ts: &#x27;1735689601.000100&#x27;, user: &#x27;U01&#x27;, client_msg_id: &#x27;aaa-2&#x27; },
+  { ts: &#x27;1735689602.000100&#x27;, user: &#x27;U02&#x27;, client_msg_id: &#x27;aaa-3&#x27; },
+  { ts: &#x27;1735689603.000100&#x27;, bot_id: &#x27;B01&#x27; },
+  { ts: &#x27;1735689604.000100&#x27;, bot_id: &#x27;B01&#x27; },
+  { ts: &#x27;1735689605.000100&#x27;, subtype: &#x27;channel_join&#x27;, user: &#x27;U03&#x27; },
+];
+
+test(&#x27;the event id is the only expression that passes both properties&#x27;, () =&gt; {
+  const row = keyStability(&#x27;event_id&#x27;);
+  assert.equal(row.verdict, &#x27;stable-unique&#x27;);
+  assert.equal(row.stable, true);
+  assert.equal(row.unique, true);
+  assert.equal(keyStability(&#x27;event.event_id&#x27;).verdict, &#x27;stable-unique&#x27;);
+});
+
+test(&#x27;a signature is unique and not stable so it rejects nothing&#x27;, () =&gt; {
+  const row = keyStability(&#x27;x-slack-signature&#x27;);
+  assert.equal(row.stable, false);
+  assert.equal(row.unique, true);
+  assert.equal(row.verdict, &#x27;not-stable&#x27;);
+});
+
+test(&#x27;a message timestamp is stable and not unique so it rejects too much&#x27;, () =&gt; {
+  const row = keyStability(&#x27;event.ts&#x27;);
+  assert.equal(row.stable, true);
+  assert.equal(row.unique, false);
+  assert.equal(row.verdict, &#x27;stable-collides&#x27;);
+  assert.equal(keyStability(&#x27;ts&#x27;).verdict, &#x27;stable-collides&#x27;);
+});
+
+test(&#x27;the retry header is reported as a flag rather than a key&#x27;, () =&gt; {
+  const row = keyStability(&#x27;x-slack-retry-num&#x27;);
+  assert.equal(row.verdict, &#x27;flag-not-key&#x27;);
+  assert.match(row.detail, /Socket Mode/);
+});
+
+test(&#x27;client_msg_id is kept apart from the keys that always exist&#x27;, () =&gt; {
+  const row = keyStability(&#x27;client_msg_id&#x27;);
+  assert.equal(row.verdict, &#x27;sparse&#x27;);
+  assert.equal(row.stable, true);
+  assert.equal(row.unique, true);
+});
+
+test(&#x27;an unknown expression is never guessed at&#x27;, () =&gt; {
+  const row = keyStability(&#x27;some_field_we_invented&#x27;);
+  assert.equal(row.verdict, &#x27;unrecognised&#x27;);
+  assert.equal(row.stable, null);
+});
+
+test(&#x27;the ttl boundary is the last retry and not a preference&#x27;, () =&gt; {
+  assert.equal(ttlVerdict(299)[0], &#x27;too-short&#x27;);
+  assert.equal(ttlVerdict(300)[0], &#x27;no-margin&#x27;);
+  assert.equal(ttlVerdict(599)[0], &#x27;no-margin&#x27;);
+  assert.equal(ttlVerdict(600)[0], &#x27;sufficient&#x27;);
+});
+
+test(&#x27;a sixty second ttl is named for the retry it misses&#x27;, () =&gt; {
+  const [state, detail] = ttlVerdict(60);
+  assert.equal(state, &#x27;too-short&#x27;);
+  assert.match(detail, /300s/);
+});
+
+test(&#x27;no ttl and no expiry are different findings&#x27;, () =&gt; {
+  assert.equal(ttlVerdict(0)[0], &#x27;no-ttl&#x27;);
+  assert.equal(ttlVerdict(null)[0], &#x27;unbounded&#x27;);
+  assert.equal(ttlVerdict(&#x27;soon&#x27;)[0], &#x27;unreadable&#x27;);
+});
+
+test(&#x27;a field on every message and a field on half of them&#x27;, () =&gt; {
+  assert.equal(keyCoverage(SAMPLE, &#x27;ts&#x27;).verdict, &#x27;always-present&#x27;);
+  const cov = keyCoverage(SAMPLE, &#x27;client_msg_id&#x27;);
+  assert.equal(cov.verdict, &#x27;sparse&#x27;);
+  assert.equal(cov.present, 3);
+  assert.equal(cov.rate, 50);
+});
+
+test(&#x27;a missing field is reported as never rather than as sparse&#x27;, () =&gt; {
+  const cov = keyCoverage(SAMPLE, &#x27;event_id&#x27;);
+  assert.equal(cov.verdict, &#x27;never&#x27;);
+  assert.match(cov.detail, /not a key/);
+});
+
+test(&#x27;an empty sample is unmeasured rather than clean&#x27;, () =&gt; {
+  const cov = keyCoverage([], &#x27;ts&#x27;);
+  assert.equal(cov.verdict, &#x27;no-sample&#x27;);
+  assert.equal(cov.rate, 0);
+});
+</code></pre>
+</div>
+</div>
+
+<h2>FAQ</h2>
+<details class="faq-item"><summary>Why event_id rather than the message timestamp?</summary><p>Because the timestamp identifies the message and the event id identifies the event. A message being posted, reacted to and then edited produces three events that a timestamp-keyed set will treat as one, so two of the three are dropped as duplicates when neither is. The event id is different for each of them and identical across the retries of each, which is exactly the pair of properties the guard needs.</p></details>
+<details class="faq-item"><summary>Is ten minutes not excessive for a TTL?</summary><p>It is two entries per event in a set of short strings, for ten minutes. The alternative failure is worse than the memory: at sixty seconds the guard catches the retry at sixty and misses the one at three hundred, so the bug survives your testing and reappears only under the load that produced the slow deliveries in the first place. Three hundred seconds is the floor and six hundred is the number to use.</p></details>
+<details class="faq-item"><summary>We moved to Socket Mode and started seeing duplicates again. Why?</summary><p>Because the retry headers are an HTTP transport feature and Socket Mode does not carry them. Any guard written as &amp;ldquo;if the retry header is present, skip&amp;rdquo; silently becomes a no-op on the socket path. The event id is in the event payload itself and arrives identically over both transports, which is one more reason to key on it rather than on delivery metadata.</p></details>
+<details class="faq-item"><summary>Should I short-circuit on X-Slack-Retry-Reason?</summary><p>As a refinement, yes, and never as the guard. A reason of http_timeout means Slack sent the payload, your service accepted it, and the response was late, so the work has probably already been done. connection_failed and ssl_error suggest it has not. Reading that improves your odds on the cases the dedupe store missed; it does not replace the store, and it is unavailable over Socket Mode.</p></details>
+<details class="faq-item"><summary>The dedupe check is right and duplicates still appear.</summary><p>Then the duplicates are probably not retries, and the spacing will tell you: sub-second copies mean two delivery paths or two replicas handling the same event, hours apart means a scheduler running twice. Retry duplicates land at roughly sixty and three hundred seconds and nowhere else. Measuring that spacing is a different script, linked below, and it is the right one to run before changing any of this.</p></details>
+
+<h2>Related field notes</h2>
+<ul>
+<li><a href="/slack/duplicate-messages-no-dedupe/">counting the duplicates and reading their spacing</a></li>
+<li><a href="/slack/retry-storm-from-event-retries/">why there are retries to deduplicate at all</a></li>
+<li><a href="/slack/bot-message-echo-loop/">the other way one event becomes many</a></li>
+</ul>
+
+<h3>Sources</h3>
+<p class="sources-note">Every figure in this note is traced to one of these. Prices are
+list rates and change &mdash; check them for your own region before acting.</p>
+<ul class="citations">
+<li><a href="https://docs.slack.dev/apis/events-api/" rel="noopener nofollow" target="_blank">Events API - Slack Docs</a></li>
+<li><a href="https://docs.slack.dev/reference/events/message" rel="noopener nofollow" target="_blank">message event reference - Slack Docs</a></li>
+<li><a href="https://docs.slack.dev/apis/events-api/using-socket-mode" rel="noopener nofollow" target="_blank">Socket Mode - Slack Docs</a></li>
+<li><a href="https://docs.slack.dev/reference/methods/conversations.history" rel="noopener nofollow" target="_blank">conversations.history method reference - Slack Docs</a></li>
+</ul>
+
+<div class="callout callout--cta">
+<div class="callout__title">Stuck on a tricky one?</div>
+<p>If your setup is misbehaving in a way this note does not cover, <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">message me on LinkedIn</a> with what you are seeing.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+<div class="container">
+<p>Field notes by <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">Allan Ni&ntilde;al</a> &middot; <a href="/">Portfolio</a> &middot; <a href="/dns/">DNS &amp; domains</a> &middot; <a href="/email/">Email &amp; SES</a> &middot; <a href="/aws/">AWS cost</a></p>
+<p class="site-footer__fine">Every script in this section is read only. They hold a token that can post into your workspace, so none of them writes: they report what is wrong and print the repair for you to run. A read-scoped token is enough.</p>
+</div>
+</footer>
+<script src="/slack/assets/slack.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
+</body>
+</html>

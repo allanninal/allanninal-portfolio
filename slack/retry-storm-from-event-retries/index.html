@@ -1,0 +1,922 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One missed ack becomes four deliveries and a 429</title>
+<meta name="description" content="Slack retries at 0, 60 and 300 seconds. Multiply the deliveries by the calls each one makes, hold that against the tier, and find where the loop settles.">
+<link rel="canonical" href="https://www.allanninal.dev/slack/retry-storm-from-event-retries/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Ni&ntilde;al">
+<meta property="og:type" content="article">
+<meta property="og:title" content="One missed ack becomes four deliveries and a 429">
+<meta property="og:description" content="Slack retries at 0, 60 and 300 seconds. Multiply the deliveries by the calls each one makes, hold that against the tier, and find where the loop settles.">
+<meta property="og:url" content="https://www.allanninal.dev/slack/retry-storm-from-event-retries/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="One missed ack becomes four deliveries and a 429">
+<meta name="twitter:description" content="Slack retries at 0, 60 and 300 seconds. Multiply the deliveries by the calls each one makes, hold that against the tier, and find where the loop settles.">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/slack/assets/slack.css">
+<link rel="stylesheet" href="/assets/site-nav.css">
+<link rel="stylesheet" href="/assets/site-mobile.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/slack/retry-storm-from-event-retries/#article","headline":"One missed ack becomes four deliveries and a 429","description":"Slack retries at 0, 60 and 300 seconds. Multiply the deliveries by the calls each one makes, hold that against the tier, and find where the loop settles.","url":"https://www.allanninal.dev/slack/retry-storm-from-event-retries/","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.allanninal.dev/slack/retry-storm-from-event-retries/"},"datePublished":"2026-08-31","dateModified":"2026-08-31","inLanguage":"en","articleSection":"Slack","keywords":"slack retry storm, x-slack-retry-num rate limit, slack event retries 429, slack events api amplification, slack retry schedule 60 300 seconds","author":{"@id":"https://www.allanninal.dev/#person"},"publisher":{"@id":"https://www.allanninal.dev/#person"},"proficiencyLevel":"Intermediate","dependencies":"Python 3.9+ with requests, or Node.js 18+","citation":["https://docs.slack.dev/apis/events-api/","https://docs.slack.dev/apis/web-api/rate-limits","https://docs.slack.dev/reference/methods/conversations.history","https://docs.slack.dev/reference/methods/users.conversations"]},{"@type":"Person","@id":"https://www.allanninal.dev/#person","name":"Allan Niñal","jobTitle":"AI and Software Engineer","url":"https://www.allanninal.dev/","sameAs":["https://www.linkedin.com/in/allanninal/","https://github.com/allanninal"]},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/slack/"},{"@type":"ListItem","position":2,"name":"Slack","item":"https://www.allanninal.dev/slack/"},{"@type":"ListItem","position":3,"name":"One missed ack becomes four deliveries and a 429","item":"https://www.allanninal.dev/slack/retry-storm-from-event-retries/"}]},{"@type":"FAQPage","@id":"https://www.allanninal.dev/slack/retry-storm-from-event-retries/#faq","mainEntity":[{"@type":"Question","name":"Is four deliveries per event really the worst case?","acceptedAnswer":{"@type":"Answer","text":"For a single event, yes: the original plus three retries, and Slack does not go beyond that. The reason it still becomes a storm is that the ceiling applies per event while the quota applies per method per minute across every event at once. A four times spike on a system running at forty percent of its budget is fine; the same spike on one running at sixty percent is not, and the difference between those two workspaces is invisible until it happens."}},{"@type":"Question","name":"Why not just add more workers to absorb the retries?","acceptedAnswer":{"@type":"Answer","text":"Because the rate limit is per method, per workspace, per app, and not per process. Two replicas share one bucket, so doubling the workers doubles the rate at which the bucket is emptied and brings the refusals forward. It is the most natural response to a queue that is not draining and it is the one that makes this particular failure worse."}},{"@type":"Question","name":"Where do the sixty and three hundred second retries show up?","acceptedAnswer":{"@type":"Answer","text":"As humps in your API call graph that no product traffic explains, minutes after the load that caused them has gone. That spacing is also the fingerprint in the workspace itself: duplicate app messages roughly a minute and roughly five minutes apart are Slack's retry schedule, and reading those gaps is how a duplicate is attributed to a retry rather than to a double subscription."}},{"@type":"Question","name":"Does the model need my real miss rate to be useful?","acceptedAnswer":{"@type":"Answer","text":"It needs a starting one, and any honest number will do, because the interesting output is where the loop settles rather than where it starts. Take whatever fraction of deliveries your logs show taking over three seconds. If a five percent start settles in the nineties, then no plausible starting value saves this configuration; if a twenty percent start settles back near twenty, the feedback is not engaged and you have real headroom."}},{"@type":"Question","name":"Could the script measure the storm instead of modelling it?","acceptedAnswer":{"@type":"Answer","text":"It could measure the aftermath, which is duplicate messages in a channel, and that is a different note with a different script. What it will not do is produce the storm to prove the model, because the quota being exhausted belongs to the whole workspace: every other app installed there would be refused alongside yours, and none of their owners agreed to the experiment."}}]}]}</script>
+</head>
+<body>
+<div class="anx-root">
+<a class="anx-skip" href="#main">Skip to content</a>
+<header class="anx-header">
+  <div class="anx-bar">
+    <a class="anx-brand" href="/" aria-label="Allan Ni&ntilde;al &mdash; home">
+      <span class="anx-brand__mark"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 7 5 12l4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 7 19 12l-4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/></svg></span>
+      <span class="anx-brand__text">allanninal<span class="anx-brand__dim">.dev</span><span class="anx-brand__section">/slack</span></span>
+    </a>
+
+    <nav class="anx-nav" aria-label="Primary">
+      <a class="anx-link" href="/">Home</a>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-work" aria-haspopup="true">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel" id="anx-work" hidden><p class="anx-panel__title">What I build</p><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+      </div>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-guides" aria-haspopup="true">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel anx-panel--wide" id="anx-guides" hidden><div class="anx-panel__group"><p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/">GitHub API<span class="anx-item__note">56</span></a><a class="anx-item" href="/slack/" aria-current="page">Slack<span class="anx-item__note">52</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">40</span></a></div></div>
+      </div>
+      <a class="anx-link" href="/blog/">Blog</a>
+      <a class="anx-link" href="/#about">About</a>
+    </nav>
+
+    <div class="anx-actions">
+      <a class="anx-icon" href="https://github.com/allanninal" rel="me noopener" target="_blank" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg></a>
+      <a class="anx-cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Collaborate</a>
+      <button class="anx-burger" type="button" aria-expanded="false" aria-controls="anx-drawer" aria-label="Open menu">
+        <span class="anx-burger__box" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="anx-drawer" id="anx-drawer" hidden>
+    <a class="anx-drawer__cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Open for collaboration</a>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/">Home</a></div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-work">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-work" hidden><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+    </div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-guides">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-guides" hidden>
+        <p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a>
+        <p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a>
+        <p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/">GitHub API<span class="anx-item__note">56</span></a><a class="anx-item" href="/slack/" aria-current="page">Slack<span class="anx-item__note">52</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">40</span></a>
+      </div>
+    </div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/blog/">Blog</a></div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/#about">About</a></div>
+    <div class="anx-drawer__foot">
+      <a href="https://github.com/allanninal" rel="me noopener" target="_blank"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg>GitHub</a>
+      <a href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">LinkedIn</a>
+      <a href="https://ko-fi.com/allanninal" rel="noopener" target="_blank">Ko-fi</a>
+    </div>
+  </div>
+</header>
+</div>
+<main id="main">
+<section class="hero">
+<div class="container prose">
+<p class="breadcrumbs"><a href="/slack/">Field notes</a> / Slack</p>
+<p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Slack</p>
+<h1>One missed ack becomes four deliveries and a 429</h1>
+<p class="lead">It is fine at ten events a minute and it is fine at forty, and then one afternoon it is not fine at anything. The handler slows down a little, some deliveries miss the deadline, Slack sends them again, the extra deliveries make the same API calls, the calls start coming back <code>ratelimited</code>, the handler waits on them, and now it is missing far more deadlines than it was a minute ago.</p><p>Nothing in that sequence is a bug. Every component is behaving exactly as designed, and together they converge on total failure and stay there until the traffic stops.</p>
+<div class="meta">
+<span class="chip">Read-only token</span>
+<span class="chip">Python and Node.js</span>
+<span class="chip">Tests included</span>
+</div>
+</div>
+</section>
+
+<div class="container prose">
+<figure class="feature-img">
+<img src="/slack/assets/img/retry-storm-from-event-retries/feature.jpg" alt="Black android smartphone on brown wooden table" width="1200" height="630" loading="eager" decoding="async">
+<figcaption>Photo by <a href="https://unsplash.com/@cardmapr?utm_source=allanninal_dev?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">CardMapr.nl</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+</figure>
+<div class="callout callout--note" id="short-answer">
+<div class="callout__title">The short answer</div>
+<p>Slack retries a delivery it believes failed up to three times, at roughly zero, sixty and three hundred seconds. That is a ceiling of four deliveries per event, so the amplification is bounded and small &mdash; on its own it would be a nuisance. What makes it a storm is the second multiplier: each delivery runs your handler, and each run of your handler makes some number of Web API calls. Four deliveries times three calls is twelve calls where you budgeted three, against a per-method quota that did not grow.</p>
+<p>So this note is arithmetic rather than a state to detect. Events per minute, times deliveries per event, times calls per handler run, held against the method's budget. And then the part people miss: the miss rate is not an input, it is an output. Being throttled makes handlers slower, slower handlers miss more deadlines, more misses mean more deliveries, and the script iterates that loop until it settles &mdash; which it always does, because the retry ceiling bounds it. <strong>Where</strong> it settles is the finding. The same forty events a minute settle at a five percent miss rate with one API call per handler run and at ninety-three percent with three, and ninety-three percent is not a slow app: it is a hair under the failure rate at which Slack switches your event subscriptions off.</p>
+</div>
+
+<h2>The problem in plain words</h2>
+<p>The reason this arrives as a surprise is that every number involved looks fine in isolation. Forty events a minute is nothing. Three API calls per event is modest. A five percent timeout rate is a good day. A Tier 3 method allows fifty requests a minute. Every one of those is defensible in a design review and the combination is over the line by a factor of two.</p>
+<p>What makes it a storm rather than a shortfall is that one of the four numbers depends on the other three. If the demand exceeds the budget, calls start being refused, and a handler that waits on a refused call takes longer, and a handler that takes longer misses the three second acknowledgement, and a missed acknowledgement produces another delivery, which makes another set of calls. The miss rate that started at five percent is now thirty, then sixty. There is no component in that loop that is misbehaving and no log line that says what happened.</p>
+<p>It also recovers strangely, which is the tell. The system does not degrade gracefully and then improve as load falls; it collapses, stays collapsed while the sixty-second and three-hundred-second retries keep arriving from events that are already minutes old, and then comes back all at once when the backlog is finally exhausted. People describe it as the service "unsticking itself", which is exactly what a feedback loop looks like from outside.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 216" role="img" aria-label="Event retries multiplying API calls until the throttling produces more retries"><defs><marker id="skrst-p-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#695a6a"/></marker><marker id="skrst-p-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="skrst-p-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="skrst-p-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a154b"/></marker></defs><rect x="10.0" y="34" width="111.2" height="66" rx="10" fill="#f7f1f7" stroke="#e4cfe5"/><text x="66" y="56" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">One event</text><text x="66" y="71" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">arrives</text><text x="66" y="88" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">three API calls to</text><text x="66" y="101" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">serve it</text><rect x="167.2" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="223" y="56" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">The ack is</text><text x="223" y="71" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">missed</text><text x="223" y="88" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">at three seconds</text><rect x="324.4" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="380" y="60" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Four deliveries</text><text x="380" y="77" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">at 0s, 60s and</text><text x="380" y="90" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">300s</text><rect x="481.59999999999997" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="537" y="56" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Twelve calls</text><text x="537" y="71" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">where three fit</text><text x="537" y="88" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">the tier starts</text><text x="537" y="101" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">refusing</text><rect x="638.8" y="34" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="694" y="56" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Handler waits</text><text x="694" y="71" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">on the 429</text><text x="694" y="88" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">and misses more</text><text x="694" y="101" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">acks</text><line x1="124" y1="67" x2="161" y2="67" stroke="#695a6a" stroke-width="2" marker-end="url(#skrst-p-plain)"/><line x1="281" y1="67" x2="318" y2="67" stroke="#695a6a" stroke-width="2" marker-end="url(#skrst-p-plain)"/><line x1="439" y1="67" x2="476" y2="67" stroke="#695a6a" stroke-width="2" marker-end="url(#skrst-p-plain)"/><line x1="596" y1="67" x2="633" y2="67" stroke="#695a6a" stroke-width="2" marker-end="url(#skrst-p-plain)"/><path d="M694,100 C694,152 223,152 223,103" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skrst-p-bad)"/><text x="459" y="156" text-anchor="middle" font-family="sans-serif" font-size="11.5" font-weight="700" fill="#cf4b3f">and the miss rate climbs</text></svg>
+<figcaption>Four numbers, each defensible on its own, and one of them depends on the other three. The loop is why this collapses rather than degrading, and why it recovers all at once instead of gradually.</figcaption>
+</figure>
+
+<h2>Why it happens</h2>
+<p><strong>The amplification is bounded at four and the consequence is not.</strong> Three retries is the ceiling and it never goes higher, so the tempting conclusion is that the worst case is a four times spike, which any system with headroom absorbs. That is true of the deliveries and false of the effect, because the four times lands on a quota that four times exceeded then feeds back into the thing producing the retries.</p>
+<p><strong>The loop has an equilibrium, and the equilibrium is the problem.</strong> Because the amplification is capped, the feedback cannot run away to infinity; it settles. What the arithmetic shows, and what makes this worth computing rather than intuiting, is that the settling point for an ordinary over-budget configuration is a miss rate in the nineties. That is not a degraded service. It is within a percentage point or two of the sustained failure rate at which Slack disables event delivery outright &mdash; which is why an app that survives one storm sometimes does not survive the next.</p>
+<p><strong>The retry spacing is why the pain outlasts the incident.</strong> Deliveries at sixty and three hundred seconds mean that five minutes after the load spike ends you are still receiving retries of events from before it started, all of them still making calls. The tail is longer than the incident, and a graph of API calls will show a second and third hump that no traffic in your product explains.</p>
+<p><strong>Per-method, per-workspace, per-app is what the budget is scoped to.</strong> Not per handler, and not per instance. Adding replicas does not add quota, so scaling out to serve the extra deliveries makes the throttling worse rather than better, which is the single most common wrong move at this point in the incident.</p>
+<p><strong>The multiplicand you control is the calls per handler run.</strong> You cannot change the retry schedule and you should not want to change the deadline. What you can change is how many API calls one delivery makes: a handler that posts a message, then updates it, then looks up two users, is four calls where one would do, and that four is multiplied by everything else in the chain.</p>
+<p><strong>An audit must not demonstrate this.</strong> Provoking the loop to prove it exists means exhausting a real workspace's quota for every app installed in it, yours and everybody else's. The script below computes and iterates a model; the only thing it measures is how many messages the workspace already produced, which it reads out of history.</p>
+
+<h2>The fix, as a flow</h2>
+<p>The one chain here with an arrow that goes backwards, and the arrow is the mechanism rather than a flourish: the box that fails is the input to the box that caused it. Every step in it is a component behaving as designed. The fix branch is arithmetic with a ladder at the end, and the top rung is not a performance verdict at all.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 362" role="img" aria-label="Multiplying events by deliveries by calls, then iterating until the loop settles"><defs><marker id="skrst-f-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#695a6a"/></marker><marker id="skrst-f-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="skrst-f-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="skrst-f-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a154b"/></marker></defs><rect x="10" y="146.0" width="216" height="70" rx="10" fill="#f7f1f7" stroke="#e4cfe5"/><text x="118" y="168.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Events times deliveries times</text><text x="118" y="183.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">calls</text><text x="118" y="200.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">iterated to a fixed point</text><rect x="300" y="22.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="48.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Settles above 95% missed</text><text x="525" y="65.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">delivery gets switched off</text><path d="M229,181 C260,181 260,49 294,49" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skrst-f-bad)"/><rect x="300" y="88.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="114.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Fixed point at 0.93</text><text x="525" y="131.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">an equilibrium made of failure</text><path d="M229,181 C260,181 260,115 294,115" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skrst-f-bad)"/><rect x="300" y="154.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="180.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Replicas added to catch up</text><text x="525" y="197.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">one bucket, emptied sooner</text><path d="M229,181 C260,181 260,181 294,181" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#skrst-f-bad)"/><rect x="300" y="220.0" width="450" height="54" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="525" y="246.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Saturated, nothing refused</text><text x="525" y="263.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">no feedback engaged yet</text><path d="M229,181 C260,181 260,247 294,247" fill="none" stroke="#695a6a" stroke-width="2" marker-end="url(#skrst-f-plain)"/><rect x="300" y="286.0" width="450" height="54" rx="10" fill="#eef7ea" stroke="#bfdcb1"/><text x="525" y="312.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">One call per handler run</text><text x="525" y="329.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">settles where it started</text><path d="M229,181 C260,181 260,313 294,313" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#skrst-f-good)"/></svg>
+<figcaption>The retry ceiling means the loop always settles. Where it settles is the finding, and the difference between the bottom row and the top one is two API calls per handler run on identical traffic.</figcaption>
+</figure>
+
+<h2>How to fix it</h2>
+<h3>Measure how many events a minute the app is really on the hook for</h3>
+<p>One page of <code>conversations.history</code> in a sample of the channels the bot belongs to, and the span between the oldest and newest <code>ts</code>, gives messages per minute. For an app subscribed to <code>message.channels</code> that is the delivery rate directly. It is a floor rather than a census, and the script says so.</p>
+<h3>Count the API calls one handler run makes</h3>
+<p>Read the handler and count them: every <code>chat.postMessage</code>, every lookup, every update. This is the one number in the model that is nobody's estimate, and it is also the one you can change this afternoon.</p>
+<h3>Expand the deliveries for the miss rate you have today</h3>
+<p>One event is one delivery plus a retry for each miss, capped at three. At a five percent miss rate that is 1.05 deliveries per event, which is nothing. At forty percent it is 1.7, and at eighty percent it is 3.4. The function is not linear in the miss rate and that is exactly why it feels like a cliff.</p>
+<h3>Hold the product against the method's budget</h3>
+<p>Events times deliveries times calls, against requests per minute for the method your handler leans on hardest. Under half the budget is fine. Over the budget is not a warning, it is the point at which some of your calls are already being refused.</p>
+<h3>Iterate it, because the miss rate is an output</h3>
+<p>Feed the throttled fraction back into the miss rate and run it again, and again. It will settle; the ceiling on retries guarantees that. The question is where, and the four answers are not variations on each other: unchanged, elevated, collapsed at a fixed point that happens to be failure, or settled above the rate at which delivery is switched off. The script prints the path so the walk is visible rather than asserted.</p>
+<h3>Cut a multiplicand rather than adding capacity</h3>
+<p>Fewer calls per handler run, or fewer events arriving, or a narrower subscription. More replicas add nothing because the quota is per app, not per process. And the deliveries factor closes itself once the deadline is met, which is a different note and the one to read next.</p>
+
+<h2>How to check it worked</h2>
+<p>Re-run with the reduced call count. The event rate will be identical, and the loop should settle instead of walking to the ceiling.</p>
+<pre><code class="language-bash">python3 slack_retry_amplification.py --calls-per-event 1 --miss-rate 0.05 --tier-per-minute 50
+# rate       observed       38.4 message(s)/minute across 5 channel(s), a floor
+# demand     tight          40.4 call(s)/minute against a budget of 50 (80.8%)
+# loop       stable         settles at a miss rate of 0.05 after 1 round(s)
+# loop       path           0.05 -&gt; 0.05
+# verdict    ok             no feedback: the throttled fraction stays at zero</code></pre>
+
+<h2>The full code</h2>
+<p>Three pure functions and one page of history per sampled channel. <code>deliveries_per_event</code> is the retry schedule as a geometric sum capped at three. <code>demand</code> multiplies the three factors and holds the product against the budget. <code>converge</code> is the note's actual claim: it feeds the throttled fraction back into the miss rate and iterates until the loop settles, and <code>settle_verdict</code> reads the ladder off the fixed point, whose top rung is not slowness but the failure rate that gets an app switched off.</p>
+<div class="repo-cta" data-repo-cta>
+<a href="https://github.com/allanninal/slack-fixes/tree/main/retry-storm-from-event-retries" rel="noopener" target="_blank">Get this script on GitHub</a>
+<a href="https://github.com/allanninal" rel="noopener" target="_blank">Follow @allanninal</a>
+<span>Python and Node.js, with tests. Read only, it never writes. One of 52 Slack fixes, free and open source.</span>
+</div>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">slack_retry_amplification.py</div>
+<pre><code class="language-python">&quot;&quot;&quot;Model the retry amplification of a Slack event handler against its quota.
+
+Read only, and it does not demonstrate the problem it describes: provoking a
+retry storm means exhausting a real workspace&#x27;s per-method quota for every app
+installed in it. The only measurement taken is how many messages the workspace
+already produced, read from one page of history per sampled channel. Everything
+else is arithmetic over numbers the caller supplies.
+&quot;&quot;&quot;
+import argparse
+import logging
+import os
+import sys
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+log = logging.getLogger(&quot;slack_retry_amplification&quot;)
+
+API = &quot;https://slack.com/api/&quot;
+
+# Slack retries a delivery it believes failed three times: immediately, after
+# about a minute, and after about five minutes. Four deliveries is the ceiling
+# and the spacing is why the tail outlasts the incident.
+MAX_RETRIES = 3
+RETRY_SCHEDULE_SECONDS = (0, 60, 300)
+
+# The miss rate is capped just short of one so the arithmetic stays meaningful.
+# The number that matters more is the other one: Slack disables an app&#x27;s event
+# subscriptions when it fails more than 95% of deliveries in an hour, so a loop
+# whose equilibrium sits above that does not end in a slow app.
+MISS_CAP = 0.99
+DISABLE_THRESHOLD = 0.95
+
+
+def deliveries_per_event(miss_rate, max_retries=MAX_RETRIES):
+    &quot;&quot;&quot;Expected deliveries for one event at a given miss rate. Pure.
+
+    A geometric sum truncated at the retry ceiling. It is deliberately not
+    linear: five percent gives 1.05 and eighty percent gives 3.4, and the
+    distance between those is why this feels like a cliff rather than a slope.
+    &quot;&quot;&quot;
+    p = min(max(float(miss_rate or 0.0), 0.0), 1.0)
+    total = 1.0
+    term = 1.0
+    for _ in range(max(int(max_retries or 0), 0)):
+        term *= p
+        total += term
+    return round(total, 4)
+
+
+def demand(events_per_minute, calls_per_event, miss_rate, tier_per_minute):
+    &quot;&quot;&quot;Multiply the three factors and hold the product against the budget. Pure.
+
+    Returns the demanded call rate, the share of the budget it takes, and the
+    fraction of calls that must be refused. That last number is the input to
+    the feedback loop, which is what makes this more than a multiplication.
+    &quot;&quot;&quot;
+    events = max(float(events_per_minute or 0.0), 0.0)
+    calls = max(float(calls_per_event or 0.0), 0.0)
+    budget = max(float(tier_per_minute or 0.0), 1.0)
+    per_event = deliveries_per_event(miss_rate)
+    demanded = events * per_event * calls
+    share = round(demanded * 100.0 / budget, 1)
+    throttled = 0.0 if demanded &lt;= budget else round(1.0 - (budget / demanded), 4)
+
+    if demanded &gt; budget:
+        verdict = &quot;over-budget&quot;
+    elif share &gt;= 80.0:
+        verdict = &quot;saturated&quot;
+    elif share &gt;= 50.0:
+        verdict = &quot;tight&quot;
+    else:
+        verdict = &quot;stable&quot;
+    return {&quot;deliveries_per_event&quot;: per_event, &quot;calls_per_minute&quot;: round(demanded, 1),
+            &quot;budget_per_minute&quot;: round(budget, 1), &quot;share_percent&quot;: share,
+            &quot;throttled_fraction&quot;: throttled, &quot;verdict&quot;: verdict}
+
+
+def settle_verdict(final_miss_rate, base_miss_rate):
+    &quot;&quot;&quot;Name the equilibrium the loop arrived at. Pure.
+
+    The loop always has a fixed point, because the retry ceiling bounds the
+    amplification. Whether that fixed point is somewhere you can live is the
+    entire question, and the top rung is not a performance problem: an app
+    failing more than 95% of deliveries for an hour has its event
+    subscriptions switched off, and they do not come back on their own.
+    &quot;&quot;&quot;
+    final = float(final_miss_rate or 0.0)
+    base = float(base_miss_rate or 0.0)
+    if final &lt;= base + 0.01:
+        return (&quot;stable&quot;, &quot;no feedback: the throttled fraction never leaves zero&quot;)
+    if final &gt;= DISABLE_THRESHOLD:
+        return (&quot;disabling&quot;,
+                &quot;the equilibrium is above the %d%% failure rate that gets event &quot;
+                &quot;subscriptions switched off. This loop does not end in a slow &quot;
+                &quot;app, it ends in a disabled one.&quot; % int(DISABLE_THRESHOLD * 100))
+    if final &gt;= 0.5:
+        return (&quot;collapsed&quot;,
+                &quot;the loop has a fixed point and the fixed point is failure: &quot;
+                &quot;most deliveries miss, most events are retried, and it stays &quot;
+                &quot;there until the traffic stops&quot;)
+    return (&quot;elevated&quot;,
+            &quot;the feedback is real and the equilibrium is survivable; there is &quot;
+            &quot;no headroom left for the next increase in traffic&quot;)
+
+
+def converge(events_per_minute, calls_per_event, base_miss_rate, tier_per_minute,
+             rounds=12):
+    &quot;&quot;&quot;Feed the throttled fraction back into the miss rate and iterate. Pure.
+
+    The claim of this note is that the miss rate is an output rather than an
+    input: throttled calls make handlers slower, slower handlers miss the three
+    second deadline, and missed deadlines produce the deliveries that caused
+    the throttling. The retry ceiling means this always settles somewhere. The
+    path is returned so the walk can be read rather than asserted.
+    &quot;&quot;&quot;
+    p = min(max(float(base_miss_rate or 0.0), 0.0), MISS_CAP)
+    base = p
+    path = [round(p, 4)]
+    for step in range(max(int(rounds or 0), 1)):
+        state = demand(events_per_minute, calls_per_event, p, tier_per_minute)
+        nxt = min(base + state[&quot;throttled_fraction&quot;], MISS_CAP)
+        path.append(round(nxt, 4))
+        if abs(nxt - p) &lt; 0.001:
+            verdict, detail = settle_verdict(nxt, base)
+            return {&quot;verdict&quot;: verdict, &quot;detail&quot;: detail,
+                    &quot;miss_rate&quot;: round(nxt, 4), &quot;rounds&quot;: step + 1, &quot;path&quot;: path,
+                    &quot;deliveries_per_event&quot;: deliveries_per_event(nxt)}
+        p = nxt
+    return {&quot;verdict&quot;: &quot;unsettled&quot;,
+            &quot;detail&quot;: &quot;still climbing after %d round(s), which is the same &quot;
+                      &quot;finding as collapse with less arithmetic&quot; % int(rounds),
+            &quot;miss_rate&quot;: round(p, 4), &quot;rounds&quot;: int(rounds), &quot;path&quot;: path,
+            &quot;deliveries_per_event&quot;: deliveries_per_event(p)}
+
+
+def observed_rate(timestamps):
+    &quot;&quot;&quot;Messages per minute across a sample of history. Pure.
+
+    A floor, not a census: one page per channel, and a workspace whose history
+    calls are clamped returns fewer objects than were asked for. Both of those
+    bias the number down, never up, which is the safe direction for a model
+    whose output is a warning.
+    &quot;&quot;&quot;
+    values = sorted(float(t) for t in timestamps or [] if t)
+    if len(values) &lt; 2:
+        return {&quot;count&quot;: len(values), &quot;span_seconds&quot;: 0.0, &quot;per_minute&quot;: 0.0,
+                &quot;note&quot;: &quot;not enough messages in the sample to derive a rate&quot;}
+    span = values[-1] - values[0]
+    if span &lt;= 0:
+        return {&quot;count&quot;: len(values), &quot;span_seconds&quot;: 0.0, &quot;per_minute&quot;: 0.0,
+                &quot;note&quot;: &quot;every sampled message shares a timestamp&quot;}
+    per_minute = round(len(values) * 60.0 / span, 1)
+    return {&quot;count&quot;: len(values), &quot;span_seconds&quot;: round(span, 1),
+            &quot;per_minute&quot;: per_minute,
+            &quot;note&quot;: &quot;a floor: one page per channel, so the real rate is higher&quot;}
+
+
+def get(session, method, **params):
+    r = session.get(API + method, params=params, timeout=30)
+    try:
+        return r.json()
+    except ValueError:
+        return {&quot;ok&quot;: False, &quot;error&quot;: &quot;unparseable_body&quot;}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(&quot;--token-env&quot;, default=&quot;SLACK_BOT_TOKEN&quot;)
+    ap.add_argument(&quot;--calls-per-event&quot;, type=float, default=3.0,
+                    help=&quot;Web API calls one handler run makes; count them&quot;)
+    ap.add_argument(&quot;--miss-rate&quot;, type=float, default=0.05,
+                    help=&quot;fraction of deliveries that miss the three second ack&quot;)
+    ap.add_argument(&quot;--tier-per-minute&quot;, type=float, default=50.0,
+                    help=&quot;requests a minute the busiest method in the handler allows&quot;)
+    ap.add_argument(&quot;--events-per-minute&quot;, type=float, default=0.0,
+                    help=&quot;override the measured rate instead of sampling history&quot;)
+    ap.add_argument(&quot;--channels&quot;, type=int, default=5,
+                    help=&quot;how many of the bot&#x27;s channels to sample&quot;)
+    args = ap.parse_args()
+
+    events = args.events_per_minute
+    token = os.environ.get(args.token_env)
+    if events &lt;= 0 and not token:
+        log.error(&quot;set %s or pass --events-per-minute&quot;, args.token_env)
+        return 2
+
+    if events &lt;= 0:
+        s = requests.Session()
+        s.headers.update({&quot;Authorization&quot;: &quot;Bearer &quot; + token})
+        who = get(s, &quot;auth.test&quot;)
+        if who.get(&quot;ok&quot;) is not True:
+            log.error(&quot;auth.test answered 200 with ok: false, error=%s&quot;, who.get(&quot;error&quot;))
+            return 2
+        mine = get(s, &quot;users.conversations&quot;, user=who.get(&quot;user_id&quot;, &quot;&quot;),
+                   types=&quot;public_channel,private_channel&quot;, limit=200)
+        ids = [c.get(&quot;id&quot;) for c in (mine.get(&quot;channels&quot;) or [])][:max(args.channels, 1)]
+        stamps, sampled = [], 0
+        for cid in ids:
+            page = get(s, &quot;conversations.history&quot;, channel=cid, limit=200)
+            if page.get(&quot;ok&quot;) is not True:
+                log.warning(&quot;rate       skipped        %s on %s&quot;, page.get(&quot;error&quot;), cid)
+                continue
+            sampled += 1
+            stamps.extend(m.get(&quot;ts&quot;) for m in (page.get(&quot;messages&quot;) or []))
+        rate = observed_rate(stamps)
+        events = rate[&quot;per_minute&quot;]
+        log.info(&quot;rate       observed       %s message(s)/minute across %d &quot;
+                 &quot;channel(s), %s&quot;, rate[&quot;per_minute&quot;], sampled, rate[&quot;note&quot;])
+
+    state = demand(events, args.calls_per_event, args.miss_rate, args.tier_per_minute)
+    (log.info if state[&quot;verdict&quot;] == &quot;stable&quot; else log.warning)(
+        &quot;demand     %-14s %.1f call(s)/minute against a budget of %.0f (%.1f%%)&quot;,
+        state[&quot;verdict&quot;], state[&quot;calls_per_minute&quot;], state[&quot;budget_per_minute&quot;],
+        state[&quot;share_percent&quot;])
+    log.info(&quot;deliveries %-14s %.2f per event at a miss rate of %.2f, retried at &quot;
+             &quot;%s seconds&quot;, &quot;expanded&quot;, state[&quot;deliveries_per_event&quot;], args.miss_rate,
+             &quot;, &quot;.join(str(x) for x in RETRY_SCHEDULE_SECONDS))
+
+    loop = converge(events, args.calls_per_event, args.miss_rate, args.tier_per_minute)
+    (log.info if loop[&quot;verdict&quot;] == &quot;stable&quot; else log.warning)(
+        &quot;loop       %-14s settles at a miss rate of %.2f after %d round(s), &quot;
+        &quot;%.2f deliveries/event&quot;, loop[&quot;verdict&quot;], loop[&quot;miss_rate&quot;],
+        loop[&quot;rounds&quot;], loop[&quot;deliveries_per_event&quot;])
+    log.info(&quot;loop       path           %s&quot;, &quot; -&gt; &quot;.join(&quot;%.2f&quot; % p for p in loop[&quot;path&quot;]))
+    (log.info if loop[&quot;verdict&quot;] == &quot;stable&quot; else log.warning)(
+        &quot;loop       %-14s %s&quot;, &quot;meaning&quot;, loop[&quot;detail&quot;])
+
+    if loop[&quot;verdict&quot;] == &quot;stable&quot; and state[&quot;verdict&quot;] in (&quot;stable&quot;, &quot;tight&quot;):
+        log.info(&quot;verdict    %-14s no feedback: the throttled fraction stays at &quot;
+                 &quot;zero&quot;, &quot;ok&quot;)
+        return 0
+    log.warning(&quot;  repair: cut the calls one handler run makes. That factor &quot;
+                &quot;multiplies everything else in the chain and it is the only one &quot;
+                &quot;of the four you can change today&quot;)
+    log.warning(&quot;  repair: narrow the subscription so fewer events arrive at all; &quot;
+                &quot;an app that receives every message in every channel is paying &quot;
+                &quot;the multiplier on traffic it will never act on&quot;)
+    log.warning(&quot;  repair: do not add replicas. The quota is per method, per &quot;
+                &quot;workspace, per app, so another process shares the same bucket &quot;
+                &quot;and arrives at the same refusals sooner&quot;)
+    return 1
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">slack-retry-amplification.mjs</div>
+<pre><code class="language-javascript">/**
+ * Model the retry amplification of a Slack event handler against its quota.
+ *
+ * Read only, and it does not demonstrate the problem it describes. The only
+ * measurement taken is how many messages the workspace already produced, read
+ * from one page of history per sampled channel. Everything else is arithmetic
+ * over numbers the caller supplies.
+ */
+
+const API = &#x27;https://slack.com/api/&#x27;;
+
+// Three retries: immediately, after about a minute, and after about five.
+const MAX_RETRIES = 3;
+const RETRY_SCHEDULE_SECONDS = [0, 60, 300];
+
+// The miss rate is capped just short of one so the arithmetic stays meaningful.
+// The number that matters more is the other one: Slack disables an app&#x27;s event
+// subscriptions when it fails more than 95% of deliveries in an hour.
+const MISS_CAP = 0.99;
+const DISABLE_THRESHOLD = 0.95;
+
+/**
+ * Expected deliveries for one event at a given miss rate. Pure.
+ * A geometric sum truncated at the retry ceiling, and deliberately not linear.
+ */
+export function deliveriesPerEvent(missRate, maxRetries = MAX_RETRIES) {
+  const p = Math.min(Math.max(Number(missRate) || 0, 0), 1);
+  let total = 1;
+  let term = 1;
+  for (let i = 0; i &lt; Math.max(Number(maxRetries) || 0, 0); i += 1) {
+    term *= p;
+    total += term;
+  }
+  return Math.round(total * 10000) / 10000;
+}
+
+/**
+ * Multiply the three factors and hold the product against the budget. Pure.
+ * The throttled fraction is the input to the feedback loop, which is what
+ * makes this more than a multiplication.
+ */
+export function demand(eventsPerMinute, callsPerEvent, missRate, tierPerMinute) {
+  const events = Math.max(Number(eventsPerMinute) || 0, 0);
+  const calls = Math.max(Number(callsPerEvent) || 0, 0);
+  const budget = Math.max(Number(tierPerMinute) || 0, 1);
+  const perEvent = deliveriesPerEvent(missRate);
+  const demanded = events * perEvent * calls;
+  const share = Math.round((demanded * 1000.0) / budget) / 10;
+  const throttled = demanded &lt;= budget
+    ? 0 : Math.round((1 - budget / demanded) * 10000) / 10000;
+
+  let verdict = &#x27;stable&#x27;;
+  if (demanded &gt; budget) verdict = &#x27;over-budget&#x27;;
+  else if (share &gt;= 80.0) verdict = &#x27;saturated&#x27;;
+  else if (share &gt;= 50.0) verdict = &#x27;tight&#x27;;
+
+  return {
+    deliveriesPerEvent: perEvent,
+    callsPerMinute: Math.round(demanded * 10) / 10,
+    budgetPerMinute: Math.round(budget * 10) / 10,
+    sharePercent: share,
+    throttledFraction: throttled,
+    verdict,
+  };
+}
+
+/**
+ * Name the equilibrium the loop arrived at. Pure.
+ * The loop always has a fixed point, because the retry ceiling bounds the
+ * amplification. Whether that fixed point is somewhere you can live is the
+ * whole question, and the top rung is not a performance problem.
+ */
+export function settleVerdict(finalMissRate, baseMissRate) {
+  const final = Number(finalMissRate) || 0;
+  const base = Number(baseMissRate) || 0;
+  if (final &lt;= base + 0.01) {
+    return [&#x27;stable&#x27;, &#x27;no feedback: the throttled fraction never leaves zero&#x27;];
+  }
+  if (final &gt;= DISABLE_THRESHOLD) {
+    return [&#x27;disabling&#x27;,
+      `the equilibrium is above the ${Math.round(DISABLE_THRESHOLD * 100)}% ` +
+      &#x27;failure rate that gets event subscriptions switched off. This loop does &#x27; +
+      &#x27;not end in a slow app, it ends in a disabled one.&#x27;];
+  }
+  if (final &gt;= 0.5) {
+    return [&#x27;collapsed&#x27;,
+      &#x27;the loop has a fixed point and the fixed point is failure: most &#x27; +
+      &#x27;deliveries miss, most events are retried, and it stays there until the &#x27; +
+      &#x27;traffic stops&#x27;];
+  }
+  return [&#x27;elevated&#x27;,
+    &#x27;the feedback is real and the equilibrium is survivable; there is no &#x27; +
+    &#x27;headroom left for the next increase in traffic&#x27;];
+}
+
+/**
+ * Feed the throttled fraction back into the miss rate and iterate. Pure.
+ * The miss rate is an output rather than an input. The retry ceiling means
+ * this always settles somewhere; where it settles is the finding.
+ */
+export function converge(eventsPerMinute, callsPerEvent, baseMissRate,
+  tierPerMinute, rounds = 12) {
+  let p = Math.min(Math.max(Number(baseMissRate) || 0, 0), MISS_CAP);
+  const base = p;
+  const path = [Math.round(p * 10000) / 10000];
+  const limit = Math.max(Number(rounds) || 0, 1);
+  for (let step = 0; step &lt; limit; step += 1) {
+    const state = demand(eventsPerMinute, callsPerEvent, p, tierPerMinute);
+    const next = Math.min(base + state.throttledFraction, MISS_CAP);
+    path.push(Math.round(next * 10000) / 10000);
+    if (Math.abs(next - p) &lt; 0.001) {
+      const [verdict, detail] = settleVerdict(next, base);
+      return {
+        verdict,
+        detail,
+        missRate: Math.round(next * 10000) / 10000,
+        rounds: step + 1,
+        path,
+        deliveriesPerEvent: deliveriesPerEvent(next),
+      };
+    }
+    p = next;
+  }
+  return {
+    verdict: &#x27;unsettled&#x27;,
+    detail: `still climbing after ${limit} round(s), which is the same finding ` +
+      &#x27;as collapse with less arithmetic&#x27;,
+    missRate: Math.round(p * 10000) / 10000,
+    rounds: limit,
+    path,
+    deliveriesPerEvent: deliveriesPerEvent(p),
+  };
+}
+
+/**
+ * Messages per minute across a sample of history. Pure.
+ * A floor, not a census: one page per channel, and a clamped history returns
+ * fewer objects than were asked for. Both bias the number down.
+ */
+export function observedRate(timestamps) {
+  const values = (timestamps ?? []).filter(Boolean).map(Number).sort((a, b) =&gt; a - b);
+  if (values.length &lt; 2) {
+    return {
+      count: values.length,
+      spanSeconds: 0,
+      perMinute: 0,
+      note: &#x27;not enough messages in the sample to derive a rate&#x27;,
+    };
+  }
+  const span = values[values.length - 1] - values[0];
+  if (span &lt;= 0) {
+    return {
+      count: values.length,
+      spanSeconds: 0,
+      perMinute: 0,
+      note: &#x27;every sampled message shares a timestamp&#x27;,
+    };
+  }
+  return {
+    count: values.length,
+    spanSeconds: Math.round(span * 10) / 10,
+    perMinute: Math.round((values.length * 600.0) / span) / 10,
+    note: &#x27;a floor: one page per channel, so the real rate is higher&#x27;,
+  };
+}
+
+async function get(token, method, params) {
+  const qs = new URLSearchParams(params);
+  const res = await fetch(`${API}${method}?${qs}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  try { return await res.json(); } catch { return { ok: false, error: &#x27;unparseable_body&#x27; }; }
+}
+
+function arg(args, name, fallback = &#x27;&#x27;) {
+  const i = args.indexOf(name);
+  return i === -1 ? fallback : args[i + 1];
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const callsPerEvent = Number(arg(args, &#x27;--calls-per-event&#x27;, 3));
+  const missRate = Number(arg(args, &#x27;--miss-rate&#x27;, 0.05));
+  const tierPerMinute = Number(arg(args, &#x27;--tier-per-minute&#x27;, 50));
+  const channels = Number(arg(args, &#x27;--channels&#x27;, 5));
+  const tokenEnv = arg(args, &#x27;--token-env&#x27;, &#x27;SLACK_BOT_TOKEN&#x27;);
+  const token = process.env[tokenEnv];
+  let events = Number(arg(args, &#x27;--events-per-minute&#x27;, 0));
+
+  if (events &lt;= 0 &amp;&amp; !token) {
+    console.error(`set ${tokenEnv} or pass --events-per-minute`);
+    process.exitCode = 2;
+    return;
+  }
+
+  if (events &lt;= 0) {
+    const who = await get(token, &#x27;auth.test&#x27;, {});
+    if (who.ok !== true) {
+      console.error(`auth.test answered 200 with ok: false, error=${who.error}`);
+      process.exitCode = 2;
+      return;
+    }
+    const mine = await get(token, &#x27;users.conversations&#x27;, {
+      user: who.user_id ?? &#x27;&#x27;, types: &#x27;public_channel,private_channel&#x27;, limit: &#x27;200&#x27;,
+    });
+    const ids = (mine.channels ?? []).map((c) =&gt; c.id).slice(0, Math.max(channels, 1));
+    const stamps = [];
+    let sampled = 0;
+    for (const cid of ids) {
+      // eslint-disable-next-line no-await-in-loop
+      const page = await get(token, &#x27;conversations.history&#x27;, { channel: cid, limit: &#x27;200&#x27; });
+      if (page.ok !== true) {
+        console.warn(`rate       skipped        ${page.error} on ${cid}`);
+        continue;
+      }
+      sampled += 1;
+      for (const m of page.messages ?? []) stamps.push(m.ts);
+    }
+    const rate = observedRate(stamps);
+    events = rate.perMinute;
+    console.log(`rate       observed       ${rate.perMinute} message(s)/minute ` +
+      `across ${sampled} channel(s), ${rate.note}`);
+  }
+
+  const state = demand(events, callsPerEvent, missRate, tierPerMinute);
+  (state.verdict === &#x27;stable&#x27; ? console.log : console.warn)(
+    `demand     ${state.verdict.padEnd(14)} ${state.callsPerMinute} call(s)/minute ` +
+    `against a budget of ${state.budgetPerMinute} (${state.sharePercent}%)`);
+  console.log(`deliveries expanded       ${state.deliveriesPerEvent} per event at a ` +
+    `miss rate of ${missRate}, retried at ${RETRY_SCHEDULE_SECONDS.join(&#x27;, &#x27;)} seconds`);
+
+  const loop = converge(events, callsPerEvent, missRate, tierPerMinute);
+  const calm = loop.verdict === &#x27;stable&#x27;;
+  (calm ? console.log : console.warn)(
+    `loop       ${loop.verdict.padEnd(14)} settles at a miss rate of ` +
+    `${loop.missRate} after ${loop.rounds} round(s), ${loop.deliveriesPerEvent} ` +
+    &#x27;deliveries/event&#x27;);
+  console.log(`loop       path           ${loop.path.map((p) =&gt; p.toFixed(2)).join(&#x27; -&gt; &#x27;)}`);
+  (calm ? console.log : console.warn)(`loop       meaning        ${loop.detail}`);
+
+  if (calm &amp;&amp; (state.verdict === &#x27;stable&#x27; || state.verdict === &#x27;tight&#x27;)) {
+    console.log(&#x27;verdict    ok             no feedback: the throttled fraction &#x27; +
+      &#x27;stays at zero&#x27;);
+    return;
+  }
+  console.warn(&#x27;  repair: cut the calls one handler run makes. That factor &#x27; +
+    &#x27;multiplies everything else in the chain and it is the only one of the four &#x27; +
+    &#x27;you can change today&#x27;);
+  console.warn(&#x27;  repair: narrow the subscription so fewer events arrive at all; &#x27; +
+    &#x27;an app that receives every message in every channel is paying the multiplier &#x27; +
+    &#x27;on traffic it will never act on&#x27;);
+  console.warn(&#x27;  repair: do not add replicas. The quota is per method, per &#x27; +
+    &#x27;workspace, per app, so another process shares the same bucket and arrives &#x27; +
+    &#x27;at the same refusals sooner&#x27;);
+  process.exitCode = 1;
+}
+
+// Only run when invoked directly, so importing this module in the tests does
+// not execute main() and fail the file on a missing token.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) =&gt; { console.error(err.message); process.exitCode = 2; });
+}
+</code></pre>
+</div>
+</div>
+
+<h2>Add a test</h2>
+<p>The tests pin the cliff and the fixed point, because those are the two claims. Deliveries per event is asserted to be almost nothing at a five percent miss rate and nearly three at eighty percent, from the same bounded schedule, which is the non-linearity people budget as if it were linear. Then the same forty events a minute are asserted to settle at five percent with one call per handler run and in the nineties with three, and a heavier configuration is asserted to settle above the failure rate that gets event delivery switched off &mdash; the rung where this stops being a performance finding.</p>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">test_slack_retry_amplification.py</div>
+<pre><code class="language-python">from slack_retry_amplification import (converge, deliveries_per_event, demand,
+                                       observed_rate, settle_verdict)
+
+
+def test_the_amplification_is_bounded_at_four_deliveries():
+    assert deliveries_per_event(1.0) == 4.0
+    assert deliveries_per_event(0.0) == 1.0
+
+
+def test_the_expansion_is_a_cliff_rather_than_a_slope():
+    assert deliveries_per_event(0.05) &lt; 1.06
+    assert deliveries_per_event(0.4) &gt; 1.6
+    assert deliveries_per_event(0.8) &gt; 2.9
+
+
+def test_a_saturated_handler_has_nothing_refused_yet():
+    state = demand(40, 1, 0.05, 50)
+    assert state[&quot;verdict&quot;] == &quot;saturated&quot;
+    assert state[&quot;share_percent&quot;] &gt; 80
+    assert state[&quot;throttled_fraction&quot;] == 0.0
+
+
+def test_three_calls_on_the_same_traffic_is_over_the_same_budget():
+    state = demand(40, 3, 0.05, 50)
+    assert state[&quot;verdict&quot;] == &quot;over-budget&quot;
+    assert state[&quot;calls_per_minute&quot;] &gt; 50
+    assert state[&quot;throttled_fraction&quot;] &gt; 0.5
+
+
+def test_the_throttled_fraction_is_what_feeds_the_loop():
+    assert demand(40, 3, 0.05, 50)[&quot;throttled_fraction&quot;] &gt; demand(
+        40, 2, 0.05, 50)[&quot;throttled_fraction&quot;]
+
+
+def test_the_same_traffic_is_stable_at_one_call_and_collapses_at_three():
+    assert converge(40, 1, 0.05, 50)[&quot;verdict&quot;] == &quot;stable&quot;
+    assert converge(40, 3, 0.05, 50)[&quot;verdict&quot;] == &quot;collapsed&quot;
+
+
+def test_a_stable_loop_keeps_the_miss_rate_it_started_with():
+    loop = converge(40, 1, 0.05, 50)
+    assert loop[&quot;miss_rate&quot;] == 0.05
+    assert loop[&quot;rounds&quot;] == 1
+
+
+def test_the_collapsed_loop_still_has_a_fixed_point():
+    loop = converge(40, 3, 0.05, 50)
+    assert loop[&quot;path&quot;][0] == 0.05
+    assert loop[&quot;path&quot;] == sorted(loop[&quot;path&quot;])
+    assert 0.9 &lt; loop[&quot;miss_rate&quot;] &lt; 0.95
+    assert loop[&quot;deliveries_per_event&quot;] &gt; 3.5
+
+
+def test_enough_load_settles_above_the_rate_that_gets_you_switched_off():
+    loop = converge(200, 5, 0.05, 50)
+    assert loop[&quot;verdict&quot;] == &quot;disabling&quot;
+    assert loop[&quot;miss_rate&quot;] &gt;= 0.95
+    assert &quot;switched off&quot; in loop[&quot;detail&quot;]
+
+
+def test_the_ladder_is_read_off_the_fixed_point_not_the_journey():
+    assert settle_verdict(0.05, 0.05)[0] == &quot;stable&quot;
+    assert settle_verdict(0.3, 0.05)[0] == &quot;elevated&quot;
+    assert settle_verdict(0.7, 0.05)[0] == &quot;collapsed&quot;
+    assert settle_verdict(0.96, 0.05)[0] == &quot;disabling&quot;
+
+
+def test_zero_traffic_cannot_feed_back():
+    assert converge(0, 10, 0.05, 50)[&quot;verdict&quot;] == &quot;stable&quot;
+
+
+def test_a_rate_needs_two_messages_and_a_span():
+    assert observed_rate([])[&quot;per_minute&quot;] == 0.0
+    assert observed_rate([&quot;1735689600.000100&quot;])[&quot;count&quot;] == 1
+    same = observed_rate([&quot;1735689600.000100&quot;, &quot;1735689600.000100&quot;])
+    assert same[&quot;per_minute&quot;] == 0.0
+    assert &quot;shares a timestamp&quot; in same[&quot;note&quot;]
+
+
+def test_the_measured_rate_is_reported_as_a_floor():
+    rate = observed_rate([&quot;1735689600.000100&quot;, &quot;1735689630.000100&quot;,
+                          &quot;1735689660.000100&quot;])
+    assert rate[&quot;span_seconds&quot;] == 60.0
+    assert rate[&quot;per_minute&quot;] == 3.0
+    assert &quot;floor&quot; in rate[&quot;note&quot;]
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">slack-retry-amplification.test.mjs</div>
+<pre><code class="language-javascript">import { test } from &#x27;node:test&#x27;;
+import assert from &#x27;node:assert/strict&#x27;;
+import {
+  converge, deliveriesPerEvent, demand, observedRate, settleVerdict,
+} from &#x27;./slack-retry-amplification.mjs&#x27;;
+
+test(&#x27;the amplification is bounded at four deliveries&#x27;, () =&gt; {
+  assert.equal(deliveriesPerEvent(1.0), 4);
+  assert.equal(deliveriesPerEvent(0), 1);
+});
+
+test(&#x27;the expansion is a cliff rather than a slope&#x27;, () =&gt; {
+  assert.ok(deliveriesPerEvent(0.05) &lt; 1.06);
+  assert.ok(deliveriesPerEvent(0.4) &gt; 1.6);
+  assert.ok(deliveriesPerEvent(0.8) &gt; 2.9);
+});
+
+test(&#x27;a saturated handler has nothing refused yet&#x27;, () =&gt; {
+  const state = demand(40, 1, 0.05, 50);
+  assert.equal(state.verdict, &#x27;saturated&#x27;);
+  assert.ok(state.sharePercent &gt; 80);
+  assert.equal(state.throttledFraction, 0);
+});
+
+test(&#x27;three calls on the same traffic is over the same budget&#x27;, () =&gt; {
+  const state = demand(40, 3, 0.05, 50);
+  assert.equal(state.verdict, &#x27;over-budget&#x27;);
+  assert.ok(state.callsPerMinute &gt; 50);
+  assert.ok(state.throttledFraction &gt; 0.5);
+});
+
+test(&#x27;the throttled fraction is what feeds the loop&#x27;, () =&gt; {
+  assert.ok(demand(40, 3, 0.05, 50).throttledFraction
+    &gt; demand(40, 2, 0.05, 50).throttledFraction);
+});
+
+test(&#x27;the same traffic is stable at one call and collapses at three&#x27;, () =&gt; {
+  assert.equal(converge(40, 1, 0.05, 50).verdict, &#x27;stable&#x27;);
+  assert.equal(converge(40, 3, 0.05, 50).verdict, &#x27;collapsed&#x27;);
+});
+
+test(&#x27;a stable loop keeps the miss rate it started with&#x27;, () =&gt; {
+  const loop = converge(40, 1, 0.05, 50);
+  assert.equal(loop.missRate, 0.05);
+  assert.equal(loop.rounds, 1);
+});
+
+test(&#x27;the collapsed loop still has a fixed point&#x27;, () =&gt; {
+  const loop = converge(40, 3, 0.05, 50);
+  assert.equal(loop.path[0], 0.05);
+  assert.deepEqual(loop.path, [...loop.path].sort((a, b) =&gt; a - b));
+  assert.ok(loop.missRate &gt; 0.9 &amp;&amp; loop.missRate &lt; 0.95);
+  assert.ok(loop.deliveriesPerEvent &gt; 3.5);
+});
+
+test(&#x27;enough load settles above the rate that gets you switched off&#x27;, () =&gt; {
+  const loop = converge(200, 5, 0.05, 50);
+  assert.equal(loop.verdict, &#x27;disabling&#x27;);
+  assert.ok(loop.missRate &gt;= 0.95);
+  assert.match(loop.detail, /switched off/);
+});
+
+test(&#x27;the ladder is read off the fixed point not the journey&#x27;, () =&gt; {
+  assert.equal(settleVerdict(0.05, 0.05)[0], &#x27;stable&#x27;);
+  assert.equal(settleVerdict(0.3, 0.05)[0], &#x27;elevated&#x27;);
+  assert.equal(settleVerdict(0.7, 0.05)[0], &#x27;collapsed&#x27;);
+  assert.equal(settleVerdict(0.96, 0.05)[0], &#x27;disabling&#x27;);
+});
+
+test(&#x27;zero traffic cannot feed back&#x27;, () =&gt; {
+  assert.equal(converge(0, 10, 0.05, 50).verdict, &#x27;stable&#x27;);
+});
+
+test(&#x27;a rate needs two messages and a span&#x27;, () =&gt; {
+  assert.equal(observedRate([]).perMinute, 0);
+  assert.equal(observedRate([&#x27;1735689600.000100&#x27;]).count, 1);
+  const same = observedRate([&#x27;1735689600.000100&#x27;, &#x27;1735689600.000100&#x27;]);
+  assert.equal(same.perMinute, 0);
+  assert.match(same.note, /shares a timestamp/);
+});
+
+test(&#x27;the measured rate is reported as a floor&#x27;, () =&gt; {
+  const rate = observedRate([&#x27;1735689600.000100&#x27;, &#x27;1735689630.000100&#x27;,
+    &#x27;1735689660.000100&#x27;]);
+  assert.equal(rate.spanSeconds, 60);
+  assert.equal(rate.perMinute, 3);
+  assert.match(rate.note, /floor/);
+});
+</code></pre>
+</div>
+</div>
+
+<h2>FAQ</h2>
+<details class="faq-item"><summary>Is four deliveries per event really the worst case?</summary><p>For a single event, yes: the original plus three retries, and Slack does not go beyond that. The reason it still becomes a storm is that the ceiling applies per event while the quota applies per method per minute across every event at once. A four times spike on a system running at forty percent of its budget is fine; the same spike on one running at sixty percent is not, and the difference between those two workspaces is invisible until it happens.</p></details>
+<details class="faq-item"><summary>Why not just add more workers to absorb the retries?</summary><p>Because the rate limit is per method, per workspace, per app, and not per process. Two replicas share one bucket, so doubling the workers doubles the rate at which the bucket is emptied and brings the refusals forward. It is the most natural response to a queue that is not draining and it is the one that makes this particular failure worse.</p></details>
+<details class="faq-item"><summary>Where do the sixty and three hundred second retries show up?</summary><p>As humps in your API call graph that no product traffic explains, minutes after the load that caused them has gone. That spacing is also the fingerprint in the workspace itself: duplicate app messages roughly a minute and roughly five minutes apart are Slack's retry schedule, and reading those gaps is how a duplicate is attributed to a retry rather than to a double subscription.</p></details>
+<details class="faq-item"><summary>Does the model need my real miss rate to be useful?</summary><p>It needs a starting one, and any honest number will do, because the interesting output is where the loop settles rather than where it starts. Take whatever fraction of deliveries your logs show taking over three seconds. If a five percent start settles in the nineties, then no plausible starting value saves this configuration; if a twenty percent start settles back near twenty, the feedback is not engaged and you have real headroom.</p></details>
+<details class="faq-item"><summary>Could the script measure the storm instead of modelling it?</summary><p>It could measure the aftermath, which is duplicate messages in a channel, and that is a different note with a different script. What it will not do is produce the storm to prove the model, because the quota being exhausted belongs to the whole workspace: every other app installed there would be refused alongside yours, and none of their owners agreed to the experiment.</p></details>
+
+<h2>Related field notes</h2>
+<ul>
+<li><a href="/slack/three-second-timeout/">the missed deadline that starts the loop</a></li>
+<li><a href="/slack/ratelimited-retry-after-ignored/">what to do with the refusal when it arrives</a></li>
+<li><a href="/slack/parallel-workers-share-quota/">who else is spending the same bucket</a></li>
+</ul>
+
+<h3>Sources</h3>
+<p class="sources-note">Every figure in this note is traced to one of these. Prices are
+list rates and change &mdash; check them for your own region before acting.</p>
+<ul class="citations">
+<li><a href="https://docs.slack.dev/apis/events-api/" rel="noopener nofollow" target="_blank">Events API - Slack Docs</a></li>
+<li><a href="https://docs.slack.dev/apis/web-api/rate-limits" rel="noopener nofollow" target="_blank">Rate limits - Slack Docs</a></li>
+<li><a href="https://docs.slack.dev/reference/methods/conversations.history" rel="noopener nofollow" target="_blank">conversations.history method reference - Slack Docs</a></li>
+<li><a href="https://docs.slack.dev/reference/methods/users.conversations" rel="noopener nofollow" target="_blank">users.conversations method reference - Slack Docs</a></li>
+</ul>
+
+<div class="callout callout--cta">
+<div class="callout__title">Stuck on a tricky one?</div>
+<p>If your setup is misbehaving in a way this note does not cover, <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">message me on LinkedIn</a> with what you are seeing.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+<div class="container">
+<p>Field notes by <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">Allan Ni&ntilde;al</a> &middot; <a href="/">Portfolio</a> &middot; <a href="/dns/">DNS &amp; domains</a> &middot; <a href="/email/">Email &amp; SES</a> &middot; <a href="/aws/">AWS cost</a></p>
+<p class="site-footer__fine">Every script in this section is read only. They hold a token that can post into your workspace, so none of them writes: they report what is wrong and print the repair for you to run. A read-scoped token is enough.</p>
+</div>
+</footer>
+<script src="/slack/assets/slack.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
+</body>
+</html>
