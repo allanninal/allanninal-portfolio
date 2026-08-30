@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Socket Mode does not load balance: replicas duplicate and drop</title>
+<meta name="description" content="Several open connections means Slack picks one per payload, without a distribution guarantee. Measure how often a trigger got exactly one answer.">
+<link rel="canonical" href="https://www.allanninal.dev/slack/socket-mode-single-instance/">
+<meta name="robots" content="index, follow">
+<meta name="author" content="Allan Ni&ntilde;al">
+<meta property="og:type" content="article">
+<meta property="og:title" content="Socket Mode does not load balance: replicas duplicate and drop">
+<meta property="og:description" content="Several open connections means Slack picks one per payload, without a distribution guarantee. Measure how often a trigger got exactly one answer.">
+<meta property="og:url" content="https://www.allanninal.dev/slack/socket-mode-single-instance/">
+<meta property="og:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Socket Mode does not load balance: replicas duplicate and drop">
+<meta name="twitter:description" content="Several open connections means Slack picks one per payload, without a distribution guarantee. Measure how often a trigger got exactly one answer.">
+<meta name="twitter:image" content="https://www.allanninal.dev/og-image.png">
+<meta name="google-adsense-account" content="ca-pub-3474747237489350">
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-DLRBEQ85ZN"></script>
+<script>window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag('js',new Date());gtag('config','G-DLRBEQ85ZN');</script>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3474747237489350" crossorigin="anonymous"></script>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/slack/assets/slack.css">
+<link rel="stylesheet" href="/assets/site-nav.css">
+<link rel="stylesheet" href="/assets/site-mobile.css">
+<script type="application/ld+json">{"@context":"https://schema.org","@graph":[{"@type":"TechArticle","@id":"https://www.allanninal.dev/slack/socket-mode-single-instance/#article","headline":"Socket Mode does not load balance: replicas duplicate and drop","description":"Several open connections means Slack picks one per payload, without a distribution guarantee. Measure how often a trigger got exactly one answer.","url":"https://www.allanninal.dev/slack/socket-mode-single-instance/","mainEntityOfPage":{"@type":"WebPage","@id":"https://www.allanninal.dev/slack/socket-mode-single-instance/"},"datePublished":"2026-08-31","dateModified":"2026-08-31","inLanguage":"en","articleSection":"Slack","keywords":"slack socket mode multiple instances, slack socket mode horizontal scaling, slack bot answers twice after scaling, slack socket mode replicas duplicate events, bolt socket mode single instance","author":{"@id":"https://www.allanninal.dev/#person"},"publisher":{"@id":"https://www.allanninal.dev/#person"},"proficiencyLevel":"Intermediate","dependencies":"Python 3.9+ with requests, or Node.js 18+; a bot token with channels:history, and the replica count the deployment actually runs","citation":["https://docs.slack.dev/apis/events-api/using-socket-mode","https://github.com/slackapi/bolt-js/issues/2487","https://github.com/slackapi/bolt-python/issues/445","https://docs.slack.dev/reference/methods/conversations.history"]},{"@type":"Person","@id":"https://www.allanninal.dev/#person","name":"Allan Niñal","jobTitle":"AI and Software Engineer","url":"https://www.allanninal.dev/","sameAs":["https://www.linkedin.com/in/allanninal/","https://github.com/allanninal"]},{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Field notes","item":"https://www.allanninal.dev/slack/"},{"@type":"ListItem","position":2,"name":"Slack","item":"https://www.allanninal.dev/slack/"},{"@type":"ListItem","position":3,"name":"Socket Mode does not load balance: replicas duplicate and drop","item":"https://www.allanninal.dev/slack/socket-mode-single-instance/"}]},{"@type":"FAQPage","@id":"https://www.allanninal.dev/slack/socket-mode-single-instance/#faq","mainEntity":[{"@type":"Question","name":"Does Slack really not distribute payloads across connections?","acceptedAnswer":{"@type":"Answer","text":"It routes each payload to one of the open connections, and the documentation is explicit that there is no predictable distribution pattern. That is a routing decision, not a work-sharing contract: there is no consumer group, no acknowledgement-based redelivery to a different consumer, and no ordering guarantee. Two connections do not mean half the load each; they mean two places a payload might arrive, one of which is chosen for you."}},{"@type":"Question","name":"Why do duplicates happen at all if each payload goes to one connection?","acceptedAnswer":{"@type":"Answer","text":"Because retries are separate deliveries. When an event is not acknowledged in time Slack sends it again, and with several connections open the retry can be routed to a different instance from the original. The first instance may well have finished the work; the second has no idea it exists. That is also why a dedupe cache in process memory does not help: neither instance ever saw both copies, so both are correct in believing the payload is new."}},{"@type":"Question","name":"Would a shared Redis dedupe cache fix it?","acceptedAnswer":{"@type":"Answer","text":"It fixes the duplicates and leaves the drops. A payload routed to an instance that is restarting, draining or wedged is not redelivered anywhere, and no cache can recover something that was never received. It is also worth noticing what a shared cache costs: at that point you have built a coordination layer in front of a transport chosen specifically to avoid needing infrastructure. One receiver and a queue you control is less code and loses nothing."}},{"@type":"Question","name":"How is this different from the note about duplicate processing on retry?","acceptedAnswer":{"@type":"Answer","text":"By the drops. A single listener that mishandles retries produces duplicates and no misses, because every payload still reaches the one process that exists. Several live connections produce duplicates and misses together, in the same channel, in the same hour. The script checks for the combination and, when it finds duplicates without drops, sends you to the retry note instead of claiming this one."}},{"@type":"Question","name":"We need more than one instance for availability. What then?","acceptedAnswer":{"@type":"Answer","text":"Keep one Socket Mode receiver and make it cheap to restart, so a failure is a short gap rather than a lost workload, and run your redundancy behind it: the receiver acknowledges and enqueues, and as many workers as you like drain the queue. If you need genuinely redundant ingress with no single receiver, that is the case for the HTTP Events API, where a load balancer distributes deliveries properly and the connection budget stops being a factor."}}]}]}</script>
+</head>
+<body>
+<div class="anx-root">
+<a class="anx-skip" href="#main">Skip to content</a>
+<header class="anx-header">
+  <div class="anx-bar">
+    <a class="anx-brand" href="/" aria-label="Allan Ni&ntilde;al &mdash; home">
+      <span class="anx-brand__mark"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9.5 7 5 12l4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/><path d="M14.5 7 19 12l-4.5 5" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/></svg></span>
+      <span class="anx-brand__text">allanninal<span class="anx-brand__dim">.dev</span><span class="anx-brand__section">/slack</span></span>
+    </a>
+
+    <nav class="anx-nav" aria-label="Primary">
+      <a class="anx-link" href="/">Home</a>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-work" aria-haspopup="true">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel" id="anx-work" hidden><p class="anx-panel__title">What I build</p><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+      </div>
+      <div class="anx-menu">
+        <button class="anx-link" type="button" data-anx-menu aria-expanded="false" aria-controls="anx-guides" aria-haspopup="true">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div class="anx-panel anx-panel--wide" id="anx-guides" hidden><div class="anx-panel__group"><p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a></div><div class="anx-panel__group"><p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/">GitHub API<span class="anx-item__note">80</span></a><a class="anx-item" href="/slack/" aria-current="page">Slack<span class="anx-item__note">83</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">72</span></a></div></div>
+      </div>
+      <a class="anx-link" href="/blog/">Blog</a>
+      <a class="anx-link" href="/#about">About</a>
+    </nav>
+
+    <div class="anx-actions">
+      <a class="anx-icon" href="https://github.com/allanninal" rel="me noopener" target="_blank" aria-label="GitHub"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg></a>
+      <a class="anx-cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Collaborate</a>
+      <button class="anx-burger" type="button" aria-expanded="false" aria-controls="anx-drawer" aria-label="Open menu">
+        <span class="anx-burger__box" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="anx-drawer" id="anx-drawer" hidden>
+    <a class="anx-drawer__cta" href="/#contact"><span class="anx-cta__dot" aria-hidden="true"></span>Open for collaboration</a>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/">Home</a></div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-work">Work<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-work" hidden><a class="anx-item" href="/#products">Products<span class="anx-item__note">live</span></a><a class="anx-item" href="/templates/">Templates</a><a class="anx-item" href="/spreadsheets/">Spreadsheets</a><a class="anx-item" href="/build/">Build on AWS</a><a class="anx-item" href="/#data">Data &amp; AI</a></div>
+    </div>
+    <div class="anx-acc">
+      <button class="anx-acc__btn" type="button" data-anx-acc aria-expanded="false" aria-controls="anx-d-guides">Guides<svg class="anx-link__chev" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <div class="anx-acc__panel" id="anx-d-guides" hidden>
+        <p class="anx-panel__title">Commerce platforms</p><a class="anx-item" href="/woocommerce/">WooCommerce<span class="anx-item__note">138</span></a><a class="anx-item" href="/shopify/">Shopify<span class="anx-item__note">36</span></a><a class="anx-item" href="/bigcommerce/">BigCommerce<span class="anx-item__note">94</span></a><a class="anx-item" href="/medusa/">Medusa<span class="anx-item__note">88</span></a><a class="anx-item" href="/shopware/">Shopware<span class="anx-item__note">59</span></a><a class="anx-item" href="/saleor/">Saleor<span class="anx-item__note">51</span></a><a class="anx-item" href="/prestashop/">PrestaShop<span class="anx-item__note">73</span></a><a class="anx-item" href="/magento/">Magento<span class="anx-item__note">59</span></a>
+        <p class="anx-panel__title">Platform &amp; infra</p><a class="anx-item" href="/aws/">AWS cost<span class="anx-item__note">6</span></a><a class="anx-item" href="/cloudflare/">Cloudflare<span class="anx-item__note">4</span></a><a class="anx-item" href="/ci/">GitHub Actions<span class="anx-item__note">4</span></a><a class="anx-item" href="/email/">Email &amp; SES<span class="anx-item__note">8</span></a><a class="anx-item" href="/dns/">DNS &amp; Domains<span class="anx-item__note">58</span></a><a class="anx-item" href="/seo/">Technical SEO<span class="anx-item__note">4</span></a>
+        <p class="anx-panel__title">APIs</p><a class="anx-item" href="/stripe/">Stripe<span class="anx-item__note">114</span></a><a class="anx-item" href="/twilio/">Twilio<span class="anx-item__note">117</span></a><a class="anx-item" href="/github/">GitHub API<span class="anx-item__note">80</span></a><a class="anx-item" href="/slack/" aria-current="page">Slack<span class="anx-item__note">83</span></a><a class="anx-item" href="/llm/">LLM APIs<span class="anx-item__note">72</span></a>
+      </div>
+    </div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/blog/">Blog</a></div>
+    <div class="anx-acc"><a class="anx-acc__btn" href="/#about">About</a></div>
+    <div class="anx-drawer__foot">
+      <a href="https://github.com/allanninal" rel="me noopener" target="_blank"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12.02c0 4.42 2.87 8.17 6.84 9.5.5.09.68-.22.68-.48 0-.24 0-.87-.01-1.7-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.95 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.56 9.56 0 0 1 12 6.84c.85 0 1.71.12 2.5.34 1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.85-2.34 4.7-4.57 4.94.36.31.68.92.68 1.86 0 1.34-.01 2.42-.01 2.75 0 .27.18.58.69.48A10.02 10.02 0 0 0 22 12.02C22 6.48 17.52 2 12 2Z"/></svg>GitHub</a>
+      <a href="https://www.linkedin.com/in/allanninal/" rel="noopener" target="_blank">LinkedIn</a>
+      <a href="https://ko-fi.com/allanninal" rel="noopener" target="_blank">Ko-fi</a>
+    </div>
+  </div>
+</header>
+</div>
+<main id="main">
+<section class="hero">
+<div class="container prose">
+<p class="breadcrumbs"><a href="/slack/">Field notes</a> / Slack</p>
+<p class="eyebrow"><span class="pill pill--diag">Diagnostic</span> Slack</p>
+<h1>Socket Mode does not load balance: replicas duplicate and drop</h1>
+<p class="lead">The app was scaled from one pod to three on Thursday afternoon, for headroom before a launch. By Friday morning the support channel had two complaints that the bot had answered the same request twice and one that it had not answered at all. Restarting a pod changes which of those happens. Rolling back to one pod makes both stop.</p><p>Nothing is wrong with the code. Three pods, three Socket Mode connections, and Slack sends each payload to <em>one</em> of them &mdash; with, in its own words, no predictable distribution pattern. That is not a work queue. There is no consumer group, no acknowledgement-based redelivery to a different consumer, and no ordering guarantee anywhere in it.</p>
+<div class="meta">
+<span class="chip">Read-only token</span>
+<span class="chip">Python and Node.js</span>
+<span class="chip">Tests included</span>
+</div>
+</div>
+</section>
+
+<div class="container prose">
+<figure class="feature-img">
+<img src="/slack/assets/img/socket-mode-single-instance/feature.jpg" alt="Two people riding electric scooters on a street." width="1200" height="630" loading="eager" decoding="async">
+<figcaption>Photo by <a href="https://unsplash.com/@qixna?utm_source=allanninal_dev?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Felix yu</a> on <a href="https://unsplash.com/?utm_source=allanninal_dev&amp;utm_medium=referral" rel="noopener nofollow" target="_blank">Unsplash</a></figcaption>
+</figure>
+<div class="callout callout--note" id="short-answer">
+<div class="callout__title">The short answer</div>
+<p>Socket Mode is not a load balancer and it is not a message queue. When several connections are open for one app, Slack routes each payload to one of them and does not promise which. Add replicas and you do not get work sharing &mdash; you get a lottery.</p>
+<p>The losses come from the lottery: a payload routed to a pod that is restarting, draining or wedged is gone, because there is no redelivery to a different consumer. <strong>The duplicates come from the retry landing somewhere else.</strong> When a delivery is not acknowledged in time Slack retries it, and with three connections open the retry can arrive on a different pod from the original. Each pod's dedupe cache is perfectly correct and completely blind: neither saw both copies. A per-process cache cannot deduplicate across processes, so the work is done twice and every individual component behaves exactly as designed.</p>
+<p><strong>The measurement is the fraction of triggers that got exactly one answer.</strong> Page <code>conversations.history</code>, count the app's replies inside a window after each mention, and sort them into none, one and many. Duplicates <em>and</em> misses in the same channel is the fingerprint no other Socket Mode failure produces: retries alone give duplicates without misses, a leaked connection pool gives misses without duplicates.</p>
+</div>
+
+<h2>The problem in plain words</h2>
+<p>The reason teams walk into this is that every other part of their stack rewards adding replicas. HTTP behind a load balancer shares work. A queue consumer group shares work. A Kafka partition assignment shares work. Socket Mode looks like a long-lived consumer connection and is nothing of the kind: it is a delivery channel, and having three of them means Slack has three places it might put a payload, not three workers splitting a stream.</p>
+<p>The non-determinism is what makes it so hard to pin down. The same message, sent twice, behaves differently. A pod restart changes the outcome. A quiet afternoon looks fine because there is enough headroom that nothing is ever slow enough to be retried. Then a busy morning produces four complaints in an hour and nobody can reproduce any of them. Every hypothesis fits some of the evidence, which is the signature of a routing problem rather than a logic problem.</p>
+<p>Idempotency keys are the usual first attempt and they usually fail, for a reason worth understanding. A dedupe cache in process memory is per-pod. Pod A handles the original, pod B handles the retry, and neither one has ever seen the other's copy, so both are certain they are handling something new. Moving the cache to Redis fixes it &mdash; and at that point you have built the coordination layer that Socket Mode was supposed to save you from, in front of a transport that still drops payloads when a pod is restarting.</p>
+<p>And the losses do not announce themselves. There is no dead-letter queue, no unacknowledged-message metric, no consumer lag. A payload routed to a pod that is thirty seconds into a rolling restart is simply never processed by anything, and the only record it existed is the human message in Slack that nobody replied to. That is why the check has to be built out of the workspace's own history rather than out of the app's telemetry: the app has no telemetry for events it never received.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 168" role="img" aria-label="Three replicas holding three connections and Slack choosing one per payload"><defs><marker id="sksmsi-p-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#695a6a"/></marker><marker id="sksmsi-p-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="sksmsi-p-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="sksmsi-p-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a154b"/></marker></defs><rect x="10.0" y="51.0" width="111.2" height="66" rx="10" fill="#f7f1f7" stroke="#e4cfe5"/><text x="66" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Scaled to three</text><text x="66" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">pods</text><text x="66" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">for launch</text><text x="66" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">headroom</text><rect x="167.2" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="223" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Three open</text><text x="223" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">sockets</text><text x="223" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">one app, three</text><text x="223" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">places</text><rect x="324.4" y="51.0" width="111.2" height="66" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="380" y="77.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Slack picks one</text><text x="380" y="94.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">no distribution</text><text x="380" y="107.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">promise</text><rect x="481.59999999999997" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="537" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Retry lands</text><text x="537" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">elsewhere</text><text x="537" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">the cache is per</text><text x="537" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">process</text><rect x="638.8" y="51.0" width="111.2" height="66" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="694" y="73.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Twice, or not</text><text x="694" y="88.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">at all</text><text x="694" y="105.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">and a restart</text><text x="694" y="118.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">changes which</text><line x1="124" y1="84" x2="161" y2="84" stroke="#695a6a" stroke-width="2" marker-end="url(#sksmsi-p-plain)"/><line x1="281" y1="84" x2="318" y2="84" stroke="#cf4b3f" stroke-width="2" marker-end="url(#sksmsi-p-bad)"/><line x1="439" y1="84" x2="476" y2="84" stroke="#695a6a" stroke-width="2" marker-end="url(#sksmsi-p-plain)"/><line x1="596" y1="84" x2="633" y2="84" stroke="#695a6a" stroke-width="2" marker-end="url(#sksmsi-p-plain)"/></svg>
+<figcaption>This is not a consumer group. There is no redelivery to a different consumer and no ordering, so a retry can land on a pod that never saw the original and a payload can land on a pod that is restarting.</figcaption>
+</figure>
+
+<h2>Why it happens</h2>
+<p><strong>Duplicates and misses together is the fingerprint, and no other note here produces it.</strong> Retries without replicas duplicate but do not lose. A leaked connection pool loses but does not duplicate, because each payload still goes to exactly one registration. A mishandled refresh loses in periodic bunches. Only several live listeners give you both at once, in the same channel, in the same hour. The script checks for the pair rather than for either half.</p>
+<p><strong>The determinism fraction is a better number than a duplicate count.</strong> &ldquo;Fourteen duplicates this week&rdquo; invites somebody to add a dedupe key. &ldquo;Sixty-two per cent of triggers got exactly one answer&rdquo; says the delivery path is non-deterministic, which is the actual finding, and it moves in the right direction as soon as the replica count comes down.</p>
+<p><strong>Spacing separates this from the retry note, and the script makes that call explicitly.</strong> Duplicates a few seconds apart, or one minute or five minutes apart, are Slack's retry schedule; if there are no misses beside them, one listener is mishandling retries and that is a different note. Duplicates less than a second apart with no misses are usually two subscriptions to the same conversation, which is a third note. The verdict names which of the three it found.</p>
+<p><strong>The replica count is an input, not an inference.</strong> The script cannot see your deployment and does not pretend to. You state how many replicas hold a connection, and the finding is reported against that number, because the repair is expressed in replicas and a diagnosis expressed in anything else is not actionable.</p>
+<p><strong>A per-process dedupe cache is not a fix and the script says so in the repair.</strong> The cache is correct; it is simply in the wrong place. If the app must run more than one instance, the deduplication has to live somewhere all of them can see, and even then the routing losses remain. That is why the repair is one receiver and a queue you control, not a smarter cache.</p>
+<p><strong>Nothing here opens a connection.</strong> Counting live connections would require minting one, which consumes part of the app's ten-connection budget and is a write. Everything above is read from the workspace and from a replica count you already know.</p>
+
+<h2>The fix, as a flow</h2>
+<p>The red arrow here is at the routing decision, and the two boxes after it are the outcomes of a coin toss rather than of a fault: every component in this picture is behaving exactly as designed, including the dedupe cache that misses. The fix branch sorts the outcome of one trigger, and it is the only branch in the batch whose rows name other notes, because duplicates and drops look identical apart from whether they appear together.</p>
+<figure class="diagram">
+<svg viewBox="0 0 760 362" role="img" aria-label="Every mention scored by how many answers it got, and the pair that identifies the cause"><defs><marker id="sksmsi-f-plain" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#695a6a"/></marker><marker id="sksmsi-f-bad" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#cf4b3f"/></marker><marker id="sksmsi-f-good" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4c9a2a"/></marker><marker id="sksmsi-f-accent" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4a154b"/></marker></defs><rect x="10" y="146.0" width="216" height="70" rx="10" fill="#f7f1f7" stroke="#e4cfe5"/><text x="118" y="172.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Answers per mention</text><text x="118" y="189.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">none, once, many, and spacing</text><rect x="300" y="22.0" width="450" height="54" rx="10" fill="#fbeeec" stroke="#e8bdb6"/><text x="525" y="48.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Duplicates and drops</text><text x="525" y="65.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">several live connections</text><path d="M229,181 C260,181 260,49 294,49" fill="none" stroke="#cf4b3f" stroke-width="2" marker-end="url(#sksmsi-f-bad)"/><rect x="300" y="88.0" width="450" height="54" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="525" y="114.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Duplicates at retry gaps</text><text x="525" y="131.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">one listener, other note</text><path d="M229,181 C260,181 260,115 294,115" fill="none" stroke="#695a6a" stroke-width="2" marker-end="url(#sksmsi-f-plain)"/><rect x="300" y="154.0" width="450" height="54" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="525" y="180.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Duplicates in the same second</text><text x="525" y="197.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">two subscriptions, other note</text><path d="M229,181 C260,181 260,181 294,181" fill="none" stroke="#695a6a" stroke-width="2" marker-end="url(#sksmsi-f-plain)"/><rect x="300" y="220.0" width="450" height="54" rx="10" fill="#fff" stroke="#e4cfe5"/><text x="525" y="246.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Drops on their own</text><text x="525" y="263.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">the cap or a refresh</text><path d="M229,181 C260,181 260,247 294,247" fill="none" stroke="#695a6a" stroke-width="2" marker-end="url(#sksmsi-f-plain)"/><rect x="300" y="286.0" width="450" height="54" rx="10" fill="#eef7ea" stroke="#bfdcb1"/><text x="525" y="312.0" text-anchor="middle" font-family="sans-serif" font-size="12.5" font-weight="700" fill="#322432">Exactly once, every time</text><text x="525" y="329.0" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#695a6a">the number to get back to</text><path d="M229,181 C260,181 260,313 294,313" fill="none" stroke="#4c9a2a" stroke-width="2" marker-end="url(#sksmsi-f-good)"/></svg>
+<figcaption>Counted per trigger rather than in total, because a duplicate count says nothing about the mentions that got nothing. It is the combination that names the failure, not either half.</figcaption>
+</figure>
+
+<h2>How to fix it</h2>
+<h3>Count the replies to each mention rather than the duplicates overall</h3>
+<p><code>reply_counts</code> walks <code>conversations.history</code> and returns, for every mention of the bot, how many app-authored messages followed it inside the window. That per-trigger count is what makes the rest possible: a total number of duplicates cannot tell you about the mentions that got nothing.</p>
+<h3>Sort the outcomes into none, once and many</h3>
+<p><code>outcome_mix</code> reduces those counts to four numbers and a fraction. The fraction &mdash; triggers answered exactly once, over all triggers &mdash; is the finding. A healthy app sits at one. Anything materially below it has a delivery path that is not deterministic, whichever direction the errors go.</p>
+<h3>Look at the gaps between repeated answers</h3>
+<p><code>repeat_runs</code> groups the app's own messages by identical text within a window and returns the intervals between them. <code>spacing_kind</code> then labels each run <code>simultaneous</code>, <code>retry</code> or <code>spread</code>. This is where the diagnosis stops being about counts and starts being about mechanism.</p>
+<h3>Let the combination pick the note</h3>
+<p><code>fingerprint</code> takes the outcome mix and the spacings and returns one of five verdicts. Duplicates with misses is this note. Retry-spaced duplicates without misses is the retry note. Sub-second duplicates without misses is a double subscription. Misses alone is the connection cap or a refresh. Nothing at all is clean, and the script will say that too.</p>
+<h3>Read the verdict against the replica count you gave it</h3>
+<p>The output states the finding in replicas because that is what you can change. Three replicas each holding a connection is three places a payload might land and two of them are wrong at any moment; the number to get to is one.</p>
+<h3>One receiver, then scale behind it</h3>
+<p>The repair the script prints is architectural. Run Socket Mode as a singleton, restarted on failure, and have it do nothing but enqueue payloads into something you control; scale the workers that drain that queue as far as you like. If ingress genuinely has to be multi-node, that is what the HTTP Events API and a load balancer are for. A shared dedupe cache is a patch on the duplicates and does nothing for the drops.</p>
+
+<h2>How to check it worked</h2>
+<p>Scale back to one replica, wait for a busy period, and run it again. The fraction is the number to watch; the duplicate count will follow it.</p>
+<pre><code class="language-bash">python3 slack_socket_replica_fingerprint.py --channel C05SUP9QT --replicas 3
+# identity   U07BOT9QD (helpbot) in Northwind
+# triggers   84 mention(s) read, answered inside 45s
+# outcome    none 9   once 63   many 12   of 84
+# exactly-once   0.750
+# spacing    retry        7 run(s) repeated at Slack retry intervals
+# spacing    simultaneous 5 run(s) repeated less than a second apart
+# verdict    several-live-connections  duplicates and misses in the same channel
+# replicas   3 replica(s) hold a connection, so a payload has 3 places to land
+#   repair: run Socket Mode as a singleton and enqueue payloads into a queue you
+#           control; scale the workers, not the receiver
+#   repair: a dedupe cache in process memory cannot see the copy another pod
+#           handled; if instances must be plural, the cache has to be shared
+#   note:   nothing here opened a connection; counting them would consume one</code></pre>
+
+<h2>The full code</h2>
+<p>The number this script exists to produce is <code>exactly-once</code>: the proportion of triggers that got one answer, no more and no less. Counting duplicates alone would hide the drops, and counting drops alone would hide the duplicates, and it is the pair that identifies the failure. <code>spacing_kind</code> is the second half of the argument, because duplicates at Slack's retry intervals with no drops beside them belong to a different note, and <code>fingerprint</code> is where those two observations are turned into a verdict that names which note you are in.</p>
+<div class="repo-cta" data-repo-cta>
+<a href="https://github.com/allanninal/slack-fixes/tree/main/socket-mode-single-instance" rel="noopener" target="_blank">Get this script on GitHub</a>
+<a href="https://github.com/allanninal" rel="noopener" target="_blank">Follow @allanninal</a>
+<span>Python and Node.js, with tests. Read only, it never writes. One of 83 Slack fixes, free and open source.</span>
+</div>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">slack_socket_replica_fingerprint.py</div>
+<pre><code class="language-python">&quot;&quot;&quot;Tell several live Socket Mode connections apart from retries and drops.
+
+Read only. Nothing here opens a connection: apps.connections.open mints one and
+counts against the ten an app is allowed, so the number of live connections is
+supplied by you as a replica count rather than measured. Everything else comes
+from conversations.history, which is where the consequences are recorded.
+
+The measurement is the fraction of triggers that got exactly one answer. Slack
+routes each payload to one of the open connections without a distribution
+guarantee, so more connections means more places a payload can land and more
+places a retry can land separately from its original.
+&quot;&quot;&quot;
+import argparse
+import logging
+import os
+import sys
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)
+log = logging.getLogger(&quot;slack_socket_replica_fingerprint&quot;)
+
+API = &quot;https://slack.com/api/&quot;
+
+# Slack retries an unacknowledged event on a schedule. Duplicates spaced like
+# this, with no drops beside them, are one listener mishandling retries - a
+# different problem with a different repair.
+RETRY_SPACINGS = (60.0, 300.0)
+RETRY_TOLERANCE = 0.25
+
+# Below this, two answers were produced at the same moment rather than in
+# sequence, which points at two subscriptions rather than two connections.
+SIMULTANEOUS_SECONDS = 1.0
+
+
+def reply_counts(messages, bot_user_id, window=45.0):
+    &quot;&quot;&quot;How many answers did each mention get? Pure.
+
+    Per trigger rather than in total, because a total duplicate count cannot
+    say anything about the mentions that got nothing at all, and it is the two
+    together that identify this failure.
+
+    Returns [(mention_ts, replies), ...] oldest first.
+    &quot;&quot;&quot;
+    marker = &quot;&lt;@%s&gt;&quot; % bot_user_id if bot_user_id else None
+    own, mentions = [], []
+    for m in messages or []:
+        ts = str((m or {}).get(&quot;ts&quot;) or &quot;&quot;)
+        if not ts:
+            continue
+        author = (m or {}).get(&quot;user&quot;) or &quot;&quot;
+        if (bot_user_id and author == bot_user_id) or (m or {}).get(&quot;bot_id&quot;):
+            own.append(float(ts))
+        elif marker and marker in str((m or {}).get(&quot;text&quot;) or &quot;&quot;):
+            mentions.append(float(ts))
+    out = []
+    for ts in sorted(mentions):
+        out.append((ts, sum(1 for o in own if ts &lt;= o &lt;= ts + float(window))))
+    return out
+
+
+def outcome_mix(counts):
+    &quot;&quot;&quot;Sort trigger outcomes into none, once and many. Pure.
+
+    Returns (mix, exactly_once). The fraction is the finding: a delivery path
+    that works answers every trigger once, and a fraction materially below one
+    is non-deterministic whichever direction the errors go in.
+    &quot;&quot;&quot;
+    rows = [int(n) for _ts, n in counts or []]
+    mix = {&quot;none&quot;: sum(1 for n in rows if n == 0),
+           &quot;once&quot;: sum(1 for n in rows if n == 1),
+           &quot;many&quot;: sum(1 for n in rows if n &gt; 1),
+           &quot;total&quot;: len(rows)}
+    fraction = 0.0 if not rows else round(mix[&quot;once&quot;] / float(len(rows)), 3)
+    return (mix, fraction)
+
+
+def repeat_runs(messages, bot_user_id, gap=600.0):
+    &quot;&quot;&quot;Runs of identical app-authored messages, and the gaps between them. Pure.
+
+    Text is compared after trimming and lowercasing, which is crude and is
+    enough: the duplicates this note is about are the same answer produced
+    twice by two processes running the same code.
+
+    Returns [(text, [delta, ...]), ...] for runs of two or more.
+    &quot;&quot;&quot;
+    said = {}
+    for m in messages or []:
+        ts = str((m or {}).get(&quot;ts&quot;) or &quot;&quot;)
+        author = (m or {}).get(&quot;user&quot;) or &quot;&quot;
+        is_app = (bot_user_id and author == bot_user_id) or (m or {}).get(&quot;bot_id&quot;)
+        text = str((m or {}).get(&quot;text&quot;) or &quot;&quot;).strip().lower()
+        if not ts or not is_app or not text:
+            continue
+        said.setdefault(text, []).append(float(ts))
+    runs = []
+    for text, stamps in said.items():
+        stamps.sort()
+        current = [stamps[0]]
+        for ts in stamps[1:]:
+            if ts - current[-1] &lt;= float(gap):
+                current.append(ts)
+            else:
+                if len(current) &gt; 1:
+                    runs.append((text, [b - a for a, b in zip(current, current[1:])]))
+                current = [ts]
+        if len(current) &gt; 1:
+            runs.append((text, [b - a for a, b in zip(current, current[1:])]))
+    return sorted(runs)
+
+
+def spacing_kind(deltas):
+    &quot;&quot;&quot;What produced this run of identical answers? Pure.
+
+    simultaneous  under a second apart: two handlers acted on the same payload
+                  at the same moment, which is usually two subscriptions.
+    retry         at Slack&#x27;s retry intervals: one listener that did not
+                  acknowledge in time, which is a different note.
+    spread        neither, so the run says nothing on its own.
+    &quot;&quot;&quot;
+    gaps = [float(d) for d in deltas or []]
+    if not gaps:
+        return &quot;single&quot;
+    if all(g &lt; SIMULTANEOUS_SECONDS for g in gaps):
+        return &quot;simultaneous&quot;
+    for g in gaps:
+        for expected in RETRY_SPACINGS:
+            if abs(g - expected) &lt;= expected * RETRY_TOLERANCE:
+                return &quot;retry&quot;
+    return &quot;spread&quot;
+
+
+def fingerprint(mix, kinds):
+    &quot;&quot;&quot;Which failure is this? Pure. Returns (verdict, detail).
+
+    The combination is the whole diagnosis. Duplicates beside drops is the only
+    shape several live connections produce; retries duplicate without dropping,
+    and a leaked connection pool drops without duplicating.
+    &quot;&quot;&quot;
+    mix = mix or {}
+    many, none = int(mix.get(&quot;many&quot;) or 0), int(mix.get(&quot;none&quot;) or 0)
+    kinds = list(kinds or [])
+    if many and none:
+        return (&quot;several-live-connections&quot;,
+                &quot;duplicates and misses in the same channel. A retry landing on a &quot;
+                &quot;different instance from its original is handled twice, and a payload &quot;
+                &quot;routed to an instance that is restarting is handled by nobody&quot;)
+    if many and &quot;retry&quot; in kinds:
+        return (&quot;retries-one-listener&quot;,
+                &quot;duplicates at Slack&#x27;s retry intervals with nothing dropped. One &quot;
+                &quot;listener that did not acknowledge in time, which is a different note&quot;)
+    if many and &quot;simultaneous&quot; in kinds:
+        return (&quot;double-subscription&quot;,
+                &quot;duplicates under a second apart with nothing dropped. Two &quot;
+                &quot;subscriptions delivering the same conversation, not two connections&quot;)
+    if many:
+        return (&quot;duplicates-unclassified&quot;,
+                &quot;repeats that match neither the retry schedule nor a simultaneous &quot;
+                &quot;pair; read the runs before concluding anything&quot;)
+    if none:
+        return (&quot;losses-only&quot;,
+                &quot;drops with no duplicates. Each payload still went to exactly one &quot;
+                &quot;place, so look at the connection cap or a mishandled refresh&quot;)
+    return (&quot;clean&quot;, &quot;every trigger in this window got exactly one answer&quot;)
+
+
+def page_history(session, channel, limit, max_pages):
+    &quot;&quot;&quot;Page conversations.history. A read, and one of two calls made.&quot;&quot;&quot;
+    out, cursor, pages = [], &quot;&quot;, 0
+    while pages &lt; max_pages:
+        params = {&quot;channel&quot;: channel, &quot;limit&quot;: str(limit)}
+        if cursor:
+            params[&quot;cursor&quot;] = cursor
+        body = session.get(API + &quot;conversations.history&quot;, params=params,
+                           timeout=30).json()
+        if body.get(&quot;ok&quot;) is not True:
+            log.error(&quot;history    unavailable    %s&quot;, body.get(&quot;error&quot;))
+            return out
+        out.extend(body.get(&quot;messages&quot;) or [])
+        cursor = ((body.get(&quot;response_metadata&quot;) or {}).get(&quot;next_cursor&quot;) or &quot;&quot;)
+        pages += 1
+        if not cursor:
+            break
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(&quot;--token-env&quot;, default=&quot;SLACK_BOT_TOKEN&quot;)
+    ap.add_argument(&quot;--channel&quot;, required=True)
+    ap.add_argument(&quot;--replicas&quot;, type=int, default=1,
+                    help=&quot;how many instances hold a Socket Mode connection&quot;)
+    ap.add_argument(&quot;--window&quot;, type=float, default=45.0)
+    ap.add_argument(&quot;--repeat-gap&quot;, type=float, default=600.0)
+    ap.add_argument(&quot;--limit&quot;, type=int, default=200)
+    ap.add_argument(&quot;--max-pages&quot;, type=int, default=5)
+    args = ap.parse_args()
+
+    token = os.environ.get(args.token_env)
+    if not token:
+        log.error(&quot;set %s to a bot token with channels:history&quot;, args.token_env)
+        return 2
+    s = requests.Session()
+    s.headers.update({&quot;Authorization&quot;: &quot;Bearer &quot; + token})
+    who = s.get(API + &quot;auth.test&quot;, timeout=30).json()
+    if who.get(&quot;ok&quot;) is not True:
+        log.error(&quot;auth.test  unavailable    %s&quot;, who.get(&quot;error&quot;))
+        return 2
+    log.info(&quot;identity   %s (%s) in %s&quot;, who.get(&quot;user_id&quot;), who.get(&quot;user&quot;),
+             who.get(&quot;team&quot;))
+
+    messages = page_history(s, args.channel, args.limit, args.max_pages)
+    counts = reply_counts(messages, who.get(&quot;user_id&quot;), args.window)
+    mix, fraction = outcome_mix(counts)
+    log.info(&quot;triggers   %d mention(s) read, answered inside %.0fs&quot;, mix[&quot;total&quot;],
+             args.window)
+    if not mix[&quot;total&quot;]:
+        log.info(&quot;verdict    nothing to measure; no mentions in the window read&quot;)
+        return 0
+    log.info(&quot;outcome    none %d   once %d   many %d   of %d&quot;, mix[&quot;none&quot;],
+             mix[&quot;once&quot;], mix[&quot;many&quot;], mix[&quot;total&quot;])
+    log.info(&quot;exactly-once   %.3f&quot;, fraction)
+
+    runs = repeat_runs(messages, who.get(&quot;user_id&quot;), args.repeat_gap)
+    kinds = [spacing_kind(deltas) for _text, deltas in runs]
+    for kind in sorted(set(kinds)):
+        log.info(&quot;spacing    %-12s %d run(s) of repeated answers&quot;, kind,
+                 kinds.count(kind))
+
+    verdict, detail = fingerprint(mix, kinds)
+    if verdict == &quot;clean&quot;:
+        log.info(&quot;verdict    clean        %s&quot;, detail)
+        return 0
+    if verdict != &quot;several-live-connections&quot;:
+        log.info(&quot;verdict    %-12s %s&quot;, verdict, detail)
+        return 0
+    log.warning(&quot;verdict    %s  %s&quot;, verdict, detail)
+    log.warning(&quot;replicas   %d replica(s) hold a connection, so a payload has %d &quot;
+                &quot;places to land and %d of them are wrong at any moment&quot;,
+                args.replicas, args.replicas, max(0, args.replicas - 1))
+    log.warning(&quot;  repair: run Socket Mode as a singleton and enqueue payloads into a &quot;
+                &quot;queue you control; scale the workers, not the receiver&quot;)
+    log.warning(&quot;  repair: a dedupe cache in process memory cannot see the copy &quot;
+                &quot;another instance handled; if instances must be plural, share it&quot;)
+    log.warning(&quot;  repair: for genuinely multi-node ingress use the HTTP Events API &quot;
+                &quot;behind a load balancer, which does distribute&quot;)
+    log.warning(&quot;  note:   nothing here opened a connection; counting them would &quot;
+                &quot;consume one of the ten this app is allowed&quot;)
+    return 1
+
+
+if __name__ == &quot;__main__&quot;:
+    sys.exit(main())
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">slack-socket-replica-fingerprint.mjs</div>
+<pre><code class="language-javascript">/**
+ * Tell several live Socket Mode connections apart from retries and drops.
+ *
+ * Read only. Nothing here opens a connection: apps.connections.open mints one
+ * and counts against the ten an app is allowed, so the number of live
+ * connections is supplied as a replica count rather than measured. Everything
+ * else comes from conversations.history, where the consequences are recorded.
+ *
+ * The measurement is the fraction of triggers that got exactly one answer.
+ */
+
+const API = &#x27;https://slack.com/api/&#x27;;
+
+// Slack retries an unacknowledged event on a schedule. Duplicates spaced like
+// this, with no drops beside them, are one listener mishandling retries.
+export const RETRY_SPACINGS = [60, 300];
+export const RETRY_TOLERANCE = 0.25;
+export const SIMULTANEOUS_SECONDS = 1;
+
+/**
+ * How many answers did each mention get? Pure.
+ * Per trigger rather than in total, because a total duplicate count says
+ * nothing about the mentions that got nothing at all.
+ */
+export function replyCounts(messages, botUserId, window = 45) {
+  const marker = botUserId ? `&lt;@${botUserId}&gt;` : null;
+  const own = [];
+  const mentions = [];
+  for (const m of messages ?? []) {
+    const ts = String((m ?? {}).ts ?? &#x27;&#x27;);
+    if (!ts) continue;
+    const author = (m ?? {}).user ?? &#x27;&#x27;;
+    if ((botUserId &amp;&amp; author === botUserId) || (m ?? {}).bot_id) own.push(Number(ts));
+    else if (marker &amp;&amp; String((m ?? {}).text ?? &#x27;&#x27;).includes(marker)) {
+      mentions.push(Number(ts));
+    }
+  }
+  return mentions.sort((a, b) =&gt; a - b)
+    .map((ts) =&gt; [ts, own.filter((o) =&gt; o &gt;= ts &amp;&amp; o &lt;= ts + Number(window)).length]);
+}
+
+/** Sort trigger outcomes into none, once and many. Pure. [mix, exactlyOnce]. */
+export function outcomeMix(counts) {
+  const rows = (counts ?? []).map(([, n]) =&gt; Number(n));
+  const mix = {
+    none: rows.filter((n) =&gt; n === 0).length,
+    once: rows.filter((n) =&gt; n === 1).length,
+    many: rows.filter((n) =&gt; n &gt; 1).length,
+    total: rows.length,
+  };
+  const fraction = rows.length ? Math.round((mix.once / rows.length) * 1000) / 1000 : 0;
+  return [mix, fraction];
+}
+
+/**
+ * Runs of identical app-authored messages, and the gaps between them. Pure.
+ * Returns [[text, [delta, ...]], ...] for runs of two or more.
+ */
+export function repeatRuns(messages, botUserId, gap = 600) {
+  const said = new Map();
+  for (const m of messages ?? []) {
+    const ts = String((m ?? {}).ts ?? &#x27;&#x27;);
+    const author = (m ?? {}).user ?? &#x27;&#x27;;
+    const isApp = (botUserId &amp;&amp; author === botUserId) || (m ?? {}).bot_id;
+    const text = String((m ?? {}).text ?? &#x27;&#x27;).trim().toLowerCase();
+    if (!ts || !isApp || !text) continue;
+    if (!said.has(text)) said.set(text, []);
+    said.get(text).push(Number(ts));
+  }
+  const runs = [];
+  const deltas = (run) =&gt; run.slice(1).map((b, i) =&gt; b - run[i]);
+  for (const [text, stamps] of said) {
+    stamps.sort((a, b) =&gt; a - b);
+    let current = [stamps[0]];
+    for (const ts of stamps.slice(1)) {
+      if (ts - current[current.length - 1] &lt;= Number(gap)) current.push(ts);
+      else {
+        if (current.length &gt; 1) runs.push([text, deltas(current)]);
+        current = [ts];
+      }
+    }
+    if (current.length &gt; 1) runs.push([text, deltas(current)]);
+  }
+  return runs.sort((a, b) =&gt; (a[0] &lt; b[0] ? -1 : 1));
+}
+
+/** What produced this run of identical answers? Pure. */
+export function spacingKind(deltas) {
+  const gaps = (deltas ?? []).map(Number);
+  if (!gaps.length) return &#x27;single&#x27;;
+  if (gaps.every((g) =&gt; g &lt; SIMULTANEOUS_SECONDS)) return &#x27;simultaneous&#x27;;
+  for (const g of gaps) {
+    for (const expected of RETRY_SPACINGS) {
+      if (Math.abs(g - expected) &lt;= expected * RETRY_TOLERANCE) return &#x27;retry&#x27;;
+    }
+  }
+  return &#x27;spread&#x27;;
+}
+
+/** Which failure is this? Pure. Returns [verdict, detail]. */
+export function fingerprint(mix, kinds) {
+  const m = mix ?? {};
+  const many = Number(m.many) || 0;
+  const none = Number(m.none) || 0;
+  const seen = kinds ?? [];
+  if (many &amp;&amp; none) {
+    return [&#x27;several-live-connections&#x27;,
+      &#x27;duplicates and misses in the same channel. A retry landing on a different &#x27;
+      + &#x27;instance from its original is handled twice, and a payload routed to an &#x27;
+      + &#x27;instance that is restarting is handled by nobody&#x27;];
+  }
+  if (many &amp;&amp; seen.includes(&#x27;retry&#x27;)) {
+    return [&#x27;retries-one-listener&#x27;,
+      &#x27;duplicates at Slack retry intervals with nothing dropped. One listener that &#x27;
+      + &#x27;did not acknowledge in time, which is a different note&#x27;];
+  }
+  if (many &amp;&amp; seen.includes(&#x27;simultaneous&#x27;)) {
+    return [&#x27;double-subscription&#x27;,
+      &#x27;duplicates under a second apart with nothing dropped. Two subscriptions &#x27;
+      + &#x27;delivering the same conversation, not two connections&#x27;];
+  }
+  if (many) {
+    return [&#x27;duplicates-unclassified&#x27;,
+      &#x27;repeats that match neither the retry schedule nor a simultaneous pair; read &#x27;
+      + &#x27;the runs before concluding anything&#x27;];
+  }
+  if (none) {
+    return [&#x27;losses-only&#x27;,
+      &#x27;drops with no duplicates. Each payload still went to exactly one place, so &#x27;
+      + &#x27;look at the connection cap or a mishandled refresh&#x27;];
+  }
+  return [&#x27;clean&#x27;, &#x27;every trigger in this window got exactly one answer&#x27;];
+}
+
+function arg(args, name, fallback = null) {
+  const i = args.indexOf(name);
+  return i === -1 ? fallback : args[i + 1];
+}
+
+async function pageHistory(headers, channel, limit, maxPages) {
+  const out = [];
+  let cursor = &#x27;&#x27;;
+  for (let page = 0; page &lt; maxPages; page += 1) {
+    const params = new URLSearchParams({ channel, limit: String(limit) });
+    if (cursor) params.set(&#x27;cursor&#x27;, cursor);
+    const body = await (await fetch(`${API}conversations.history?${params}`,
+      { headers })).json();
+    if (body.ok !== true) {
+      console.error(`history    unavailable    ${body.error}`);
+      return out;
+    }
+    out.push(...(body.messages ?? []));
+    cursor = (body.response_metadata ?? {}).next_cursor ?? &#x27;&#x27;;
+    if (!cursor) break;
+  }
+  return out;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const tokenEnv = arg(args, &#x27;--token-env&#x27;, &#x27;SLACK_BOT_TOKEN&#x27;);
+  const token = process.env[tokenEnv];
+  const channel = arg(args, &#x27;--channel&#x27;, &#x27;&#x27;);
+  if (!token || !channel) {
+    console.error(`set ${tokenEnv} to a bot token with channels:history, and pass `
+      + &#x27;--channel&#x27;);
+    process.exitCode = 2;
+    return;
+  }
+  const headers = { Authorization: `Bearer ${token}` };
+  const who = await (await fetch(`${API}auth.test`, { headers })).json();
+  if (who.ok !== true) {
+    console.error(`auth.test  unavailable    ${who.error}`);
+    process.exitCode = 2;
+    return;
+  }
+  console.log(`identity   ${who.user_id} (${who.user}) in ${who.team}`);
+
+  const window = Number(arg(args, &#x27;--window&#x27;, &#x27;45&#x27;));
+  const replicas = Number(arg(args, &#x27;--replicas&#x27;, &#x27;1&#x27;));
+  const messages = await pageHistory(headers, channel,
+    Number(arg(args, &#x27;--limit&#x27;, &#x27;200&#x27;)), Number(arg(args, &#x27;--max-pages&#x27;, &#x27;5&#x27;)));
+  const counts = replyCounts(messages, who.user_id, window);
+  const [mix, fraction] = outcomeMix(counts);
+  console.log(`triggers   ${mix.total} mention(s) read, answered inside ${window}s`);
+  if (!mix.total) {
+    console.log(&#x27;verdict    nothing to measure; no mentions in the window read&#x27;);
+    return;
+  }
+  console.log(`outcome    none ${mix.none}   once ${mix.once}   many ${mix.many}   of `
+    + `${mix.total}`);
+  console.log(`exactly-once   ${fraction}`);
+
+  const runs = repeatRuns(messages, who.user_id, Number(arg(args, &#x27;--repeat-gap&#x27;,
+    &#x27;600&#x27;)));
+  const kinds = runs.map(([, deltas]) =&gt; spacingKind(deltas));
+  for (const kind of [...new Set(kinds)].sort()) {
+    console.log(`spacing    ${kind.padEnd(12)} `
+      + `${kinds.filter((k) =&gt; k === kind).length} run(s) of repeated answers`);
+  }
+
+  const [verdict, detail] = fingerprint(mix, kinds);
+  if (verdict !== &#x27;several-live-connections&#x27;) {
+    console.log(`verdict    ${verdict.padEnd(12)} ${detail}`);
+    return;
+  }
+  console.warn(`verdict    ${verdict}  ${detail}`);
+  console.warn(`replicas   ${replicas} replica(s) hold a connection, so a payload has `
+    + `${replicas} places to land and ${Math.max(0, replicas - 1)} of them are wrong `
+    + &#x27;at any moment&#x27;);
+  console.warn(&#x27;  repair: run Socket Mode as a singleton and enqueue payloads into a &#x27;
+    + &#x27;queue you control; scale the workers, not the receiver&#x27;);
+  console.warn(&#x27;  repair: a dedupe cache in process memory cannot see the copy another &#x27;
+    + &#x27;instance handled; if instances must be plural, share it&#x27;);
+  console.warn(&#x27;  repair: for genuinely multi-node ingress use the HTTP Events API &#x27;
+    + &#x27;behind a load balancer, which does distribute&#x27;);
+  console.warn(&#x27;  note:   nothing here opened a connection; counting them would &#x27;
+    + &#x27;consume one of the ten this app is allowed&#x27;);
+  process.exitCode = 1;
+}
+
+// Only run when invoked directly, so importing this module in the tests does
+// not execute main() and fail the file on a missing token.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) =&gt; { console.error(err.message); process.exitCode = 2; });
+}
+</code></pre>
+</div>
+</div>
+
+<h2>Add a test</h2>
+<p>Every test here is about a boundary between this note and one of its neighbours, because the evidence is nearly the same in all of them and only the combination differs. Duplicates with drops must come back as several connections; the same duplicates without drops must come back as retries or as a double subscription, depending on their spacing; drops without duplicates must be handed to the connection cap. <code>outcome_mix</code> is tested for the fraction on a clean run, which has to be exactly one, because a check that cannot say <em>this is fine</em> is not usable on a healthy app.</p>
+<div class="code-block" data-code>
+<div class="code-block__bar">
+<button class="code-tab" data-lang="python" aria-selected="true" type="button">Python</button>
+<button class="code-tab" data-lang="node" aria-selected="false" type="button">Node.js</button>
+<button class="code-block__copy" type="button">Copy</button>
+</div>
+<div class="code-pane" data-lang="python" data-active="true">
+<div class="code-filename">test_slack_socket_replica_fingerprint.py</div>
+<pre><code class="language-python">from slack_socket_replica_fingerprint import (
+    fingerprint, outcome_mix, repeat_runs, reply_counts, spacing_kind,
+)
+
+
+def test_a_mention_answered_once_counts_once():
+    msgs = [{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;U1&quot;, &quot;text&quot;: &quot;&lt;@UBOT&gt; go&quot;},
+            {&quot;ts&quot;: &quot;110&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;on it&quot;}]
+    assert reply_counts(msgs, &quot;UBOT&quot;, 45) == [(100.0, 1)]
+
+
+def test_two_answers_inside_the_window_count_as_two():
+    msgs = [{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;U1&quot;, &quot;text&quot;: &quot;&lt;@UBOT&gt; go&quot;},
+            {&quot;ts&quot;: &quot;110&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;on it&quot;},
+            {&quot;ts&quot;: &quot;111&quot;, &quot;bot_id&quot;: &quot;B1&quot;, &quot;text&quot;: &quot;on it&quot;}]
+    assert reply_counts(msgs, &quot;UBOT&quot;, 45) == [(100.0, 2)]
+
+
+def test_a_mention_with_nothing_after_it_counts_as_zero():
+    msgs = [{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;U1&quot;, &quot;text&quot;: &quot;&lt;@UBOT&gt; go&quot;}]
+    assert reply_counts(msgs, &quot;UBOT&quot;, 45) == [(100.0, 0)]
+
+
+def test_a_clean_run_is_exactly_one():
+    mix, fraction = outcome_mix([(1, 1), (2, 1), (3, 1)])
+    assert mix == {&quot;none&quot;: 0, &quot;once&quot;: 3, &quot;many&quot;: 0, &quot;total&quot;: 3}
+    assert fraction == 1.0
+
+
+def test_the_fraction_falls_for_drops_and_for_duplicates_alike():
+    _mix, fraction = outcome_mix([(1, 0), (2, 1), (3, 2), (4, 1)])
+    assert fraction == 0.5
+
+
+def test_an_empty_window_divides_by_nothing():
+    assert outcome_mix([]) == ({&quot;none&quot;: 0, &quot;once&quot;: 0, &quot;many&quot;: 0, &quot;total&quot;: 0}, 0.0)
+
+
+def test_identical_answers_close_together_are_one_run():
+    msgs = [{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;Done&quot;},
+            {&quot;ts&quot;: &quot;100.4&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;done&quot;}]
+    runs = repeat_runs(msgs, &quot;UBOT&quot;, 600)
+    assert len(runs) == 1
+    assert round(runs[0][1][0], 1) == 0.4
+
+
+def test_a_single_answer_is_not_a_run():
+    assert repeat_runs([{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;done&quot;}], &quot;UBOT&quot;) == []
+
+
+def test_the_same_answer_hours_apart_is_two_separate_runs_of_one():
+    msgs = [{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;done&quot;},
+            {&quot;ts&quot;: &quot;99999&quot;, &quot;user&quot;: &quot;UBOT&quot;, &quot;text&quot;: &quot;done&quot;}]
+    assert repeat_runs(msgs, &quot;UBOT&quot;, 600) == []
+
+
+def test_human_messages_are_never_counted_as_repeats():
+    msgs = [{&quot;ts&quot;: &quot;100&quot;, &quot;user&quot;: &quot;U1&quot;, &quot;text&quot;: &quot;same&quot;},
+            {&quot;ts&quot;: &quot;101&quot;, &quot;user&quot;: &quot;U2&quot;, &quot;text&quot;: &quot;same&quot;}]
+    assert repeat_runs(msgs, &quot;UBOT&quot;) == []
+
+
+def test_sub_second_repeats_are_simultaneous():
+    assert spacing_kind([0.2, 0.4]) == &quot;simultaneous&quot;
+
+
+def test_a_one_minute_gap_is_slacks_retry_schedule():
+    assert spacing_kind([61.0]) == &quot;retry&quot;
+    assert spacing_kind([290.0]) == &quot;retry&quot;
+
+
+def test_a_gap_that_is_neither_says_nothing_on_its_own():
+    assert spacing_kind([17.0]) == &quot;spread&quot;
+    assert spacing_kind([]) == &quot;single&quot;
+
+
+def test_duplicates_beside_drops_is_this_note():
+    verdict, detail = fingerprint({&quot;none&quot;: 4, &quot;once&quot;: 60, &quot;many&quot;: 6, &quot;total&quot;: 70},
+                                  [&quot;retry&quot;, &quot;simultaneous&quot;])
+    assert verdict == &quot;several-live-connections&quot;
+    assert &quot;different instance&quot; in detail
+
+
+def test_retry_spaced_duplicates_without_drops_belong_to_the_retry_note():
+    assert fingerprint({&quot;none&quot;: 0, &quot;once&quot;: 60, &quot;many&quot;: 6, &quot;total&quot;: 66},
+                       [&quot;retry&quot;])[0] == &quot;retries-one-listener&quot;
+
+
+def test_simultaneous_duplicates_without_drops_are_a_double_subscription():
+    assert fingerprint({&quot;none&quot;: 0, &quot;once&quot;: 60, &quot;many&quot;: 6, &quot;total&quot;: 66},
+                       [&quot;simultaneous&quot;])[0] == &quot;double-subscription&quot;
+
+
+def test_drops_without_duplicates_are_handed_to_the_cap_note():
+    verdict, detail = fingerprint({&quot;none&quot;: 9, &quot;once&quot;: 60, &quot;many&quot;: 0, &quot;total&quot;: 69}, [])
+    assert verdict == &quot;losses-only&quot;
+    assert &quot;connection cap&quot; in detail
+
+
+def test_repeats_that_match_no_pattern_are_left_unclassified():
+    assert fingerprint({&quot;none&quot;: 0, &quot;once&quot;: 5, &quot;many&quot;: 2, &quot;total&quot;: 7},
+                       [&quot;spread&quot;])[0] == &quot;duplicates-unclassified&quot;
+
+
+def test_a_healthy_channel_is_reported_as_clean():
+    assert fingerprint({&quot;none&quot;: 0, &quot;once&quot;: 70, &quot;many&quot;: 0, &quot;total&quot;: 70}, [])[0] == &quot;clean&quot;
+    assert fingerprint({}, [])[0] == &quot;clean&quot;
+</code></pre>
+</div>
+<div class="code-pane" data-lang="node">
+<div class="code-filename">slack-socket-replica-fingerprint.test.mjs</div>
+<pre><code class="language-javascript">import { test } from &#x27;node:test&#x27;;
+import assert from &#x27;node:assert/strict&#x27;;
+import {
+  fingerprint, outcomeMix, repeatRuns, replyCounts, spacingKind,
+} from &#x27;./slack-socket-replica-fingerprint.mjs&#x27;;
+
+test(&#x27;a mention answered once counts once&#x27;, () =&gt; {
+  const msgs = [{ ts: &#x27;100&#x27;, user: &#x27;U1&#x27;, text: &#x27;&lt;@UBOT&gt; go&#x27; },
+    { ts: &#x27;110&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;on it&#x27; }];
+  assert.deepEqual(replyCounts(msgs, &#x27;UBOT&#x27;, 45), [[100, 1]]);
+});
+
+test(&#x27;two answers inside the window count as two&#x27;, () =&gt; {
+  const msgs = [{ ts: &#x27;100&#x27;, user: &#x27;U1&#x27;, text: &#x27;&lt;@UBOT&gt; go&#x27; },
+    { ts: &#x27;110&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;on it&#x27; },
+    { ts: &#x27;111&#x27;, bot_id: &#x27;B1&#x27;, text: &#x27;on it&#x27; }];
+  assert.deepEqual(replyCounts(msgs, &#x27;UBOT&#x27;, 45), [[100, 2]]);
+});
+
+test(&#x27;a mention with nothing after it counts as zero&#x27;, () =&gt; {
+  const msgs = [{ ts: &#x27;100&#x27;, user: &#x27;U1&#x27;, text: &#x27;&lt;@UBOT&gt; go&#x27; }];
+  assert.deepEqual(replyCounts(msgs, &#x27;UBOT&#x27;, 45), [[100, 0]]);
+});
+
+test(&#x27;a clean run is exactly one&#x27;, () =&gt; {
+  const [mix, fraction] = outcomeMix([[1, 1], [2, 1], [3, 1]]);
+  assert.deepEqual(mix, {
+    none: 0, once: 3, many: 0, total: 3,
+  });
+  assert.equal(fraction, 1);
+});
+
+test(&#x27;the fraction falls for drops and for duplicates alike&#x27;, () =&gt; {
+  const [, fraction] = outcomeMix([[1, 0], [2, 1], [3, 2], [4, 1]]);
+  assert.equal(fraction, 0.5);
+});
+
+test(&#x27;an empty window divides by nothing&#x27;, () =&gt; {
+  assert.deepEqual(outcomeMix([]), [{
+    none: 0, once: 0, many: 0, total: 0,
+  }, 0]);
+});
+
+test(&#x27;identical answers close together are one run&#x27;, () =&gt; {
+  const msgs = [{ ts: &#x27;100&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;Done&#x27; },
+    { ts: &#x27;100.4&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;done&#x27; }];
+  const runs = repeatRuns(msgs, &#x27;UBOT&#x27;, 600);
+  assert.equal(runs.length, 1);
+  assert.equal(Math.round(runs[0][1][0] * 10) / 10, 0.4);
+});
+
+test(&#x27;a single answer is not a run&#x27;, () =&gt; {
+  assert.deepEqual(repeatRuns([{ ts: &#x27;100&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;done&#x27; }], &#x27;UBOT&#x27;), []);
+});
+
+test(&#x27;the same answer hours apart is two separate runs of one&#x27;, () =&gt; {
+  const msgs = [{ ts: &#x27;100&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;done&#x27; },
+    { ts: &#x27;99999&#x27;, user: &#x27;UBOT&#x27;, text: &#x27;done&#x27; }];
+  assert.deepEqual(repeatRuns(msgs, &#x27;UBOT&#x27;, 600), []);
+});
+
+test(&#x27;human messages are never counted as repeats&#x27;, () =&gt; {
+  const msgs = [{ ts: &#x27;100&#x27;, user: &#x27;U1&#x27;, text: &#x27;same&#x27; },
+    { ts: &#x27;101&#x27;, user: &#x27;U2&#x27;, text: &#x27;same&#x27; }];
+  assert.deepEqual(repeatRuns(msgs, &#x27;UBOT&#x27;), []);
+});
+
+test(&#x27;sub second repeats are simultaneous&#x27;, () =&gt; {
+  assert.equal(spacingKind([0.2, 0.4]), &#x27;simultaneous&#x27;);
+});
+
+test(&#x27;a one minute gap is Slack retry schedule&#x27;, () =&gt; {
+  assert.equal(spacingKind([61]), &#x27;retry&#x27;);
+  assert.equal(spacingKind([290]), &#x27;retry&#x27;);
+});
+
+test(&#x27;a gap that is neither says nothing on its own&#x27;, () =&gt; {
+  assert.equal(spacingKind([17]), &#x27;spread&#x27;);
+  assert.equal(spacingKind([]), &#x27;single&#x27;);
+});
+
+test(&#x27;duplicates beside drops is this note&#x27;, () =&gt; {
+  const [verdict, detail] = fingerprint({
+    none: 4, once: 60, many: 6, total: 70,
+  }, [&#x27;retry&#x27;, &#x27;simultaneous&#x27;]);
+  assert.equal(verdict, &#x27;several-live-connections&#x27;);
+  assert.match(detail, /different instance/);
+});
+
+test(&#x27;retry spaced duplicates without drops belong to the retry note&#x27;, () =&gt; {
+  assert.equal(fingerprint({
+    none: 0, once: 60, many: 6, total: 66,
+  }, [&#x27;retry&#x27;])[0], &#x27;retries-one-listener&#x27;);
+});
+
+test(&#x27;simultaneous duplicates without drops are a double subscription&#x27;, () =&gt; {
+  assert.equal(fingerprint({
+    none: 0, once: 60, many: 6, total: 66,
+  }, [&#x27;simultaneous&#x27;])[0], &#x27;double-subscription&#x27;);
+});
+
+test(&#x27;drops without duplicates are handed to the cap note&#x27;, () =&gt; {
+  const [verdict, detail] = fingerprint({
+    none: 9, once: 60, many: 0, total: 69,
+  }, []);
+  assert.equal(verdict, &#x27;losses-only&#x27;);
+  assert.match(detail, /connection cap/);
+});
+
+test(&#x27;repeats that match no pattern are left unclassified&#x27;, () =&gt; {
+  assert.equal(fingerprint({
+    none: 0, once: 5, many: 2, total: 7,
+  }, [&#x27;spread&#x27;])[0], &#x27;duplicates-unclassified&#x27;);
+});
+
+test(&#x27;a healthy channel is reported as clean&#x27;, () =&gt; {
+  assert.equal(fingerprint({
+    none: 0, once: 70, many: 0, total: 70,
+  }, [])[0], &#x27;clean&#x27;);
+  assert.equal(fingerprint({}, [])[0], &#x27;clean&#x27;);
+});
+</code></pre>
+</div>
+</div>
+
+<h2>FAQ</h2>
+<details class="faq-item"><summary>Does Slack really not distribute payloads across connections?</summary><p>It routes each payload to one of the open connections, and the documentation is explicit that there is no predictable distribution pattern. That is a routing decision, not a work-sharing contract: there is no consumer group, no acknowledgement-based redelivery to a different consumer, and no ordering guarantee. Two connections do not mean half the load each; they mean two places a payload might arrive, one of which is chosen for you.</p></details>
+<details class="faq-item"><summary>Why do duplicates happen at all if each payload goes to one connection?</summary><p>Because retries are separate deliveries. When an event is not acknowledged in time Slack sends it again, and with several connections open the retry can be routed to a different instance from the original. The first instance may well have finished the work; the second has no idea it exists. That is also why a dedupe cache in process memory does not help: neither instance ever saw both copies, so both are correct in believing the payload is new.</p></details>
+<details class="faq-item"><summary>Would a shared Redis dedupe cache fix it?</summary><p>It fixes the duplicates and leaves the drops. A payload routed to an instance that is restarting, draining or wedged is not redelivered anywhere, and no cache can recover something that was never received. It is also worth noticing what a shared cache costs: at that point you have built a coordination layer in front of a transport chosen specifically to avoid needing infrastructure. One receiver and a queue you control is less code and loses nothing.</p></details>
+<details class="faq-item"><summary>How is this different from the note about duplicate processing on retry?</summary><p>By the drops. A single listener that mishandles retries produces duplicates and no misses, because every payload still reaches the one process that exists. Several live connections produce duplicates and misses together, in the same channel, in the same hour. The script checks for the combination and, when it finds duplicates without drops, sends you to the retry note instead of claiming this one.</p></details>
+<details class="faq-item"><summary>We need more than one instance for availability. What then?</summary><p>Keep one Socket Mode receiver and make it cheap to restart, so a failure is a short gap rather than a lost workload, and run your redundancy behind it: the receiver acknowledges and enqueues, and as many workers as you like drain the queue. If you need genuinely redundant ingress with no single receiver, that is the case for the HTTP Events API, where a load balancer distributes deliveries properly and the connection budget stops being a factor.</p></details>
+
+<h2>Related field notes</h2>
+<ul>
+<li><a href="/slack/duplicate-processing-on-retry/">the same duplicates without the drops</a></li>
+<li><a href="/slack/app-mention-vs-message-double-fire/">two subscriptions rather than two connections</a></li>
+<li><a href="/slack/duplicate-messages-no-dedupe/">the key that stops a repeat becoming a second message</a></li>
+</ul>
+
+<h3>Sources</h3>
+<p class="sources-note">Every figure in this note is traced to one of these. Prices are
+list rates and change &mdash; check them for your own region before acting.</p>
+<ul class="citations">
+<li><a href="https://docs.slack.dev/apis/events-api/using-socket-mode" rel="noopener nofollow" target="_blank">Using Socket Mode - Slack Docs</a></li>
+<li><a href="https://github.com/slackapi/bolt-js/issues/2487" rel="noopener nofollow" target="_blank">bolt-js #2487: multiple instances each receive some of the events</a></li>
+<li><a href="https://github.com/slackapi/bolt-python/issues/445" rel="noopener nofollow" target="_blank">bolt-python #445: scaling Socket Mode horizontally duplicates work</a></li>
+<li><a href="https://docs.slack.dev/reference/methods/conversations.history" rel="noopener nofollow" target="_blank">conversations.history method reference - Slack Docs</a></li>
+</ul>
+
+<div class="callout callout--cta">
+<div class="callout__title">Stuck on a tricky one?</div>
+<p>If your setup is misbehaving in a way this note does not cover, <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">message me on LinkedIn</a> with what you are seeing.</p>
+</div>
+</div>
+</main>
+<footer class="site-footer">
+<div class="container">
+<p>Field notes by <a href="https://www.linkedin.com/in/allanninal/" rel="noopener">Allan Ni&ntilde;al</a> &middot; <a href="/">Portfolio</a> &middot; <a href="/dns/">DNS &amp; domains</a> &middot; <a href="/email/">Email &amp; SES</a> &middot; <a href="/aws/">AWS cost</a></p>
+<p class="site-footer__fine">Every script in this section is read only. They hold a token that can post into your workspace, so none of them writes: they report what is wrong and print the repair for you to run. A read-scoped token is enough.</p>
+</div>
+</footer>
+<script src="/slack/assets/slack.js" defer></script>
+<script defer src="/assets/site-nav.js"></script>
+</body>
+</html>
