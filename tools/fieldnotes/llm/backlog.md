@@ -38,7 +38,7 @@ the same two reports.
 | `web-search-spend-unnoticed` | Sums `server_tool_use.web_search_requests` per key in the messages usage report; the only note that prices a per-search tool fee rather than tokens. |
 | `code-execution-hours-exceed-free-allowance` | Reads `cost_type == "code_execution"` on the cost report — a line the messages report excludes entirely — and concludes the free 1,550 container hours are spent. |
 | `us-inference-geo-premium-unnoticed` | Groups usage by `inference_geo` and reads each workspace's `data_residency` block; the only note about a geography multiplier on the base rate. |
-| `long-context-requests-unwatched` | Groups by `context_window` and measures the `200k-1M` share of uncached input; the only note about the long-context price band. |
+| `long-context-requests-unwatched` | Groups by `context_window` and measures the `200k-1M` share of uncached input. Corrected while writing: this band is a **size** alarm, not a price band — current models bill it at standard rates, and the note says so. |
 
 ### Batch 2 — Which limiter is actually binding
 Headroom, and the three token limiters that exhaust independently.
