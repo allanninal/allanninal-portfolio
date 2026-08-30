@@ -11,10 +11,10 @@ export const maker = {
     "I'm an AI and Software Engineer based in Talisay, Cebu, Philippines. I build intelligent products that combine data analytics with modern AI — from data pipelines and visualizations to full applications powered by state-of-the-art machine learning models.",
     "My work spans the whole stack: data engineering and analysis, AI/ML application development, and the fullstack and AWS infrastructure to ship and run them — DNS, SSL, and servers included. I care about making AI practical and accessible through well-designed software.",
     "I ship in public and a lot: a growing portfolio of live products across AI tools, Cebu-focused services, trading, and SaaS — plus a year-long project releasing one free, MIT-licensed website template every day.",
-    "I'm not looking for a job. I'm looking for people to build with — co-founders, open-source collaborators, and teams with a hard problem worth solving together. If you're building something, I'd love to hear about it.",
+    "I'm not looking for a job in the usual sense. I'm looking for something to build and people to build it with: a founding engineer or technical co-founder seat at a startup early enough that the product is still being decided, or a collaboration on a hard problem in AI, data or AWS. If you're building something, I'd love to hear about it.",
   ],
   location: 'Talisay, Cebu, Philippines · UTC+8',
-  availableFor: 'Co-building products, open-source collaboration, and joint work on AI, data, and AWS.',
+  availableFor: 'A founding engineer or technical co-founder seat at an early startup, and collaboration on AI, data and AWS work.',
   socials: {
     github: 'https://github.com/allanninal',
     linkedin: 'https://www.linkedin.com/in/allanninal/',
@@ -23,6 +23,31 @@ export const maker = {
     kofi: 'https://ko-fi.com/allanninal',
   },
 };
+
+// The three shapes of work worth naming individually. "Open for collaboration"
+// on its own is true but unsearchable: somebody looking to fill a founding
+// engineer seat does not read that and recognise themselves in it.
+export const openings = [
+  {
+    role: 'Technical co-founder',
+    detail:
+      'A startup early enough that CTO would be a title without a department. ' +
+      'Deciding what to build, building the first version of it, and owning the ' +
+      'infrastructure it runs on.',
+  },
+  {
+    role: 'Founding engineer',
+    detail:
+      'First or early engineer on a small team. Shipping product and the AWS it ' +
+      'runs on, and setting the conventions the next engineers inherit.',
+  },
+  {
+    role: 'Collaboration',
+    detail:
+      'Co-building a product, open-source work, or a stubborn problem in AI, ' +
+      'data engineering or cloud cost. Paid or not, depending on what it is.',
+  },
+];
 
 export interface Product {
   id: string;
