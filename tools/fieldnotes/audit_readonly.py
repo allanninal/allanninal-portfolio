@@ -40,12 +40,20 @@ CHECKS = (("python write call", REQUEST_PY),
 # answer their question without it. Exempted by proximity to the endpoint name,
 # so a write to any other path is still caught.
 COUNT_TOKENS = re.compile(r"count_tokens")
+# GitHub's GraphQL endpoint takes queries over POST. Exempt only when the script
+# also proves it refuses mutations, and only for POST -- see check_section.py.
+GRAPHQL = re.compile(r"/graphql")
+MUTATION_GUARD = re.compile(r"mutation", re.I)
 
 
 def real_hit(text: str, rx):
-    """First match that is not the count_tokens pre-flight."""
+    """First match that is not one of the two documented read-only POSTs."""
     for m in rx.finditer(text):
-        if COUNT_TOKENS.search(text[max(0, m.start() - 400):m.end() + 400]):
+        posts = "post" in m.group(0).lower()
+        window = text[max(0, m.start() - 400):m.end() + 400]
+        if posts and COUNT_TOKENS.search(window):
+            continue
+        if posts and GRAPHQL.search(window) and MUTATION_GUARD.search(text):
             continue
         return m
     return None

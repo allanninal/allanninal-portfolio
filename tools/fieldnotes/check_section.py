@@ -37,6 +37,7 @@ WRITE_CALLS = re.compile(
     r'"(POST|PUT|PATCH|DELETE)"'
     r'|\bmethod:\s*[\'"](POST|PUT|PATCH|DELETE)'
     r'|=\s*[\'"](POST|PUT|PATCH|DELETE)[\'"]'
+    r'|\b(?:requests|session|s|client|http)\.(?:post|put|patch|delete)\s*\('
     r'|--apply')
 
 # The one permitted non-GET in the whole read-only estate: Anthropic's token
@@ -46,11 +47,31 @@ WRITE_CALLS = re.compile(
 # verb no longer helps because the assignment form is matched too.
 COUNT_TOKENS = re.compile(r"count_tokens")
 
+# The second permitted non-GET: GitHub's GraphQL endpoint, which takes queries
+# over POST as well as mutations. A query is a read, so /graphql notes cannot be
+# written without it. Exempted only when the script also proves it will not send
+# a mutation, so the exemption cannot be borrowed by a script that writes.
+GRAPHQL = re.compile(r"/graphql")
+MUTATION_GUARD = re.compile(r"mutation", re.I)
+
 
 def write_call_hits(body: str):
-    """Yield write-verb matches, skipping the count_tokens pre-flight."""
+    """Yield write-verb matches, skipping the two documented read-only POSTs.
+
+    count_tokens generates nothing and bills nothing. A GraphQL query is a read,
+    but the same endpoint accepts mutations, so that exemption additionally
+    requires the script to mention mutations at all -- which every /graphql note
+    here does, because each one refuses a document containing one.
+    """
     for m in WRITE_CALLS.finditer(body):
-        if COUNT_TOKENS.search(body[max(0, m.start() - 400):m.end() + 400]):
+        # Only POST is ever exempt. A PUT, PATCH or DELETE next to an exempt
+        # endpoint is still a write, and waving it through because a nearby URL
+        # happened to match would be a hole rather than an exception.
+        posts = "post" in m.group(0).lower()
+        window = body[max(0, m.start() - 400):m.end() + 400]
+        if posts and COUNT_TOKENS.search(window):
+            continue
+        if posts and GRAPHQL.search(window) and MUTATION_GUARD.search(body):
             continue
         yield m
 
