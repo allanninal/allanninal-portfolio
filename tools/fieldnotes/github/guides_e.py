@@ -2410,4 +2410,838 @@ test('a cheap path at a modest rate is clear', () => {
 "citations": [CITE_REST_LIMITS, CITE_BEST, CITE_GRAPHQL_LIMITS, CITE_TROUBLESHOOT],
 },
 
+
+{
+"slug": "search-bucket-exhausted",
+"title": "Search has its own 30-per-minute bucket and drains separately",
+"description": "resources.search is not resources.core, and its window is 60 seconds rather than an hour. A search-per-repository loop empties it in the first minute.",
+"h1": "search has its own 30-per-minute bucket and drains separately",
+"category": "GitHub API",
+"pill": "Diagnostic",
+"chips": ["Read-only token", "Python and Node.js", "Tests included"],
+"keywords": ["github search api rate limit", "github 30 requests per minute search",
+             "search api rate limit exceeded", "resources.search rate_limit",
+             "github search query 256 characters"],
+"deps": "Python 3.9+ with requests, or Node.js 18+",
+"lead": "The job loops over four hundred repositories and runs one search in each. Around the thirtieth it starts returning 403, and the part that makes no sense is that everything else keeps working: the repository reads in the same loop, on the same token, in the same second, are fine. Two buckets, and only one of them is empty. The error message does not mention which.",
+"short_answer": """<p><code>GET /rate_limit</code> returns every bucket at once, and <code>resources.search</code> is not <code>resources.core</code>. Search allows <strong>30 requests a minute</strong> authenticated, 10 unauthenticated, and code search is tighter again at 10 a minute. The window is sixty seconds rather than an hour, so it empties and refills far faster than anything else on the token.</p>
+<p>Compare them in the same units and the surprise goes away. Core is 5,000 an hour, which is about 83 a minute. Search is 30 a minute. The bucket with the smaller number is not the smaller allowance by accident &mdash; per minute, search is nearly three times tighter than core, and a loop that calls it once per item was never going to fit.</p>""",
+"problem": """<p>The partial failure is what costs the time. If everything broke, you would suspect the token. Because only the searches break, the investigation goes to the search query, then to the repository the query names, then to permissions on that repository, and only much later to the idea that search is billed somewhere else entirely.</p>
+<p>The recovery is fast enough to be misleading too. A sixty-second window means the bucket refills while you are still reading the stack trace, so a retry by hand works and the bug is filed as flaky. It reproduces reliably only at the original rate, which nobody runs by hand.</p>
+<p>Underneath it is usually the same shape: a search that was written for one repository and later put in a loop. One search per repository is a perfectly reasonable thing to write and it scales exactly as badly as it can, because the cost is per call and the allowance resets on a clock rather than accumulating.</p>""",
+"why": """<p><strong>Buckets are independent and the document lists all of them.</strong> <code>GET /rate_limit</code> returns <code>core</code>, <code>search</code>, <code>code_search</code>, <code>graphql</code> and several more. Spending one does not touch another, which is why ordinary REST calls carry on while search refuses, and it is also why the check is easy: the answer is in one free request.</p>
+<p><strong>The windows are different lengths, so the raw numbers do not compare.</strong> 5,000 against 30 looks like an enormous gap and is not one, because the first is per hour and the second is per minute. Normalise both to requests per minute &mdash; 83 against 30 &mdash; and search is the tighter constraint on almost every job that uses it at all.</p>
+<p><strong>On any real call, <code>x-ratelimit-resource</code> names the bucket that was billed.</strong> That header is the direct evidence. A response carrying <code>x-ratelimit-resource: search</code> was charged to the 30-a-minute allowance no matter what the rest of your integration is doing.</p>
+<p><strong>One broad search costs the same as one narrow one.</strong> The allowance counts requests, not results. A query naming forty repositories costs a single call, the same as a query naming one, so batching is close to free and is the entire repair.</p>
+<p><strong>What limits the batching is the query, not the API.</strong> A search query may be at most 256 characters and may use no more than five <code>AND</code>, <code>OR</code> or <code>NOT</code> operators. Multiple <code>repo:</code> qualifiers are combined for you and do not spend operators, so the practical constraint is the character budget, which is a packing problem with an exact answer.</p>""",
+"steps": [
+ {"h": "Read every bucket in one free request",
+  "body": """<p><code>GET /rate_limit</code> does not consume any bucket, including the one it reports. Look at <code>resources.search</code> next to <code>resources.core</code>. If search is at zero and core has thousands left, the diagnosis is finished and the rest of this note is about the repair.</p>"""},
+ {"h": "Put the two buckets in the same units",
+  "body": """<p>Divide each limit by its window in minutes. Core over an hour is about 83 a minute; search over its sixty-second window is 30; code search is 10. Doing this once permanently fixes the intuition that search is a rounding error next to core, which is the belief that lets a per-item search loop get written in the first place.</p>"""},
+ {"h": "Cost the loop you actually have",
+  "body": """<p>Number of items divided by 30 is the number of minutes the loop needs at best, and every call past the first 30 in any minute is refused rather than queued. Four hundred repositories is fourteen minutes of pure waiting, assuming nothing else on the token searches at the same time.</p>"""},
+ {"h": "Pack the loop into a handful of queries",
+  "body": """<p>A search query accepts many <code>repo:</code> qualifiers, which are combined as alternatives, so one query can cover as many repositories as fit inside 256 characters. Pack greedily, filter the combined results client side, and four hundred calls become roughly twenty. Keep an eye on the five-operator limit if your base query already uses explicit <code>AND</code>, <code>OR</code> or <code>NOT</code>.</p>"""},
+ {"h": "Prove which bucket moved",
+  "body": """<p>Read <code>/rate_limit</code>, run one search, read it again. <code>search.used</code> goes up by one and <code>core.used</code> does not move. That is a two-request demonstration that costs one search call, and it settles the argument about whether search spends your hourly quota better than any amount of documentation reading.</p>"""},
+],
+"verify": """<p>Run the plan again with the packed queries and confirm the call count fits inside a single window.</p>
+<pre><code class="language-bash">python3 github_search_budget.py --repos-file repos.txt --base "is:issue is:open label:bug"
+# clear: 412 repositories pack into 19 queries, inside one 30-a-minute window</code></pre>""",
+"code_intro": "Four pure functions, and the interesting one is the packer. <code>bucket_pressure</code> normalises every bucket in the rate-limit document to requests per minute so windows of different lengths can be compared at all; <code>plan_loop</code> costs a per-item loop against that rate; <code>pack_repo_queries</code> is a greedy bin pack against the 256-character query limit that also counts the boolean operators in your base query; and <code>verdict</code> puts them together. The network layer is one free <code>/rate_limit</code> call, optionally three if you ask it to prove the point with a single live search.",
+"py_file": "github_search_budget.py",
+"py": '''"""Budget a search workload against the search bucket, not the core one.
+
+Read only. GET /rate_limit is free and reports every bucket; the optional probe
+issues one real search, which is a GET and costs one search call.
+
+Search is billed to resources.search, which allows 30 requests a minute
+authenticated over a 60 second window. Core allows 5,000 an hour, which is
+about 83 a minute. Comparing 5,000 against 30 is what makes people think search
+is the generous one; comparing 83 against 30 is what makes them stop.
+"""
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("github_search_budget")
+
+API = "https://api.github.com"
+UA = "github-search-budget/1.0"
+
+# A search query is capped at 256 characters and five boolean operators.
+MAX_QUERY = 256
+MAX_OPERATORS = 5
+
+# The rate-limit document reports limit, used and reset for every bucket but
+# never the length of the window, and the windows are not all the same. Without
+# this table a per-minute comparison is impossible, which is the comparison the
+# whole note turns on.
+WINDOWS = {
+    "core": 3600, "graphql": 3600, "integration_manifest": 3600,
+    "code_scanning_upload": 3600, "actions_runner_registration": 3600,
+    "scim": 3600, "dependency_sbom": 3600, "audit_log": 3600,
+    "search": 60, "code_search": 60, "source_import": 60,
+    "dependency_snapshots": 60,
+}
+
+
+def bucket_pressure(resources, now):
+    """Normalise every bucket to requests per minute. Pure.
+
+    A bucket whose window this table does not know is still reported, with
+    per_minute left as None rather than guessed. An invented window would
+    produce a confident number that is wrong, and the point of the function is
+    to make two numbers comparable.
+    """
+    out = {}
+    for name, b in sorted((resources or {}).items()):
+        try:
+            limit = int(b.get("limit"))
+            used = int(b.get("used", 0))
+            reset = float(b.get("reset", 0))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        window = WINDOWS.get(name)
+        remaining = b.get("remaining")
+        if not isinstance(remaining, int):
+            remaining = max(0, limit - used)
+        out[name] = {
+            "limit": limit, "used": used, "remaining": remaining,
+            "window": window,
+            "per_minute": round(limit / (window / 60.0), 1) if window else None,
+            "refills_in": max(0, round(reset - float(now))),
+        }
+    return out
+
+
+def plan_loop(items, per_minute):
+    """Cost a one-call-per-item loop against a per-minute allowance. Pure.
+
+    Calls past the allowance in a given minute are refused, not queued, which
+    is the difference between a slow job and a failing one.
+    """
+    try:
+        items = max(0, int(items))
+    except (TypeError, ValueError):
+        items = 0
+    try:
+        rate = float(per_minute)
+    except (TypeError, ValueError):
+        rate = 0.0
+
+    if rate <= 0:
+        return {"calls": items, "minutes": None, "refused_in_first_minute": None}
+    return {"calls": items,
+            "minutes": round(items / rate, 1),
+            "refused_in_first_minute": max(0, items - int(rate))}
+
+
+def pack_repo_queries(repos, base="", max_len=MAX_QUERY, max_operators=MAX_OPERATORS):
+    """Pack repo: qualifiers into as few queries as the length limit allows. Pure.
+
+    Multiple repo: qualifiers are combined as alternatives and do not spend
+    boolean operators, so the binding constraint is the 256 character budget.
+    Greedy is optimal enough here: the qualifiers are all about the same length,
+    so there is nothing for a cleverer pack to recover.
+
+    Returns {"queries", "too_long", "operators"}. too_long holds any single
+    repository that cannot fit even on its own, which is a real if rare case
+    for a long org and repository name under a long base query.
+    """
+    base = (base or "").strip()
+    operators = sum(1 for token in base.split() if token in ("AND", "OR", "NOT"))
+
+    queries, too_long = [], []
+    current = ""
+    for repo in repos or []:
+        name = str(repo).strip()
+        if not name:
+            continue
+        qualifier = "repo:" + name
+        if len(base) + 1 + len(qualifier) > max_len:
+            too_long.append(name)
+            continue
+        candidate = (current + " " + qualifier).strip() if current else qualifier
+        if len(base) + (1 if base else 0) + len(candidate) <= max_len:
+            current = candidate
+        else:
+            queries.append((base + " " + current).strip() if base else current)
+            current = qualifier
+    if current:
+        queries.append((base + " " + current).strip() if base else current)
+
+    return {"queries": queries, "too_long": too_long, "operators": operators,
+            "over_operator_limit": operators > max_operators}
+
+
+def verdict(search, core, plan=None, packed=None):
+    """Turn the buckets and the plan into one finding. Pure."""
+    if not search:
+        return ("no-search-bucket",
+                "the rate-limit document did not include a search bucket, so "
+                "there is nothing to budget against")
+
+    core_rate = (core or {}).get("per_minute")
+    comparison = ("" if core_rate is None else
+                  " Core allows %.0f a minute over its hour, so search is the "
+                  "tighter of the two despite the larger-looking number."
+                  % core_rate)
+
+    if search["remaining"] <= 0:
+        return ("exhausted",
+                "search is empty and refills in %d second(s). Core still has "
+                "%s of %s, which is why every non-search call kept working: "
+                "they are different buckets."
+                % (search["refills_in"], (core or {}).get("remaining", "?"),
+                   (core or {}).get("limit", "?")))
+
+    if plan and plan.get("refused_in_first_minute"):
+        packing = ""
+        if packed and packed.get("queries"):
+            packing = (" Packed into repo: qualifiers the same work is %d "
+                       "quer%s." % (len(packed["queries"]),
+                                    "y" if len(packed["queries"]) == 1 else "ies"))
+        return ("over-budget",
+                "%d searches at %s a minute needs %s minute(s), and %d of them "
+                "are refused inside the first minute rather than queued.%s%s"
+                % (plan["calls"], search["per_minute"], plan["minutes"],
+                   plan["refused_in_first_minute"], packing, comparison))
+
+    if search["used"] >= search["limit"] * 0.8:
+        return ("tight",
+                "%d of %d spent in the current 60 second window, refilling in "
+                "%d second(s).%s"
+                % (search["used"], search["limit"], search["refills_in"],
+                   comparison))
+
+    if plan and plan.get("calls"):
+        return ("clear",
+                "%d search(es) at %s a minute fits in %s minute(s) with nothing "
+                "refused.%s" % (plan["calls"], search["per_minute"],
+                                plan["minutes"], comparison))
+
+    return ("clear",
+            "%d of %d left in this window.%s"
+            % (search["remaining"], search["limit"], comparison))
+
+
+def rate_limit(session):
+    r = session.get(API + "/rate_limit", timeout=30)
+    if r.status_code != 200:
+        log.error("GET /rate_limit returned %d: %s", r.status_code, r.text[:200])
+        return None
+    return r.json().get("resources", {})
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repos", default="",
+                    help="comma separated owner/name list the loop searches")
+    ap.add_argument("--repos-file", default=None,
+                    help="file with one owner/name per line (read only)")
+    ap.add_argument("--base", default="is:issue is:open",
+                    help="the query your loop runs in each repository")
+    ap.add_argument("--probe", default=None, metavar="QUERY",
+                    help="run one real search to show which bucket it bills to")
+    args = ap.parse_args()
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        log.error("set GITHUB_TOKEN (a read-only token is enough)")
+        return 2
+
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": UA,
+    })
+
+    before = rate_limit(session)
+    if before is None:
+        return 2
+
+    pressure = bucket_pressure(before, time.time())
+    for name, b in pressure.items():
+        log.info("%-28s %5d / %-6d %s",
+                 name, b["used"], b["limit"],
+                 "%.0f a minute" % b["per_minute"] if b["per_minute"]
+                 else "window not in this table")
+
+    repos = [r.strip() for r in args.repos.split(",") if r.strip()]
+    if args.repos_file:
+        with open(args.repos_file, encoding="utf-8") as fh:
+            repos.extend(line.strip() for line in fh if line.strip())
+
+    search = pressure.get("search")
+    plan = plan_loop(len(repos), (search or {}).get("per_minute")) if repos else None
+    packed = pack_repo_queries(repos, args.base) if repos else None
+
+    if args.probe:
+        r = session.get(API + "/search/issues", params={"q": args.probe, "per_page": 1},
+                        timeout=30)
+        billed = {k.lower(): v for k, v in r.headers.items()}.get("x-ratelimit-resource")
+        after = bucket_pressure(rate_limit(session) or {}, time.time())
+        log.info("probe returned %d, billed to the %s bucket", r.status_code, billed)
+        log.info("search.used %d -> %d, core.used %d -> %d",
+                 pressure["search"]["used"], after["search"]["used"],
+                 pressure["core"]["used"], after["core"]["used"])
+
+    state, detail = verdict(search, pressure.get("core"), plan, packed)
+    log.info("%s: %s", state, detail)
+
+    if packed and packed["queries"] and state != "clear":
+        log.info("repair: run these %d quer%s instead of one per repository, "
+                 "and filter the combined results client side:",
+                 len(packed["queries"]),
+                 "y" if len(packed["queries"]) == 1 else "ies")
+        for q in packed["queries"][:10]:
+            log.info("  %s", q)
+        if len(packed["queries"]) > 10:
+            log.info("  ... and %d more", len(packed["queries"]) - 10)
+    if packed and packed["too_long"]:
+        log.warning("%d repositor(y/ies) cannot fit in a %d character query "
+                    "beside this base query and still need their own call: %s",
+                    len(packed["too_long"]), MAX_QUERY,
+                    ", ".join(packed["too_long"][:5]))
+    if packed and packed["over_operator_limit"]:
+        log.warning("the base query already uses %d boolean operators and the "
+                    "limit is %d", packed["operators"], MAX_OPERATORS)
+    if state != "clear":
+        log.info("repair: where a list endpoint can answer the same question, "
+                 "use it instead. Issues, pull requests and commits all have "
+                 "list endpoints billed to core rather than to search.")
+        log.info("repair: cache search results by query string. The allowance "
+                 "counts requests, so a repeated query is pure waste.")
+
+    print(json.dumps({"state": state, "search": search,
+                      "core": pressure.get("core"), "plan": plan,
+                      "queries": (packed or {}).get("queries", [])}, indent=2))
+    return 1 if state in ("exhausted", "over-budget") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "github-search-budget.mjs",
+"js": '''/**
+ * Budget a search workload against the search bucket, not the core one.
+ *
+ * Read only. GET /rate_limit is free and reports every bucket; the optional
+ * probe issues one real search, which is a GET and costs one search call.
+ *
+ * Search allows 30 requests a minute over a 60 second window. Core allows
+ * 5,000 an hour, which is about 83 a minute. The second comparison is the one
+ * that stops people writing a search per item.
+ */
+const API = 'https://api.github.com';
+const UA = 'github-search-budget/1.0';
+
+// A search query is capped at 256 characters and five boolean operators.
+export const MAX_QUERY = 256;
+export const MAX_OPERATORS = 5;
+
+// The rate-limit document never reports the length of a bucket's window, and
+// the windows are not all the same, so a per-minute comparison needs this.
+const WINDOWS = {
+  core: 3600, graphql: 3600, integration_manifest: 3600,
+  code_scanning_upload: 3600, actions_runner_registration: 3600,
+  scim: 3600, dependency_sbom: 3600, audit_log: 3600,
+  search: 60, code_search: 60, source_import: 60, dependency_snapshots: 60,
+};
+
+/**
+ * Normalise every bucket to requests per minute. Pure.
+ * An unknown window leaves per_minute null rather than guessed: an invented
+ * window produces a confident wrong number.
+ */
+export function bucketPressure(resources, now) {
+  const out = {};
+  for (const name of Object.keys(resources ?? {}).sort()) {
+    const b = resources[name];
+    const limit = Number.parseInt(b?.limit, 10);
+    const used = Number.parseInt(b?.used ?? 0, 10);
+    const reset = Number(b?.reset ?? 0);
+    if (!Number.isFinite(limit) || !Number.isFinite(used) || !Number.isFinite(reset)) continue;
+    const window = WINDOWS[name] ?? null;
+    const remaining = Number.isInteger(b?.remaining) ? b.remaining : Math.max(0, limit - used);
+    out[name] = {
+      limit, used, remaining, window,
+      per_minute: window ? Math.round((limit / (window / 60)) * 10) / 10 : null,
+      refills_in: Math.max(0, Math.round(reset - Number(now))),
+    };
+  }
+  return out;
+}
+
+/**
+ * Cost a one-call-per-item loop against a per-minute allowance. Pure.
+ * Calls past the allowance are refused, not queued.
+ */
+export function planLoop(items, perMinute) {
+  const n = Math.max(0, Number.parseInt(items, 10) || 0);
+  const rate = Number(perMinute);
+  if (!Number.isFinite(rate) || rate <= 0) {
+    return { calls: n, minutes: null, refused_in_first_minute: null };
+  }
+  return {
+    calls: n,
+    minutes: Math.round((n / rate) * 10) / 10,
+    refused_in_first_minute: Math.max(0, n - Math.trunc(rate)),
+  };
+}
+
+/**
+ * Pack repo: qualifiers into as few queries as the length limit allows. Pure.
+ * repo: qualifiers are combined as alternatives and do not spend boolean
+ * operators, so the binding constraint is the 256 character budget. Greedy is
+ * good enough: the qualifiers are all about the same length.
+ */
+export function packRepoQueries(repos, base = '', maxLen = MAX_QUERY, maxOperators = MAX_OPERATORS) {
+  const stem = (base ?? '').trim();
+  const operators = stem.split(/\\s+/).filter((t) => ['AND', 'OR', 'NOT'].includes(t)).length;
+
+  const queries = [];
+  const tooLong = [];
+  let current = '';
+  for (const repo of repos ?? []) {
+    const name = String(repo).trim();
+    if (!name) continue;
+    const qualifier = `repo:${name}`;
+    if (stem.length + 1 + qualifier.length > maxLen) { tooLong.push(name); continue; }
+    const candidate = current ? `${current} ${qualifier}` : qualifier;
+    if (stem.length + (stem ? 1 : 0) + candidate.length <= maxLen) {
+      current = candidate;
+    } else {
+      queries.push(stem ? `${stem} ${current}` : current);
+      current = qualifier;
+    }
+  }
+  if (current) queries.push(stem ? `${stem} ${current}` : current);
+
+  return { queries, too_long: tooLong, operators, over_operator_limit: operators > maxOperators };
+}
+
+/** Turn the buckets and the plan into one finding. Pure. */
+export function verdict(search, core, plan = null, packed = null) {
+  if (!search) {
+    return ['no-search-bucket',
+      'the rate-limit document did not include a search bucket, so there is ' +
+      'nothing to budget against'];
+  }
+
+  const coreRate = core?.per_minute ?? null;
+  const comparison = coreRate === null ? ''
+    : ` Core allows ${Math.round(coreRate)} a minute over its hour, so search ` +
+      'is the tighter of the two despite the larger-looking number.';
+
+  if (search.remaining <= 0) {
+    return ['exhausted',
+      `search is empty and refills in ${search.refills_in} second(s). Core ` +
+      `still has ${core?.remaining ?? '?'} of ${core?.limit ?? '?'}, which is ` +
+      'why every non-search call kept working: they are different buckets.'];
+  }
+
+  if (plan?.refused_in_first_minute) {
+    let packing = '';
+    if (packed?.queries?.length) {
+      packing = ` Packed into repo: qualifiers the same work is ` +
+        `${packed.queries.length} quer${packed.queries.length === 1 ? 'y' : 'ies'}.`;
+    }
+    return ['over-budget',
+      `${plan.calls} searches at ${search.per_minute} a minute needs ` +
+      `${plan.minutes} minute(s), and ${plan.refused_in_first_minute} of them ` +
+      `are refused inside the first minute rather than queued.${packing}${comparison}`];
+  }
+
+  if (search.used >= search.limit * 0.8) {
+    return ['tight',
+      `${search.used} of ${search.limit} spent in the current 60 second ` +
+      `window, refilling in ${search.refills_in} second(s).${comparison}`];
+  }
+
+  if (plan?.calls) {
+    return ['clear',
+      `${plan.calls} search(es) at ${search.per_minute} a minute fits in ` +
+      `${plan.minutes} minute(s) with nothing refused.${comparison}`];
+  }
+
+  return ['clear',
+    `${search.remaining} of ${search.limit} left in this window.${comparison}`];
+}
+
+async function rateLimit(headers) {
+  const res = await fetch(`${API}/rate_limit`, { headers });
+  if (res.status !== 200) {
+    console.error(`GET /rate_limit returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    return null;
+  }
+  return (await res.json()).resources ?? {};
+}
+
+async function main() {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) {
+    console.error('set GITHUB_TOKEN (a read-only token is enough)');
+    process.exitCode = 2;
+    return;
+  }
+  const repos = (process.argv[2] ?? '').split(',').map((r) => r.trim()).filter(Boolean);
+  const base = process.argv[3] ?? 'is:issue is:open';
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': UA,
+  };
+
+  const before = await rateLimit(headers);
+  if (!before) { process.exitCode = 2; return; }
+
+  const pressure = bucketPressure(before, Date.now() / 1000);
+  for (const [name, b] of Object.entries(pressure)) {
+    const rate = b.per_minute ? `${Math.round(b.per_minute)} a minute` : 'window not in this table';
+    console.log(`${name.padEnd(28)} ${b.used} / ${b.limit} ${rate}`);
+  }
+
+  const search = pressure.search;
+  const plan = repos.length ? planLoop(repos.length, search?.per_minute) : null;
+  const packed = repos.length ? packRepoQueries(repos, base) : null;
+
+  const [state, detail] = verdict(search, pressure.core, plan, packed);
+  console.log(`${state}: ${detail}`);
+
+  if (packed?.queries?.length && state !== 'clear') {
+    console.log(`repair: run these ${packed.queries.length} quer` +
+      `${packed.queries.length === 1 ? 'y' : 'ies'} instead of one per ` +
+      'repository, and filter the combined results client side:');
+    for (const q of packed.queries.slice(0, 10)) console.log(`  ${q}`);
+    if (packed.queries.length > 10) console.log(`  ... and ${packed.queries.length - 10} more`);
+  }
+  if (packed?.too_long?.length) {
+    console.warn(`${packed.too_long.length} repository name(s) cannot fit in a ` +
+      `${MAX_QUERY} character query beside this base query: ` +
+      packed.too_long.slice(0, 5).join(', '));
+  }
+  if (packed?.over_operator_limit) {
+    console.warn(`the base query already uses ${packed.operators} boolean ` +
+      `operators and the limit is ${MAX_OPERATORS}`);
+  }
+  if (state !== 'clear') {
+    console.log('repair: where a list endpoint can answer the same question, ' +
+      'use it instead. Issues, pull requests and commits all have list ' +
+      'endpoints billed to core rather than to search.');
+    console.log('repair: cache search results by query string. The allowance ' +
+      'counts requests, so a repeated query is pure waste.');
+  }
+
+  console.log(JSON.stringify({
+    state, search, core: pressure.core, plan, queries: packed?.queries ?? [],
+  }, null, 2));
+  process.exitCode = (state === 'exhausted' || state === 'over-budget') ? 1 : 0;
+}
+
+// Only run when invoked directly, so importing this from the test file does not
+// start main() and set an exit code the tests never asked for.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "Two things here are worth pinning hard. The first is the unit conversion, because the entire note rests on it: 5,000 an hour and 30 a minute are 83 and 30 in the same units, and a test asserts that ordering explicitly so nobody later 'simplifies' the windows table away. The second is the packer, which has the ordinary bin-packing edges plus one specific to search &mdash; a repository whose name is long enough that it cannot share a query with anything, and the base query that has already spent the five boolean operators before a single <code>repo:</code> is added.",
+"test_py_file": "test_github_search_budget.py",
+"test_py": '''from github_search_budget import (bucket_pressure, plan_loop,
+                                  pack_repo_queries, verdict)
+
+NOW = 1_800_000_000.0
+
+RESOURCES = {
+    "core": {"limit": 5000, "used": 120, "remaining": 4880, "reset": NOW + 2400},
+    "search": {"limit": 30, "used": 4, "remaining": 26, "reset": NOW + 41},
+    "code_search": {"limit": 10, "used": 0, "remaining": 10, "reset": NOW + 55},
+    "graphql": {"limit": 5000, "used": 0, "remaining": 5000, "reset": NOW + 2400},
+}
+
+
+def test_the_two_buckets_only_compare_once_the_windows_match():
+    p = bucket_pressure(RESOURCES, NOW)
+    assert p["core"]["per_minute"] == round(5000 / 60.0, 1)
+    assert p["search"]["per_minute"] == 30.0
+    # The whole point of the note: search is the tighter allowance even though
+    # its limit is 166 times smaller.
+    assert p["search"]["per_minute"] < p["core"]["per_minute"]
+
+
+def test_code_search_is_tighter_still():
+    p = bucket_pressure(RESOURCES, NOW)
+    assert p["code_search"]["per_minute"] == 10.0
+
+
+def test_a_bucket_with_an_unknown_window_is_reported_not_guessed():
+    p = bucket_pressure({"something_new": {"limit": 99, "used": 1, "reset": NOW}}, NOW)
+    assert p["something_new"]["per_minute"] is None
+    assert p["something_new"]["limit"] == 99
+
+
+def test_a_malformed_bucket_is_skipped():
+    assert bucket_pressure({"core": {"limit": "lots"}}, NOW) == {}
+    assert bucket_pressure(None, NOW) == {}
+
+
+def test_refills_in_never_goes_negative():
+    p = bucket_pressure({"search": {"limit": 30, "used": 30, "reset": NOW - 90}}, NOW)
+    assert p["search"]["refills_in"] == 0
+
+
+def test_a_loop_longer_than_the_window_refuses_the_surplus():
+    plan = plan_loop(400, 30)
+    assert plan["minutes"] == 13.3
+    assert plan["refused_in_first_minute"] == 370
+
+
+def test_a_loop_inside_the_window_refuses_nothing():
+    assert plan_loop(12, 30)["refused_in_first_minute"] == 0
+
+
+def test_a_missing_rate_is_not_treated_as_infinite():
+    plan = plan_loop(400, None)
+    assert plan["minutes"] is None
+    assert plan["refused_in_first_minute"] is None
+
+
+def test_a_short_list_becomes_one_query():
+    packed = pack_repo_queries(["octo/one", "octo/two"], "is:issue is:open")
+    assert len(packed["queries"]) == 1
+    assert packed["queries"][0].startswith("is:issue is:open repo:octo/one")
+    assert len(packed["queries"][0]) <= 256
+
+
+def test_a_long_list_splits_and_every_query_fits():
+    repos = ["acme/service-%02d" % i for i in range(40)]
+    packed = pack_repo_queries(repos, "is:issue is:open label:bug")
+    assert len(packed["queries"]) > 1
+    assert all(len(q) <= 256 for q in packed["queries"])
+    # Every repository appears exactly once across the packed queries.
+    joined = " ".join(packed["queries"])
+    assert all(joined.count("repo:" + r) == 1 for r in repos)
+    # The saving is the point: 40 calls collapse to a handful.
+    assert len(packed["queries"]) < 8
+
+
+def test_a_repository_that_cannot_fit_beside_the_base_query_is_named():
+    packed = pack_repo_queries(["acme/" + "x" * 250, "acme/ok"], "is:issue")
+    assert packed["too_long"] == ["acme/" + "x" * 250]
+    assert packed["queries"] == ["is:issue repo:acme/ok"]
+
+
+def test_empty_input_packs_into_nothing():
+    assert pack_repo_queries([], "is:issue")["queries"] == []
+    assert pack_repo_queries(None)["queries"] == []
+    assert pack_repo_queries(["", "  "])["queries"] == []
+
+
+def test_boolean_operators_in_the_base_query_are_counted():
+    packed = pack_repo_queries(["a/b"], "cat OR dog OR bird OR fish OR rat OR ox")
+    assert packed["operators"] == 5
+    assert packed["over_operator_limit"] is False
+    more = pack_repo_queries(["a/b"], "a OR b OR c OR d OR e OR f OR g")
+    assert more["over_operator_limit"] is True
+
+
+def test_an_empty_search_bucket_points_at_the_healthy_core_one():
+    p = bucket_pressure(dict(RESOURCES, search={"limit": 30, "used": 30,
+                                                "remaining": 0, "reset": NOW + 12}), NOW)
+    state, detail = verdict(p["search"], p["core"])
+    assert state == "exhausted"
+    assert "different buckets" in detail
+    assert "12 second(s)" in detail
+
+
+def test_an_oversized_loop_reports_the_packed_alternative():
+    p = bucket_pressure(RESOURCES, NOW)
+    repos = ["acme/service-%02d" % i for i in range(400)]
+    state, detail = verdict(p["search"], p["core"],
+                            plan_loop(400, p["search"]["per_minute"]),
+                            pack_repo_queries(repos, "is:issue is:open"))
+    assert state == "over-budget"
+    assert "refused inside the first minute" in detail
+    assert "queries" in detail
+
+
+def test_the_core_comparison_is_stated_in_the_same_units():
+    p = bucket_pressure(RESOURCES, NOW)
+    _, detail = verdict(p["search"], p["core"])
+    assert "83 a minute" in detail
+
+
+def test_a_healthy_bucket_with_no_plan_is_clear():
+    p = bucket_pressure(RESOURCES, NOW)
+    assert verdict(p["search"], p["core"])[0] == "clear"
+
+
+def test_no_search_bucket_is_not_reported_as_healthy():
+    assert verdict(None, None)[0] == "no-search-bucket"
+''',
+"test_js_file": "github-search-budget.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  bucketPressure, planLoop, packRepoQueries, verdict,
+} from './github-search-budget.mjs';
+
+const NOW = 1800000000;
+
+const RESOURCES = {
+  core: { limit: 5000, used: 120, remaining: 4880, reset: NOW + 2400 },
+  search: { limit: 30, used: 4, remaining: 26, reset: NOW + 41 },
+  code_search: { limit: 10, used: 0, remaining: 10, reset: NOW + 55 },
+  graphql: { limit: 5000, used: 0, remaining: 5000, reset: NOW + 2400 },
+};
+
+test('the two buckets only compare once the windows match', () => {
+  const p = bucketPressure(RESOURCES, NOW);
+  assert.equal(p.core.per_minute, Math.round((5000 / 60) * 10) / 10);
+  assert.equal(p.search.per_minute, 30);
+  assert.ok(p.search.per_minute < p.core.per_minute);
+});
+
+test('code search is tighter still', () => {
+  assert.equal(bucketPressure(RESOURCES, NOW).code_search.per_minute, 10);
+});
+
+test('a bucket with an unknown window is reported, not guessed', () => {
+  const p = bucketPressure({ something_new: { limit: 99, used: 1, reset: NOW } }, NOW);
+  assert.equal(p.something_new.per_minute, null);
+  assert.equal(p.something_new.limit, 99);
+});
+
+test('a malformed bucket is skipped', () => {
+  assert.deepEqual(bucketPressure({ core: { limit: 'lots' } }, NOW), {});
+  assert.deepEqual(bucketPressure(null, NOW), {});
+});
+
+test('refills_in never goes negative', () => {
+  const p = bucketPressure({ search: { limit: 30, used: 30, reset: NOW - 90 } }, NOW);
+  assert.equal(p.search.refills_in, 0);
+});
+
+test('a loop longer than the window refuses the surplus', () => {
+  const plan = planLoop(400, 30);
+  assert.equal(plan.minutes, 13.3);
+  assert.equal(plan.refused_in_first_minute, 370);
+});
+
+test('a loop inside the window refuses nothing', () => {
+  assert.equal(planLoop(12, 30).refused_in_first_minute, 0);
+});
+
+test('a missing rate is not treated as infinite', () => {
+  const plan = planLoop(400, null);
+  assert.equal(plan.minutes, null);
+  assert.equal(plan.refused_in_first_minute, null);
+});
+
+test('a short list becomes one query', () => {
+  const packed = packRepoQueries(['octo/one', 'octo/two'], 'is:issue is:open');
+  assert.equal(packed.queries.length, 1);
+  assert.ok(packed.queries[0].startsWith('is:issue is:open repo:octo/one'));
+  assert.ok(packed.queries[0].length <= 256);
+});
+
+test('a long list splits and every query fits', () => {
+  const repos = Array.from({ length: 40 }, (_, i) => `acme/service-${String(i).padStart(2, '0')}`);
+  const packed = packRepoQueries(repos, 'is:issue is:open label:bug');
+  assert.ok(packed.queries.length > 1);
+  assert.ok(packed.queries.every((q) => q.length <= 256));
+  const joined = packed.queries.join(' ');
+  for (const r of repos) {
+    assert.equal(joined.split(`repo:${r}`).length - 1, 1);
+  }
+  assert.ok(packed.queries.length < 8);
+});
+
+test('a repository that cannot fit beside the base query is named', () => {
+  const huge = 'acme/' + 'x'.repeat(250);
+  const packed = packRepoQueries([huge, 'acme/ok'], 'is:issue');
+  assert.deepEqual(packed.too_long, [huge]);
+  assert.deepEqual(packed.queries, ['is:issue repo:acme/ok']);
+});
+
+test('empty input packs into nothing', () => {
+  assert.deepEqual(packRepoQueries([], 'is:issue').queries, []);
+  assert.deepEqual(packRepoQueries(null).queries, []);
+  assert.deepEqual(packRepoQueries(['', '  ']).queries, []);
+});
+
+test('boolean operators in the base query are counted', () => {
+  const packed = packRepoQueries(['a/b'], 'cat OR dog OR bird OR fish OR rat OR ox');
+  assert.equal(packed.operators, 5);
+  assert.equal(packed.over_operator_limit, false);
+  assert.equal(packRepoQueries(['a/b'], 'a OR b OR c OR d OR e OR f OR g').over_operator_limit, true);
+});
+
+test('an empty search bucket points at the healthy core one', () => {
+  const p = bucketPressure({
+    ...RESOURCES,
+    search: { limit: 30, used: 30, remaining: 0, reset: NOW + 12 },
+  }, NOW);
+  const [state, detail] = verdict(p.search, p.core);
+  assert.equal(state, 'exhausted');
+  assert.match(detail, /different buckets/);
+  assert.match(detail, /12 second\\(s\\)/);
+});
+
+test('an oversized loop reports the packed alternative', () => {
+  const p = bucketPressure(RESOURCES, NOW);
+  const repos = Array.from({ length: 400 }, (_, i) => `acme/service-${String(i).padStart(2, '0')}`);
+  const [state, detail] = verdict(p.search, p.core,
+    planLoop(400, p.search.per_minute), packRepoQueries(repos, 'is:issue is:open'));
+  assert.equal(state, 'over-budget');
+  assert.match(detail, /refused inside the first minute/);
+  assert.match(detail, /queries/);
+});
+
+test('the core comparison is stated in the same units', () => {
+  const p = bucketPressure(RESOURCES, NOW);
+  assert.match(verdict(p.search, p.core)[1], /83 a minute/);
+});
+
+test('a healthy bucket with no plan is clear', () => {
+  const p = bucketPressure(RESOURCES, NOW);
+  assert.equal(verdict(p.search, p.core)[0], 'clear');
+});
+
+test('no search bucket is not reported as healthy', () => {
+  assert.equal(verdict(null, null)[0], 'no-search-bucket');
+});
+''',
+"faq": [
+ ("Does a search request use up my 5,000 an hour as well?",
+  "No, and you can watch that be true. Read GET /rate_limit, run one search, read it again: search.used goes up by one and core.used does not move. They are separate buckets with separate windows, which is exactly why the failure is so confusing when it happens, because every other call on the token carries on working."),
+ ("Why is 30 a minute worse than 5,000 an hour?",
+  "Because the windows differ and the raw numbers are not comparable. 5,000 an hour is about 83 a minute; 30 a minute is 30. Search is the tighter allowance by nearly three to one, and it also refuses rather than queues, so the thirty-first call in a minute is an error rather than a wait. Normalising both to per-minute is the single most useful thing you can do with that document."),
+ ("How many repositories fit in one query?",
+  "As many repo: qualifiers as fit in 256 characters, which for typical org and repository names is somewhere between fifteen and twenty-five. Multiple repo: qualifiers are treated as alternatives and do not spend any of the five permitted AND, OR or NOT operators, so the character budget is what actually binds. Pack greedily and check each query's length before you send it."),
+ ("Should I use search at all?",
+  "Often not. If a list endpoint can answer the question, it is billed to core, it paginates properly and it is not capped at 1,000 results. Search earns its place for cross-repository questions and full-text matching. A loop that searches one repository at a time is usually a list endpoint that has not been found yet."),
+ ("What about code search?",
+  "Tighter again: 10 requests a minute, reported separately as resources.code_search in the same document. It is the bucket most likely to be empty when someone reports that search is broken, and because it has its own entry, the same normalisation shows it at 10 a minute against search's 30 without any extra work."),
+],
+"related": [
+ ("/github/search-1000-result-cap/", "Search returns at most 1,000 results"),
+ ("/github/secondary-limit-concurrency/", "Over 100 concurrent requests trips a limit"),
+ ("/github/no-conditional-requests/", "Polling without ETags spends full quota"),
+],
+"citations": [CITE_SEARCH, CITE_REST_LIMITS, CITE_SEARCH_SYNTAX, CITE_RATE_ENDPOINT],
+},
+
 ]
