@@ -1922,7 +1922,7 @@ def main():
                         "POST /v1/organization/spend_limit "
                         "{'threshold_amount': <cents>, 'currency': 'USD', "
                         "'interval': 'month'} and an early warning with "
-                        "POST /v1/organization/spend_alerts at about 60%% of it.")
+                        "POST /v1/organization/spend_alerts at about 60% of it.")
         else:
             log.warning("  repair: Anthropic has no spend-limit endpoint. Set "
                         "the organization and per-workspace limits in the "
@@ -2415,3 +2415,695 @@ test('both providers fold into the same day keyed dollars', () => {
 "citations": [CITE_COSTS, CITE_AN_COST_REPORT, CITE_AN_USAGE_COST, CITE_ADMIN],
 },
 
+{
+"slug": "one-model-or-project-dominates-cost",
+"title": "One line item or project is most of the organization's bill",
+"description": "Ungrouped, the cost report is one opaque number per day. Grouped by line_item and project_id it is usually one row carrying most of the total.",
+"h1": "one line item or project is most of the organization's bill",
+"category": "LLM APIs",
+"pill": "Diagnostic",
+"chips": ["Read-only key", "Python and Node.js", "Tests included"],
+"keywords": ["openai costs group_by line_item", "openai cost by project",
+             "which model is costing the most", "openai quantity_unit tokens",
+             "llm cost attribution"],
+"deps": "Python 3.9+ with requests, or Node.js 18+. Needs OPENAI_ADMIN_KEY, an organization admin key provisioned read-only, because /v1/organization/costs rejects a project key.",
+"lead": "The bill is roughly what everyone expected, which is why nobody has opened it. When somebody finally does, one line item is seventy-eight percent of it, and it is not the one the team spent last quarter optimising. There is no error here and nothing failed. There is a month of engineering time that went into a row worth three percent of the total, because the report was read as a single number and single numbers do not have a shape.",
+"short_answer": """<p>Two GETs with an <strong>organization admin key</strong>, over the same window: <code>GET /v1/organization/costs?start_time={now-30d}&amp;bucket_width=1d&amp;limit=30&amp;group_by=line_item</code> and the same call with <code>group_by=project_id</code>. Aggregate <code>amount.value</code> per row, sort descending, and compute each row's share of the total.</p>
+<p>Grouping is the entire trick. Without it, <code>line_item</code> and <code>project_id</code> both come back <code>null</code> and the response is one undifferentiated number per day &mdash; which is exactly how the report gets read as "about what we expected". Note that <code>group_by</code> on the costs endpoint accepts only <code>project_id</code>, <code>line_item</code> and <code>api_key_id</code>. It does not accept <code>model</code>: the model is inside the <code>line_item</code> string.</p>
+<p>Grouped rows also carry <code>quantity</code> and <code>quantity_unit</code>, so you can derive an effective price per million tokens from the report itself and check it against the price card. A dominant row whose derived unit price is five times its neighbour's is a model choice; one whose unit price is ordinary is a volume problem, and those have different fixes.</p>""",
+"problem": """<p>Concentration is not an anomaly. It is the normal shape of an LLM bill, and that is precisely why it goes unmeasured: nothing about it looks like a fault, so no alert is ever built for it and no review ever names it. The organization ends up with a total it believes and no idea which part of the total it is.</p>
+<p>What that costs is not overspend, it is misdirected work. Teams optimise the thing they remember being expensive &mdash; the model with the frightening reputation, the endpoint that was slow that one time &mdash; and shave three percent off the bill in a sprint while the row carrying three quarters of it is untouched. Getting the ranking takes one call and settles the argument before anyone starts.</p>""",
+"why": """<p><strong>The default response is deliberately undifferentiated.</strong> <code>GET /v1/organization/costs</code> without <code>group_by</code> returns one <code>amount</code> per bucket with <code>line_item</code> and <code>project_id</code> both <code>null</code>. That is not a bug and there is nothing missing from it; it is a total, and a total is the one thing you already knew.</p>
+<p><strong>The model is not a group key here.</strong> The usage endpoints accept <code>group_by=model</code>. The costs endpoint does not &mdash; only <code>project_id</code>, <code>line_item</code> and <code>api_key_id</code>. The model name appears inside the <code>line_item</code> string, alongside the token side, in labels like <code>"gpt-5.6-sol, input"</code>. Any per-model cost figure is therefore something you parsed, not something you were given.</p>
+<p><strong>A null row means something specific.</strong> A grouped response can still carry a <code>null</code> name, and it is not "unknown": on the project axis it is spend that belongs to no project. Reporting it as unattributed rather than as a mystery is the difference between a finding somebody can act on and one they cannot.</p>
+<p><strong>quantity and quantity_unit let you check the price.</strong> Grouped rows carry both, with the unit drawn from a small enumeration &mdash; <code>tokens</code>, <code>1000_tokens</code>, <code>duration_seconds</code>, <code>duration_minutes</code>, <code>duration_hours</code>, <code>gibibyte_hours</code>, <code>images</code>, <code>characters</code>. Dividing dollars by tokens gives an effective rate per million you can hold against the price card, and it catches the case where the row is expensive because of what it is rather than how much of it there is.</p>
+<p><strong>Two axes, two different fixes.</strong> A dominant <em>line item</em> is a model or token-side problem and the repair is a substitution: the same work on a cheaper model, or fewer output tokens. A dominant <em>project</em> is an ownership problem and the repair is a boundary: its own spend limit, its own key, its own team looking at its own number.</p>""",
+"steps": [
+ {"h": "Ask the same window twice, grouped differently",
+  "body": """<p>One call grouped by <code>line_item</code>, one by <code>project_id</code>, both over the same thirty days. Two axes because they have different repairs, and the same window because a ranking is only comparable against itself.</p>"""},
+ {"h": "Rank by share, not by dollars",
+  "body": """<p>Sum <code>amount.value</code> per row and divide by the total. A row's share is the number that decides whether it is worth a sprint; its absolute size only tells you how big the organization is.</p>"""},
+ {"h": "Derive the unit price and check it against the price card",
+  "body": """<p>Grouped rows carry <code>quantity</code> and <code>quantity_unit</code>. For the token units, dollars per million tokens falls straight out. A dominant row at an ordinary unit price is a volume problem; at five times the neighbouring rate it is a model choice, and the arithmetic for the substitute is right there.</p>"""},
+ {"h": "Say what a null row is rather than calling it unknown",
+  "body": """<p>A <code>null</code> name in a grouped response is spend the axis cannot attribute. Print it as that. An organization whose largest row is unattributed has an attribution problem to fix before it has a cost problem to argue about.</p>"""},
+ {"h": "Then act on the axis you found it on",
+  "body": """<p>A dominant line item: price the substitute and run the comparison &mdash; Claude Opus 5 at $5/$25 per MTok against Haiku 4.5 at $1/$5 is a five-fold difference for work that may not need the bigger model. A dominant project: give it its own spend limit and its own owner. Both are printed for you to run.</p>"""},
+],
+"verify": """<p>Re-run after the substitution or the boundary has landed. The winning row should have moved down the ranking, and the total should have moved with it.</p>
+<pre><code class="language-bash">python3 openai_cost_concentration_audit.py --days 30
+# line_item   spread      no single row above 50% of $18,204.55 across 11 row(s)
+# project_id  spread      no single row above 50% of $18,204.55 across 6 row(s)</code></pre>""",
+"code_intro": "No clock in this one at all. It reads a single window and asks how the money inside it is distributed, which makes the whole script three pure functions: the ranking, which has to keep a null name as a null rather than turning it into the string “unknown”; the derived unit price, which returns nothing at all for the units that are not tokens rather than dividing dollars by images and printing a number; and the classifier, which separates one dominant row from two large ones from a bill with no lever in it, because “spread” is an answer and a useful one.",
+"py_file": "openai_cost_concentration_audit.py",
+"py": '''"""Rank OpenAI organization spend by line item and by project.
+
+Read only. Two GET requests against /v1/organization/costs, which rejects
+project keys: this needs an organization admin key (sk-admin-), which can and
+should be provisioned read-only.
+
+Nothing here is broken. The finding is where the money is, which the default
+ungrouped response cannot tell you, and the repair is a substitution or a
+boundary printed for you to decide on.
+"""
+import argparse
+import logging
+import os
+import sys
+import time
+
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("openai_cost_concentration_audit")
+
+API = "https://api.openai.com/v1"
+
+# group_by on the costs endpoint takes only these. Not model: the model name
+# lives inside the line_item string, next to the token side.
+AXES = ("line_item", "project_id")
+
+# quantity_unit is a small enumeration and only two members of it are tokens.
+# The others are seconds, hours, gibibyte-hours, images and characters, and
+# dividing dollars by those does not produce a price per million tokens.
+TOKENS_PER_UNIT = {"tokens": 1.0, "1000_tokens": 1000.0}
+
+FINDINGS = ("dominant", "top-heavy", "unattributable")
+
+
+def rank(buckets, field):
+    """Aggregate a grouped cost report by one field. Pure.
+
+    Returns rows sorted by dollars descending, each carrying its share of the
+    total. A row whose name is null keeps a null name: turning it into the
+    string "unknown" would hide that the report answered precisely, and that
+    the answer was "this spend belongs to no project".
+    """
+    rows = {}
+    for bucket in buckets or []:
+        for result in bucket.get("results") or []:
+            raw = result.get(field)
+            name = raw.strip() if isinstance(raw, str) and raw.strip() else None
+            row = rows.setdefault(name, {"name": name, "amount": 0.0,
+                                         "quantity": 0.0, "unit": None})
+            try:
+                row["amount"] += float((result.get("amount") or {}).get("value") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                row["quantity"] += float(result.get("quantity") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            unit = result.get("quantity_unit")
+            unit = str(unit).strip() if isinstance(unit, str) and unit.strip() else None
+            if unit and row["unit"] is None:
+                row["unit"] = unit
+            elif unit and row["unit"] not in (unit, "mixed"):
+                row["unit"] = "mixed"
+
+    total = sum(row["amount"] for row in rows.values())
+    out = []
+    for row in rows.values():
+        row = dict(row)
+        row["amount"] = round(row["amount"], 2)
+        row["share"] = round(row["amount"] / total, 4) if total > 0 else 0.0
+        out.append(row)
+    out.sort(key=lambda r: (-r["amount"], r["name"] or ""))
+    return out
+
+
+def unit_price(amount, quantity, unit):
+    """Dollars per million tokens for one row, or None. Pure.
+
+    None for every unit that is not tokens. A row billed in images or in
+    gibibyte-hours has a perfectly good unit price and it is not a token price,
+    so reporting one would be inventing a number that looks comparable to the
+    rows around it and is not.
+    """
+    scale = TOKENS_PER_UNIT.get(str(unit or "").strip().lower())
+    if scale is None:
+        return None
+    try:
+        tokens = float(quantity or 0.0) * scale
+        dollars = float(amount or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if tokens <= 0:
+        return None
+    return round(dollars / (tokens / 1000000.0), 4)
+
+
+def verdict(ranked, threshold=0.50, pair_threshold=0.75, min_spend=1.0):
+    """Classify one axis of a ranking. Pure. Returns (state, detail).
+
+    "spread" is an answer, not a failure to find something: a bill with no row
+    above half is a bill with no single lever in it, and knowing that is worth
+    the call. "unattributable" is kept separate from "dominant" because a
+    largest row the report could not name is an attribution problem, and no
+    amount of model substitution fixes it.
+    """
+    rows = [dict(row) for row in (ranked or [])]
+    total = round(sum(float(row.get("amount") or 0.0) for row in rows), 2)
+    if not rows or total < min_spend:
+        return ("no-spend",
+                "$%.2f across %d row(s), too little to rank" % (total, len(rows)))
+
+    top = rows[0]
+    share = float(top.get("amount") or 0.0) / total
+    name = top.get("name")
+
+    if name is None and share >= threshold:
+        return ("unattributable",
+                "%.0f%% of $%.2f is on a row the report returned with no name. "
+                "Null is not unknown here: this axis cannot attribute that "
+                "spend, which is a problem to fix before the cost is one to "
+                "argue about." % (share * 100, total))
+
+    if share >= threshold:
+        return ("dominant",
+                "%r is %.0f%% of $%.2f. Optimising anything else moves at most "
+                "%.0f%% of the bill." % (name, share * 100, total,
+                                         (1 - share) * 100))
+
+    if len(rows) > 1:
+        second = float(rows[1].get("amount") or 0.0) / total
+        if share + second >= pair_threshold:
+            return ("top-heavy",
+                    "%r and %r are %.0f%% of $%.2f between them, with neither "
+                    "above %.0f%% alone." % (name, rows[1].get("name"),
+                                             (share + second) * 100, total,
+                                             threshold * 100))
+
+    return ("spread",
+            "no single row above %.0f%% of $%.2f across %d row(s)"
+            % (threshold * 100, total, len(rows)))
+
+
+def get(session, params):
+    r = session.get(API + "/organization/costs", params=params, timeout=90)
+    if r.status_code in (401, 403):
+        raise SystemExit("%d from OpenAI: /v1/organization/costs needs an "
+                         "organization admin key (sk-admin-), not a project key"
+                         % r.status_code)
+    r.raise_for_status()
+    return r.json()
+
+
+def buckets(session, params, max_pages=40):
+    params = dict(params)
+    for _ in range(max_pages):
+        page = get(session, params)
+        for bucket in page.get("data") or []:
+            yield bucket
+        if not page.get("has_more") or not page.get("next_page"):
+            return
+        params = dict(params)
+        params["page"] = page["next_page"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=30,
+                    help="days of daily cost buckets to read (default 30)")
+    ap.add_argument("--threshold", type=float, default=0.50,
+                    help="share above which one row is called dominant "
+                         "(default 0.50)")
+    ap.add_argument("--top", type=int, default=5,
+                    help="rows to print per axis (default 5)")
+    args = ap.parse_args()
+
+    key = os.environ.get("OPENAI_ADMIN_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        log.error("set OPENAI_ADMIN_KEY (an organization admin key, read-only "
+                  "scopes are enough)")
+        return 2
+
+    session = requests.Session()
+    session.headers.update({"Authorization": "Bearer " + key})
+    start = int(time.time()) - args.days * 86400
+
+    found = 0
+    for axis in AXES:
+        rows = rank(list(buckets(session, {
+            "start_time": start,
+            "bucket_width": "1d",
+            "limit": min(180, max(1, args.days)),
+            "group_by": [axis],
+        })), axis)
+        state, detail = verdict(rows, args.threshold)
+        line = "%-11s %-13s %s" % (axis, state, detail)
+
+        if state in FINDINGS:
+            found += 1
+            log.warning(line)
+        else:
+            log.info(line)
+
+        for row in rows[:args.top]:
+            price = unit_price(row["amount"], row["quantity"], row["unit"])
+            log.info("    %-38s $%10.2f  %5.1f%%  %s",
+                     row["name"] if row["name"] is not None else "(no name)",
+                     row["amount"], row["share"] * 100,
+                     ("$%.2f per 1M tokens" % price) if price is not None
+                     else "%s, not a token unit" % (row["unit"] or "no unit"))
+
+        if state == "dominant" and axis == "line_item":
+            log.warning("  repair: price the substitute for %r and run the "
+                        "comparison before optimising anything else. Output "
+                        "tokens are the expensive side on every current model, "
+                        "and a smaller model at the same volume is usually a "
+                        "multiple cheaper rather than a few percent.",
+                        rows[0]["name"])
+        elif state == "dominant" and axis == "project_id":
+            log.warning("  repair: give project %r its own spend limit and its "
+                        "own owner. A project this size behind the "
+                        "organization's single ceiling means one loop in it can "
+                        "stop everybody else's traffic.", rows[0]["name"])
+        elif state == "unattributable":
+            log.warning("  repair: this spend belongs to no %s. Move the traffic "
+                        "onto named projects and keys before treating any "
+                        "per-team number as real.", axis)
+
+    log.info("2 axis/axes ranked, %d with a concentrated bill", found)
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''',
+"js_file": "openai-cost-concentration-audit.mjs",
+"js": '''/**
+ * Rank OpenAI organization spend by line item and by project.
+ *
+ * Read only. Two GET requests against /v1/organization/costs, which rejects
+ * project keys: this needs an organization admin key (sk-admin-), provisioned
+ * read-only. Nothing here is broken; the finding is where the money is.
+ */
+const API = 'https://api.openai.com/v1';
+
+// group_by on the costs endpoint takes only these. Not model: the model name
+// lives inside the line_item string, next to the token side.
+const AXES = ['line_item', 'project_id'];
+
+// quantity_unit is a small enumeration and only two members are tokens.
+const TOKENS_PER_UNIT = { tokens: 1.0, '1000_tokens': 1000.0 };
+
+const FINDINGS = ['dominant', 'top-heavy', 'unattributable'];
+
+/**
+ * Aggregate a grouped cost report by one field. Pure. Rows come back sorted by
+ * dollars descending with each row's share of the total. A row whose name is
+ * null keeps a null name: turning it into "unknown" would hide that the report
+ * answered precisely, and that the answer was "this belongs to no project".
+ */
+export function rank(buckets, field) {
+  const rows = new Map();
+  for (const bucket of buckets ?? []) {
+    for (const result of bucket.results ?? []) {
+      const raw = result[field];
+      const name = (typeof raw === 'string' && raw.trim()) ? raw.trim() : null;
+      const row = rows.get(name)
+        ?? { name, amount: 0, quantity: 0, unit: null };
+      const amount = Number(result.amount?.value ?? 0);
+      if (Number.isFinite(amount)) row.amount += amount;
+      const quantity = Number(result.quantity ?? 0);
+      if (Number.isFinite(quantity)) row.quantity += quantity;
+      const rawUnit = result.quantity_unit;
+      const unit = (typeof rawUnit === 'string' && rawUnit.trim())
+        ? rawUnit.trim() : null;
+      if (unit && row.unit === null) row.unit = unit;
+      else if (unit && row.unit !== unit && row.unit !== 'mixed') row.unit = 'mixed';
+      rows.set(name, row);
+    }
+  }
+
+  const total = [...rows.values()].reduce((a, row) => a + row.amount, 0);
+  const out = [...rows.values()].map((row) => ({
+    ...row,
+    amount: Math.round(row.amount * 100) / 100,
+    share: total > 0 ? Math.round((row.amount / total) * 10000) / 10000 : 0,
+  }));
+  out.sort((a, b) => (b.amount - a.amount)
+    || String(a.name ?? '').localeCompare(String(b.name ?? '')));
+  return out;
+}
+
+/**
+ * Dollars per million tokens for one row, or null. Pure. null for every unit
+ * that is not tokens: a row billed in images or gibibyte-hours has a perfectly
+ * good unit price and it is not a token price, so printing one would invent a
+ * number that looks comparable to the rows around it and is not.
+ */
+export function unitPrice(amount, quantity, unit) {
+  const scale = TOKENS_PER_UNIT[String(unit ?? '').trim().toLowerCase()];
+  if (scale === undefined) return null;
+  const tokens = (Number(quantity) || 0) * scale;
+  const dollars = Number(amount);
+  if (!Number.isFinite(tokens) || !Number.isFinite(dollars) || tokens <= 0) {
+    return null;
+  }
+  return Math.round((dollars / (tokens / 1000000)) * 10000) / 10000;
+}
+
+/**
+ * Classify one axis of a ranking. Pure. Returns [state, detail]. "spread" is an
+ * answer rather than a failure to find something, and "unattributable" is kept
+ * apart from "dominant" because no model substitution fixes it.
+ */
+export function verdict(ranked, threshold = 0.50, pairThreshold = 0.75,
+                        minSpend = 1.0) {
+  const rows = (ranked ?? []).map((row) => ({ ...row }));
+  const total = Math.round(rows.reduce((a, row) => a + (Number(row.amount) || 0), 0)
+    * 100) / 100;
+  if (rows.length === 0 || total < minSpend) {
+    return ['no-spend',
+      `$${total.toFixed(2)} across ${rows.length} row(s), too little to rank`];
+  }
+
+  const top = rows[0];
+  const share = (Number(top.amount) || 0) / total;
+  const name = top.name ?? null;
+  const shown = name === null ? 'null' : JSON.stringify(name);
+
+  if (name === null && share >= threshold) {
+    return ['unattributable',
+      `${Math.round(share * 100)}% of $${total.toFixed(2)} is on a row the ` +
+      'report returned with no name. Null is not unknown here: this axis ' +
+      'cannot attribute that spend, which is a problem to fix before the cost ' +
+      'is one to argue about.'];
+  }
+
+  if (share >= threshold) {
+    return ['dominant',
+      `${shown} is ${Math.round(share * 100)}% of $${total.toFixed(2)}. ` +
+      `Optimising anything else moves at most ${Math.round((1 - share) * 100)}% ` +
+      'of the bill.'];
+  }
+
+  if (rows.length > 1) {
+    const second = (Number(rows[1].amount) || 0) / total;
+    if (share + second >= pairThreshold) {
+      const other = rows[1].name === null ? 'null' : JSON.stringify(rows[1].name);
+      return ['top-heavy',
+        `${shown} and ${other} are ${Math.round((share + second) * 100)}% of ` +
+        `$${total.toFixed(2)} between them, with neither above ` +
+        `${Math.round(threshold * 100)}% alone.`];
+    }
+  }
+
+  return ['spread',
+    `no single row above ${Math.round(threshold * 100)}% of $${total.toFixed(2)} ` +
+    `across ${rows.length} row(s)`];
+}
+
+async function get(key, params) {
+  const url = new URL(`${API}/organization/costs`);
+  for (const [k, v] of Object.entries(params)) {
+    if (Array.isArray(v)) v.forEach((one) => url.searchParams.append(k, String(one)));
+    else if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${key}` } });
+  if (res.status === 401 || res.status === 403) {
+    throw new Error(`${res.status} from OpenAI: /v1/organization/costs needs an ` +
+                    'organization admin key (sk-admin-), not a project key');
+  }
+  if (!res.ok) throw new Error(`${res.status} from /organization/costs`);
+  return res.json();
+}
+
+async function readBuckets(key, params, maxPages = 40) {
+  const out = [];
+  let query = { ...params };
+  for (let i = 0; i < maxPages; i += 1) {
+    const page = await get(key, query);
+    out.push(...(page.data ?? []));
+    if (!page.has_more || !page.next_page) break;
+    query = { ...params, page: page.next_page };
+  }
+  return out;
+}
+
+async function main() {
+  const key = process.env.OPENAI_ADMIN_KEY ?? process.env.OPENAI_API_KEY;
+  if (!key) {
+    console.error('set OPENAI_ADMIN_KEY (an organization admin key, read-only ' +
+                  'scopes are enough)');
+    process.exitCode = 2;
+    return;
+  }
+
+  const days = Number(process.env.DAYS ?? 30);
+  const threshold = Number(process.env.THRESHOLD ?? 0.50);
+  const top = Number(process.env.TOP ?? 5);
+  const start = Math.floor(Date.now() / 1000) - days * 86400;
+
+  let found = 0;
+  for (const axis of AXES) {
+    const rows = rank(await readBuckets(key, {
+      start_time: start,
+      bucket_width: '1d',
+      limit: Math.min(180, Math.max(1, days)),
+      group_by: [axis],
+    }), axis);
+    const [state, detail] = verdict(rows, threshold);
+    const line = `${axis.padEnd(11)} ${state.padEnd(13)} ${detail}`;
+
+    if (FINDINGS.includes(state)) {
+      found += 1;
+      console.warn(line);
+    } else {
+      console.log(line);
+    }
+
+    for (const row of rows.slice(0, top)) {
+      const price = unitPrice(row.amount, row.quantity, row.unit);
+      console.log(`    ${String(row.name ?? '(no name)').padEnd(38)} ` +
+        `$${row.amount.toFixed(2)}  ${(row.share * 100).toFixed(1)}%  ` +
+        (price === null
+          ? `${row.unit ?? 'no unit'}, not a token unit`
+          : `$${price.toFixed(2)} per 1M tokens`));
+    }
+
+    if (state === 'dominant' && axis === 'line_item') {
+      console.warn(`  repair: price the substitute for ${JSON.stringify(rows[0].name)} ` +
+        'and run the comparison before optimising anything else. Output tokens ' +
+        'are the expensive side on every current model, and a smaller model at ' +
+        'the same volume is usually a multiple cheaper rather than a few percent.');
+    } else if (state === 'dominant' && axis === 'project_id') {
+      console.warn(`  repair: give project ${JSON.stringify(rows[0].name)} its own ` +
+        'spend limit and its own owner. A project this size behind the ' +
+        "organization's single ceiling means one loop in it can stop everybody " +
+        "else's traffic.");
+    } else if (state === 'unattributable') {
+      console.warn(`  repair: this spend belongs to no ${axis}. Move the traffic ` +
+        'onto named projects and keys before treating any per-team number as real.');
+    }
+  }
+
+  console.log(`2 axis/axes ranked, ${found} with a concentrated bill`);
+  process.exitCode = found ? 1 : 0;
+}
+
+// Only run when invoked directly, so importing this module from the test file
+// does not fire main() and fail on the missing key.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => { console.error(err.message); process.exitCode = 2; });
+}
+''',
+"test_intro": "The tests are about the three answers this script can give that are not “one row is huge”. Two rows at thirty-eight percent each is a different finding from one row at seventy-eight, and a bill with no row above half is an answer worth printing rather than silence. The null row gets its own test because the tempting shortcut &mdash; rendering it as “unknown” &mdash; converts a precise statement about unattributable spend into a shrug. And the unit price returns nothing for images, because dividing dollars by pictures produces a number that looks like a token rate and is not.",
+"test_py_file": "test_openai_cost_concentration_audit.py",
+"test_py": '''from openai_cost_concentration_audit import rank, unit_price, verdict
+
+
+def row(name="gpt-5.6-sol, input", amount=0.0, quantity=0.0, unit="tokens"):
+    return {"name": name, "amount": amount, "quantity": quantity, "unit": unit}
+
+
+def result(line_item="gpt-5.6-sol, input", value=0.0, quantity=0.0,
+           unit="tokens", project=None):
+    return {"line_item": line_item, "project_id": project,
+            "amount": {"value": value, "currency": "usd"},
+            "quantity": quantity, "quantity_unit": unit}
+
+
+def bucket(*results):
+    return {"start_time": 0, "end_time": 86400, "results": list(results)}
+
+
+def test_one_row_carrying_most_of_the_bill_is_the_finding():
+    state, detail = verdict([row(amount=7800.0), row(name="b", amount=1500.0),
+                             row(name="c", amount=700.0)])
+    assert state == "dominant"
+    assert "78% of $10000.00" in detail
+    assert "at most 22% of the bill" in detail
+
+
+def test_two_large_rows_are_not_one_dominant_row():
+    state, detail = verdict([row(name="a", amount=4000.0),
+                             row(name="b", amount=3800.0),
+                             row(name="c", amount=2200.0)])
+    assert state == "top-heavy"
+    assert "78% of $10000.00 between them" in detail
+
+
+def test_a_bill_with_no_lever_in_it_is_an_answer():
+    rows = [row(name=str(i), amount=2000.0) for i in range(5)]
+    state, detail = verdict(rows)
+    assert state == "spread"
+    assert "across 5 row(s)" in detail
+    assert verdict([])[0] == "no-spend"
+    assert verdict([row(amount=0.4)])[0] == "no-spend"
+
+
+def test_a_null_top_row_is_unattributable_rather_than_unknown():
+    state, detail = verdict([row(name=None, amount=9000.0),
+                             row(name="b", amount=1000.0)])
+    assert state == "unattributable"
+    assert "no name" in detail
+    assert "Null is not unknown" in detail
+    # Below the threshold it is just another row, not a finding.
+    assert verdict([row(name="a", amount=6000.0),
+                    row(name=None, amount=4000.0)])[0] == "dominant"
+
+
+def test_the_unit_price_is_only_computed_for_token_units():
+    assert unit_price(200.0, 50000000, "tokens") == 4.0
+    assert unit_price(200.0, 50000, "1000_tokens") == 4.0
+    assert unit_price(20.0, 4, "images") is None
+    assert unit_price(20.0, 4, "duration_hours") is None
+    assert unit_price(20.0, 0, "tokens") is None
+    assert unit_price(20.0, 100, None) is None
+    assert unit_price(20.0, 100, "mixed") is None
+
+
+def test_ranking_sums_across_buckets_and_keeps_a_null_name_null():
+    rows = rank([
+        bucket(result(value=60.0, quantity=15000000),
+               result(line_item="gpt-5.6-luna, input", value=10.0, quantity=1000000)),
+        bucket(result(value=30.0, quantity=7500000),
+               result(line_item=None, value=5.0, quantity=0, unit=None)),
+    ], "line_item")
+    assert [r["name"] for r in rows] == ["gpt-5.6-sol, input",
+                                         "gpt-5.6-luna, input", None]
+    assert rows[0]["amount"] == 90.0
+    assert rows[0]["quantity"] == 22500000
+    assert rows[0]["share"] == 0.8571
+    assert rows[2]["name"] is None
+    assert rows[2]["unit"] is None
+
+
+def test_mixed_units_in_one_row_are_reported_as_mixed_not_guessed():
+    rows = rank([bucket(result(value=1.0, quantity=10, unit="tokens"),
+                        result(value=1.0, quantity=2, unit="images"))],
+                "line_item")
+    assert rows[0]["unit"] == "mixed"
+    assert unit_price(rows[0]["amount"], rows[0]["quantity"], rows[0]["unit"]) is None
+''',
+"test_js_file": "openai-cost-concentration-audit.test.mjs",
+"test_js": '''import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { rank, unitPrice, verdict } from './openai-cost-concentration-audit.mjs';
+
+function row({ name = 'gpt-5.6-sol, input', amount = 0, quantity = 0,
+               unit = 'tokens' } = {}) {
+  return { name, amount, quantity, unit };
+}
+
+function result({ lineItem = 'gpt-5.6-sol, input', value = 0, quantity = 0,
+                  unit = 'tokens', project = null } = {}) {
+  return { line_item: lineItem, project_id: project,
+           amount: { value, currency: 'usd' },
+           quantity, quantity_unit: unit };
+}
+
+function bucket(...results) {
+  return { start_time: 0, end_time: 86400, results };
+}
+
+test('one row carrying most of the bill is the finding', () => {
+  const [state, detail] = verdict([row({ amount: 7800 }),
+                                   row({ name: 'b', amount: 1500 }),
+                                   row({ name: 'c', amount: 700 })]);
+  assert.equal(state, 'dominant');
+  assert.match(detail, /78% of \\$10000\\.00/);
+  assert.match(detail, /at most 22% of the bill/);
+});
+
+test('two large rows are not one dominant row', () => {
+  const [state, detail] = verdict([row({ name: 'a', amount: 4000 }),
+                                   row({ name: 'b', amount: 3800 }),
+                                   row({ name: 'c', amount: 2200 })]);
+  assert.equal(state, 'top-heavy');
+  assert.match(detail, /78% of \\$10000\\.00 between them/);
+});
+
+test('a bill with no lever in it is an answer', () => {
+  const rows = [0, 1, 2, 3, 4].map((i) => row({ name: String(i), amount: 2000 }));
+  const [state, detail] = verdict(rows);
+  assert.equal(state, 'spread');
+  assert.match(detail, /across 5 row\\(s\\)/);
+  assert.equal(verdict([])[0], 'no-spend');
+  assert.equal(verdict([row({ amount: 0.4 })])[0], 'no-spend');
+});
+
+test('a null top row is unattributable rather than unknown', () => {
+  const [state, detail] = verdict([row({ name: null, amount: 9000 }),
+                                   row({ name: 'b', amount: 1000 })]);
+  assert.equal(state, 'unattributable');
+  assert.match(detail, /no name/);
+  assert.match(detail, /Null is not unknown/);
+  assert.equal(verdict([row({ name: 'a', amount: 6000 }),
+                        row({ name: null, amount: 4000 })])[0], 'dominant');
+});
+
+test('the unit price is only computed for token units', () => {
+  assert.equal(unitPrice(200, 50000000, 'tokens'), 4.0);
+  assert.equal(unitPrice(200, 50000, '1000_tokens'), 4.0);
+  assert.equal(unitPrice(20, 4, 'images'), null);
+  assert.equal(unitPrice(20, 4, 'duration_hours'), null);
+  assert.equal(unitPrice(20, 0, 'tokens'), null);
+  assert.equal(unitPrice(20, 100, null), null);
+  assert.equal(unitPrice(20, 100, 'mixed'), null);
+});
+
+test('ranking sums across buckets and keeps a null name null', () => {
+  const rows = rank([
+    bucket(result({ value: 60, quantity: 15000000 }),
+           result({ lineItem: 'gpt-5.6-luna, input', value: 10, quantity: 1000000 })),
+    bucket(result({ value: 30, quantity: 7500000 }),
+           result({ lineItem: null, value: 5, quantity: 0, unit: null })),
+  ], 'line_item');
+  assert.deepEqual(rows.map((r) => r.name),
+    ['gpt-5.6-sol, input', 'gpt-5.6-luna, input', null]);
+  assert.equal(rows[0].amount, 90);
+  assert.equal(rows[0].quantity, 22500000);
+  assert.equal(rows[0].share, 0.8571);
+  assert.equal(rows[2].name, null);
+  assert.equal(rows[2].unit, null);
+});
+
+test('mixed units in one row are reported as mixed not guessed', () => {
+  const rows = rank([bucket(result({ value: 1, quantity: 10, unit: 'tokens' }),
+                            result({ value: 1, quantity: 2, unit: 'images' }))],
+                    'line_item');
+  assert.equal(rows[0].unit, 'mixed');
+  assert.equal(unitPrice(rows[0].amount, rows[0].quantity, rows[0].unit), null);
+});
+''',
+"faq": [
+ ("Why can I not just group the cost report by model?",
+  "Because the costs endpoint does not accept it. group_by there takes project_id, line_item and api_key_id only. The model name is embedded in the line_item string alongside the token side, in labels like 'gpt-5.6-sol, input', so a per-model figure is something you parse out of a label rather than something the API gives you. The usage endpoints do accept group_by=model, but they return tokens rather than dollars."),
+ ("Is concentration actually a problem?",
+  "Not by itself. It is the normal shape of an LLM bill and a perfectly healthy organization can have one row at seventy percent. What it changes is where effort goes: it makes the difference between a sprint that moves the bill and one that moves three percent of it. Treat the ranking as a map, not an alarm."),
+ ("What does a null line_item or project_id mean in a grouped response?",
+  "That the report could not attribute that spend on that axis. On the project axis it is spend belonging to no project. It is worth reporting as its own state rather than as unknown, because the repair is different: you are not optimising a model, you are moving traffic onto named projects and keys so the number becomes attributable at all."),
+ ("How reliable is the derived price per million tokens?",
+  "Reliable enough to compare rows and to catch an order-of-magnitude surprise, and not a substitute for the price card. Grouped rows carry quantity and quantity_unit, so the arithmetic is exact for the two token units — but a line item that mixes context lengths, cache reads or discounted batch traffic averages them into one rate. Use it to rank, not to invoice."),
+ ("What does the substitution actually save?",
+  "It depends entirely on the gap between the models, which is why the script prints the arithmetic rather than a promise. Claude Opus 5 is $5 per MTok input and $25 output, Sonnet 5 is $2 and $10, Haiku 4.5 is $1 and $5: a classification or routing workload on the largest model costs five times what it costs on the smallest for identical throughput. The saving is that ratio applied to the row you just ranked first."),
+],
+"related": [REL_SPIKE, REL_FAST, REL_OUTPUT_COST],
+"citations": [CITE_COSTS, CITE_PY_API, CITE_USAGE_COMPLETIONS, CITE_ADMIN],
+},
+
+]

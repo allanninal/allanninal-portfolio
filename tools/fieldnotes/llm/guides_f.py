@@ -123,7 +123,7 @@ GUIDES = [
 "verify": """<p>Re-run a fortnight after the router is moved. The model should have dropped out of the findings entirely, not merely shrunk.</p>
 <pre><code class="language-bash">python3 openai_model_rightsizing_audit.py
 # oversized    gpt-5           412,880 request(s), mean output 19 token(s)
-#   repair: gpt-5-mini answers this shape of question; 14d spend on gpt-5 was $3,411.20
+#   repair: gpt-5-mini answers this shape of question; 30d spend on gpt-5 was $3411.20
 # 6 model(s) checked, 1 finding(s)</code></pre>""",
 "code_intro": "One usage call, one costs call, and one permissions call per project that appeared, all GET. It wants <code>OPENAI_ADMIN_KEY</code>, an organization admin key with read scopes, because a project key is rejected by every <code>/v1/organization</code> endpoint. Five pure functions carry the judgement: which tier a model id belongs to, which cheaper sibling replaces it, how the daily buckets fold, what the folded numbers mean, and whether the project is constrained from reaching the expensive model in the first place.",
 "py_file": "openai_model_rightsizing_audit.py",
@@ -141,6 +141,7 @@ import argparse
 import datetime as dt
 import logging
 import os
+import re
 import sys
 
 import requests
@@ -359,12 +360,25 @@ def spend_by_line_item(session, start_time):
 
 
 def spend_for(model, spend):
-    """Best-effort match of a model id against the cost report's line items."""
+    """Spend on exactly this model, from the cost report's line items. Pure.
+
+    Substring matching is not good enough here. "gpt-5" occurs inside
+    "gpt-5-mini, input tokens" and inside a fine-tune id built on it, and
+    quoting either as the premium model's spend overstates the saving in the
+    one line a reader is actually going to act on. So the match has to sit
+    between boundaries: no letter, digit, dot, dash or colon on either side.
+    """
     name = str(model or "").strip().lower()
+    if not name:
+        return 0.0
+    pattern = re.compile(r"(?<![-a-z0-9.:])" + re.escape(name) + r"(?![-a-z0-9.])")
     total = 0.0
-    for item, amount in spend.items():
-        if name and name in item.lower():
-            total += amount
+    for item, amount in (spend or {}).items():
+        if pattern.search(str(item).lower()):
+            try:
+                total += float(amount)
+            except (TypeError, ValueError):
+                pass
     return total
 
 
@@ -655,11 +669,25 @@ async function spendByLineItem(key, startTime) {
   return out;
 }
 
-function spendFor(model, spend) {
+/**
+ * Spend on exactly this model, from the cost report's line items. Pure.
+ * Substring matching is not good enough: "gpt-5" occurs inside "gpt-5-mini,
+ * input tokens" and inside a fine-tune id built on it, and quoting either as
+ * the premium model's spend overstates the saving in the one line a reader is
+ * going to act on. Model ids only contain letters, digits, dots and dashes, so
+ * the escape is a pair of character classes rather than a backslash dance.
+ */
+export function spendFor(model, spend) {
   const name = String(model ?? '').trim().toLowerCase();
+  if (!name) return 0;
+  const escaped = name.replace(/[.-]/g, (c) => `[${c}]`);
+  const pattern = new RegExp(`(?<![-a-z0-9.:])${escaped}(?![-a-z0-9.])`);
   let total = 0;
-  for (const [item, amount] of Object.entries(spend)) {
-    if (name && item.toLowerCase().includes(name)) total += amount;
+  for (const [item, amount] of Object.entries(spend ?? {})) {
+    if (pattern.test(String(item).toLowerCase())) {
+      const value = Number(amount);
+      if (Number.isFinite(value)) total += value;
+    }
   }
   return total;
 }
@@ -732,7 +760,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 "test_intro": "The load-bearing test is that a high-volume premium model with a mean output of nineteen tokens is a finding, and that the same ratio on the mini sibling is not &mdash; the whole note is that shape and tier have to be read together. The rest hold the near misses apart: long answers on a premium model are the model doing its job, short answers over a huge prompt are a caching problem wearing this problem's signature, and a model too quiet to have a shape gets no verdict at all.",
 "test_py_file": "test_openai_model_rightsizing_audit.py",
 "test_py": '''from openai_model_rightsizing_audit import (fold, permissions_state, sibling,
-                                            tier, verdict)
+                                            spend_for, tier, verdict)
 
 
 def row(requests=10000, output=190000, input_=900000, projects=("proj_a",)):
@@ -818,11 +846,24 @@ def test_permissions_say_whether_the_expensive_model_can_come_back():
                              "gpt-5") == "allowed"
     assert permissions_state({}, "gpt-5") == "unreadable"
     assert permissions_state(None, "gpt-5") == "unreadable"
+
+
+def test_spend_is_matched_to_the_model_and_not_to_its_siblings():
+    # The repair line quotes a dollar figure, so a substring match that swept in
+    # the mini model would overstate exactly the number a reader acts on.
+    spend = {"gpt-5, input tokens": 3000.00,
+             "gpt-5, output tokens": 411.20,
+             "gpt-5-mini, input tokens": 90.00,
+             "ft:gpt-5:acme::x, input tokens": 12.00}
+    assert spend_for("gpt-5", spend) == 3411.20
+    assert spend_for("gpt-5-mini", spend) == 90.00
+    assert spend_for("", spend) == 0.0
+    assert spend_for("gpt-5", {}) == 0.0
 ''',
 "test_js_file": "openai-model-rightsizing-audit.test.mjs",
 "test_js": '''import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fold, permissionsState, sibling, tier, verdict }
+import { fold, permissionsState, sibling, spendFor, tier, verdict }
   from './openai-model-rightsizing-audit.mjs';
 
 /** A folded row shaped like fold() returns them. */
@@ -907,6 +948,19 @@ test('permissions say whether the expensive model can come back', () => {
                'allowed');
   assert.equal(permissionsState({}, 'gpt-5'), 'unreadable');
   assert.equal(permissionsState(null, 'gpt-5'), 'unreadable');
+});
+
+test('spend is matched to the model and not to its siblings', () => {
+  const spend = {
+    'gpt-5, input tokens': 3000.00,
+    'gpt-5, output tokens': 411.20,
+    'gpt-5-mini, input tokens': 90.00,
+    'ft:gpt-5:acme::x, input tokens': 12.00,
+  };
+  assert.equal(spendFor('gpt-5', spend), 3411.20);
+  assert.equal(spendFor('gpt-5-mini', spend), 90.00);
+  assert.equal(spendFor('', spend), 0);
+  assert.equal(spendFor('gpt-5', {}), 0);
 });
 ''',
 "faq": [
@@ -1799,15 +1853,21 @@ def verdict(recon, tolerance=0.02):
         return ("reconciled",
                 "%s, inside the %.1f%% tolerance" % (money, tolerance * 100))
 
-    other = (recon.get("by_family") or {}).get("other", 0.0)
+    # Derived from the uncovered rows rather than from by_family, because
+    # by_family counts both sides and the question here is only about the half
+    # the dashboard cannot render.
+    uncovered_by_family = {}
+    for label, _item, value, _quantity, _unit in recon.get("rows") or []:
+        uncovered_by_family[label] = uncovered_by_family.get(label, 0.0) + value
+
+    other = uncovered_by_family.get("other", 0.0)
     if uncovered > 0 and other / uncovered > 0.5:
         return ("unclassified-line-items",
                 "%s, and most of it is on line items this script could not "
                 "classify. Read the raw line_item strings before assuming which "
                 "endpoint explains them." % money)
 
-    biggest = max((recon.get("by_family") or {}).items(),
-                  key=lambda kv: kv[1] if kv[0] not in ("text",) else -1,
+    biggest = max(uncovered_by_family.items(), key=lambda kv: kv[1],
                   default=("nothing", 0.0))
     return ("gap",
             "%s. Largest uncovered family is %s at $%.2f."
@@ -2033,7 +2093,15 @@ export function verdict(recon, tolerance = 0.02) {
     return ['reconciled', `${money}, inside the ${(tolerance * 100).toFixed(1)}% tolerance`];
   }
 
-  const other = (recon.by_family ?? {}).other ?? 0;
+  // Derived from the uncovered rows rather than from by_family, because
+  // by_family counts both sides and the question here is only about the half
+  // the dashboard cannot render.
+  const uncoveredByFamily = {};
+  for (const [label, , value] of recon.rows ?? []) {
+    uncoveredByFamily[label] = (uncoveredByFamily[label] ?? 0) + value;
+  }
+
+  const other = uncoveredByFamily.other ?? 0;
   if (uncovered > 0 && other / uncovered > 0.5) {
     return ['unclassified-line-items',
       `${money}, and most of it is on line items this script could not ` +
@@ -2042,8 +2110,7 @@ export function verdict(recon, tolerance = 0.02) {
   }
 
   let biggest = ['nothing', 0];
-  for (const [label, value] of Object.entries(recon.by_family ?? {})) {
-    if (label === 'text') continue;
+  for (const [label, value] of Object.entries(uncoveredByFamily)) {
     if (value > biggest[1]) biggest = [label, value];
   }
   return ['gap',
