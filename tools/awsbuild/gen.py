@@ -1,3 +1,10 @@
+"""NOTE: gen.py rewrites article HTML from the specs, which drops the
+feature photos wired in by images.py. After any regeneration, REWIRE
+FEATURE PHOTOS by replaying used.json:
+
+    python3 -c "import sys; sys.path.insert(0,'tools'); from awsbuild import images; \
+      [images.wire(k, v) for k, v in images.load_used().items()]"
+"""
 """Render every spec under specs/ into /build, then rebuild the derived files."""
 import importlib.util
 import pathlib
