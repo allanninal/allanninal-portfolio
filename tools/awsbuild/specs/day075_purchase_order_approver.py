@@ -909,7 +909,7 @@ SPEC["parts"] = [
 {
  "slug": "purchase-order-approver-engineering-reference",
  "title": "Engineering reference: the purchase order approver architecture",
- "nav": "Engineering reference",
+ "nav": "Reference",
  "read": 7, "words": 1050,
  "desc": ("The same system drawn for engineers: service names, region, the Lambda inventory, "
           "IAM scopes, DynamoDB schemas, the SES receipt rule set and the Bedrock model id."),

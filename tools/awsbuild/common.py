@@ -210,7 +210,7 @@ def reference_part(*, slug, name, prefix, lede, outside, inside, note,
     return {
      "slug": f"{slug}-engineering-reference",
      "title": f"Engineering reference: the {name.lower()} architecture",
-     "nav": "Engineering reference",
+     "nav": "Reference",
      "read": 7, "words": 1050,
      "desc": (f"The {name.lower()} drawn for engineers: service names, region, the Lambda "
               f"inventory, IAM scopes, DynamoDB schemas and the Bedrock model id."),
