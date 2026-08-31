@@ -27,15 +27,28 @@ def e(s):
     return html.escape(str(s), quote=True)
 
 
+_TAG = re.compile(r"(<[^>]+>)")
+_ENT = re.compile(r"&(?![a-zA-Z][a-zA-Z0-9]{1,9};|#\d{1,6};|#x[0-9a-fA-F]{1,5};)")
+
+
 def t(s):
-    """Typographic pass: the site writes real punctuation as entities."""
-    s = str(s)
-    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    s = s.replace("--", "&mdash;")
-    s = re.sub(r"(\w)'(\w)", r"\1&rsquo;\2", s)
-    s = re.sub(r'"([^"]*)"', r"&ldquo;\1&rdquo;", s)
-    s = s.replace("'", "&rsquo;")
-    return s
+    """Typographic pass over prose, leaving inline markup alone.
+
+    Specs carry inline <strong>/<em>/<code>, so this splits on tags and only
+    touches the text between them -- otherwise an href would come out with
+    curly quotes and a real ampersand would be double-escaped.
+    """
+    out = []
+    for i, chunk in enumerate(_TAG.split(str(s))):
+        if i % 2:
+            out.append(chunk)
+            continue
+        chunk = _ENT.sub("&amp;", chunk)
+        chunk = chunk.replace("--", "&mdash;")
+        chunk = re.sub(r'"([^"]*)"', r"&ldquo;\1&rdquo;", chunk)
+        chunk = chunk.replace("'", "&rsquo;")
+        out.append(chunk)
+    return "".join(out)
 
 
 def plain(s):
