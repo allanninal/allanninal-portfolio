@@ -18,6 +18,15 @@ CARD = re.compile(
     r'<p class="card__tagline">(.*?)</p>\s*'
     r'<p class="card__meta"><time datetime="(\d{4}-\d{2}-\d{2})">', re.S)
 
+# 20 of the hand-written taglines carried &amp;rsquo; -- a double escape that
+# predates any of this tooling. Undo it on the way in so it cannot propagate.
+DOUBLE = re.compile(r"&amp;(?=[a-zA-Z][a-zA-Z0-9]{1,9};|#\d{1,6};)")
+
+
+def _clean(s):
+    return DOUBLE.sub("&", s.strip())
+
+
 PART = re.compile(r'<h2 class="series-index__title"[^>]*><a href="/build/([a-z0-9-]+)/">(.*?)</a>')
 
 
@@ -30,7 +39,7 @@ def scan():
         if sidx.exists():
             parts = [{"slug": s, "title": ti}
                      for s, ti in PART.findall(sidx.read_text(encoding="utf-8"))]
-        out[slug] = {"slug": slug, "name": name.strip(), "tagline": tagline.strip(),
+        out[slug] = {"slug": slug, "name": _clean(name), "tagline": _clean(tagline),
                      "date": date, "parts": parts}
     return out
 
