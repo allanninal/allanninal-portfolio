@@ -27,8 +27,10 @@ def legend(cats):
 
 def do_figure(m):
     fig = LEGEND_RE.sub("", m.group(0))
-    if "<svg" not in fig:
-        return fig
+    if "<svg" not in fig or 'data-gen="1"' in fig:
+        # generated diagrams already carry the palette and picked their own
+        # icons from the spec; re-deriving them from labels would be a downgrade
+        return m.group(0)
     fig, cats = diagrams.transform_page(fig)
     leg = legend(cats)
     if leg:

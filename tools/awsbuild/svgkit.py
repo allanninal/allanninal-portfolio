@@ -33,8 +33,18 @@ FONT = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'
 _ids = itertools.count(1)
 
 
+# SVG text is character data, not HTML, so an entity written in a spec would
+# render literally. Turn the few the specs use back into characters first.
+_UNENT = {"&mdash;": "\u2014", "&ndash;": "\u2013", "&rsquo;": "\u2019",
+          "&lsquo;": "\u2018", "&ldquo;": "\u201c", "&rdquo;": "\u201d",
+          "&amp;": "&", "&nbsp;": "\u00a0", "&pound;": "\u00a3", "&hellip;": "\u2026"}
+
+
 def esc(s):
-    return html.escape(str(s), quote=False)
+    s = str(s)
+    for k, v in _UNENT.items():
+        s = s.replace(k, v)
+    return html.escape(s, quote=False)
 
 
 class Canvas:
@@ -111,7 +121,7 @@ class Canvas:
         cls = "diagram diagram--wide" if wide else "diagram"
         p = self.pfx
         return (
-            f'<svg class="{cls}" viewBox="0 0 {self.w} {self.h}" '
+            f'<svg class="{cls}" data-gen="1" viewBox="0 0 {self.w} {self.h}" '
             f'xmlns="http://www.w3.org/2000/svg" role="img" '
             f'aria-labelledby="{p}-t {p}-d">'
             f'<title id="{p}-t">{esc(title)}</title>'
