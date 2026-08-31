@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from awsbuild import registry, thumbs  # noqa: E402
+from awsbuild import apply_resources, registry, thumbs  # noqa: E402
 from awsbuild.diagrams import pick_icon  # noqa: E402
 from awsbuild.pages import BASE, fmt_date  # noqa: E402
 
@@ -198,6 +198,8 @@ def main():
     print("sitemap urls:", build_sitemap(reg))
     print("feed entries:", build_feed(reg))
     print("llms.txt series:", build_llms(reg))
+    total, live = apply_resources.build()
+    print(f"resources page: {total} blueprints, {live} with products")
 
 
 if __name__ == "__main__":
