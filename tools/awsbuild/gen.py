@@ -30,12 +30,33 @@ def related_for(reg, specs, slug):
     return pool[::step][:9]
 
 
+def check_slugs(specs, reg):
+    """Two series must never claim the same article slug: /build is flat, so a
+    collision silently overwrites somebody else's post."""
+    owner = {}
+    for e in reg.values():
+        for p in e["parts"]:
+            owner[p["slug"]] = e["slug"]
+    clashes = []
+    for spec in specs:
+        for p in spec["parts"]:
+            prev = owner.get(p["slug"])
+            if prev and prev != spec["slug"]:
+                clashes.append(f'{p["slug"]}: {prev} vs {spec["slug"]}')
+            owner[p["slug"]] = spec["slug"]
+        if len({p["slug"] for p in spec["parts"]}) != len(spec["parts"]):
+            clashes.append(f'{spec["slug"]}: duplicate slug within the series')
+    if clashes:
+        raise SystemExit("slug collisions:\n  " + "\n  ".join(clashes))
+
+
 def main(only=None):
     reg = registry.load()
     specs = [s for s in load_specs() if not only or s["slug"] in only]
     if not specs:
         print("no specs")
         return
+    check_slugs(specs, reg)
     for spec in specs:
         assert len(spec["parts"]) == 7, f"{spec['slug']}: {len(spec['parts'])} parts"
         ob = offer_block(spec["slug"])
