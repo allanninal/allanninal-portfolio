@@ -29,7 +29,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Philippine Agricultural Production', href: '/projects/agriculture-analysis.html' },
   { name: 'Philippine Government Budget & Spending', href: '/projects/budget-analysis.html' },
   { name: 'Philippine Election Results 2022', href: '/projects/election-analysis.html' },
-  { name: 'Philippine Internet & Digital Connectivity', href: '/projects/internet-analysis.html' },
+  { name: 'Philippine Internet 2000-2025', href: '/projects/internet-analysis.html' },
   { name: 'Philippine Stock Market (PSE) Analysis', href: '/projects/stock-market-analysis.html' },
   { name: 'Philippine City Competitiveness Index', href: '/projects/competitiveness-analysis.html' },
   { name: 'Metro Manila Public Transit Network', href: '/projects/transit-analysis.html' },

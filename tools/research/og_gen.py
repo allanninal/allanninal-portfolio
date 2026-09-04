@@ -123,6 +123,10 @@ SPECS = [
          title="Philippine COVID-19 2020&ndash;2026",
          sub="Confirmed deaths against excess deaths, and what the case fatality rate leaves out",
          stats=[("66,864", "Confirmed Deaths"), ("290,774", "Excess Deaths"), ("OWID", "Source")]),
+    dict(file="og-internet.png", icon="&#128225;", pill="Connectivity",
+         title="Philippine Internet 2000&ndash;2025",
+         sub="Speeds up 9.2&times; in six years, and still last in ASEAN for who is online",
+         stats=[("150 Mbps", "Fixed, 2025Q3"), ("6 of 6", "ASEAN Access Rank"), ("WB+Ookla", "Source")]),
 ]
 
 if __name__ == "__main__":
