@@ -111,6 +111,10 @@ SPECS = [
          title="Philippine Rice Prices",
          sub="Twenty-six years from the farm gate to the shelf",
          stats=[("2.9&times;", "Since 2000"), ("21%", "Retail Margin 2020"), ("WFP+DA", "Source")]),
+    dict(file="og-electricity.png", icon="&#9889;", pill="Energy",
+         title="Philippine Electricity",
+         sub="The most coal-dependent grid in Southeast Asia",
+         stats=[("58.7%", "Coal Share 2025"), ("P14.78", "Meralco /kWh"), ("Ember", "Source")]),
 ]
 
 if __name__ == "__main__":
