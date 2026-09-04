@@ -119,6 +119,10 @@ SPECS = [
          title="Philippine Earthquakes 2000&ndash;2026",
          sub="Every M4.5+ event in the USGS catalogue &mdash; and the threshold below which it stops being usable",
          stats=[("9,203", "Events M4.5+"), ("M7.8", "Strongest"), ("USGS", "Source")]),
+    dict(file="og-covid.png", icon="&#129440;", pill="Health Data",
+         title="Philippine COVID-19 2020&ndash;2026",
+         sub="Confirmed deaths against excess deaths, and what the case fatality rate leaves out",
+         stats=[("66,864", "Confirmed Deaths"), ("290,774", "Excess Deaths"), ("OWID", "Source")]),
 ]
 
 if __name__ == "__main__":
