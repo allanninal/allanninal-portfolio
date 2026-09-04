@@ -52,7 +52,14 @@ select round(avg_daily_value_php / 1e9, 2) from ph_pse_annual_indicators where y
 select round(avg_daily_value_php / 1e9, 2) from ph_pse_annual_indicators where year = 2025;
 
 -- fact: pse.foreign.5y
-select round(sum(foreign_net_php) / 1e9, 1) from ph_pse_annual_indicators;
+-- foreign_net_php is a MAGNITUDE; the sign lives in foreign_direction. Summing
+-- the column raw returns +198.8 for five straight years of net selling, and the
+-- verifier only caught it once it learned to read the minus in '-P198.8B'.
+-- checks.sql now asserts the direction vocabulary so a 'net buying' year cannot
+-- be added as a bare positive.
+select round(sum(case when foreign_direction = 'net selling' then -foreign_net_php
+                      else foreign_net_php end) / 1e9, 1)
+from ph_pse_annual_indicators;
 
 -- fact: pse.raised.2021
 select round(capital_raised_php / 1e9, 2) from ph_pse_annual_indicators where year = 2021;

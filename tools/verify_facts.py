@@ -89,7 +89,16 @@ def as_number(text):
     t = text.replace("&nbsp;", " ").replace(" ", " ").strip()
     t = t.replace("&times;", "x").replace("&mdash;", "-")
     m = NUM.search(t)
-    return float(m.group(0).replace(",", "")) if m else None
+    if not m:
+        return None
+    v = float(m.group(0).replace(",", ""))
+    # The minus does not have to touch the digits. "-$54.3B" and "-P2.35" both
+    # read as negative to a human, but NUM only ever sees the digits, because a
+    # currency symbol sits between. Taking those as positive would let exactly
+    # the sign error this tool exists to catch walk straight through.
+    if v > 0 and re.search(r"[-\u2212]\s*[^\d\s]*$", t[: m.start()]):
+        v = -v
+    return v
 
 
 def displayed_precision(text):
@@ -146,8 +155,13 @@ def check(page):
                 print("  MISMATCH %-28s page %r, data %r" % (key, text.strip(), want))
                 bad += 1
             continue
+        # Agreement to the precision the page chose to display, as a tolerance
+        # rather than round-and-compare: Python rounds half to even, so a CSV
+        # value of 5.25 shown as the conventional 5.3 would be reported as a
+        # mismatch against round(5.25, 1) == 5.2. A half-unit band accepts every
+        # correct rounding of the same value and still rejects 229.5 shown as 230.
         p = displayed_precision(text)
-        if round(want, p) != round(shown, p):
+        if abs(want - shown) > 0.5 * 10 ** -p:
             print("  MISMATCH %-28s page shows %s, data says %s" % (key, shown, want))
             bad += 1
     print("  %-46s %d fact(s), %d mismatch(es)" % (page, len(claims), bad))
