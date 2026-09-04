@@ -169,7 +169,7 @@ def check(page):
 
 
 def main():
-    pages = sys.argv[1:] or sorted(glob.glob("projects/*.html"))
+    pages = sys.argv[1:] or sorted(glob.glob("projects/*.html") + glob.glob("blog/*.html"))
     total = checked = 0
     for p in pages:
         r = check(p)

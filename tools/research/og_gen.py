@@ -115,6 +115,10 @@ SPECS = [
          title="Philippine Electricity",
          sub="The most coal-dependent grid in Southeast Asia",
          stats=[("58.7%", "Coal Share 2025"), ("P14.78", "Meralco /kWh"), ("Ember", "Source")]),
+    dict(file="og-earthquake.png", icon="&#127755;", pill="Seismic Data",
+         title="Philippine Earthquakes 2000&ndash;2026",
+         sub="Every M4.5+ event in the USGS catalogue &mdash; and the threshold below which it stops being usable",
+         stats=[("9,203", "Events M4.5+"), ("M7.8", "Strongest"), ("USGS", "Source")]),
 ]
 
 if __name__ == "__main__":
