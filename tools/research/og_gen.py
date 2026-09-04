@@ -107,6 +107,10 @@ SPECS = [
          title="Philippine Foreign Trade",
          sub="A decade of imports, exports, and a deficit that never closes",
          stats=[("$200.9B", "Total Trade"), ("53.4%", "Electronics"), ("WITS", "Source")]),
+    dict(file="og-rice-prices.png", icon="&#127823;", pill="Food Prices",
+         title="Philippine Rice Prices",
+         sub="Twenty-six years from the farm gate to the shelf",
+         stats=[("2.9&times;", "Since 2000"), ("21%", "Retail Margin 2020"), ("WFP+DA", "Source")]),
 ]
 
 if __name__ == "__main__":
