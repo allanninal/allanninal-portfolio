@@ -1,0 +1,53 @@
+# Data pipeline. Scripts were previously run by hand from memory; this file is
+# the record of what produces what, and it refuses to build a page from data
+# that has not passed its checks.
+#
+# Setup once:   make venv
+# Everything:   make check
+
+PY      := .venv/bin/python
+PROJECTS := $(sort $(dir $(wildcard data/*/checks.sql)))
+
+.PHONY: help venv check lint clean-cache
+help:
+	@echo "make venv      create .venv and install the four tools"
+	@echo "make check     run every project's checks.sql (non-zero exit on error)"
+	@echo "make lint      static ReDoS scan over all build scripts"
+	@echo "make rice      rebuild the rice panel, then check it"
+	@echo "make pse       rebuild the PSE datasets, then check them"
+
+venv:
+	uv venv .venv
+	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
+
+# --- validation -------------------------------------------------------------
+check:
+	@$(PY) data/_lib/check.py
+
+lint:
+	@.venv/bin/regexploit-py $$(find data tools -name '*.py') || true
+
+# --- rice -------------------------------------------------------------------
+RICE     := data/ph-food-prices/ph_rice_prices_daily.csv
+RICE_COV := data/ph-food-prices/ph_rice_prices_coverage.csv
+
+$(RICE) $(RICE_COV): data/ph-food-prices/_build/fetch_bantay_presyo.py
+	$(PY) $<
+
+data/ph-food-prices/ph_rice_annual.csv: $(RICE) data/ph-food-prices/_build/build_series.py
+	$(PY) data/_lib/check.py data/ph-food-prices
+	$(PY) data/ph-food-prices/_build/build_series.py
+
+rice: data/ph-food-prices/ph_rice_annual.csv
+
+# --- PSE --------------------------------------------------------------------
+PSE := data/ph-pse/ph_psei_annual.csv
+
+$(PSE): data/ph-pse/_build/fetch_pse.py
+	$(PY) $<
+
+pse: $(PSE)
+	$(PY) data/_lib/check.py data/ph-pse
+
+clean-cache:
+	find data -name '.cache' -type d -prune -exec rm -rf {} +

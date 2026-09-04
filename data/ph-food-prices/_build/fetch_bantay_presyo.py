@@ -83,6 +83,15 @@ def cells(line):
     return [c.strip() for c in re.split(r"\s{2,}", line.strip()) if c.strip()]
 
 
+# Typos in the DA's own published PDFs. Corrected explicitly rather than by a
+# clever rule, so each one is a decision on the record. Verified against the
+# source document before being added here:
+#   sGlutinous -> Glutinous   (Daily-Price-Index-May-27-2026.pdf prints
+#                              "sGlutinous Rice"; the row above it is the
+#                              imported "Glutinous Rice" at 61.09)
+SOURCE_TYPOS = {"sGlutinous": "Glutinous"}
+
+
 def normalise(name):
     """Fold naming drift so a variety is one series, not two.
 
@@ -94,7 +103,7 @@ def normalise(name):
     n = re.sub(r"^Jasponica/Japonica$", "Japonica/Jasponica", n, flags=re.I)
     n = re.sub(r"^Well[ -]?Milled$", "Well Milled", n, flags=re.I)
     n = re.sub(r"^Regular[ -]?Milled$", "Regular Milled", n, flags=re.I)
-    return n
+    return SOURCE_TYPOS.get(n, n)
 
 
 def parse_rice(text):
