@@ -22,7 +22,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts
+check: facts backlinks
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -58,3 +58,9 @@ pse: $(PSE)
 
 clean-cache:
 	find data -name '.cache' -type d -prune -exec rm -rf {} +
+
+# A project page quotes its blog post's title in the back-link box. Retitling
+# the post leaves that quote stale, below the fold, in prose -- four pages were
+# wrong before this ran in CI.
+backlinks:
+	@$(PY) tools/nav/sync_backlinks.py --check

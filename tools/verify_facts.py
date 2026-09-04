@@ -145,6 +145,15 @@ def check(page):
             continue
         want, shown = rows[0][0], as_number(text)
         if shown is None:
+            # Not every published fact is a number. Region codes, month names and
+            # place names are facts too, and a query that returns one should be
+            # comparable as text rather than rejected for having no digits.
+            if isinstance(want, str):
+                if want.strip() != text.strip():
+                    print("  MISMATCH %-28s page %r, data %r"
+                          % (key, text.strip(), want))
+                    bad += 1
+                continue
             print("  ERROR    %-28s no number in rendered text %r" % (key, text))
             bad += 1
             continue

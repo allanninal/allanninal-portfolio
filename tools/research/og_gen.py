@@ -131,6 +131,10 @@ SPECS = [
          title="Philippine Agriculture 1961&ndash;2024",
          sub="Rice output up 4.9&times; on barely more land &mdash; and still behind the region per hectare",
          stats=[("19.09M t", "Rice, 2024"), ("33%", "Behind Vietnam"), ("FAOSTAT", "Source")]),
+    dict(file="og-election.png", icon="&#128499;&#65039;", pill="Elections",
+         title="The 2022 Philippine Election",
+         sub="The margin, and the two million ballots that named no president",
+         stats=[("82.98%", "Turnout"), ("2,213,371", "Invalid Ballots"), ("Canvass", "Source")]),
 ]
 
 if __name__ == "__main__":
