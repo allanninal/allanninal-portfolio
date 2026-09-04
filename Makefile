@@ -8,10 +8,11 @@
 PY      := .venv/bin/python
 PROJECTS := $(sort $(dir $(wildcard data/*/checks.sql)))
 
-.PHONY: help venv check lint clean-cache
+.PHONY: help venv check facts lint clean-cache
 help:
 	@echo "make venv      create .venv and install the four tools"
 	@echo "make check     run every project's checks.sql (non-zero exit on error)"
+	@echo "make facts     verify every data-fact on every page resolves to a CSV row"
 	@echo "make lint      static ReDoS scan over all build scripts"
 	@echo "make rice      rebuild the rice panel, then check it"
 	@echo "make pse       rebuild the PSE datasets, then check them"
@@ -21,8 +22,14 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check:
+check: facts
 	@$(PY) data/_lib/check.py
+
+# Prose numbers are typed by hand while reading a CSV -- the same process that
+# put a sign error and a phantom all-time high on the PSE page. This makes a
+# figure that does not round-trip to a row impossible to publish.
+facts:
+	@$(PY) tools/verify_facts.py
 
 lint:
 	@.venv/bin/regexploit-py $$(find data tools -name '*.py') || true
