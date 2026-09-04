@@ -127,6 +127,10 @@ SPECS = [
          title="Philippine Internet 2000&ndash;2025",
          sub="Speeds up 9.2&times; in six years, and still last in ASEAN for who is online",
          stats=[("150 Mbps", "Fixed, 2025Q3"), ("6 of 6", "ASEAN Access Rank"), ("WB+Ookla", "Source")]),
+    dict(file="og-agriculture.png", icon="&#127806;", pill="Agriculture",
+         title="Philippine Agriculture 1961&ndash;2024",
+         sub="Rice output up 4.9&times; on barely more land &mdash; and still behind the region per hectare",
+         stats=[("19.09M t", "Rice, 2024"), ("33%", "Behind Vietnam"), ("FAOSTAT", "Source")]),
 ]
 
 if __name__ == "__main__":

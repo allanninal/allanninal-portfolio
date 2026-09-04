@@ -26,7 +26,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Overseas Filipino Workers 2024', href: '/projects/ofw-analysis.html' },
   { name: 'Philippine COVID-19 2020-2026', href: '/projects/covid-analysis.html' },
   { name: 'Philippine Earthquakes 2000-2026', href: '/projects/earthquake-analysis.html' },
-  { name: 'Philippine Agricultural Production', href: '/projects/agriculture-analysis.html' },
+  { name: 'Philippine Agriculture 1961-2024', href: '/projects/agriculture-analysis.html' },
   { name: 'Philippine Government Budget & Spending', href: '/projects/budget-analysis.html' },
   { name: 'Philippine Election Results 2022', href: '/projects/election-analysis.html' },
   { name: 'Philippine Internet 2000-2025', href: '/projects/internet-analysis.html' },
