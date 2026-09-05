@@ -8,12 +8,13 @@
 PY      := .venv/bin/python
 PROJECTS := $(sort $(dir $(wildcard data/*/checks.sql)))
 
-.PHONY: help venv check facts lint clean-cache
+.PHONY: help venv check facts lint scripts render clean-cache
 help:
 	@echo "make venv      create .venv and install the four tools"
 	@echo "make check     run every project's checks.sql (non-zero exit on error)"
 	@echo "make facts     verify every data-fact on every page resolves to a CSV row"
 	@echo "make lint      static ReDoS scan over all build scripts"
+	@echo "make render    load every page in headless Chromium and check it paints"
 	@echo "make rice      rebuild the rice panel, then check it"
 	@echo "make pse       rebuild the PSE datasets, then check them"
 
@@ -22,7 +23,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks sources reveal styling
+check: facts backlinks sources reveal styling scripts
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -84,3 +85,11 @@ reveal:
 # shipped that way after being regenerated with the wrong class vocabulary.
 styling:
 	@$(PY) tools/pages/styling.py
+
+# An older nav injector left <script defer src="/assets/site-nav.js"> open in the
+# middle of the dengue page's chart block. A src script ignores its inline
+# content, so two chart configs never ran and two canvases were blank from
+# publication -- past valid JS, verified facts, balanced tags and parsing
+# JSON-LD. Only a browser could see it, and nothing was looking.
+scripts:
+	@$(PY) tools/pages/scripts.py

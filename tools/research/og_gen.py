@@ -167,6 +167,10 @@ SPECS = [
          title="What 41,544 Households Actually Spend",
          sub="The 2015 FIES microdata, opened &mdash; and Engel&rsquo;s law holding at every step",
          stats=[("41,544", "Households"), ("0.4438", "Gini"), ("FIES 2015", "Source")]),
+    dict(file="og-housing.png", icon="&#127968;", pill="Property &amp; Households",
+         title="The Cheap City Is Not Cheap",
+         sub="1,500 asking prices per square metre, against how households actually live",
+         stats=[("13&times; &rarr; 2.9&times;", "Gap, per m&sup2;"), ("48.5%", "Safe water"), ("39.9 pts", "Stove gap")]),
 ]
 
 if __name__ == "__main__":
