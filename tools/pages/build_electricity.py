@@ -18,7 +18,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import Page, js, r, section, prose_section       # noqa: E402
+from _common import Page, js, r                               # noqa: E402
 
 D = "data/ph-electricity"
 PAGE = "projects/electricity-analysis.html"
@@ -123,7 +123,7 @@ def main():
 '''.format(**F))
 
     S = [
-        section(1, "Three Times The Electricity",
+        p.section(1, "Three Times The Electricity",
                 "Before any share can be read, the denominator has to be visible. The "
                 "Philippines generates roughly three times the electricity it did in "
                 "2000, and every share on this page moves against that.",
@@ -136,7 +136,7 @@ def main():
                   "and a smaller share of a much larger total.".format(
                       r=F["rtwh00"], m=F["rtwhmult"]))],
                 "Total generation by year, TWh", "totalChart"),
-        section(2, "The Share That Went Backwards",
+        p.section(2, "The Share That Went Backwards",
                 "This is the finding the earlier version of this page missed by charting "
                 "only coal. The renewable share did not stall &mdash; it fell, by nearly "
                 "twenty points, from a base that was already largely hydro and "
@@ -151,7 +151,7 @@ def main():
                   "fell because coal absorbed almost all of the demand growth, not "
                   "because renewables shrank.")],
                 "Renewable and fossil share of generation, %", "shareChart"),
-        section(3, "What The Grid Actually Runs On",
+        p.section(3, "What The Grid Actually Runs On",
                 "All {n} fuels Ember tracks, latest year. The composition is unusual for "
                 "the region: geothermal is larger than hydro, and larger than solar and "
                 "wind combined by a wide margin.".format(n=F["nfuel"]),
@@ -166,7 +166,7 @@ def main():
                   "grew fastest elsewhere are still marginal "
                   "here.".format(so=F["solar"], w=F["wind"]))],
                 "Generation mix by fuel, {y}".format(y=last), "mixChart"),
-        section(4, "Against The Region",
+        p.section(4, "Against The Region",
                 "Coal share for the Philippines and its neighbours at {y}. The gap is "
                 "not marginal.".format(y=F["seay"]),
                 [("Philippines", "{seaph}%".format(**F), None,
@@ -179,7 +179,7 @@ def main():
                   "Almost none &mdash; a gas grid, and a reminder that "
                   "\"Southeast Asian\" is not a single energy story.")],
                 "Coal share of generation over time, ASEAN peers", "peerChart"),
-        section(5, "One Distributor's Rate",
+        p.section(5, "One Distributor's Rate",
                 "Meralco's all-in residential rate, for the {f} of {t} months that could "
                 "be retrieved. The advisories are published per month and older ones "
                 "fall off the site, so this is a window rather than a "
@@ -194,7 +194,7 @@ def main():
                   "not interpolate across the {m} that do not.".format(
                       f=F["found"], t=F["total"], m=F["missing"]))],
                 "Meralco all-in residential rate, months retrieved", "meralcoChart"),
-        prose_section(6, "What This Page Does Not Cover",
+        p.prose(6, "What This Page Does Not Cover",
                       "Generation mix and one distributor's residential rate. That is "
                       "less than the topic deserves, and the gaps are specific.",
                       [("Rates outside Meralco",
@@ -214,7 +214,7 @@ def main():
                         "regulatory rate base all sit behind this and none are in these "
                         "CSVs. The page reports what the mix and the rate did, not what "
                         "drove them.")]),
-        prose_section(7, "Method",
+        p.prose(7, "Method",
                       "Two fetchers and one derive step over five CSVs.",
                       [("Ember, not a national source",
                         "Ember compiles national statistics into a comparable series, "

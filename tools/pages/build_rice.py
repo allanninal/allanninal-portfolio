@@ -17,7 +17,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import Page, js, r, section, prose_section       # noqa: E402
+from _common import Page, js, r                               # noqa: E402
 
 D = "data/ph-food-prices"
 PAGE = "projects/rice-prices-analysis.html"
@@ -124,7 +124,7 @@ def main():
 '''.format(**F))
 
     S = [
-        section(1, "Nearly Tripled In A Generation",
+        p.section(1, "Nearly Tripled In A Generation",
                 "Retail rice per kilo, from the WFP market series. The level is the "
                 "part everyone knows; the sections after it are the parts that are not "
                 "in the headline.",
@@ -136,7 +136,7 @@ def main():
                   "In nominal terms over twenty-six years. The page does not claim this "
                   "as a real-terms increase.")],
                 "Retail rice price per kilo, PHP", "trendChart"),
-        section(2, "The Farmer's Share",
+        p.section(2, "The Farmer's Share",
                 "Farmgate, wholesale and retail for the {n} years where all three were "
                 "collected. This is the single most useful thing in the dataset and the "
                 "earlier version of this page did not show it.".format(n=F["nchain"]),
@@ -149,7 +149,7 @@ def main():
                   "Added between farmgate and retail per kilo, on a farmgate price of "
                   "P{f}.".format(f=F["farmgate"]))],
                 "Farmgate, wholesale and retail per kilo, PHP", "chainChart"),
-        section(3, "Where You Buy It",
+        p.section(3, "Where You Buy It",
                 "Mean retail rice by region in {y}, across {m} markets. A national "
                 "average sits in the middle of a spread this wide and describes nobody "
                 "in particular.".format(y=F["ryear"], m=F["markets"]),
@@ -161,7 +161,7 @@ def main():
                   "P{s} per kilo between them, in the same year, for retail rice "
                   "across {n} regions.".format(s=F["rspread"], n=F["nreg"]))],
                 "Mean retail rice price by region, {y}".format(y=F["ryear"]), "regionChart"),
-        section(4, "Which Rice",
+        p.section(4, "Which Rice",
                 "WFP tracks {n} distinct rice commodities. They are not "
                 "interchangeable, and a series that averages across them moves when the "
                 "reporting mix changes rather than when prices do.".format(n=F["nvar"]),
@@ -173,7 +173,7 @@ def main():
                   "Between the dearest and cheapest variety in the same year &mdash; "
                   "wider than the gap between the dearest and cheapest region.")],
                 "Mean price by rice variety over time, PHP per kilo", "varietyChart"),
-        section(5, "The Import Premium Closed",
+        p.section(5, "The Import Premium Closed",
                 "Local rice used to sell above imported. The 2019 tariff law replaced "
                 "import quotas with a duty, and the gap has nearly closed.",
                 [("Local, latest", "P{v}".format(v=r(f(prem[-1]["local_php_kg"]), 2)),
@@ -186,7 +186,7 @@ def main():
                   "rice.premium.gap.latest",
                   "Local over imported. It was several pesos before the tariff law.")],
                 "Local against imported rice, PHP per kilo", "premiumChart"),
-        prose_section(6, "What This Page Does Not Cover",
+        p.prose(6, "What This Page Does Not Cover",
                       "Rice prices, from two sources, at national and regional level. "
                       "The obvious next questions are not answered here.",
                       [("Why the margin is what it is",
@@ -204,7 +204,7 @@ def main():
                         "same markets &mdash; over 200,000 observations. This page is "
                         "only rice; the rest is unexplored rather than excluded on "
                         "principle.")]),
-        prose_section(7, "Method",
+        p.prose(7, "Method",
                       "Two sources, one derive step, seven CSVs.",
                       [("Two price series, kept apart",
                         "WFP market prices run 2000-2026 and DA Bantay Presyo supplies "

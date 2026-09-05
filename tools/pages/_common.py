@@ -32,6 +32,41 @@ def r(x, nd=0):
     return float(d) if nd else int(d)
 
 
+# Two class vocabularies exist across these pages and they are not compatible.
+# The later, generated pages use stat-*/section-number/grid-3/chart-wrapper; the
+# earliest hand-built ones use metric-*/section-desc/insights-grid/chart-card and
+# define none of the former. Emitting the wrong family produces markup the page
+# has no CSS for, which renders as unstyled stacked text -- correct content,
+# broken presentation, and every automated check still passing.
+#
+# So the theme is detected from what the page's own stylesheet defines.
+THEMES = {
+    "modern": dict(
+        hero_desc="hero-description", grid="stats-grid", card="stat-card",
+        value="stat-value", label="stat-label", numbered=True,
+        sec_desc="section-description", cards_grid="grid-3",
+        card_head="h4", card_body="p", chart_wrap=True),
+    "classic": dict(
+        hero_desc="hero-desc", grid="metrics-grid", card="metric-card",
+        value="metric-value", label="metric-label", numbered=False,
+        sec_desc="section-desc", cards_grid="insights-grid",
+        card_head="div class=\"insight-title\"", card_body="p class=\"insight-text\"",
+        chart_wrap=False),
+}
+
+
+def detect_theme(src):
+    """Which class family this page's stylesheet actually defines."""
+    has = lambda c: re.search(r"\." + re.escape(c) + r"\s*[,{ :.]", src) is not None
+    if has("stat-value") and has("grid-3"):
+        return "modern"
+    if has("metric-value") and has("insights-grid"):
+        return "classic"
+    # Default to modern: it is what the generated pages use, and a page that
+    # defines neither is a page nothing has been generated onto yet.
+    return "modern"
+
+
 def section(n, title, desc, cards, chart_title=None, canvas=None, extra=""):
     """One <section> with a numbered header, optional chart, and insight cards.
 
@@ -96,6 +131,105 @@ class Page(object):
     def __init__(self, path):
         self.path = path
         self.src = open(path).read()
+        self.theme = detect_theme(self.src)
+        self.t = THEMES[self.theme]
+
+
+    def retheme(self, html):
+        """Translate the modern class names into this page's vocabulary.
+
+        Generators are written once against one vocabulary; a page that defines
+        the other gets unstyled stacked text otherwise -- content correct,
+        presentation broken, and nothing in the pipeline catches it because the
+        markup is valid either way.
+        """
+        if self.theme == "modern":
+            return html
+        for a, b in (("hero-description", "hero-desc"), ("stats-grid", "metrics-grid"),
+                     ("stat-card", "metric-card"), ("stat-value", "metric-value"),
+                     ("stat-label", "metric-label"),
+                     ("section-description", "section-desc"), ("grid-3", "insights-grid")):
+            html = html.replace('class="%s' % a, 'class="%s' % b)
+            html = html.replace('class="%s"' % a, 'class="%s"' % b)
+        return html
+
+    def section(self, n, title, desc, cards, chart_title=None, canvas=None, extra=""):
+        """Numbered section rendered in this page's own class vocabulary."""
+        t = THEMES[self.theme]
+        head_open = "<" + t["card_head"] + ">"
+        head_close = "</" + t["card_head"].split()[0] + ">"
+        body_open = "<" + t["card_body"] + ">"
+        body_close = "</" + t["card_body"].split()[0] + ">"
+        c = "\n".join(
+            '                    <div class="insight-card">\n'
+            '                        %s%s%s\n'
+            '                        <div class="insight-value"%s>%s</div>\n'
+            '                        %s%s%s\n'
+            '                    </div>'
+            % (head_open, h, head_close,
+               (' data-fact="%s"' % k) if k else "", v,
+               body_open, p, body_close)
+            for h, v, k, p in cards)
+        if canvas and t["chart_wrap"]:
+            cv = ('\n                <div class="chart-container fade-up">\n'
+                  '                    <div class="chart-title"><span>%s</span></div>\n'
+                  '                    <div class="chart-wrapper"><canvas id="%s"></canvas></div>\n'
+                  '                </div>\n' % (chart_title, canvas))
+        elif canvas:
+            cv = ('\n                <div class="chart-grid fade-up">\n'
+                  '                    <div class="chart-card">\n'
+                  '                        <h3 class="chart-title">%s</h3>\n'
+                  '                        <div class="chart-container tall"><canvas id="%s"></canvas></div>\n'
+                  '                    </div>\n'
+                  '                </div>\n' % (chart_title, canvas))
+        else:
+            cv = ""
+        num = ('                    <div class="section-number">%02d</div>\n' % n) \
+            if t["numbered"] else ""
+        return ('        <section class="section fade-up">\n'
+                '            <div class="container">\n'
+                '                <div class="section-header fade-up">\n'
+                '%s'
+                '                    <h2>%s</h2>\n'
+                '                    <p class="%s">%s</p>\n'
+                '                </div>\n'
+                '%s%s\n'
+                '                <div class="%s fade-up">\n'
+                '%s\n'
+                '                </div>\n'
+                '            </div>\n'
+                '        </section>\n'
+                % (num, title, t["sec_desc"], desc, cv, extra, t["cards_grid"], c))
+
+    def prose(self, n, title, desc, cards):
+        """Section of explanatory cards with no figures in them."""
+        t = THEMES[self.theme]
+        head_open = "<" + t["card_head"] + ">"
+        head_close = "</" + t["card_head"].split()[0] + ">"
+        body_open = "<" + t["card_body"] + ">"
+        body_close = "</" + t["card_body"].split()[0] + ">"
+        c = "\n".join(
+            '                    <div class="insight-card">\n'
+            '                        %s%s%s\n'
+            '                        %s%s%s\n'
+            '                    </div>' % (head_open, h, head_close,
+                                            body_open, p, body_close)
+            for h, p in cards)
+        num = ('                    <div class="section-number">%02d</div>\n' % n) \
+            if t["numbered"] else ""
+        return ('        <section class="section fade-up">\n'
+                '            <div class="container">\n'
+                '                <div class="section-header fade-up">\n'
+                '%s'
+                '                    <h2>%s</h2>\n'
+                '                    <p class="%s">%s</p>\n'
+                '                </div>\n\n'
+                '                <div class="%s fade-up">\n'
+                '%s\n'
+                '                </div>\n'
+                '            </div>\n'
+                '        </section>\n'
+                % (num, title, t["sec_desc"], desc, t["cards_grid"], c))
 
     def _at(self, marker, start=0):
         # Tolerant of two things these pages vary in. Indentation: they were
@@ -122,6 +256,7 @@ class Page(object):
         section, and the next call then failed looking for a marker this method
         had just removed. Stop at whichever boundary appears first.
         """
+        html = self.retheme(html)
         i = self._at("<h1>")
         ends = []
         for marker in ('<div class="project-info">', '<section class="tldr-section">',
@@ -136,6 +271,7 @@ class Page(object):
         self.src = self.src[:i] + html + "\n" + self.src[j:]
 
     def tldr(self, html):
+        html = self.retheme(html)
         i = self._at('<span class="tldr-badge">')
         j = self._at("</div>", i + 1)
         self.src = self.src[:i] + html + self.src[j:]
