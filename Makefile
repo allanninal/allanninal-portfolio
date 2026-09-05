@@ -22,7 +22,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks
+check: facts backlinks sources
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -64,3 +64,10 @@ clean-cache:
 # wrong before this ran in CI.
 backlinks:
 	@$(PY) tools/nav/sync_backlinks.py --check
+
+# Citations are declared once per project in data/<project>/sources.csv and
+# rendered onto the page from there. The electricity page's footer once credited
+# the World Food Programme and the DOH because it had been copied from another
+# page, and twenty of twenty-seven pages had no citation line at all.
+sources:
+	@$(PY) tools/pages/sources.py --check

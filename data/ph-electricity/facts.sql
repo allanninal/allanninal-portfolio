@@ -2,19 +2,19 @@
 -- Each query must return exactly one value.
 
 -- fact: el.coal.2005
-select share_pct from ph_generation_mix where year = 2005 and source = 'Coal';
+select share_pct from ph_generation_mix where year = 2005 and fuel = 'Coal';
 
 -- fact: el.coal.2015
-select share_pct from ph_generation_mix where year = 2015 and source = 'Coal';
+select share_pct from ph_generation_mix where year = 2015 and fuel = 'Coal';
 
 -- fact: el.coal.2024
-select share_pct from ph_generation_mix where year = 2024 and source = 'Coal';
+select share_pct from ph_generation_mix where year = 2024 and fuel = 'Coal';
 
 -- fact: el.coal.2025
-select share_pct from ph_generation_mix where year = 2025 and source = 'Coal';
+select share_pct from ph_generation_mix where year = 2025 and fuel = 'Coal';
 
 -- fact: el.solar.2025
-select share_pct from ph_generation_mix where year = 2025 and source = 'Solar';
+select share_pct from ph_generation_mix where year = 2025 and fuel = 'Solar';
 
 -- fact: el.coal.thailand
 select coal_share_pct from sea_coal_share where area = 'Thailand' and year = 2025;

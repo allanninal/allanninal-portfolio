@@ -22,7 +22,7 @@ where t.n = 0;
 
 -- check: generation shares are percentages
 -- level: error
-select year, source, share_pct from ph_generation_mix
+select year, fuel, share_pct from ph_generation_mix
 where share_pct < 0 or share_pct > 100;
 
 -- check: coal share covers the peer set

@@ -84,10 +84,16 @@ class Page(object):
         self.src = open(path).read()
 
     def _at(self, marker, start=0):
-        # Indentation-agnostic: these pages were written at different times and
-        # nest the same blocks at different depths, so an exact-indent index()
-        # silently fails on the next page it is pointed at.
-        m = re.search(r"^[ \t]*" + re.escape(marker), self.src[start:], re.M)
+        # Tolerant of two things these pages vary in. Indentation: they were
+        # written at different times and nest the same blocks at different
+        # depths, so an exact-indent index() silently fails on the next page it
+        # is pointed at. And extra classes: one page has
+        # <div class="project-info fade-up"> where the rest have
+        # <div class="project-info">, which is enough to break an exact match.
+        pat = re.escape(marker)
+        if marker.endswith('">'):
+            pat = re.escape(marker[:-2]) + r'[^"]*">'
+        m = re.search(r"^[ \t]*" + pat, self.src[start:], re.M)
         if not m:
             raise SystemExit("%s: marker not found: %r" % (self.path, marker))
         return start + m.start()
