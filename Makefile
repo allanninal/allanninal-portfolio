@@ -22,7 +22,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks sources
+check: facts backlinks sources reveal
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -71,3 +71,10 @@ backlinks:
 # page, and twenty of twenty-seven pages had no citation line at all.
 sources:
 	@$(PY) tools/pages/sources.py --check
+
+# Two pages shipped with .fade-up { opacity: 0 } and nothing that ever added the
+# .visible class, so parts of them were invisible from publication. Every other
+# check passed the whole time: the markup was there, the facts verified, the tags
+# balanced. Nothing tested what a browser paints.
+reveal:
+	@$(PY) tools/pages/reveal.py --check
