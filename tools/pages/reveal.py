@@ -24,23 +24,43 @@ import os
 import re
 import sys
 
-SNIPPET = """        // Reveal .fade-up sections on scroll. Without this the page's own CSS
-        // leaves every .fade-up element at opacity 0 forever.
-        const revealObserver = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting) entry.target.classList.add('visible');
-            });
-        }, { threshold: 0.05, rootMargin: '0px 0px -40px 0px' });
-        document.querySelectorAll('.fade-up').forEach(el => revealObserver.observe(el));
-        // Anything already on screen at load, in case the observer is late.
-        window.addEventListener('load', () => {
-            document.querySelectorAll('.fade-up').forEach(el => {
-                if (el.getBoundingClientRect().top < window.innerHeight) {
-                    el.classList.add('visible');
-                }
-            });
-        });
+MARK = "<!-- reveal:fade-up -->"
 
+# Its own tag at the end of <body>, not appended to an existing inline script.
+# The first inline <script> on these pages is the analytics tag in <head>, so a
+# snippet placed there runs before the body exists and
+# document.querySelectorAll('.fade-up') matches nothing -- which is exactly the
+# blank page it was meant to fix, with the observer present in the source.
+#
+# Guarded on readyState so it works whether the parser has finished or not, and
+# it reveals whatever is already on screen before observing the rest, so the
+# first viewport is never blank while waiting for a scroll event.
+SNIPPET = MARK + """
+<script>
+(function () {
+  function reveal() {
+    var els = document.querySelectorAll('.fade-up');
+    if (!els.length) return;
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add('visible'); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.02, rootMargin: '0px 0px -32px 0px' });
+    els.forEach(function (el) {
+      if (el.getBoundingClientRect().top < window.innerHeight * 1.25) {
+        el.classList.add('visible');
+      } else {
+        io.observe(el);
+      }
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', reveal);
+  } else {
+    reveal();
+  }
+})();
+</script>
 """
 
 
@@ -53,18 +73,17 @@ def needs_fix(src):
 
 def fix(path, check):
     src = open(path).read()
-    if not needs_fix(src):
+    if MARK in src or not needs_fix(src):
         return False
     if check:
         return True
-    m = re.search(r"^[ \t]*<script>\s*$", src, re.M)
-    if not m:
-        m = re.search(r"^[ \t]*<script>", src, re.M)
-    if not m:
-        raise SystemExit("%s: no inline <script> to insert the observer into" % path)
-    i = m.end()
-    src = src[:i] + "\n" + SNIPPET + src[i:].lstrip("\n")
-    open(path, "w").write(src)
+    # End of <body>, never appended to an existing inline script: the first one
+    # on these pages is the analytics tag in <head>, where this code would run
+    # before the body exists and match nothing.
+    if "</body>" not in src:
+        raise SystemExit("%s: no </body> to insert before" % path)
+    i = src.rindex("</body>")
+    open(path, "w").write(src[:i] + SNIPPET + src[i:])
     return True
 
 
