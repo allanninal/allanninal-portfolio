@@ -14,7 +14,7 @@ help:
 	@echo "make check     run every project's checks.sql (non-zero exit on error)"
 	@echo "make facts     verify every data-fact on every page resolves to a CSV row"
 	@echo "make lint      static ReDoS scan over all build scripts"
-	@echo "make render    load every page in headless Chromium and check it paints"
+	@echo "make render    load every page in headless Chromium and check it paints (needs a server on :8971)"
 	@echo "make rice      rebuild the rice panel, then check it"
 	@echo "make pse       rebuild the PSE datasets, then check them"
 
@@ -85,6 +85,14 @@ reveal:
 # shipped that way after being regenerated with the wrong class vocabulary.
 styling:
 	@$(PY) tools/pages/styling.py
+
+# Nothing static can tell you whether a page paints. Two pages shipped visibly
+# broken while every check below passed. This loads each one in headless Chromium,
+# scrolls to fire the reveal observers, then fails on a canvas with no pixels, a
+# .fade-up still transparent, a horizontal page scroll, or a same-origin console
+# error. Needs a server: python3 -m http.server 8971
+render:
+	@node tools/pages/render_check.js $$(ls projects/*.html blog/*.html | sed 's|^|http://localhost:8971/|')
 
 # An older nav injector left <script defer src="/assets/site-nav.js"> open in the
 # middle of the dengue page's chart block. A src script ignores its inline
