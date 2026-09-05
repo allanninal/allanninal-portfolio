@@ -63,15 +63,22 @@ def theme_of(src):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from _common import theme_for
     t = theme_for(src)
+    from _common import only_defined
     return dict(wrap=t["wrap"], grid=t["cards_grid"], desc=t["sec_desc"],
                 head=t["card_head"], body=t["card_body"],
-                sec_head=t["sec_head"], card_wrap=t["card_wrap"])
+                sec_head=t["sec_head"], card_wrap=t["card_wrap"],
+                footer_link=only_defined(src, "footer-link"))
 
 
 def render(project, t=None):
     t = t or dict(wrap="section fade-up", grid="grid-3",
                   desc="section-description", head="h4", body="p",
-                  sec_head="section-header", card_wrap="insight-card")
+                  sec_head="section-header", card_wrap="insight-card",
+                  footer_link="footer-link")
+    # Four pages style .footer-credit and .footer-nav but no .footer-link, so
+    # emitting it unconditionally put an undefined class on their footers -- the
+    # same class-vocabulary trap the section builders already resolve for.
+    link_cls = (' class="%s"' % t["footer_link"]) if t.get("footer_link") else ""
     rows = list(csv.DictReader(open(os.path.join(project, "sources.csv"))))
     if not rows:
         raise SystemExit("%s/sources.csv is empty" % project)
@@ -117,8 +124,8 @@ def render(project, t=None):
         </section>
 ''' % (t["wrap"], hcls, t["desc"], project, t["grid"], "\n".join(cards)),
             ", ".join(
-                '<a href="%s" class="footer-link" target="_blank" rel="noopener">%s</a>'
-                % (r["url"], r["name"]) for r in rows))
+                '<a href="%s"%s target="_blank" rel="noopener">%s</a>'
+                % (r["url"], link_cls, r["name"]) for r in rows))
 
 
 def apply_to(page, check):
@@ -154,14 +161,44 @@ def apply_to(page, check):
             i = src.rfind("\n", 0, k) + 1
         src = src[:i] + block + "\n" + src[i:]
 
-    # Footer line, replaced or inserted after the byline.
+    # ---- footer credit line -------------------------------------------------
+    #
+    # This step matched exactly one footer shape and silently did nothing on the
+    # others, so of 28 project pages the line had landed on 6. Worse, six pages
+    # carried a STALE credit that the tool could not see: the typhoon page still
+    # read "Data Source: NDRRMC/DROMIC via HDX" after its impact figures were
+    # deleted, and the weather page still credited the Kaggle scrape it had stopped
+    # using. That is the exact failure this file exists to prevent.
+    #
+    # Three shapes are in the repo:
+    #   <p class="footer-credit">Data Analysis by Allan Nin~al | Data Source: ...
+    #   <p class="footer-text">Data Analysis by <a ...>Allan Nin~al</a> | ...
+    #   pages with no credit line at all
+    # The name appears as a literal n-tilde on some pages and as an entity on
+    # others, and sometimes inside a link, so the byline is located by the words
+    # around it rather than by matching the name.
     if re.search(r"Sources:\s*<a", src):
         src = re.sub(r"Sources:\s*<a.*?(?=</p>)", "Sources: " + footer, src,
                      count=1, flags=re.S)
     else:
-        m = re.search(r"(Data Analysis by Allan Ni&ntilde;al[^<]*)", src)
+        # Everything from "Data Analysis by" to the end of that element, so an
+        # existing "| Data Source: ..." clause is replaced rather than appended to.
+        m = re.search(r"(Data Analysis by\s*(?:<a[^>]*>)?\s*Allan\s*"
+                      r"(?:Ni&ntilde;al|Ni\u00f1al)\s*(?:</a>)?)(.*?)(</p>|</div>)",
+                      src, re.S)
         if m:
-            src = src[:m.end()] + "\n                Sources: " + footer + src[m.end():]
+            tail = m.group(2)
+            keep = "" if re.search(r"Data Source:|Sources:|API:", tail) else tail
+            src = (src[:m.end(1)] + keep
+                   + "\n                Sources: " + footer + src[m.start(3):])
+        else:
+            # Fourth shape: a footer paragraph that opens straight into
+            # "Data Source:" with no byline at all. Replace the whole clause.
+            m = re.search(r'(<p class="footer-text">\s*)Data Source:.*?(</p>)',
+                          src, re.S)
+            if m:
+                src = (src[:m.end(1)] + "Sources: " + footer + "\n            "
+                       + src[m.start(2):])
 
     if src == before:
         return 0, 0

@@ -9,6 +9,7 @@ export interface WorkItem {
 
 // 25 Philippine open-data deep dives. Links resolve at the deployed site root.
 export const dataProjects: WorkItem[] = [
+  { name: 'What The World Reads: Wikipedia by Country', href: '/projects/global-reading-analysis.html' },
   { name: 'Philippine Household Income: FIES 2015', href: '/projects/fies-analysis.html' },
   { name: 'Philippine Food Prices: 62 Foods, 26 Years', href: '/projects/food-prices-analysis.html' },
   { name: 'Philippine Public Education: 11 Years of DepEd Counts', href: '/projects/education-analysis.html' },

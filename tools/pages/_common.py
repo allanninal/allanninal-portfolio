@@ -591,6 +591,73 @@ class Page(object):
         self._swap(r'"description": "[^"]*"',
                    '"description": %s' % json.dumps(description), "ld desc")
 
+    def relocate(self, old_slug, og_image=None, keywords=None,
+                 dataset_name=None, dataset_desc=None, breadcrumb=None):
+        """Repoint every self-referential field after copying a page as a scaffold.
+
+        head() rewrites the title, description, OG/Twitter text and the JSON-LD
+        headline, which is everything an existing page needs. A page created by
+        copying another one needs more: its canonical URL, og:url, og:image,
+        keywords, JSON-LD @id, dataset block and breadcrumb all still name the page
+        it was copied from.
+
+        Found when the first non-Philippines page was built from a copy of the
+        typhoon page and shipped declaring canonical
+        /projects/typhoon-analysis.html -- which tells search engines the new page
+        is a duplicate of a different article and should not be indexed at all.
+        """
+        new_slug = os.path.splitext(os.path.basename(self.path))[0]
+        if old_slug == new_slug:
+            return
+        before = self.src
+        # Every self-reference: canonical, og:url, JSON-LD @id, breadcrumb item.
+        self.src = self.src.replace("/projects/%s.html" % old_slug,
+                                    "/projects/%s.html" % new_slug)
+        self.src = self.src.replace("/blog/%s.html" % old_slug,
+                                    "/blog/%s.html" % new_slug)
+        if before == self.src:
+            raise SystemExit("%s: relocate found no reference to %s -- is the "
+                             "scaffold slug right?" % (self.path, old_slug))
+        if og_image:
+            self.src = re.sub(r'(og:image" content="[^"]*/)[^"/]+(")',
+                              lambda m: m.group(1) + og_image + m.group(2),
+                              self.src)
+            self.src = re.sub(r'(twitter:image" content="[^"]*/)[^"/]+(")',
+                              lambda m: m.group(1) + og_image + m.group(2),
+                              self.src)
+            self.src = re.sub(r'("image":\s*"[^"]*/)[^"/]+(")',
+                              lambda m: m.group(1) + og_image + m.group(2),
+                              self.src)
+        if keywords:
+            self._swap(r'<meta name="keywords" content="[^"]*">',
+                       '<meta name="keywords" content="%s">' % ", ".join(keywords),
+                       "keywords")
+            self.src = re.sub(r'"keywords":\s*\[[^\]]*\]',
+                              lambda _m: '"keywords": %s' % json.dumps(keywords),
+                              self.src, count=1)
+        if dataset_name:
+            self.src = re.sub(r'("@type":\s*"Dataset",\s*"name":\s*")[^"]*(")',
+                              lambda m: m.group(1) + dataset_name + m.group(2),
+                              self.src, count=1)
+            # Some pages put name before @type; cover that ordering too.
+            self.src = re.sub(r'("name":\s*")[^"]*(",\s*"description":\s*"[^"]*",'
+                              r'\s*"@type":\s*"Dataset")',
+                              lambda m: m.group(1) + dataset_name + m.group(2),
+                              self.src, count=1)
+        if dataset_desc:
+            i = self.src.find('"Dataset"')
+            if i > 0:
+                j = self.src.find('"description"', i)
+                if 0 < j < i + 400:
+                    k = self.src.index('"', self.src.index(":", j) + 1)
+                    e = self.src.index('"', k + 1)
+                    self.src = self.src[:k + 1] + dataset_desc + self.src[e:]
+        if breadcrumb:
+            # The last breadcrumb item is this page.
+            self.src = re.sub(r'("name":\s*")[^"]*("\s*\}\s*\]\s*\})',
+                              lambda m: m.group(1) + breadcrumb + m.group(2),
+                              self.src, count=1)
+
     def faq(self, pairs):
         if '"mainEntity": [' not in self.src:
             return

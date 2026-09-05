@@ -195,6 +195,10 @@ SPECS = [
          title="How Much Warmer? Ask Which Model",
          sub="Two ERA5 reanalyses, 1940&ndash;2024 &mdash; a degree apart, and both warming",
          stats=[("1.09&deg;C", "Model disagreement"), ("1.9&times;", "On the rate"), ("8 of 9", "Records since 2020")]),
+    dict(file="og-reading.png", icon="&#127760;", pill="Global &middot; Wikipedia",
+         title="No Such Thing As What The World Reads",
+         sub="One week, 18 countries, 14 languages &mdash; and almost no overlap",
+         stats=[("2.81%", "Median overlap"), ("0 of 140", "India on Hindi"), ("60 of 91", "Language pairs sharing none")]),
 ]
 
 if __name__ == "__main__":
