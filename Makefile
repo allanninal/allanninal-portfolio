@@ -8,7 +8,7 @@
 PY      := .venv/bin/python
 PROJECTS := $(sort $(dir $(wildcard data/*/checks.sql)))
 
-.PHONY: help venv check facts lint scripts render sitemap tracked clean-cache
+.PHONY: help venv check facts lint scripts render sitemap tracked dates blogorder clean-cache
 help:
 	@echo "make venv      create .venv and install the four tools"
 	@echo "make check     run every project's checks.sql (non-zero exit on error)"
@@ -17,6 +17,8 @@ help:
 	@echo "make render    load every page in headless Chromium and check it paints (needs a server on :8971)"
 	@echo "make sitemap   verify sitemap-pages.xml is current and every sitemap covers its pages"
 	@echo "make tracked   verify every /build series part is committed, not just generated"
+	@echo "make dates     verify dateModified matches the last commit that changed each page"
+	@echo "make blogorder verify the blog index is ordered by each post's datePublished"
 	@echo "make rice      rebuild the rice panel, then check it"
 	@echo "make pse       rebuild the PSE datasets, then check them"
 
@@ -25,7 +27,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks sources reveal styling scripts sitemap tracked
+check: facts backlinks sources reveal styling scripts sitemap tracked dates blogorder
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -97,6 +99,21 @@ styling:
 sitemap:
 	@$(PY) tools/nav/sitemap.py --check
 	@$(PY) tools/nav/sitemap.py --audit
+
+# Eight pages were rewritten from scratch while still declaring dateModified as
+# 2026-01-26, so every machine-readable signal said the content was seven months
+# old and the blog index sorted the day's work into the middle of the page. The
+# date comes from the last commit that touched the file, so running it twice does
+# not keep moving dates.
+dates:
+	@$(PY) tools/pages/dates.py --check
+
+# The blog index was hand-ordered and had drifted: rewritten posts sat at positions
+# 8 to 18, and cebu-logistics (3 May) sat above dengue (5 May). Order now derives
+# from each post's own datePublished, so the index cannot disagree with the
+# articles. Cards move verbatim, so hand-written excerpts survive.
+blogorder:
+	@$(PY) tools/pages/blog_order.py --check
 
 # .gitignore had `!/build/` on line 3 saying /build is published site content, and
 # a bare `build/` on line 60. Last match wins, so every NEW file under build/ was
