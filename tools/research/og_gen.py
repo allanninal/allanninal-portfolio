@@ -199,6 +199,10 @@ SPECS = [
          title="No Such Thing As What The World Reads",
          sub="One week, 18 countries, 14 languages &mdash; and almost no overlap",
          stats=[("2.81%", "Median overlap"), ("0 of 140", "India on Hindi"), ("60 of 91", "Language pairs sharing none")]),
+    dict(file="og-grid.png", icon="&#9889;", pill="Global &middot; Energy",
+         title="An Annual Share Hides Both Its Tails",
+         sub="Eight European grids, every hour of 2025 &mdash; and 3,917 negative prices",
+         stats=[("2.0&times;", "Worst hour vs a year"), ("59 pts", "Germany's spread"), ("4 of 8", "Same worst week")]),
 ]
 
 if __name__ == "__main__":

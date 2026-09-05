@@ -592,7 +592,9 @@ class Page(object):
                    '"description": %s' % json.dumps(description), "ld desc")
 
     def relocate(self, old_slug, og_image=None, keywords=None,
-                 dataset_name=None, dataset_desc=None, breadcrumb=None):
+                 dataset_name=None, dataset_desc=None, breadcrumb=None,
+                 crumb_tail=None, tags=None, info=None, creator=None,
+                 dataset_url=None):
         """Repoint every self-referential field after copying a page as a scaffold.
 
         head() rewrites the title, description, OG/Twitter text and the JSON-LD
@@ -615,9 +617,14 @@ class Page(object):
                                     "/projects/%s.html" % new_slug)
         self.src = self.src.replace("/blog/%s.html" % old_slug,
                                     "/blog/%s.html" % new_slug)
-        if before == self.src:
-            raise SystemExit("%s: relocate found no reference to %s -- is the "
-                             "scaffold slug right?" % (self.path, old_slug))
+        if before == self.src and ("/%s.html" % new_slug) not in self.src:
+            # Nothing replaced AND no self-reference present: the slug is wrong.
+            # Nothing replaced but the new slug already there is simply a rerun,
+            # which must be a no-op -- the first version raised on it and broke
+            # every rebuild after the first.
+            raise SystemExit("%s: relocate found no reference to %s and none to "
+                             "itself -- is the scaffold slug right?"
+                             % (self.path, old_slug))
         if og_image:
             self.src = re.sub(r'(og:image" content="[^"]*/)[^"/]+(")',
                               lambda m: m.group(1) + og_image + m.group(2),
@@ -657,6 +664,68 @@ class Page(object):
             self.src = re.sub(r'("name":\s*")[^"]*("\s*\}\s*\]\s*\})',
                               lambda m: m.group(1) + breadcrumb + m.group(2),
                               self.src, count=1)
+        if creator:
+            self.src = re.sub(r'("creator":\s*\{\s*"@type":\s*"Organization",\s*'
+                              r'"name":\s*")[^"]*(")',
+                              lambda m: m.group(1) + creator + m.group(2),
+                              self.src, count=1)
+        if dataset_url:
+            # The JSON-LD Dataset "url", which is the scaffold's source, not this
+            # page's. Anchored on the Dataset block so it cannot hit another url.
+            i = self.src.find('"Dataset"')
+            if i > 0:
+                m = re.compile(r'("url":\s*")[^"]*(")').search(self.src, i - 400,
+                                                               i + 400)
+                if m:
+                    self.src = (self.src[:m.start()] + m.group(1) + dataset_url
+                                + m.group(2) + self.src[m.end():])
+        if crumb_tail:
+            # The visible breadcrumb's last <span>, which is not the JSON-LD one.
+            self.src = re.sub(r'(<div class="header-breadcrumb">.*?)<span>[^<]*</span>'
+                              r'(\s*</div>)',
+                              lambda m: (m.group(1) + "<span>" + crumb_tail
+                                         + "</span>" + m.group(2)),
+                              self.src, count=1, flags=re.S)
+        if tags is not None:
+            # header-meta pills. The first carries a "featured" class and an emoji
+            # on these pages, so it is rebuilt rather than pattern-matched.
+            m = re.search(r'<div class="header-meta">.*?</div>\s*\n', self.src, re.S)
+            if m:
+                pills = ['                <span class="header-tag%s">%s</span>'
+                         % (" featured" if i == 0 else "", t)
+                         for i, t in enumerate(tags)]
+                self.src = (self.src[:m.start()]
+                            + '<div class="header-meta">\n'
+                            + "\n".join(pills)
+                            + "\n            </div>\n"
+                            + self.src[m.end():])
+        if info:
+            # The project-info cards: [(label, html_value), ...]. Their content is
+            # per-page (sources, coverage, stack) and a scaffolded page inherits the
+            # wrong one, which reads as a factual claim about the new page.
+            #
+            # The block's end is found by counting divs, not by a non-greedy match.
+            # A non-greedy ".*?</div>" stops at the end of the FIRST info-card, so
+            # the first version replaced one card and left the rest -- including a
+            # coverage line still describing the scaffold's data.
+            open_tag = '<div class="project-info">'
+            i = self.src.find(open_tag)
+            if i >= 0:
+                depth, k = 1, i + len(open_tag)
+                for m in re.finditer(r"<div\b|</div>", self.src[i + len(open_tag):]):
+                    depth += 1 if m.group(0) == "<div" else -1
+                    if depth == 0:
+                        k = i + len(open_tag) + m.start()
+                        break
+                cards = []
+                for label, value in info:
+                    cards.append(
+                        '\n                <div class="info-card">'
+                        '\n                    <div class="info-card-label">%s</div>'
+                        '\n                    <div class="info-card-value">%s</div>'
+                        '\n                </div>' % (label, value))
+                self.src = (self.src[:i + len(open_tag)] + "".join(cards)
+                            + "\n            " + self.src[k:])
 
     def faq(self, pairs):
         if '"mainEntity": [' not in self.src:
