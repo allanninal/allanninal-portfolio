@@ -70,7 +70,10 @@ def main():
         mlast=r(max(f(x["rate_php_per_kwh"]) for x in mer), 2),
         seay=seay,
     )
+    # Signed, because facts.sql publishes the signed change. The prose uses the
+    # magnitude, since "fell -19.6 points" reads as a rise.
     F["renewchange"] = r(F["renew"] - F["renew00"], 1)
+    F["renewdrop"] = abs(F["renewchange"])
     F["twhmult"] = r(F["twh"] / F["twh00"], 1)
     F["rtwhmult"] = r(F["rtwh"] / F["rtwh00"], 1)
     F["cov"] = r(100.0 * F["found"] / F["total"], 0)
@@ -113,7 +116,7 @@ def main():
 '''.format(**F))
 
     p.tldr('''                    <span class="tldr-badge">Key Takeaways</span>
-                    <p class="tldr-headline">The renewable share fell <span data-fact="el.renew.change">{renewchange}</span> points in twenty-five years while renewable output rose <span data-fact="el.renew.twh.latest">{rtwh}</span> TWh from <span data-fact="el.renew.twh.2000">{rtwh00}</span>. Both are true. Quoting either one alone gets the country wrong.</p>
+                    <p class="tldr-headline">The renewable share fell by <span data-fact="el.renew.drop">{renewdrop}</span> points in twenty-five years while renewable output rose <span data-fact="el.renew.twh.latest">{rtwh}</span> TWh from <span data-fact="el.renew.twh.2000">{rtwh00}</span>. Both are true. Quoting either one alone gets the country wrong.</p>
                     <ul class="tldr-list">
                         <li>Total generation went from <span data-fact="el.total.2000">{twh00}</span> TWh to <span data-fact="el.total.latest">{twh}</span> TWh &mdash; <span data-fact="el.total.mult">{twhmult}</span> times as much electricity. Almost all of that increase was met with coal.</li>
                         <li>Coal is <span data-fact="el.coal.2025">{coal}%</span> of generation, up from <span data-fact="el.coal.2005">{coal05}%</span> in 2005 and <span data-fact="el.coal.vs.thailand">{vsth}</span> times Thailand's <span data-fact="el.coal.thailand">{th}%</span>.</li>
@@ -145,7 +148,7 @@ def main():
                   "Large hydro and geothermal, before the coal build-out."),
                  ("Renewable share, {year}".format(**F), "{renew}%".format(**F),
                   "el.renew.latest",
-                  "A fall of {c} points.".format(c=F["renewchange"])),
+                  "A fall of {c} points.".format(c=F["renewdrop"])),
                  ("Why both numbers matter", "&mdash;", None,
                   "Renewable generation nearly doubled over the same period. The share "
                   "fell because coal absorbed almost all of the demand growth, not "

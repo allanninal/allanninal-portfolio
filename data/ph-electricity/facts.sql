@@ -122,3 +122,10 @@ select sum(months) from ph_meralco_status;
 -- fact: el.meralco.coverage.pct
 select round(100.0 * (select months from ph_meralco_status where status = 'found')
            / (select sum(months) from ph_meralco_status), 0);
+
+-- fact: el.renew.drop
+-- Magnitude of the fall. facts.sql also publishes the signed change as
+-- el.renew.change; prose reads better with the magnitude ("fell by 19.6 points"
+-- rather than "fell -19.6 points") and the two must not drift apart.
+select abs(round((select renewable_pct from ph_generation_rollup order by year desc limit 1)
+                - (select renewable_pct from ph_generation_rollup where year = 2000), 1));
