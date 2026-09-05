@@ -14,7 +14,7 @@ where commodity not in (
 )
 group by 1;
 
--- check: coverage continuity by year
+-- check: coverage continuity by year (known)
 -- level: warn
 -- A year with source PDFs but no output rows means the parser stopped working
 -- on that layout. Warn, not error, while the infographic era is a known gap.
@@ -25,7 +25,7 @@ left join (select strftime(date, '%Y') as yr, count(*) as n_rows
            from ph_rice_prices_daily group by 1) d using (yr)
 where coalesce(d.n_rows, 0) = 0 and c.n_files > 0;
 
--- check: per-series price envelope
+-- check: per-series price envelope (known)
 -- level: warn
 -- Deliberately per-commodity, not a global band. Basmati legitimately trades
 -- at 215-250 PHP/kg; a global 10-200 check flags 173 good rows and teaches
@@ -132,7 +132,7 @@ where property in ('household spending weights', 'quality or grade adjustment',
                    '2026 in change figures')
   and value <> 0;
 
--- check: most commodities do not span the record
+-- check: most commodities do not span the record (known)
 -- level: warn
 -- Recorded rather than fixed. The date range describes the file; it does not
 -- describe most of the commodities in it, and every rate on the page is scoped
@@ -140,7 +140,7 @@ where property in ('household spending weights', 'quality or grade adjustment',
 select value, note from ph_food_coverage
 where property = 'commodities spanning the whole record';
 
--- check: the 2020 cohort's growth rates cover the inflation spike
+-- check: the 2020 cohort's growth rates cover the inflation spike (known)
 -- level: warn
 -- A five-year rate beginning in 2020 includes 2022-23 and is not comparable
 -- with a twenty-five-year rate. The page groups by cohort instead of ranking

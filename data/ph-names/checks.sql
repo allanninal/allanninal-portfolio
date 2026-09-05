@@ -114,14 +114,14 @@ where property in ('collection date stated in the file', 'time dimension',
                    'methodology published by the source')
   and value <> 0;
 
--- check: the top thousand names do not cover everyone
+-- check: the top thousand names do not cover everyone (known)
 -- level: warn
 -- Recorded so the page cannot quietly present a partial list as a whole
 -- population.
 select value, note from ph_names_coverage
 where property = 'share of the population covered';
 
--- check: single-character entries are recorded rather than silently kept
+-- check: single-character entries are recorded rather than silently kept (known)
 -- level: warn
 -- "H" is in the list with 25,745 bearers. It may be a genuine recorded forename,
 -- an initial standing in for one, or an extraction artefact in the source. The

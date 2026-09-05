@@ -43,7 +43,7 @@ select a.year, a.country, a.rank_in_asean6, b.country, b.rank_in_asean6
 from ph_lpi_ranks a join ph_lpi_ranks b on a.year = b.year
 where a.rank_in_asean6 < b.rank_in_asean6 and a.overall_score < b.overall_score;
 
--- check: the overall score is not a mean of the six dimensions
+-- check: the overall score is not a mean of the six dimensions (known)
 -- level: warn
 -- The LPI overall is a weighted aggregate computed by the World Bank, not the
 -- average of the published sub-scores. This check fires while the two differ,

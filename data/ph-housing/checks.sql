@@ -104,14 +104,14 @@ having count(*) <> 6
 select count(distinct year) from ph_housing_asean
 having count(distinct year) <> 1;
 
--- check: bedroom medians are backed by enough listings to mean anything
+-- check: bedroom medians are backed by enough listings to mean anything (known)
 -- level: warn
 -- Above six bedrooms the sample runs out and the medians start jumping around;
 -- the page shows the counts beside them rather than hiding the thin tail.
 select bedrooms, listings, median_price_php from ph_housing_by_bedroom
 where listings < 20;
 
--- check: coverage is uneven enough to matter
+-- check: coverage is uneven enough to matter (known)
 -- level: warn
 -- Recorded as a warning because it is a permanent property of a portal scrape,
 -- not a defect to fix. It is why nothing here is called a national figure.
@@ -144,7 +144,7 @@ from ph_housing_listings
 where floor_area_sqm > 0 and price_php is not null
   and (price_php / floor_area_sqm < 1000 or price_php / floor_area_sqm > 5000000);
 
--- check: the per-square-metre range is as wide as the page says
+-- check: the per-square-metre range is as wide as the page says (known)
 -- level: warn
 -- Recorded rather than fixed. A 333x spread between the cheapest and dearest
 -- square metre in a 1,500-row scrape is a fact about the inventory, and it is

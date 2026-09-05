@@ -148,14 +148,14 @@ where property in ('private schools', 'learning outcomes',
                    'dropouts or repetition', 'school or class counts')
   and value <> 0;
 
--- check: senior high is more crowded than when it started
+-- check: senior high is more crowded than when it started (known)
 -- level: warn
 -- Recorded because it runs against the direction of every other ratio here: the
 -- new tier opened at 19.9 pupils per teacher and was at 26.83 four years later.
 select academic_year, pupils_per_teacher from ph_education_levels
 where level = 'senior high' and pupils_per_teacher > 25;
 
--- check: at least one country is excluded from the spending ranking
+-- check: at least one country is excluded from the spending ranking (known)
 -- level: warn
 select country, education_spend_pct_gdp, note from ph_education_spend_asean
 where comparable = 'no';

@@ -151,7 +151,7 @@ select property, value from ph_weather_coverage
 where property in ('station observations', 'typhoon tracks', 'urban heat island')
   and value <> 0;
 
--- check: most heat records are recent
+-- check: most heat records are recent (known)
 -- level: warn
 -- Eight of the nine cities set their hottest day in 2020-2024. Recorded rather
 -- than asserted, because it is the kind of finding that should be visible in the
@@ -159,7 +159,7 @@ where property in ('station observations', 'typhoon tracks', 'urban heat island'
 select city, date, value from ph_weather_records
 where record = 'hottest day' and date >= '2020-01-01';
 
--- check: hot-day counts are sensitive to the model, not just to the weather
+-- check: hot-day counts are sensitive to the model, not just to the weather (known)
 -- level: warn
 -- A count of days above 35 C depends on absolute temperature, and the two
 -- reanalyses differ by more than a degree. The direction of the change is robust;

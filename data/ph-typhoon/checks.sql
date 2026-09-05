@@ -106,7 +106,7 @@ where prev is not null and peak_wind_kt > prev;
 select name, peak_wind_kt, peak_wind_kmh from ph_typhoon_strongest
 where abs(peak_wind_kmh - peak_wind_kt * 1.852) > 1;
 
--- check: every storm in the strongest list is category 5
+-- check: every storm in the strongest list is category 5 (known)
 -- level: warn
 -- Recorded rather than asserted: the top of a 45-season list should be, and if it
 -- ever is not that is worth seeing.
@@ -136,7 +136,7 @@ where property in ('deaths, damage or people affected',
                    'PAGASA local storm names')
   and value <> 0;
 
--- check: most of the archive predates usable intensity data
+-- check: most of the archive predates usable intensity data (known)
 -- level: warn
 -- Why the page uses 957 storms rather than 2,905.
 select property, value from ph_typhoon_coverage

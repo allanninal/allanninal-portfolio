@@ -125,20 +125,20 @@ group by 1 having count(*) <> (select max(c) from (
 select property, value from ph_traffic_coverage
 where property in ('injury or fatality counts', 'traffic volume') and value <> 0;
 
--- check: one city dominates the file
+-- check: one city dominates the file (known)
 -- level: warn
 -- Recorded rather than fixed. It is a permanent property of the source and the
 -- reason nothing here is called a ranking of dangerous cities.
 select city, pct_of_all from ph_traffic_by_city where pct_of_all > 40;
 
--- check: not all of Metro Manila is present
+-- check: not all of Metro Manila is present (known)
 -- level: warn
 -- NCR has 17 local government units. Anything short of that is a gap in MMDA's
 -- reporting, and the page states the count rather than implying completeness.
 select count(*) n from ph_traffic_by_city where city <> '(no city given)'
 having count(*) < 17;
 
--- check: free-text incident types include misspellings
+-- check: free-text incident types include misspellings (known)
 -- level: warn
 -- "VEHCICULAR ACCIDENT" appears eight times, so any exact-string count of
 -- accidents is a floor. The families group by substring for this reason.

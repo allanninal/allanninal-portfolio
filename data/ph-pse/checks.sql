@@ -12,7 +12,7 @@ where foreign_direction not in ('net selling', 'net buying');
 -- query that applies foreign_direction will double-negate it.
 select year, foreign_net_php from ph_pse_annual_indicators where foreign_net_php < 0;
 
--- check: the two foreign-flow sources agree on direction
+-- check: the two foreign-flow sources agree on direction (known)
 -- level: warn
 -- ph_pse_annual_indicators comes from PSE's published annual infographics;
 -- ph_pse_foreign_annual is reconstructed from 380 weekly report PDFs. They
