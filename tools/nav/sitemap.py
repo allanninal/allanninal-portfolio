@@ -3,6 +3,7 @@
 
     tools/nav/sitemap.py            rewrite sitemap-pages.xml and the index entry
     tools/nav/sitemap.py --check    exit non-zero if either is out of date
+    tools/nav/sitemap.py --audit    check every sitemap in the index for coverage
 
 This file was hand-maintained and had drifted twice over. Found 2026-09-05:
 
@@ -115,7 +116,59 @@ def index_updated(newest):
     return pat.sub(lambda mm: mm.group(1) + newest + mm.group(3), s, count=1)
 
 
+def audit():
+    """Every sitemap in the index: does it list every indexable page it covers?
+
+    This is the check that would have caught the sitemap-pages.xml gap. Run
+    across all 23 sitemaps it finds only correct exclusions -- 302 template
+    sub-pages carrying robots noindex, and four 404 pages -- so the rule is:
+    a page is expected in its section's sitemap unless it says noindex or is a
+    404. Anything else absent is a page search engines will not be told about.
+    """
+    root = open(INDEX).read()
+    subs = re.findall(r"<loc>" + re.escape(BASE) + r"([^<]+)</loc>", root)
+    bad = 0
+    print("%-24s %6s %6s %7s  %s" % ("section", "pages", "listed", "missing",
+                                     "note"))
+    for sm in subs:
+        if not os.path.exists(sm):
+            print("  %-22s  sitemap file is missing" % sm)
+            bad += 1
+            continue
+        listed = set(re.findall(r"<loc>([^<]+)</loc>", open(sm).read()))
+        d = os.path.dirname(sm)
+        if d == "":
+            files = (sorted(glob.glob("projects/*.html"))
+                     + sorted(glob.glob("blog/*.html")) + ["index.html"])
+        else:
+            files = sorted(glob.glob(d + "/**/*.html", recursive=True))
+        missing, excluded = [], 0
+        for f in files:
+            u = BASE + f
+            alt = BASE + f[:-len("index.html")] if f.endswith("index.html") else None
+            if u in listed or (alt and alt in listed):
+                continue
+            if os.path.basename(f) == "404.html":
+                excluded += 1
+                continue
+            head = open(f, errors="replace").read(6000)
+            if re.search(r'name="robots"[^>]*noindex', head):
+                excluded += 1
+                continue
+            missing.append(f)
+        bad += len(missing)
+        note = "%d excluded (noindex or 404)" % excluded if excluded else ""
+        print("  %-22s %6d %6d %7d  %s"
+              % (d or "(root)", len(files), len(listed), len(missing), note))
+        for f in missing[:6]:
+            print("      missing: %s" % f)
+    print("\n%d indexable page(s) absent from a sitemap" % bad)
+    return bad
+
+
 def main():
+    if "--audit" in sys.argv:
+        sys.exit(1 if audit() else 0)
     check = "--check" in sys.argv
     rows, uncommitted = entries()
     newest = max(d for _, d, _, _ in rows)
