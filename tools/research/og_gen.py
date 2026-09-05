@@ -203,6 +203,10 @@ SPECS = [
          title="An Annual Share Hides Both Its Tails",
          sub="Eight European grids, every hour of 2025 &mdash; and 3,917 negative prices",
          stats=[("2.0&times;", "Worst hour vs a year"), ("59 pts", "Germany's spread"), ("4 of 8", "Same worst week")]),
+    dict(file="og-water.png", icon="&#128167;", pill="Global &middot; Water",
+         title="A Quarter Of The World Has No Safe-Water Number",
+         sub="Two rungs of the WHO/UNICEF ladder, quoted as if they were one",
+         stats=[("2.21B", "People, no estimate"), ("18.4 pts", "Median gap"), ("2075", "Universal, at this rate")]),
 ]
 
 if __name__ == "__main__":
