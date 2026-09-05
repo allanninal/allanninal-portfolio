@@ -33,7 +33,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Philippine Stock Market (PSE) Analysis', href: '/projects/stock-market-analysis.html' },
   { name: 'Philippine City Competitiveness Index', href: '/projects/competitiveness-analysis.html' },
   { name: 'Metro Manila Public Transit Network', href: '/projects/transit-analysis.html' },
-  { name: 'Filipino Social Media Text & Hate Speech', href: '/projects/social-media-analysis.html' },
+  { name: 'Inside a Filipino Hate-Speech Corpus', href: '/projects/social-media-analysis.html' },
 ];
 
 // 10 open-source AI/ML demo apps on GitHub.

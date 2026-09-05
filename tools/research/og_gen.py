@@ -139,6 +139,10 @@ SPECS = [
          title="Philippine Public Finances",
          sub="Debt and its cost are both below their 1990s levels &mdash; and both have turned back up",
          stats=[("56.6%", "Debt / GDP"), ("15.3%", "Spending on Interest"), ("WB+IMF", "Source")]),
+    dict(file="og-social-media.png", icon="&#128172;", pill="NLP / Text",
+         title="Inside a Filipino Hate-Speech Corpus",
+         sub="27,383 labelled posts, opened and measured &mdash; with none of the text reproduced",
+         stats=[("273", "Posts Leaking"), ("79%", "Under 140 Chars"), ("HuggingFace", "Source")]),
 ]
 
 if __name__ == "__main__":
