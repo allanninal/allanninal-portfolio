@@ -143,6 +143,10 @@ SPECS = [
          title="Inside a Filipino Hate-Speech Corpus",
          sub="27,383 labelled posts, opened and measured &mdash; with none of the text reproduced",
          stats=[("273", "Posts Leaking"), ("79%", "Under 140 Chars"), ("HuggingFace", "Source")]),
+    dict(file="og-transit.png", icon="&#128652;", pill="Transit / OSM",
+         title="What Metro Manila&rsquo;s Transit Map Leaves Out",
+         sub="803 bus routes mapped, 26 jeepney routes &mdash; the gap is the finding",
+         stats=[("803", "Bus Routes"), ("26", "Jeepney Routes"), ("OSM", "Source")]),
 ]
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Philippine Internet 2000-2025', href: '/projects/internet-analysis.html' },
   { name: 'Philippine Stock Market (PSE) Analysis', href: '/projects/stock-market-analysis.html' },
   { name: 'Philippine City Competitiveness Index', href: '/projects/competitiveness-analysis.html' },
-  { name: 'Metro Manila Public Transit Network', href: '/projects/transit-analysis.html' },
+  { name: 'What Metro Manila Transit Mapping Misses', href: '/projects/transit-analysis.html' },
   { name: 'Inside a Filipino Hate-Speech Corpus', href: '/projects/social-media-analysis.html' },
 ];
 
