@@ -16,9 +16,11 @@ same datasets, rewritten rather than replaced, so the date they first appeared i
 still true and dateModified is exactly the field that carries a rewrite. Changing
 datePublished would also silently reorder a reader's sense of what came first.
 
-The date comes from the last commit that touched the file, not from today, so
-running this twice does not keep moving dates and a page nobody has edited keeps
-the date it earned.
+The date comes from the last commit that made a *content* change, not from today
+and not from the last commit of any kind. Commits that only rewrote a date field
+are skipped, because otherwise this tool chases its own tail: it writes a date,
+that write is itself a commit, and the next run wants to bump it again. Four blog
+posts did exactly that on the first run after the fix, flipping 09-04 to 09-05.
 """
 import glob
 import json
@@ -31,10 +33,33 @@ PAGES = sorted(glob.glob("projects/*.html")) + sorted(glob.glob("blog/*.html"))
 MOD = re.compile(r'("dateModified"\s*:\s*")([^"]+)(")')
 
 
-def commit_date(path):
-    out = subprocess.run(["git", "log", "-1", "--format=%cs", "--", path],
-                         capture_output=True, text=True).stdout.strip()
-    return out if re.fullmatch(r"\d{4}-\d{2}-\d{2}", out) else None
+# A commit that only rewrote a date field is not a content change. Without this
+# the tool chases its own tail: it writes the last commit date into the page, that
+# write becomes a new commit, and on the next run the page looks stale again.
+# Found immediately -- four blog posts flipped 2026-09-04 -> 2026-09-05 on the run
+# straight after the one that had just set them to 2026-09-04.
+DATEISH = re.compile(r'"date(?:Published|Modified)"|<time[^>]*datetime=')
+
+
+def commit_date(path, depth=12):
+    """Date of the last commit that changed something other than a date field."""
+    log = subprocess.run(["git", "log", "--format=%H %cs", "-n", str(depth),
+                          "--", path], capture_output=True, text=True).stdout.split("\n")
+    for line in log:
+        if not line.strip():
+            continue
+        sha, _, day = line.partition(" ")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day.strip()):
+            continue
+        diff = subprocess.run(["git", "show", "--format=", "--unified=0", sha,
+                               "--", path], capture_output=True, text=True).stdout
+        changed = [l for l in diff.split("\n")
+                   if (l.startswith("+") or l.startswith("-"))
+                   and not l.startswith(("+++", "---"))]
+        if any(not DATEISH.search(l) for l in changed):
+            return day.strip()
+        # else: a dates-only commit, keep walking back
+    return None
 
 
 def main():
