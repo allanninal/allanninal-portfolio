@@ -8,13 +8,14 @@
 PY      := .venv/bin/python
 PROJECTS := $(sort $(dir $(wildcard data/*/checks.sql)))
 
-.PHONY: help venv check facts lint scripts render clean-cache
+.PHONY: help venv check facts lint scripts render sitemap clean-cache
 help:
 	@echo "make venv      create .venv and install the four tools"
 	@echo "make check     run every project's checks.sql (non-zero exit on error)"
 	@echo "make facts     verify every data-fact on every page resolves to a CSV row"
 	@echo "make lint      static ReDoS scan over all build scripts"
 	@echo "make render    load every page in headless Chromium and check it paints (needs a server on :8971)"
+	@echo "make sitemap   verify sitemap-pages.xml covers every page with a current lastmod"
 	@echo "make rice      rebuild the rice panel, then check it"
 	@echo "make pse       rebuild the PSE datasets, then check them"
 
@@ -23,7 +24,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks sources reveal styling scripts
+check: facts backlinks sources reveal styling scripts sitemap
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -85,6 +86,15 @@ reveal:
 # shipped that way after being regenerated with the wrong class vocabulary.
 styling:
 	@$(PY) tools/pages/styling.py
+
+# sitemap-pages.xml was hand-maintained and had drifted twice: eight pages
+# missing entirely (including electricity and rice-prices), and every lastmod
+# reading late August while the pages had been rewritten that day. Neither is
+# visible by looking at the file -- it is well-formed XML with plausible dates.
+# Generated from the filesystem now, with lastmod from the last commit that
+# touched each page rather than from mtime.
+sitemap:
+	@$(PY) tools/nav/sitemap.py --check
 
 # Nothing static can tell you whether a page paints. Two pages shipped visibly
 # broken while every check below passed. This loads each one in headless Chromium,
