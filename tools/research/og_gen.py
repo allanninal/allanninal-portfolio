@@ -175,6 +175,10 @@ SPECS = [
          title="17,312 Tweets About Traffic",
          sub="Half the file is one city &mdash; and lockdown cut the daily rate by 89%",
          stats=[("50.4%", "One city"), ("28&rarr;3", "Per day, ECQ"), ("14 of 17", "LGUs present")]),
+    dict(file="og-food-prices.png", icon="&#129362;", pill="Food Prices",
+         title="Onions Cost More Than Pork",
+         sub="214,215 WFP prices &mdash; and only two foods have the full 26 years",
+         stats=[("&#8369;487.50", "Onions, Jan 2023"), ("+299.9%", "Pork since 2000"), ("+134.2%", "Rice, same years")]),
 ]
 
 if __name__ == "__main__":

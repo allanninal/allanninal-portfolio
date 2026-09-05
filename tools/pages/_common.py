@@ -82,18 +82,45 @@ def detect_theme(src):
     return "modern"
 
 
+def only_defined(src, *candidates):
+    """The first candidate this page defines, or "" if it defines none.
+
+    pick() falls back to its first candidate so that a role always has a name.
+    That is right for roles the layout cannot do without, and wrong for optional
+    wrappers: the food-prices page styles no section-header and no insight-card
+    at all, and emitting them anyway put five undefined classes on it. Where a
+    page has no candidate, the caller omits the attribute instead.
+    """
+    for c in candidates:
+        if defines(src, c):
+            return c
+    return ""
+
+
 def theme_for(src):
-    """Per-role class names resolved against this page's stylesheet."""
+    """Per-role class names resolved against this page's stylesheet.
+
+    Three layout families are in the repo and each has variants, so this resolves
+    role by role rather than picking a family. The candidate lists are ordered
+    most-specific first and were assembled by listing what each page's own
+    stylesheet actually defines; a class emitted without a definition is still
+    valid markup, renders as unstyled stacked text, and passes every check that
+    does not look for exactly this.
+    """
     return dict(
-        hero_desc=pick(src, "hero-description", "hero-desc", "header-subtitle"),
-        grid=pick(src, "stats-grid", "metrics-grid"),
-        card=pick(src, "stat-card", "metric-card"),
-        value=pick(src, "stat-value", "metric-value"),
-        label=pick(src, "stat-label", "metric-label"),
-        sec_desc=pick(src, "section-description", "section-desc"),
+        hero_desc=pick(src, "hero-description", "hero-desc", "hero-subtitle",
+                       "header-subtitle"),
+        grid=pick(src, "stats-grid", "metrics-grid", "metrics-row", "hero-stats"),
+        card=pick(src, "stat-card", "metric-card", "hero-stat"),
+        value=pick(src, "stat-value", "metric-value", "hero-stat-value"),
+        label=pick(src, "stat-label", "metric-label", "hero-stat-label"),
+        sec_desc=pick(src, "section-description", "section-desc", "chart-subtitle"),
         cards_grid=pick(src, "grid-3", "insights-grid", "insight-grid"),
         numbered=defines(src, "section-number"),
         wrap="section fade-up" if defines(src, "section") else "fade-up",
+        # Optional wrappers: omitted where the page styles neither name.
+        sec_head=only_defined(src, "section-header"),
+        card_wrap=only_defined(src, "insight-card", "insight-box"),
         card_head=("h4" if defines(src, "grid-3")
                    else ('div class="insight-title"' if defines(src, "insight-title")
                          else "h4")),
@@ -102,7 +129,12 @@ def theme_for(src):
         # there produced unstyled body copy.
         card_body=('p class="insight-text"' if defines(src, "insight-text") else "p"),
         chart_wrap=defines(src, "chart-wrapper"),
-        insight_value=pick(src, "insight-value", "metric-value", "stat-value"),
+        # Two pages wrap a canvas in .chart-card inside .charts-grid rather than
+        # in .chart-wrapper, and one uses .chart-grid. Resolved, not assumed.
+        chart_outer=only_defined(src, "chart-grid", "charts-grid"),
+        chart_card=only_defined(src, "chart-card"),
+        insight_value=pick(src, "insight-value", "metric-value", "insight-number",
+                           "stat-value"),
     )
 
 
@@ -200,13 +232,14 @@ class Page(object):
         head_close = "</" + t["card_head"].split()[0] + ">"
         body_open = "<" + t["card_body"] + ">"
         body_close = "</" + t["card_body"].split()[0] + ">"
+        cw = (' class="%s"' % t["card_wrap"]) if t["card_wrap"] else ""
         c = "\n".join(
-            '                    <div class="insight-card">\n'
+            '                    <div%s>\n'
             '                        %s%s%s\n'
             '                        <div class="%s"%s>%s</div>\n'
             '                        %s%s%s\n'
             '                    </div>'
-            % (head_open, h, head_close, t["insight_value"],
+            % (cw, head_open, h, head_close, t["insight_value"],
                (' data-fact="%s"' % k) if k else "", v,
                body_open, p, body_close)
             for h, v, k, p in cards)
@@ -215,12 +248,20 @@ class Page(object):
                   '                    <div class="chart-title"><span>%s</span></div>\n'
                   '                    <div class="chart-wrapper"><canvas id="%s"></canvas></div>\n'
                   '                </div>\n' % (chart_title, canvas))
-        elif canvas:
-            cv = ('\n                <div class="chart-grid fade-up">\n'
-                  '                    <div class="chart-card">\n'
+        elif canvas and t["chart_outer"] and t["chart_card"]:
+            cv = ('\n                <div class="%s fade-up">\n'
+                  '                    <div class="%s">\n'
                   '                        <h3 class="chart-title">%s</h3>\n'
                   '                        <div class="chart-container tall"><canvas id="%s"></canvas></div>\n'
                   '                    </div>\n'
+                  '                </div>\n'
+                  % (t["chart_outer"], t["chart_card"], chart_title, canvas))
+        elif canvas:
+            # No grid or card class on this page: the container alone carries the
+            # sizing, and the title is a plain heading.
+            cv = ('\n                <div class="chart-container fade-up">\n'
+                  '                    <h3 class="chart-title">%s</h3>\n'
+                  '                    <canvas id="%s"></canvas>\n'
                   '                </div>\n' % (chart_title, canvas))
         else:
             cv = ""
@@ -229,9 +270,10 @@ class Page(object):
         # class="section" is only styled on the modern pages; emitting it on a
         # classic page adds a class its stylesheet never defines.
         cls = t["wrap"]
+        hcls = ("%s fade-up" % t["sec_head"]) if t["sec_head"] else "fade-up"
         return ('        <section class="%s">\n'
                 '            <div class="container">\n'
-                '                <div class="section-header fade-up">\n'
+                '                <div class="%s">\n'
                 '%s'
                 '                    <h2>%s</h2>\n'
                 '                    <p class="%s">%s</p>\n'
@@ -242,7 +284,7 @@ class Page(object):
                 '                </div>\n'
                 '            </div>\n'
                 '        </section>\n'
-                % (cls, num, title, t["sec_desc"], desc, cv, extra,
+                % (cls, hcls, num, title, t["sec_desc"], desc, cv, extra,
                    t["cards_grid"], c))
 
     def prose(self, n, title, desc, cards):
@@ -252,19 +294,21 @@ class Page(object):
         head_close = "</" + t["card_head"].split()[0] + ">"
         body_open = "<" + t["card_body"] + ">"
         body_close = "</" + t["card_body"].split()[0] + ">"
+        cw = (' class="%s"' % t["card_wrap"]) if t["card_wrap"] else ""
         c = "\n".join(
-            '                    <div class="insight-card">\n'
+            '                    <div%s>\n'
             '                        %s%s%s\n'
             '                        %s%s%s\n'
-            '                    </div>' % (head_open, h, head_close,
+            '                    </div>' % (cw, head_open, h, head_close,
                                             body_open, p, body_close)
             for h, p in cards)
         num = ('                    <div class="section-number">%02d</div>\n' % n) \
             if t["numbered"] else ""
         cls = t["wrap"]
+        hcls = ("%s fade-up" % t["sec_head"]) if t["sec_head"] else "fade-up"
         return ('        <section class="%s">\n'
                 '            <div class="container">\n'
-                '                <div class="section-header fade-up">\n'
+                '                <div class="%s">\n'
                 '%s'
                 '                    <h2>%s</h2>\n'
                 '                    <p class="%s">%s</p>\n'
@@ -274,7 +318,7 @@ class Page(object):
                 '                </div>\n'
                 '            </div>\n'
                 '        </section>\n'
-                % (cls, num, title, t["sec_desc"], desc, t["cards_grid"], c))
+                % (cls, hcls, num, title, t["sec_desc"], desc, t["cards_grid"], c))
 
     def _at(self, marker, start=0):
         # Tolerant of two things these pages vary in. Indentation: they were
@@ -405,20 +449,72 @@ class Page(object):
         new += "".join("        </div>\n" for _ in range(shortfall))
         self.src = self.src[:i] + new + self.src[j:]
 
+    BEGIN = "        // charts:generated -- everything below is rebuilt\n"
+
     def charts(self, blocks):
-        # Indentation varies: the later pages close with "    </script>" and the
-        # earliest ones with "</script>" at column zero, which threw here.
-        m = re.search(r"^[ \t]*new Chart\(", self.src, re.M)
+        """Replace the page's chart configs, idempotently.
+
+        This used to anchor on the first "new Chart(" and replace from there to
+        the closing </script>. Two things went wrong with that, both found by
+        loading the page in a browser rather than by reading it:
+
+          * whatever sat between the script's opening tag and the first chart
+            survived. On the food-prices page that was
+            "document.getElementById('ricePriceChart').getContext('2d')" for a
+            canvas the new sections had removed, so the script threw on line one
+            and *all six* charts stayed blank -- not just the missing one;
+          * it was not idempotent. The comment lines above the first chart were
+            not part of the replaced span, so every rebuild prepended another
+            copy. Five rebuilds left the same comment four times over.
+
+        So the generated region is now fenced by a sentinel. Lines before it are
+        kept only if they are page setup (Chart.defaults and the like) rather than
+        a reference to a canvas, since a stale canvas reference is exactly the
+        fault above.
+        """
+        m = re.search(r"^[ \t]*(?:// charts:generated|new Chart\()", self.src, re.M)
         if not m:
             raise SystemExit("%s: no chart block found" % self.path)
-        i = m.start()
-        e = re.compile(r"^[ \t]*</script>", re.M).search(self.src, i)
+        e = re.compile(r"^[ \t]*</script>", re.M).search(self.src, m.start())
         if not e:
             raise SystemExit("%s: chart block is not closed" % self.path)
-        self.src = self.src[:i] + "\n\n".join(blocks) + "\n" + self.src[e.start():]
+
+        # Walk back to the opening <script> so setup above the first chart is
+        # visible, and drop from it anything that addresses a canvas.
+        o = self.src.rfind("<script>", 0, m.start())
+        head = ""
+        if o >= 0:
+            body_start = self.src.index(">", o) + 1
+            keep = []
+            for line in self.src[body_start:m.start()].split("\n"):
+                if "getElementById" in line or "getContext" in line:
+                    continue
+                if line.strip().startswith("//") and not line.strip("/ ").startswith(
+                        ("Chart.defaults", "Global", "Shared")):
+                    # Comments here belong to a previous generated run or to the
+                    # canvas line just dropped; the generated blocks carry their
+                    # own.
+                    continue
+                keep.append(line)
+            head = "\n".join(keep).rstrip("\n")
+            if head.strip():
+                head += "\n\n"
+            self.src = self.src[:body_start] + head + self.src[m.start():]
+            shift = body_start + len(head) - m.start()
+            m_start = body_start + len(head)
+            e_start = e.start() + shift
+        else:
+            m_start, e_start = m.start(), e.start()
+
+        self.src = (self.src[:m_start] + self.BEGIN
+                    + "\n\n".join(blocks) + "\n" + self.src[e_start:])
 
     def _swap(self, pat, rep, why):
-        self.src, n = re.subn(pat, rep, self.src, count=1)
+        # The replacement goes through a lambda so re never interprets it as a
+        # template. A page whose description contains a peso sign gets it back
+        # from json.dumps as \u20b1, and re.subn reads that \u as a bad escape
+        # and raises -- which is a crash triggered by the page's own content.
+        self.src, n = re.subn(pat, lambda _m: rep, self.src, count=1)
         if not n:
             raise SystemExit("%s: head patch failed (%s)" % (self.path, why))
 

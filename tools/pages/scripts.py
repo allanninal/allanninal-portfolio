@@ -21,7 +21,14 @@ Three faults are checked, all of which make code silently not run:
      dead, and this is what happened above;
   2. unbalanced <script> and </script> counts, which reparents whatever follows;
   3. the same external script included more than once, which is how the split
-     above announced itself (two site-nav.js tags on one page).
+     above announced itself (two site-nav.js tags on one page);
+  4. an unguarded getElementById for an id the page does not contain. On the
+     food-prices page a rebuild removed a canvas but left
+     getElementById('ricePriceChart').getContext('2d') above the chart configs.
+     That threw on the first line of the script, so all six charts on the page
+     stayed blank -- one stale reference taking down every chart after it. Only
+     direct dereferences count: code that stores the result and null-checks it,
+     or uses ?., is correct and is not reported.
 
 Exits non-zero on any of them.
 """
@@ -33,6 +40,14 @@ import sys
 OPEN = re.compile(r"<script\b([^>]*)>", re.I)
 CLOSE = re.compile(r"</script\s*>", re.I)
 SRC = re.compile(r"""\bsrc\s*=\s*["']([^"']+)["']""", re.I)
+# Only an *unguarded* dereference is a fault. getElementById returns null for a
+# missing id, and null on its own is harmless: two template pages in this repo do
+# "const t = getElementById(x); if (!t) return;" and one uses "a?.querySelector",
+# both of which are correct. What throws is reaching straight through the result
+# with a plain dot, which is what the food-prices page did with
+# getElementById('ricePriceChart').getContext('2d').
+BYID = re.compile(r"""getElementById\(\s*['"]([A-Za-z][\w:.-]*)['"]\s*\)\s*\.""")
+HASID = re.compile(r"""\bid\s*=\s*["']([^"']+)["']""", re.I)
 
 
 def spans(src):
@@ -74,6 +89,19 @@ def problems(path):
         if len(lines) > 1:
             bad.append("%s included %d times (lines %s)"
                        % (url, len(lines), ", ".join(str(x) for x in lines)))
+
+    # Ids the document actually has, against the ids the scripts ask for. Only
+    # literal single-argument lookups are checked; anything computed is skipped
+    # rather than guessed at.
+    present = set(HASID.findall(src))
+    for attrs, inner, line in spans(src):
+        if SRC.search(attrs):
+            continue
+        for want in set(BYID.findall(inner)):
+            if want not in present:
+                bad.append('getElementById("%s").<...> dereferences a missing '
+                           "id, which throws and stops every statement after it "
+                           "(script at line %d)" % (want, line))
     return bad
 
 
@@ -87,7 +115,10 @@ def main():
     for path in pages:
         for msg in problems(path):
             bad += 1
-            print("  %-46s %s" % (os.path.basename(path), msg))
+            # The full path, not the basename: the first version printed
+            # "index.html" for faults in five different template directories,
+            # which made them impossible to find.
+            print("  %-52s %s" % (path, msg))
     print("%d page(s) checked, %d script fault(s)" % (len(pages), bad))
     sys.exit(1 if bad else 0)
 

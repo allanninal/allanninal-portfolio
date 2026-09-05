@@ -64,12 +64,14 @@ def theme_of(src):
     from _common import theme_for
     t = theme_for(src)
     return dict(wrap=t["wrap"], grid=t["cards_grid"], desc=t["sec_desc"],
-                head=t["card_head"], body=t["card_body"])
+                head=t["card_head"], body=t["card_body"],
+                sec_head=t["sec_head"], card_wrap=t["card_wrap"])
 
 
 def render(project, t=None):
     t = t or dict(wrap="section fade-up", grid="grid-3",
-                  desc="section-description", head="h4", body="p")
+                  desc="section-description", head="h4", body="p",
+                  sec_head="section-header", card_wrap="insight-card")
     rows = list(csv.DictReader(open(os.path.join(project, "sources.csv"))))
     if not rows:
         raise SystemExit("%s/sources.csv is empty" % project)
@@ -86,18 +88,20 @@ def render(project, t=None):
         note = (r.get("note") or "").strip()
         hc = t["head"].split()[0]
         bc = t["body"].split()[0]
+        cw = (' class="%s"' % t["card_wrap"]) if t["card_wrap"] else ""
         cards.append(
-            '                    <div class="insight-card">\n'
+            '                    <div%s>\n'
             '                        <%s><a href="%s" target="_blank" rel="noopener" '
             'style="color:inherit;text-decoration:underline;'
             'text-underline-offset:3px;text-decoration-color:rgba(148,163,184,0.5);">%s</a>%s</%s>\n'
             '                        <%s>%s%s</%s>\n'
             '                    </div>'
-            % (t["head"], r["url"], r["name"], badge, hc,
+            % (cw, t["head"], r["url"], r["name"], badge, hc,
                t["body"], r["covers"], (" &mdash; " + note) if note else "", bc))
+    hcls = ("%s fade-up" % t["sec_head"]) if t["sec_head"] else "fade-up"
     return ('''        <section class="%s">
             <div class="container">
-                <div class="section-header fade-up">
+                <div class="%s">
                     <h2>Sources &amp; Citations</h2>
                     <p class="%s">
                         Every figure on this page traces to one of these, through a CSV in
@@ -111,7 +115,7 @@ def render(project, t=None):
                 </div>
             </div>
         </section>
-''' % (t["wrap"], t["desc"], project, t["grid"], "\n".join(cards)),
+''' % (t["wrap"], hcls, t["desc"], project, t["grid"], "\n".join(cards)),
             ", ".join(
                 '<a href="%s" class="footer-link" target="_blank" rel="noopener">%s</a>'
                 % (r["url"], r["name"]) for r in rows))
