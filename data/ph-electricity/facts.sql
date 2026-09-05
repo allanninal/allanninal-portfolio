@@ -50,3 +50,75 @@ select count(*) from ph_generation_mix;
 
 -- fact: el.coal.rows
 select count(*) from sea_coal_share;
+
+-- Added when the page was deepened: the original version charted only coal and
+-- omitted the finding below entirely.
+
+-- fact: el.renew.2000
+select renewable_pct from ph_generation_rollup where year = 2000;
+
+-- fact: el.renew.latest
+select renewable_pct from ph_generation_rollup order by year desc limit 1;
+
+-- fact: el.renew.change
+select round((select renewable_pct from ph_generation_rollup order by year desc limit 1)
+           - (select renewable_pct from ph_generation_rollup where year = 2000), 1);
+
+-- fact: el.fossil.latest
+select fossil_pct from ph_generation_rollup order by year desc limit 1;
+
+-- fact: el.total.2000
+select total_twh from ph_generation_rollup where year = 2000;
+
+-- fact: el.total.latest
+select total_twh from ph_generation_rollup order by year desc limit 1;
+
+-- fact: el.total.mult
+select round((select total_twh from ph_generation_rollup order by year desc limit 1)
+           / (select total_twh from ph_generation_rollup where year = 2000), 1);
+
+-- fact: el.renew.twh.2000
+select renewable_twh from ph_generation_rollup where year = 2000;
+
+-- fact: el.renew.twh.latest
+-- Renewable generation nearly doubled in absolute terms while its SHARE fell by
+-- twenty points. Both are true; quoting either alone misleads.
+select renewable_twh from ph_generation_rollup order by year desc limit 1;
+
+-- fact: el.geothermal
+-- Ember files Philippine geothermal under "Other renewables", which is why that
+-- bucket is unusually large here.
+select share_pct from ph_generation_mix
+where fuel = 'Other renewables' and year = (select max(year) from ph_generation_mix);
+
+-- fact: el.solar
+select share_pct from ph_generation_mix
+where fuel = 'Solar' and year = (select max(year) from ph_generation_mix);
+
+-- fact: el.wind
+select share_pct from ph_generation_mix
+where fuel = 'Wind' and year = (select max(year) from ph_generation_mix);
+
+-- fact: el.gas
+select share_pct from ph_generation_mix
+where fuel = 'Gas' and year = (select max(year) from ph_generation_mix);
+
+-- fact: el.hydro
+select share_pct from ph_generation_mix
+where fuel = 'Hydro' and year = (select max(year) from ph_generation_mix);
+
+-- fact: el.fuels
+select count(distinct fuel) from ph_generation_mix;
+
+-- fact: el.meralco.found
+select months from ph_meralco_status where status = 'found';
+
+-- fact: el.meralco.missing
+select months from ph_meralco_status where status = 'not found';
+
+-- fact: el.meralco.total
+select sum(months) from ph_meralco_status;
+
+-- fact: el.meralco.coverage.pct
+select round(100.0 * (select months from ph_meralco_status where status = 'found')
+           / (select sum(months) from ph_meralco_status), 0);

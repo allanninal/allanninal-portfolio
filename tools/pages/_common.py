@@ -9,6 +9,7 @@ common part, extracted once.
 Nothing here knows about any particular project: callers pass content, this
 places it.
 """
+import decimal
 import json
 import os
 import re
@@ -16,6 +17,19 @@ import re
 
 def js(x):
     return json.dumps(x)
+
+
+def r(x, nd=0):
+    """Round half away from zero, the way SQL does.
+
+    Python rounds half to even, so round(2.235, 2) is 2.23 while DuckDB gives
+    2.24. facts.sql rounds in SQL and the page rounds in Python, so any figure
+    landing exactly on a half disagrees between them and verify_facts.py -- quite
+    correctly -- refuses to publish it.
+    """
+    d = decimal.Decimal(str(x)).quantize(decimal.Decimal(1).scaleb(-nd),
+                                         rounding=decimal.ROUND_HALF_UP)
+    return float(d) if nd else int(d)
 
 
 def section(n, title, desc, cards, chart_title=None, canvas=None, extra=""):
@@ -99,8 +113,26 @@ class Page(object):
         return start + m.start()
 
     def hero(self, html):
+        """Replace the <h1> and stats block, stopping at whatever comes next.
+
+        Page order is not consistent. On most pages the project-info block
+        follows the hero and the TL;DR comes after it; on the poverty page the
+        TL;DR comes FIRST and project-info sits below it. Ending the hero at
+        project-info unconditionally therefore deleted that page's whole TL;DR
+        section, and the next call then failed looking for a marker this method
+        had just removed. Stop at whichever boundary appears first.
+        """
         i = self._at("<h1>")
-        j = self._at('<div class="project-info">', i)
+        ends = []
+        for marker in ('<div class="project-info">', '<section class="tldr-section">',
+                       '<span class="tldr-badge">', '<section class="section">'):
+            try:
+                ends.append(self._at(marker, i))
+            except SystemExit:
+                pass
+        if not ends:
+            raise SystemExit("%s: no boundary after <h1>" % self.path)
+        j = min(ends)
         self.src = self.src[:i] + html + "\n" + self.src[j:]
 
     def tldr(self, html):
@@ -109,16 +141,52 @@ class Page(object):
         self.src = self.src[:i] + html + self.src[j:]
 
     def sections(self, blocks):
-        i = self._at('<section class="section">')
-        j = self.src.index("<h2>Related Projects</h2>")
-        j = self.src.rindex("<section", 0, j)
-        j = self.src.rindex("\n", 0, j) + 1
+        """Replace the page's content sections, whatever they are called.
+
+        The pages disagree on markup. The ones generated later use
+        <section class="section">; the earliest hand-built ones use
+        <section class="fade-up"> and have no Related Projects block at all.
+        Anchoring on one class meant this method silently targeted the Sources
+        section on those pages instead of the content.
+
+        So: start at the first <section> after the TL;DR closes, and end at the
+        sources marker if present, else Related Projects, else the footer.
+        """
+        after = 0
+        for marker in ('<section class="tldr-section">', '<span class="tldr-badge">'):
+            try:
+                after = self.src.index("</section>", self._at(marker)) + len("</section>")
+                break
+            except (SystemExit, ValueError):
+                continue
+        i = self.src.index("<section", after)
+        i = self.src.rfind("\n", 0, i) + 1
+
+        j = None
+        for end in ("<!-- sources:start -->", "<h2>Related Projects</h2>"):
+            k = self.src.find(end, i)
+            if k >= 0:
+                j = k if end.startswith("<!--") else self.src.rfind("<section", i, k)
+                j = self.src.rfind("\n", 0, j) + 1
+                break
+        if j is None:
+            k = self.src.rindex("<footer")
+            j = self.src.rfind("\n", 0, k) + 1
+        if j <= i:
+            raise SystemExit("%s: content region resolved to nothing" % self.path)
         self.src = self.src[:i] + "\n".join(blocks) + self.src[j:]
 
     def charts(self, blocks):
-        i = self.src.index("        new Chart(")
-        j = self.src.index("    </script>", i)
-        self.src = self.src[:i] + "\n\n".join(blocks) + "\n" + self.src[j:]
+        # Indentation varies: the later pages close with "    </script>" and the
+        # earliest ones with "</script>" at column zero, which threw here.
+        m = re.search(r"^[ \t]*new Chart\(", self.src, re.M)
+        if not m:
+            raise SystemExit("%s: no chart block found" % self.path)
+        i = m.start()
+        e = re.compile(r"^[ \t]*</script>", re.M).search(self.src, i)
+        if not e:
+            raise SystemExit("%s: chart block is not closed" % self.path)
+        self.src = self.src[:i] + "\n\n".join(blocks) + "\n" + self.src[e.start():]
 
     def _swap(self, pat, rep, why):
         self.src, n = re.subn(pat, rep, self.src, count=1)
@@ -162,9 +230,30 @@ class Page(object):
             '                    "text": %s\n'
             '                }\n'
             '            }' % (json.dumps(q), json.dumps(a)) for q, a in pairs.items())
+        # Find the array's own closing bracket by matching, not by assuming a
+        # layout. Some pages pretty-print the FAQ across many lines and others
+        # keep the whole array on one line; anchoring on "\n        ]" worked
+        # only for the first kind.
         i = self.src.index('"mainEntity": [')
-        j = self.src.index("\n        ]", i)
-        self.src = self.src[:i] + '"mainEntity": [\n' + items + self.src[j:]
+        k = i + len('"mainEntity": [')
+        depth, j = 1, None
+        while k < len(self.src):
+            ch = self.src[k]
+            if ch == '"':                       # skip over strings
+                k += 1
+                while k < len(self.src) and self.src[k] != '"':
+                    k += 2 if self.src[k] == "\\" else 1
+            elif ch in "[{":
+                depth += 1
+            elif ch in "]}":
+                depth -= 1
+                if depth == 0:
+                    j = k
+                    break
+            k += 1
+        if j is None:
+            raise SystemExit("%s: mainEntity array is not closed" % self.path)
+        self.src = self.src[:i] + '"mainEntity": [\n' + items + "\n        " + self.src[j:]
 
     def save(self, nsec, ncharts):
         open(self.path, "w").write(self.src)

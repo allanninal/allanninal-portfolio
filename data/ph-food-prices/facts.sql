@@ -76,3 +76,104 @@ where grade = 'Premium' order by month desc limit 1;
 -- fact: rice.premium.gap.latest
 select local_premium_php_kg from ph_rice_imported_local
 where grade = 'Premium' order by month desc limit 1;
+
+-- Added when the page was deepened: the original charted three series from two
+-- of six CSVs, and left the regional, varietal and margin structure unused.
+
+-- fact: rice.region.high
+select region from ph_rice_by_region order by mean_php_kg desc limit 1;
+
+-- fact: rice.region.high.price
+select mean_php_kg from ph_rice_by_region order by mean_php_kg desc limit 1;
+
+-- fact: rice.region.low
+select region from ph_rice_by_region order by mean_php_kg limit 1;
+
+-- fact: rice.region.low.price
+select mean_php_kg from ph_rice_by_region order by mean_php_kg limit 1;
+
+-- fact: rice.region.spread
+select round((select mean_php_kg from ph_rice_by_region order by mean_php_kg desc limit 1)
+           - (select mean_php_kg from ph_rice_by_region order by mean_php_kg limit 1), 2);
+
+-- fact: rice.region.spread.pct
+select round(100.0 * ((select mean_php_kg from ph_rice_by_region order by mean_php_kg desc limit 1)
+                    / (select mean_php_kg from ph_rice_by_region order by mean_php_kg limit 1) - 1), 1);
+
+-- fact: rice.region.year
+select distinct year from ph_rice_by_region;
+
+-- fact: rice.regions
+select count(*) from ph_rice_by_region;
+
+-- fact: rice.markets
+select markets from ph_rice_market_coverage order by year desc limit 1;
+
+-- fact: rice.markets.regions
+select regions from ph_rice_market_coverage order by year desc limit 1;
+
+-- fact: rice.obs
+select sum(observations) from ph_rice_market_coverage;
+
+-- fact: rice.varieties
+select count(distinct commodity) from ph_rice_by_variety;
+
+-- fact: rice.variety.high
+select commodity from ph_rice_by_variety
+where year = (select max(year) from ph_rice_by_variety) order by mean_php_kg desc limit 1;
+
+-- fact: rice.variety.high.price
+select mean_php_kg from ph_rice_by_variety
+where year = (select max(year) from ph_rice_by_variety) order by mean_php_kg desc limit 1;
+
+-- fact: rice.variety.low
+select commodity from ph_rice_by_variety
+where year = (select max(year) from ph_rice_by_variety) order by mean_php_kg limit 1;
+
+-- fact: rice.variety.low.price
+select mean_php_kg from ph_rice_by_variety
+where year = (select max(year) from ph_rice_by_variety) order by mean_php_kg limit 1;
+
+-- fact: rice.variety.spread
+select round((select mean_php_kg from ph_rice_by_variety
+              where year = (select max(year) from ph_rice_by_variety)
+              order by mean_php_kg desc limit 1)
+           - (select mean_php_kg from ph_rice_by_variety
+              where year = (select max(year) from ph_rice_by_variety)
+              order by mean_php_kg limit 1), 2);
+
+-- fact: rice.farmer.share
+-- What share of the retail price reaches the farmer. The single most useful
+-- number in this dataset, and it was not on the page.
+select farmer_share_pct from ph_rice_margin_chain order by year desc limit 1;
+
+-- fact: rice.farmer.share.year
+select year from ph_rice_margin_chain order by year desc limit 1;
+
+-- fact: rice.farmer.share.min
+select min(farmer_share_pct) from ph_rice_margin_chain;
+
+-- fact: rice.farmer.share.max
+select max(farmer_share_pct) from ph_rice_margin_chain;
+
+-- fact: rice.margin.years
+select count(*) from ph_rice_margin_chain;
+
+-- fact: rice.farmgate.latest
+select farmgate_php_kg from ph_rice_margin_chain order by year desc limit 1;
+
+-- fact: rice.retail.chain
+select retail_php_kg from ph_rice_margin_chain order by year desc limit 1;
+
+-- fact: rice.farm.to.retail
+select farm_to_retail from ph_rice_margin_chain order by year desc limit 1;
+
+-- fact: rice.pdfs.total
+select count(*) from ph_rice_prices_coverage;
+
+-- fact: rice.pdfs.parsed
+select count(*) from ph_rice_prices_coverage where status = 'parsed';
+
+-- fact: rice.pdfs.pct
+select round(100.0 * (select count(*) from ph_rice_prices_coverage where status = 'parsed')
+           / (select count(*) from ph_rice_prices_coverage), 0);

@@ -21,7 +21,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import Page, js, section, prose_section          # noqa: E402
+from _common import Page, js, r, section, prose_section       # noqa: E402
 
 D = "data/ph-poverty"
 PAGE = "projects/poverty-analysis.html"
@@ -44,18 +44,18 @@ def main():
     ph = [r for r in asean if r["country"] == "Philippines"][0]
 
     F = dict(
-        nat=round(f(last("poverty_national_pct")["poverty_national_pct"]), 1),
+        nat=r(f(last("poverty_national_pct")["poverty_national_pct"]), 1),
         year=last("poverty_national_pct")["year"],
-        nat0=round(f(first("poverty_national_pct")["poverty_national_pct"]), 1),
+        nat0=r(f(first("poverty_national_pct")["poverty_national_pct"]), 1),
         nat0y=first("poverty_national_pct")["year"],
-        p365=round(f(last("poverty_365usd_pct")["poverty_365usd_pct"]), 1),
-        p215=round(f(last("poverty_215usd_pct")["poverty_215usd_pct"]), 1),
-        gini=round(f(last("gini")["gini"]), 1),
-        gini0=round(f(first("gini")["gini"]), 1), gini0y=first("gini")["year"],
-        bot=round(f(last("income_share_bottom_20")["income_share_bottom_20"]), 1),
-        top=round(f(last("income_share_top_10")["income_share_top_10"]), 1),
-        vuln=round(f(last("vulnerable_employment_pct")["vulnerable_employment_pct"]), 1),
-        unemp=round(f(last("unemployment_pct")["unemployment_pct"]), 2),
+        p365=r(f(last("poverty_365usd_pct")["poverty_365usd_pct"]), 1),
+        p215=r(f(last("poverty_215usd_pct")["poverty_215usd_pct"]), 1),
+        gini=r(f(last("gini")["gini"]), 1),
+        gini0=r(f(first("gini")["gini"]), 1), gini0y=first("gini")["year"],
+        bot=r(f(last("income_share_bottom_20")["income_share_bottom_20"]), 1),
+        top=r(f(last("income_share_top_10")["income_share_top_10"]), 1),
+        vuln=r(f(last("vulnerable_employment_pct")["vulnerable_employment_pct"]), 1),
+        unemp=r(f(last("unemployment_pct")["unemployment_pct"]), 2),
         gni=int(f(last("gni_per_capita_usd")["gni_per_capita_usd"])),
         nsurv=len(surv),
         span=max(int(r["survey_year"]) for r in surv)
@@ -64,8 +64,8 @@ def main():
         aphgini=f(ph["gini"]),
         arank=sum(1 for r in asean if f(r["gini"]) >= f(ph["gini"])),
     )
-    F["ginichange"] = round(F["gini"] - F["gini0"], 1)
-    F["ratio"] = round(F["top"] / F["bot"], 1)
+    F["ginichange"] = r(F["gini"] - F["gini0"], 1)
+    F["ratio"] = r(F["top"] / F["bot"], 1)
 
     p = Page(PAGE)
     p.hero('''                <h1>Poverty, And The Jobs That Do Not Fix It</h1>
