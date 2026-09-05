@@ -133,8 +133,14 @@ def theme_for(src):
         # in .chart-wrapper, and one uses .chart-grid. Resolved, not assumed.
         chart_outer=only_defined(src, "chart-grid", "charts-grid"),
         chart_card=only_defined(src, "chart-card"),
-        insight_value=pick(src, "insight-value", "metric-value", "insight-number",
-                           "stat-value"),
+        # The figure inside a section card. Resolved or omitted, not defaulted:
+        # the education page styles insight-title and insight-text but no value
+        # class at all, and pick() falling through to its first candidate put an
+        # undefined insight-value on every card it generated. A bare div reads
+        # fine; a class no stylesheet defines does not.
+        insight_value=only_defined(src, "insight-value", "insight-number",
+                                   "metric-value", "stat-value",
+                                   "hero-stat-value"),
     )
 
 
@@ -215,15 +221,28 @@ class Page(object):
         markup is valid either way.
         """
         t = self.t
-        for a, b in (("hero-description", t["hero_desc"]), ("stats-grid", t["grid"]),
-                     ("stat-card", t["card"]), ("stat-value", t["value"]),
-                     ("stat-label", t["label"]),
-                     ("section-description", t["sec_desc"]),
-                     ("grid-3", t["cards_grid"])):
-            if a != b:
-                html = re.sub(r'class="([^"]*)\b' + re.escape(a) + r'\b',
-                              lambda m, b=b: 'class="%s%s' % (m.group(1), b), html)
-        return html
+        MAP = {"hero-description": t["hero_desc"], "stats-grid": t["grid"],
+               "stat-card": t["card"], "stat-value": t["value"],
+               "stat-label": t["label"],
+               "section-description": t["sec_desc"], "grid-3": t["cards_grid"]}
+
+        # Whole class tokens only. The first version matched with \b, and "-" is a
+        # word boundary, so "stat-value" matched inside "hero-stat-value" -- which
+        # a generator emits when the page's own vocabulary is the hero-stat-* one.
+        # The result was class="hero-hero-stat-value": a class no stylesheet
+        # defines, on the page's headline figures, produced by the very code that
+        # exists to prevent that.
+        def swap(m):
+            names = [MAP.get(c, c) for c in m.group(1).split()]
+            # Collapse duplicates a rename can create without reordering.
+            seen, out = set(), []
+            for c in names:
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
+            return 'class="%s"' % " ".join(out)
+
+        return re.sub(r'class="([^"]*)"', swap, html)
 
     def section(self, n, title, desc, cards, chart_title=None, canvas=None, extra=""):
         """Numbered section rendered in this page's own class vocabulary."""
@@ -233,13 +252,14 @@ class Page(object):
         body_open = "<" + t["card_body"] + ">"
         body_close = "</" + t["card_body"].split()[0] + ">"
         cw = (' class="%s"' % t["card_wrap"]) if t["card_wrap"] else ""
+        vc = (' class="%s"' % t["insight_value"]) if t["insight_value"] else ""
         c = "\n".join(
             '                    <div%s>\n'
             '                        %s%s%s\n'
-            '                        <div class="%s"%s>%s</div>\n'
+            '                        <div%s%s>%s</div>\n'
             '                        %s%s%s\n'
             '                    </div>'
-            % (cw, head_open, h, head_close, t["insight_value"],
+            % (cw, head_open, h, head_close, vc,
                (' data-fact="%s"' % k) if k else "", v,
                body_open, p, body_close)
             for h, v, k, p in cards)

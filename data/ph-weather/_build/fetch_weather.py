@@ -73,6 +73,13 @@ CITIES = [
 # without saying which model produced it is quoting a coin flip.
 MODELS = ["era5", "era5_land"]
 
+# The two-model cross-check runs on a named subset rather than on all nine.
+# Open-Meteo's free tier counts an 85-year request as many calls and returns 429
+# well before 27 of them are done; the cross-check exists to show that the two
+# reconstructions disagree, which six cities spanning Luzon to Mindanao
+# establish as well as nine would. Every city still gets the full daily series.
+CROSS = {"Laoag", "Baguio", "Manila", "Legazpi", "Cebu", "Davao"}
+
 SRC = ("Open-Meteo archive API (ECMWF ERA5 / ERA5-Land reanalysis), "
        "https://open-meteo.com/")
 
@@ -222,6 +229,8 @@ def main():
              round(d["precipitation_sum"][wet], 1), "mm of rain", SRC]]
 
         # ---- the two models, on annual mean temperature only ----------------
+        if name not in CROSS:
+            continue
         per_model = {}
         for mo in MODELS:
             md = fetch(lat, lon, ["temperature_2m_mean"], model=mo)

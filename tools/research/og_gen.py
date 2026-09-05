@@ -179,6 +179,10 @@ SPECS = [
          title="Onions Cost More Than Pork",
          sub="214,215 WFP prices &mdash; and only two foods have the full 26 years",
          stats=[("&#8369;487.50", "Onions, Jan 2023"), ("+299.9%", "Pork since 2000"), ("+134.2%", "Rice, same years")]),
+    dict(file="og-education.png", icon="&#127979;", pill="Public Schools",
+         title="A School Tier Built In Four Years",
+         sub="DepEd counts, 11 years &mdash; and the biggest senior high track is not STEM",
+         stats=[("37.8% TVL", "vs 9.0% STEM"), ("38.9&rarr;25.8", "Pupils/teacher"), ("1.62M", "Out of school")]),
 ]
 
 if __name__ == "__main__":
