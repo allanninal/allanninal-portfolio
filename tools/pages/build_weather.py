@@ -553,10 +553,15 @@ def main():
             }
         });''' % (js(DECS),
                   "[" + ", ".join(
-                      "{ label: %s, data: %s, borderColor: '%s', borderWidth: 2, "
+                      "{ label: %s, data: %s, borderColor: '%s', "
+                      # backgroundColor too: Chart.js fills a point from it and
+                      # otherwise falls back to rgba(0,0,0,0.1), which on this dark
+                      # page draws the markers as hollow rings.
+                      "backgroundColor: '%s', borderWidth: 2, "
                       "pointRadius: 3, fill: false, spanGaps: true }"
                       % (js(c),
-                         js([(hd(c, d) or None) for d in DECS]), PAL[i % len(PAL)])
+                         js([(hd(c, d) or None) for d in DECS]),
+                         PAL[i % len(PAL)], PAL[i % len(PAL)])
                       for i, c in enumerate(ALLC)) + "]"),
 
               '''        // 05 decadal means for every city. The 2020s point is five years, which the
@@ -576,12 +581,16 @@ def main():
             }
         });''' % (js(DECS),
                   "[" + ", ".join(
-                      "{ label: %s, data: %s, borderColor: '%s', borderWidth: 2, "
+                      "{ label: %s, data: %s, borderColor: '%s', "
+                      # backgroundColor too: Chart.js fills a point from it and
+                      # otherwise falls back to rgba(0,0,0,0.1), which on this dark
+                      # page draws the markers as hollow rings.
+                      "backgroundColor: '%s', borderWidth: 2, "
                       "pointRadius: 3, fill: false }"
                       % (js(c),
                          js([next((f(x["mean_c"]) for x in dec
                                    if x["city"] == c and x["decade"] == d), None)
-                             for d in DECS]), PAL[i % len(PAL)])
+                             for d in DECS]), PAL[i % len(PAL)], PAL[i % len(PAL)])
                       for i, c in enumerate(ALLC)) + "]"),
 
               '''        // 06 the shape of the year. Baguio's monsoon peak dwarfs everything, which
@@ -600,13 +609,17 @@ def main():
             }
         });''' % (js([MONTH[m] for m in range(1, 13)]),
                   "[" + ", ".join(
-                      "{ label: %s, data: %s, borderColor: '%s', borderWidth: 2, "
+                      "{ label: %s, data: %s, borderColor: '%s', "
+                      # backgroundColor too: Chart.js fills a point from it and
+                      # otherwise falls back to rgba(0,0,0,0.1), which on this dark
+                      # page draws the markers as hollow rings.
+                      "backgroundColor: '%s', borderWidth: 2, "
                       "pointRadius: 2, fill: false }"
                       % (js(c),
                          js([next((f(x["mean_rainfall_mm"]) for x in mon
                                    if x["city"] == c and int(x["month"]) == m),
                                   None) for m in range(1, 13)]),
-                         PAL[i % len(PAL)])
+                         PAL[i % len(PAL)], PAL[i % len(PAL)])
                       for i, c in enumerate(ALLC)) + "]"),
               ]
 

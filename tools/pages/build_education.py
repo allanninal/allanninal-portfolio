@@ -514,9 +514,9 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Enrollees', data: %s, borderColor: '#3b82f6',
+                    { label: 'Enrollees', data: %s, borderColor: '#3b82f6', backgroundColor: '#3b82f6',
                       borderWidth: 3, pointRadius: 3, fill: false, yAxisID: 'y' },
-                    { label: 'Teachers', data: %s, borderColor: '#22c55e',
+                    { label: 'Teachers', data: %s, borderColor: '#22c55e', backgroundColor: '#22c55e',
                       borderWidth: 3, pointRadius: 3, fill: false, yAxisID: 'y1' }
                 ]
             },
@@ -541,7 +541,7 @@ def main():
                     { label: 'Senior high enrollees', data: %s,
                       backgroundColor: '#8b5cf6', yAxisID: 'y' },
                     { type: 'line', label: 'Senior high teachers', data: %s,
-                      borderColor: '#f59e0b', borderWidth: 3, pointRadius: 4,
+                      borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 3, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },
@@ -564,11 +564,11 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Elementary', data: %s, borderColor: '#3b82f6',
+                    { label: 'Elementary', data: %s, borderColor: '#3b82f6', backgroundColor: '#3b82f6',
                       borderWidth: 3, pointRadius: 3, fill: false },
-                    { label: 'Junior high', data: %s, borderColor: '#22c55e',
+                    { label: 'Junior high', data: %s, borderColor: '#22c55e', backgroundColor: '#22c55e',
                       borderWidth: 3, pointRadius: 3, fill: false },
-                    { label: 'Senior high', data: %s, borderColor: '#ef4444',
+                    { label: 'Senior high', data: %s, borderColor: '#ef4444', backgroundColor: '#ef4444',
                       borderWidth: 3, pointRadius: 4, fill: false }
                 ]
             },

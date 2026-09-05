@@ -537,7 +537,7 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Fixed latency (ms)', data: %s, borderColor: '#3b82f6',
+                    { label: 'Fixed latency (ms)', data: %s, borderColor: '#3b82f6', backgroundColor: '#3b82f6',
                       borderWidth: 2, pointRadius: 2, fill: false },
                     { label: 'Mobile latency (ms)', data: %s, borderColor: '#ef4444',
                       backgroundColor: 'rgba(239,68,68,0.12)', borderWidth: 2,

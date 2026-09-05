@@ -568,7 +568,7 @@ def main():
                     { label: 'Incidents', data: %s, backgroundColor: '#3b82f6',
                       yAxisID: 'y' },
                     { type: 'line', label: 'Distinct free-text spellings', data: %s,
-                      borderColor: '#ef4444', borderWidth: 2, pointRadius: 4,
+                      borderColor: '#ef4444', backgroundColor: '#ef4444', borderWidth: 2, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },

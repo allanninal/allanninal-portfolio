@@ -457,16 +457,28 @@ def main():
                 labels: %s,
                 datasets: [
                     { label: 'Middle 90%% of hours (p5 to p95)', data: %s,
-                      backgroundColor: 'rgba(59,130,246,0.45)',
-                      borderColor: '#3b82f6', borderWidth: 1 },
+                      backgroundColor: 'rgba(59,130,246,0.72)',
+                      borderColor: '#93c5fd', borderWidth: 1 },
+                    // pointBackgroundColor, not just borderColor. Chart.js fills a
+                    // point from backgroundColor, and leaving it unset takes
+                    // Chart.defaults -- which on this page is near-black, so all
+                    // three of these series drew invisibly on a dark background
+                    // while the canvas still had plenty of ink in it.
                     { type: 'line', label: 'Annual share (energy-weighted)',
-                      data: %s, borderColor: '#ef4444', borderWidth: 0,
-                      pointRadius: 6, pointStyle: 'rectRot', showLine: false },
+                      data: %s, borderColor: '#ef4444',
+                      backgroundColor: '#ef4444', pointBackgroundColor: '#ef4444',
+                      pointBorderColor: '#fff', pointBorderWidth: 1,
+                      borderWidth: 0, pointRadius: 7, pointStyle: 'rectRot',
+                      showLine: false },
                     { type: 'line', label: 'Worst hour of the year', data: %s,
-                      borderColor: '#f59e0b', borderWidth: 0, pointRadius: 4,
+                      borderColor: '#f59e0b', backgroundColor: '#f59e0b',
+                      pointBackgroundColor: '#f59e0b', pointBorderColor: '#fff',
+                      pointBorderWidth: 1, borderWidth: 0, pointRadius: 5,
                       showLine: false },
                     { type: 'line', label: 'Best hour of the year', data: %s,
-                      borderColor: '#22c55e', borderWidth: 0, pointRadius: 4,
+                      borderColor: '#22c55e', backgroundColor: '#22c55e',
+                      pointBackgroundColor: '#22c55e', pointBorderColor: '#fff',
+                      pointBorderWidth: 1, borderWidth: 0, pointRadius: 5,
                       showLine: false }
                 ]
             },

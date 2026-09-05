@@ -290,11 +290,11 @@ def main():
             type: 'line',
             data: {
                 datasets: [
-                    { label: 'National poverty line (%%)', data: %s, borderColor: '#ef4444',
+                    { label: 'National poverty line (%%)', data: %s, borderColor: '#ef4444', backgroundColor: '#ef4444',
                       borderWidth: 2, pointRadius: 5, showLine: true, spanGaps: true },
-                    { label: '$3.65 a day (%%)', data: %s, borderColor: '#f59e0b',
+                    { label: '$3.65 a day (%%)', data: %s, borderColor: '#f59e0b', backgroundColor: '#f59e0b',
                       borderWidth: 2, pointRadius: 5, showLine: true, spanGaps: true },
-                    { label: '$2.15 a day (%%)', data: %s, borderColor: '#22c55e',
+                    { label: '$2.15 a day (%%)', data: %s, borderColor: '#22c55e', backgroundColor: '#22c55e',
                       borderWidth: 2, pointRadius: 5, showLine: true, spanGaps: true }
                 ]
             },

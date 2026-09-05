@@ -524,7 +524,7 @@ def main():
                     { label: 'Total change (%%)', data: %s, backgroundColor: '#3b82f6',
                       yAxisID: 'y' },
                     { type: 'line', label: 'Compound rate (%%/year)', data: %s,
-                      borderColor: '#ef4444', borderWidth: 2, pointRadius: 4,
+                      borderColor: '#ef4444', backgroundColor: '#ef4444', borderWidth: 2, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },

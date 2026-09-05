@@ -539,7 +539,7 @@ def main():
                     { label: 'Median asking price (PHP)', data: %s,
                       backgroundColor: 'rgba(59,130,246,0.65)', yAxisID: 'y' },
                     { type: 'line', label: 'Median price per m² (PHP)', data: %s,
-                      borderColor: '#f59e0b', borderWidth: 3, pointRadius: 4,
+                      borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 3, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },
@@ -585,7 +585,7 @@ def main():
                     { label: 'Median asking price (PHP)', data: %s,
                       backgroundColor: %s, yAxisID: 'y' },
                     { type: 'line', label: 'Listings', data: %s,
-                      borderColor: '#64748b', borderWidth: 2, pointRadius: 3,
+                      borderColor: '#64748b', backgroundColor: '#64748b', borderWidth: 2, pointRadius: 3,
                       fill: false, yAxisID: 'y1' }
                 ]
             },

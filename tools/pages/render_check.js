@@ -51,16 +51,42 @@ const { chromium } = require('/Users/allanninal/Projects/GuroOS/node_modules/pla
         .map(e => e.className + ' :: ' + (e.textContent || '').trim().slice(0, 40));
       const wide = document.documentElement.scrollWidth >
                    document.documentElement.clientWidth + 2;
+
+      // A dataset drawn in a colour nobody set. Chart.js fills points and bars
+      // from backgroundColor; leaving it unset takes Chart.defaults, which on
+      // these dark pages is near-black and therefore invisible. The canvas still
+      // has plenty of ink from the other series, so the blank-canvas test above
+      // passes while a whole series is missing -- which is exactly what happened
+      // to three series on the European grid page.
+      const invisible = [];
+      if (window.Chart && Chart.instances) {
+        for (const c of Object.values(Chart.instances)) {
+          for (const d of c.data.datasets) {
+            const shows = (d.pointRadius && d.pointRadius > 0) ||
+                          (d.type || c.config.type) === 'bar';
+            const bg = d.pointBackgroundColor || d.backgroundColor;
+            if (shows && !bg) {
+              invisible.push((c.canvas.id || '?') + ' :: ' +
+                             (d.label || '(unlabelled)'));
+            }
+          }
+        }
+      }
       return { canvases: document.querySelectorAll('canvas').length, blank, hidden,
-               wide, h: document.body.scrollHeight };
+               wide, invisible, h: document.body.scrollHeight };
     });
-    const ok = !errs.length && !r.blank.length && !r.hidden.length && !r.wide;
+    const ok = !errs.length && !r.blank.length && !r.hidden.length &&
+               !r.wide && !r.invisible.length;
     if (!ok) bad++;
     console.log((ok ? '  ok   ' : '  FAIL ') + path.split('/').pop() +
       '  canvases=' + r.canvases + ' blank=' + r.blank.length +
-      ' hidden=' + r.hidden.length + ' h=' + r.h + (r.wide ? ' H-SCROLL' : ''));
+      ' hidden=' + r.hidden.length +
+      ' nocolour=' + r.invisible.length +
+      ' h=' + r.h + (r.wide ? ' H-SCROLL' : ''));
     if (r.blank.length) console.log('         blank: ' + r.blank.join(', '));
     if (r.hidden.length) console.log('         hidden: ' + r.hidden.slice(0,4).join(' | '));
+    if (r.invisible.length) console.log('         no backgroundColor: ' +
+      r.invisible.slice(0, 5).join(', '));
     if (errs.length) console.log('         errors: ' + errs.slice(0, 4).join(' | '));
     await p.close();
   }
