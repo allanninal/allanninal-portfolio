@@ -147,6 +147,10 @@ SPECS = [
          title="What Metro Manila&rsquo;s Transit Map Leaves Out",
          sub="803 bus routes mapped, 26 jeepney routes &mdash; the gap is the finding",
          stats=[("803", "Bus Routes"), ("26", "Jeepney Routes"), ("OSM", "Source")]),
+    dict(file="og-competitiveness.png", icon="&#128666;", pill="Logistics",
+         title="How Well Do Goods Actually Move?",
+         sub="Philippine logistics on the World Bank LPI &mdash; on time, then stuck at the border",
+         stats=[("3.3 / 5", "Overall LPI"), ("2.8", "Customs"), ("World Bank", "Source")]),
 ]
 
 if __name__ == "__main__":
