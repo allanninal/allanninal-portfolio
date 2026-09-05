@@ -151,6 +151,10 @@ SPECS = [
          title="How Well Do Goods Actually Move?",
          sub="Philippine logistics on the World Bank LPI &mdash; on time, then stuck at the border",
          stats=[("3.3 / 5", "Overall LPI"), ("2.8", "Customs"), ("World Bank", "Source")]),
+    dict(file="og-health.png", icon="&#129658;", pill="Health Data",
+         title="Philippine Health 1960&ndash;2024",
+         sub="Sixty years of progress &mdash; and two indicators going the wrong way",
+         stats=[("69.9 yrs", "Life Expectancy"), ("625", "TB per 100k"), ("World Bank", "Source")]),
 ]
 
 if __name__ == "__main__":

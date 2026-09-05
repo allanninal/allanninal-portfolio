@@ -22,7 +22,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Philippine Foreign Trade (2015–Q1 2026)', href: '/projects/trade-analysis.html' },
   { name: 'Philippine Typhoon Impact (2014–2020)', href: '/projects/typhoon-analysis.html' },
   { name: 'Philippine Regional Poverty & Income', href: '/projects/poverty-analysis.html' },
-  { name: 'Philippine Health Indicators', href: '/projects/health-analysis.html' },
+  { name: 'Philippine Health 1960-2024', href: '/projects/health-analysis.html' },
   { name: 'Overseas Filipino Workers 2024', href: '/projects/ofw-analysis.html' },
   { name: 'Philippine COVID-19 2020-2026', href: '/projects/covid-analysis.html' },
   { name: 'Philippine Earthquakes 2000-2026', href: '/projects/earthquake-analysis.html' },
