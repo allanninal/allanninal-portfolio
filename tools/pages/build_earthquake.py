@@ -257,7 +257,7 @@ def main():
          ("At M6.0 or above", F["m60"], "eq.m60plus",
           "Frequent enough that building standards, not luck, decide the outcome.")],
         extra='''
-                <div class="table-container fade-up">
+                <div class="fade-up" style="overflow-x:auto;">
                     <table class="data-table">
                         <thead>
                             <tr>
@@ -757,7 +757,7 @@ def main():
     swap(r'"headline": "[^"]*"',
          '"headline": "Philippine Earthquakes 2000-2026: What the USGS Catalogue Can and Cannot Tell You"',
          "headline")
-    swap(r'"description": "Data-driven analysis[^"]*"',
+    swap(r'"description": "(?:Data-driven analysis|Every M4\.5\+)[^"]*"',
          '"description": %s' % json.dumps(desc), "article description")
 
     # The FAQ block is regenerated whole. The old third question was about

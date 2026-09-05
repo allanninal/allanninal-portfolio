@@ -52,7 +52,24 @@ def project_for(page):
     return None
 
 
-def render(project):
+def theme_of(src):
+    """Per-role class names, resolved against this page's own stylesheet.
+
+    Shares _common.theme_for so the Sources block cannot drift from the sections
+    above it. An earlier two-family version emitted grid-3 on pages that define
+    only insights-grid, so the citations this file exists to surface arrived
+    unstyled on exactly the pages that most needed them.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _common import theme_for
+    t = theme_for(src)
+    return dict(wrap=t["wrap"], grid=t["cards_grid"], desc=t["sec_desc"],
+                head=t["card_head"], body=t["card_body"])
+
+
+def render(project, t=None):
+    t = t or dict(wrap="section fade-up", grid="grid-3",
+                  desc="section-description", head="h4", body="p")
     rows = list(csv.DictReader(open(os.path.join(project, "sources.csv"))))
     if not rows:
         raise SystemExit("%s/sources.csv is empty" % project)
@@ -67,32 +84,34 @@ def render(project):
                      'color:#94a3b8;margin-left:8px;" title="%s">%s</span>'
                      % (TIER_NOTE[tier], TIER_LABEL[tier]))
         note = (r.get("note") or "").strip()
+        hc = t["head"].split()[0]
+        bc = t["body"].split()[0]
         cards.append(
             '                    <div class="insight-card">\n'
-            '                        <h4><a href="%s" target="_blank" rel="noopener" '
+            '                        <%s><a href="%s" target="_blank" rel="noopener" '
             'style="color:inherit;text-decoration:underline;'
-            'text-underline-offset:3px;text-decoration-color:rgba(148,163,184,0.5);">%s</a>%s</h4>\n'
-            '                        <p>%s%s</p>\n'
+            'text-underline-offset:3px;text-decoration-color:rgba(148,163,184,0.5);">%s</a>%s</%s>\n'
+            '                        <%s>%s%s</%s>\n'
             '                    </div>'
-            % (r["url"], r["name"], badge, r["covers"],
-               (" &mdash; " + note) if note else ""))
-    return ('''        <section class="section">
+            % (t["head"], r["url"], r["name"], badge, hc,
+               t["body"], r["covers"], (" &mdash; " + note) if note else "", bc))
+    return ('''        <section class="%s">
             <div class="container">
                 <div class="section-header fade-up">
                     <h2>Sources &amp; Citations</h2>
-                    <p class="section-description">
+                    <p class="%s">
                         Every figure on this page traces to one of these, through a CSV in
                         <code>%s/</code>. Each is checked against its source query on every
                         build.
                     </p>
                 </div>
 
-                <div class="grid-3 fade-up">
+                <div class="%s fade-up">
 %s
                 </div>
             </div>
         </section>
-''' % (project, "\n".join(cards)),
+''' % (t["wrap"], t["desc"], project, t["grid"], "\n".join(cards)),
             ", ".join(
                 '<a href="%s" class="footer-link" target="_blank" rel="noopener">%s</a>'
                 % (r["url"], r["name"]) for r in rows))
@@ -102,8 +121,8 @@ def apply_to(page, check):
     project = project_for(page)
     if not project:
         return 0, 0
-    sec, footer = render(project)
     src = open(page).read()
+    sec, footer = render(project, theme_of(src))
     before = src
 
     block = MARK_START + "\n" + sec + "        " + MARK_END

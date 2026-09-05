@@ -22,7 +22,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks sources reveal
+check: facts backlinks sources reveal styling
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -78,3 +78,9 @@ sources:
 # balanced. Nothing tested what a browser paints.
 reveal:
 	@$(PY) tools/pages/reveal.py --check
+
+# A class the page's own stylesheet never defines is still valid markup, so it
+# passes every other check and renders as unstyled stacked text. Two pages
+# shipped that way after being regenerated with the wrong class vocabulary.
+styling:
+	@$(PY) tools/pages/styling.py

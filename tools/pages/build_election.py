@@ -181,7 +181,7 @@ def main():
           "Candidates four through ten together, against {r:,} for second "
           "place.".format(r=F["r"]))],
         extra='''
-                <div class="table-container fade-up">
+                <div class="fade-up" style="overflow-x:auto;">
                     <table class="data-table">
                         <thead><tr><th>#</th><th>Candidate</th><th>Party</th>
                         <th style="text-align:right">Votes</th>

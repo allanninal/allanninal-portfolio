@@ -248,10 +248,9 @@ def main():
                         "<code>facts.sql</code> and re-checked on each build.")]),
     ]
 
-    S.append('''        <section class="section">
+    S.append('''        <section class="fade-up">
             <div class="container">
                 <div class="section-header fade-up">
-                    <div class="section-number">08</div>
                     <h2>Key Findings &amp; Summary</h2>
                 </div>
                 <div class="insight-card fade-up">

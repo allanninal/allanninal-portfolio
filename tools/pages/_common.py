@@ -55,16 +55,49 @@ THEMES = {
 }
 
 
+def defines(src, cls):
+    return re.search(r"\." + re.escape(cls) + r"\s*[,{ :.]", src) is not None
+
+
+def pick(src, *candidates):
+    """First class name this page's own stylesheet defines.
+
+    Per role rather than per family. A two-family model was too coarse: the
+    poverty page defines metric-value AND grid-3 but neither insights-grid nor
+    section-description, so classifying it as one family or the other emitted a
+    class it has no styling for either way.
+    """
+    for c in candidates:
+        if defines(src, c):
+            return c
+    return candidates[0]
+
+
 def detect_theme(src):
-    """Which class family this page's stylesheet actually defines."""
-    has = lambda c: re.search(r"\." + re.escape(c) + r"\s*[,{ :.]", src) is not None
-    if has("stat-value") and has("grid-3"):
+    """Legacy two-family label, kept for the numbered/chart-markup choice."""
+    if defines(src, "stat-value") and defines(src, "grid-3"):
         return "modern"
-    if has("metric-value") and has("insights-grid"):
+    if defines(src, "metric-value") and defines(src, "insights-grid"):
         return "classic"
-    # Default to modern: it is what the generated pages use, and a page that
-    # defines neither is a page nothing has been generated onto yet.
     return "modern"
+
+
+def theme_for(src):
+    """Per-role class names resolved against this page's stylesheet."""
+    return dict(
+        hero_desc=pick(src, "hero-description", "hero-desc"),
+        grid=pick(src, "stats-grid", "metrics-grid"),
+        card=pick(src, "stat-card", "metric-card"),
+        value=pick(src, "stat-value", "metric-value"),
+        label=pick(src, "stat-label", "metric-label"),
+        sec_desc=pick(src, "section-description", "section-desc"),
+        cards_grid=pick(src, "grid-3", "insights-grid"),
+        numbered=defines(src, "section-number"),
+        wrap="section fade-up" if defines(src, "section") else "fade-up",
+        card_head="h4" if defines(src, "grid-3") else 'div class="insight-title"',
+        card_body="p" if defines(src, "grid-3") else 'p class="insight-text"',
+        chart_wrap=defines(src, "chart-wrapper"),
+    )
 
 
 def section(n, title, desc, cards, chart_title=None, canvas=None, extra=""):
@@ -132,7 +165,7 @@ class Page(object):
         self.path = path
         self.src = open(path).read()
         self.theme = detect_theme(self.src)
-        self.t = THEMES[self.theme]
+        self.t = theme_for(self.src)
 
 
     def retheme(self, html):
@@ -143,19 +176,20 @@ class Page(object):
         presentation broken, and nothing in the pipeline catches it because the
         markup is valid either way.
         """
-        if self.theme == "modern":
-            return html
-        for a, b in (("hero-description", "hero-desc"), ("stats-grid", "metrics-grid"),
-                     ("stat-card", "metric-card"), ("stat-value", "metric-value"),
-                     ("stat-label", "metric-label"),
-                     ("section-description", "section-desc"), ("grid-3", "insights-grid")):
-            html = html.replace('class="%s' % a, 'class="%s' % b)
-            html = html.replace('class="%s"' % a, 'class="%s"' % b)
+        t = self.t
+        for a, b in (("hero-description", t["hero_desc"]), ("stats-grid", t["grid"]),
+                     ("stat-card", t["card"]), ("stat-value", t["value"]),
+                     ("stat-label", t["label"]),
+                     ("section-description", t["sec_desc"]),
+                     ("grid-3", t["cards_grid"])):
+            if a != b:
+                html = re.sub(r'class="([^"]*)\b' + re.escape(a) + r'\b',
+                              lambda m, b=b: 'class="%s%s' % (m.group(1), b), html)
         return html
 
     def section(self, n, title, desc, cards, chart_title=None, canvas=None, extra=""):
         """Numbered section rendered in this page's own class vocabulary."""
-        t = THEMES[self.theme]
+        t = self.t
         head_open = "<" + t["card_head"] + ">"
         head_close = "</" + t["card_head"].split()[0] + ">"
         body_open = "<" + t["card_body"] + ">"
@@ -186,7 +220,10 @@ class Page(object):
             cv = ""
         num = ('                    <div class="section-number">%02d</div>\n' % n) \
             if t["numbered"] else ""
-        return ('        <section class="section fade-up">\n'
+        # class="section" is only styled on the modern pages; emitting it on a
+        # classic page adds a class its stylesheet never defines.
+        cls = t["wrap"]
+        return ('        <section class="%s">\n'
                 '            <div class="container">\n'
                 '                <div class="section-header fade-up">\n'
                 '%s'
@@ -199,11 +236,12 @@ class Page(object):
                 '                </div>\n'
                 '            </div>\n'
                 '        </section>\n'
-                % (num, title, t["sec_desc"], desc, cv, extra, t["cards_grid"], c))
+                % (cls, num, title, t["sec_desc"], desc, cv, extra,
+                   t["cards_grid"], c))
 
     def prose(self, n, title, desc, cards):
         """Section of explanatory cards with no figures in them."""
-        t = THEMES[self.theme]
+        t = self.t
         head_open = "<" + t["card_head"] + ">"
         head_close = "</" + t["card_head"].split()[0] + ">"
         body_open = "<" + t["card_body"] + ">"
@@ -217,7 +255,8 @@ class Page(object):
             for h, p in cards)
         num = ('                    <div class="section-number">%02d</div>\n' % n) \
             if t["numbered"] else ""
-        return ('        <section class="section fade-up">\n'
+        cls = t["wrap"]
+        return ('        <section class="%s">\n'
                 '            <div class="container">\n'
                 '                <div class="section-header fade-up">\n'
                 '%s'
@@ -229,7 +268,7 @@ class Page(object):
                 '                </div>\n'
                 '            </div>\n'
                 '        </section>\n'
-                % (num, title, t["sec_desc"], desc, t["cards_grid"], c))
+                % (cls, num, title, t["sec_desc"], desc, t["cards_grid"], c))
 
     def _at(self, marker, start=0):
         # Tolerant of two things these pages vary in. Indentation: they were
