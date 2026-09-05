@@ -135,6 +135,10 @@ SPECS = [
          title="The 2022 Philippine Election",
          sub="The margin, and the two million ballots that named no president",
          stats=[("82.98%", "Turnout"), ("2,213,371", "Invalid Ballots"), ("Canvass", "Source")]),
+    dict(file="og-budget.png", icon="&#127974;", pill="Public Finance",
+         title="Philippine Public Finances",
+         sub="Debt and its cost are both below their 1990s levels &mdash; and both have turned back up",
+         stats=[("56.6%", "Debt / GDP"), ("15.3%", "Spending on Interest"), ("WB+IMF", "Source")]),
 ]
 
 if __name__ == "__main__":
