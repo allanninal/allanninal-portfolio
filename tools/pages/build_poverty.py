@@ -101,7 +101,7 @@ def main():
                         <div class="stat-label">Gini coefficient</div>
                     </div>
                 </div>
-'''.format(**F))
+'''.format(wrapcls=p.t["wrap"], **F))
 
     p.tldr('''                    <span class="tldr-badge">Key Takeaways</span>
                     <p class="tldr-headline">The gap between <span data-fact="pov.unemployment">{unemp}%</span> unemployment and <span data-fact="pov.vulnerable">{vuln}%</span> vulnerable employment is the whole story. Work is not scarce here; paid, secure work is.</p>
@@ -111,7 +111,7 @@ def main():
                         <li>The poorest fifth of the country receives <span data-fact="pov.bottom20">{bot}%</span> of income. The richest tenth receives <span data-fact="pov.top10">{top}%</span> &mdash; <span data-fact="pov.ratio">{ratio}</span> times as much, spread over half as many people.</li>
                         <li>These come from household surveys run every few years: <span data-fact="pov.surveys">{nsurv}</span> points across {span} years. The charts plot points on a real time axis rather than a smooth line, because the years between were never measured.</li>
                     </ul>
-'''.format(**F))
+'''.format(wrapcls=p.t["wrap"], **F))
 
     S = [
         p.section(1, "Full Employment, Without The Jobs",
@@ -221,7 +221,7 @@ def main():
                         "bound to a query in <code>facts.sql</code>.")]),
     ]
 
-    S.append('''        <section class="section fade-up">
+    S.append('''        <section class="{wrapcls}">
             <div class="container">
                 <div class="section-header fade-up">
                     <h2>Key Findings &amp; Summary</h2>
@@ -255,7 +255,7 @@ def main():
                 </div>
             </div>
         </section>
-'''.format(**F))
+'''.format(wrapcls=p.t["wrap"], **F))
 
     yrs = [r["year"] for r in ann]
     sy = [int(r["survey_year"]) for r in surv]

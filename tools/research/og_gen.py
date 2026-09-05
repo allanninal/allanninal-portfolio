@@ -163,6 +163,10 @@ SPECS = [
          title="Poverty and the Jobs That Do Not Fix It",
          sub="2.24% unemployment, 33.6% vulnerable employment &mdash; work is not scarce, paid work is",
          stats=[("15.5%", "Below Poverty Line"), ("33.6%", "Vulnerable Work"), ("World Bank", "Source")]),
+    dict(file="og-fies.png", icon="&#127968;", pill="Household Survey",
+         title="What 41,544 Households Actually Spend",
+         sub="The 2015 FIES microdata, opened &mdash; and Engel&rsquo;s law holding at every step",
+         stats=[("41,544", "Households"), ("0.4438", "Gini"), ("FIES 2015", "Source")]),
 ]
 
 if __name__ == "__main__":

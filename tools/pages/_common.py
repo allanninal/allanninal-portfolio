@@ -85,17 +85,22 @@ def detect_theme(src):
 def theme_for(src):
     """Per-role class names resolved against this page's stylesheet."""
     return dict(
-        hero_desc=pick(src, "hero-description", "hero-desc"),
+        hero_desc=pick(src, "hero-description", "hero-desc", "header-subtitle"),
         grid=pick(src, "stats-grid", "metrics-grid"),
         card=pick(src, "stat-card", "metric-card"),
         value=pick(src, "stat-value", "metric-value"),
         label=pick(src, "stat-label", "metric-label"),
         sec_desc=pick(src, "section-description", "section-desc"),
-        cards_grid=pick(src, "grid-3", "insights-grid"),
+        cards_grid=pick(src, "grid-3", "insights-grid", "insight-grid"),
         numbered=defines(src, "section-number"),
         wrap="section fade-up" if defines(src, "section") else "fade-up",
-        card_head="h4" if defines(src, "grid-3") else 'div class="insight-title"',
-        card_body="p" if defines(src, "grid-3") else 'p class="insight-text"',
+        card_head=("h4" if defines(src, "grid-3")
+                   else ('div class="insight-title"' if defines(src, "insight-title")
+                         else "h4")),
+        # Only use the insight-text wrapper where the page styles it; a third
+        # layout defines insight-title but not insight-text, and emitting it
+        # there produced unstyled body copy.
+        card_body=('p class="insight-text"' if defines(src, "insight-text") else "p"),
         chart_wrap=defines(src, "chart-wrapper"),
         insight_value=pick(src, "insight-value", "metric-value", "stat-value"),
     )
@@ -308,7 +313,13 @@ class Page(object):
             ends.append(self._at('<div class="project-info">', i))
         except SystemExit:
             pass
-        close = self.src.find("</section>", i)
+        # The hero is <section class="hero"> on most pages and <header> on at
+        # least one. Take whichever closing tag comes first after the <h1>;
+        # searching only for </section> ran straight past the header and ate its
+        # container's closing </div>.
+        cands = [self.src.find(t, i) for t in ("</section>", "</header>")]
+        cands = [c for c in cands if c >= 0]
+        close = min(cands) if cands else -1
         if close >= 0:
             ends.append(self.src.rfind("\n", 0, close) + 1)
         if not ends:
@@ -375,7 +386,24 @@ class Page(object):
             j = self.src.rfind("\n", 0, k) + 1
         if j <= i:
             raise SystemExit("%s: content region resolved to nothing" % self.path)
-        self.src = self.src[:i] + "\n".join(blocks) + self.src[j:]
+
+        # Same arithmetic as hero(): the replaced region can begin inside a
+        # wrapper it does not open and end outside one it does not close, so the
+        # div balance of what goes out is matched by what comes in. On one page
+        # the TL;DR sits inside a <div class="container"> that the content
+        # region then closed, and cutting there left it open for the rest of the
+        # document.
+        def net(text):
+            return (len(re.findall(r"<div\b", text))
+                    - len(re.findall(r"</div>", text)))
+
+        new = "\n".join(blocks)
+        shortfall = net(new) - net(self.src[i:j])
+        if shortfall < 0:
+            raise SystemExit("%s: content blocks close %d more div(s) than the "
+                             "region they replace" % (self.path, -shortfall))
+        new += "".join("        </div>\n" for _ in range(shortfall))
+        self.src = self.src[:i] + new + self.src[j:]
 
     def charts(self, blocks):
         # Indentation varies: the later pages close with "    </script>" and the
