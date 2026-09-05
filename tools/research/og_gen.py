@@ -183,6 +183,10 @@ SPECS = [
          title="A School Tier Built In Four Years",
          sub="DepEd counts, 11 years &mdash; and the biggest senior high track is not STEM",
          stats=[("37.8% TVL", "vs 9.0% STEM"), ("38.9&rarr;25.8", "Pupils/teacher"), ("1.62M", "Out of school")]),
+    dict(file="og-names.png", icon="&#128100;", pill="Forenames",
+         title="One Filipino In 48 Is Called Mary",
+         sub="1,000 names &mdash; and two columns that quietly date an undated file",
+         stats=[("2,229,082", "Named Mary"), ("1.21%", "Column disagreement"), ("70.4%", "Population covered")]),
 ]
 
 if __name__ == "__main__":
