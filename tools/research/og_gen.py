@@ -155,6 +155,10 @@ SPECS = [
          title="Philippine Health 1960&ndash;2024",
          sub="Sixty years of progress &mdash; and two indicators going the wrong way",
          stats=[("69.9 yrs", "Life Expectancy"), ("625", "TB per 100k"), ("World Bank", "Source")]),
+    dict(file="og-ofw.png", icon="&#9992;&#65039;", pill="Migration",
+         title="What Migration Sends Home",
+         sub="$41.56B in 2025 &mdash; 5.33&times; all net foreign direct investment",
+         stats=[("$41.56B", "Remittances 2025"), ("5.33&times;", "Net FDI"), ("World Bank", "Source")]),
 ]
 
 if __name__ == "__main__":
