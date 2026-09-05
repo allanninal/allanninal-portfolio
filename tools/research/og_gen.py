@@ -187,6 +187,10 @@ SPECS = [
          title="One Filipino In 48 Is Called Mary",
          sub="1,000 names &mdash; and two columns that quietly date an undated file",
          stats=[("2,229,082", "Named Mary"), ("1.21%", "Column disagreement"), ("70.4%", "Population covered")]),
+    dict(file="og-typhoon.png", icon="&#127786;", pill="Tropical Cyclones",
+         title="Two Thirds Of Every Pacific Storm",
+         sub="IBTrACS tracks, 1980&ndash;2024 &mdash; and no month of the year without one",
+         stats=[("66.2%", "Of the basin"), ("21.3/yr", "In PH waters"), ("315 km/h", "The record")]),
 ]
 
 if __name__ == "__main__":

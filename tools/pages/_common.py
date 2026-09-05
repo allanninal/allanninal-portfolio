@@ -461,11 +461,39 @@ class Page(object):
             return (len(re.findall(r"<div\b", text))
                     - len(re.findall(r"</div>", text)))
 
+        def unclosed_openers(text):
+            """Opening <div> tags in this text that it never closes.
+
+            The typhoon page wraps every section in one outer
+            <div class="container"> that opens inside the replaced region and
+            closes outside it. Emitting sections that each carry their own
+            container leaves that outer div unopened, and the balance guard below
+            correctly refused. Re-emitting the tags verbatim keeps the class,
+            which a generic <div> would not.
+            """
+            stack = []
+            for m in re.finditer(r"<div\b[^>]*>|</div>", text):
+                if m.group(0).startswith("</"):
+                    if stack:
+                        stack.pop()
+                else:
+                    stack.append(m.group(0))
+            return stack
+
         new = "\n".join(blocks)
-        shortfall = net(new) - net(self.src[i:j])
+        removed = self.src[i:j]
+        shortfall = net(new) - net(removed)
         if shortfall < 0:
-            raise SystemExit("%s: content blocks close %d more div(s) than the "
-                             "region they replace" % (self.path, -shortfall))
+            # The region opens wrappers it does not close. Re-open the same ones,
+            # outermost first, so whatever closes them after j still matches.
+            openers = unclosed_openers(removed)
+            if len(openers) != -shortfall:
+                raise SystemExit(
+                    "%s: content blocks close %d more div(s) than the region they "
+                    "replace, and %d unclosed opener(s) were found -- the two "
+                    "should agree" % (self.path, -shortfall, len(openers)))
+            new = ("".join("    %s\n" % t for t in openers)) + new
+            shortfall = 0
         new += "".join("        </div>\n" for _ in range(shortfall))
         self.src = self.src[:i] + new + self.src[j:]
 
