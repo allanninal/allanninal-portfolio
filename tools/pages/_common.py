@@ -97,6 +97,7 @@ def theme_for(src):
         card_head="h4" if defines(src, "grid-3") else 'div class="insight-title"',
         card_body="p" if defines(src, "grid-3") else 'p class="insight-text"',
         chart_wrap=defines(src, "chart-wrapper"),
+        insight_value=pick(src, "insight-value", "metric-value", "stat-value"),
     )
 
 
@@ -197,10 +198,10 @@ class Page(object):
         c = "\n".join(
             '                    <div class="insight-card">\n'
             '                        %s%s%s\n'
-            '                        <div class="insight-value"%s>%s</div>\n'
+            '                        <div class="%s"%s>%s</div>\n'
             '                        %s%s%s\n'
             '                    </div>'
-            % (head_open, h, head_close,
+            % (head_open, h, head_close, t["insight_value"],
                (' data-fact="%s"' % k) if k else "", v,
                body_open, p, body_close)
             for h, v, k, p in cards)
@@ -286,28 +287,48 @@ class Page(object):
         return start + m.start()
 
     def hero(self, html):
-        """Replace the <h1> and stats block, stopping at whatever comes next.
+        """Replace the <h1> and stats block, keeping the hero's wrappers closed.
 
-        Page order is not consistent. On most pages the project-info block
-        follows the hero and the TL;DR comes after it; on the poverty page the
-        TL;DR comes FIRST and project-info sits below it. Ending the hero at
-        project-info unconditionally therefore deleted that page's whole TL;DR
-        section, and the next call then failed looking for a marker this method
-        had just removed. Stop at whichever boundary appears first.
+        Page order is not consistent. On most pages a project-info block follows
+        the hero and the TL;DR comes after it; on the poverty page the TL;DR
+        comes first and project-info sits far below, past a block of stale
+        metrics. Ending the hero at project-info therefore deleted that page's
+        TL;DR, and ending it at </section> ate the container's closing </div>.
+
+        So the end is the hero's own </section> (or project-info if that comes
+        first), and the div balance of what was removed is compared with the div
+        balance of what is inserted -- any shortfall is closed explicitly. That
+        is arithmetic rather than guesswork about which trailing tags belong to
+        whom.
         """
         html = self.retheme(html)
         i = self._at("<h1>")
         ends = []
-        for marker in ('<div class="project-info">', '<section class="tldr-section">',
-                       '<span class="tldr-badge">', '<section class="section">'):
-            try:
-                ends.append(self._at(marker, i))
-            except SystemExit:
-                pass
+        try:
+            ends.append(self._at('<div class="project-info">', i))
+        except SystemExit:
+            pass
+        close = self.src.find("</section>", i)
+        if close >= 0:
+            ends.append(self.src.rfind("\n", 0, close) + 1)
         if not ends:
             raise SystemExit("%s: no boundary after <h1>" % self.path)
         j = min(ends)
-        self.src = self.src[:i] + html + "\n" + self.src[j:]
+
+        def net(text):
+            return (len(re.findall(r"<div\b", text))
+                    - len(re.findall(r"</div>", text)))
+
+        # The removed span starts inside the hero's container, so it carries
+        # that container's </div> without the matching <div>: its net is
+        # negative. To preserve the document's balance the inserted block must
+        # end with the same net, so the difference is appended as closers.
+        shortfall = net(html) - net(self.src[i:j])
+        if shortfall < 0:
+            raise SystemExit("%s: hero block closes %d more div(s) than the "
+                             "region it replaces" % (self.path, -shortfall))
+        closers = "".join("                </div>\n" for _ in range(shortfall))
+        self.src = self.src[:i] + html + closers + "\n" + self.src[j:]
 
     def tldr(self, html):
         html = self.retheme(html)
@@ -334,8 +355,13 @@ class Page(object):
                 break
             except (SystemExit, ValueError):
                 continue
-        i = self.src.index("<section", after)
-        i = self.src.rfind("\n", 0, i) + 1
+        # Start immediately after the TL;DR rather than at the next <section>.
+        # The poverty page keeps a block of fabricated metrics in a bare
+        # <div class="container"> between the two, which a <section> anchor
+        # skipped straight past and left on the page.
+        i = self.src.rfind("\n", 0, self.src.find("\n", after) + 1) + 1
+        if i <= after:
+            i = after
 
         j = None
         for end in ("<!-- sources:start -->", "<h2>Related Projects</h2>"):

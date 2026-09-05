@@ -21,7 +21,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Philippine Dengue Surveillance (2016–Q1 2026)', href: '/projects/dengue-analysis.html' },
   { name: 'Philippine Foreign Trade (2015–Q1 2026)', href: '/projects/trade-analysis.html' },
   { name: 'Philippine Typhoon Impact (2014–2020)', href: '/projects/typhoon-analysis.html' },
-  { name: 'Philippine Regional Poverty & Income', href: '/projects/poverty-analysis.html' },
+  { name: 'Poverty and the Jobs That Do Not Fix It', href: '/projects/poverty-analysis.html' },
   { name: 'Philippine Health 1960-2024', href: '/projects/health-analysis.html' },
   { name: 'What Migration Sends Home', href: '/projects/ofw-analysis.html' },
   { name: 'Philippine COVID-19 2020-2026', href: '/projects/covid-analysis.html' },

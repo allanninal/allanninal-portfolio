@@ -159,6 +159,10 @@ SPECS = [
          title="What Migration Sends Home",
          sub="$41.56B in 2025 &mdash; 5.33&times; all net foreign direct investment",
          stats=[("$41.56B", "Remittances 2025"), ("5.33&times;", "Net FDI"), ("World Bank", "Source")]),
+    dict(file="og-poverty.png", icon="&#128176;", pill="Poverty &amp; Work",
+         title="Poverty and the Jobs That Do Not Fix It",
+         sub="2.24% unemployment, 33.6% vulnerable employment &mdash; work is not scarce, paid work is",
+         stats=[("15.5%", "Below Poverty Line"), ("33.6%", "Vulnerable Work"), ("World Bank", "Source")]),
 ]
 
 if __name__ == "__main__":

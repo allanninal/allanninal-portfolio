@@ -21,7 +21,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import Page, js, r, section, prose_section       # noqa: E402
+from _common import Page, js, r                               # noqa: E402
 
 D = "data/ph-poverty"
 PAGE = "projects/poverty-analysis.html"
@@ -114,7 +114,7 @@ def main():
 '''.format(**F))
 
     S = [
-        section(1, "Full Employment, Without The Jobs",
+        p.section(1, "Full Employment, Without The Jobs",
                 "Two labour figures that are both true and appear to contradict each "
                 "other. Unemployment counts people looking for work and not finding it. "
                 "Vulnerable employment counts own-account and unpaid family workers "
@@ -131,7 +131,7 @@ def main():
                   "unpaid or informal. Reporting the first number without the second is "
                   "the most common way to make this look better than it is.")],
                 "Unemployment against vulnerable employment, %", "labourChart"),
-        section(2, "Poverty Is Falling",
+        p.section(2, "Poverty Is Falling",
                 "The national poverty rate and the two international lines, at every "
                 "year they were measured. This part is unambiguously good.",
                 [("National line", "{nat}%".format(**F), "pov.national",
@@ -144,7 +144,7 @@ def main():
                   "Extreme poverty. Far lower, and the two lines moving differently is "
                   "why quoting only one is misleading.")],
                 "Poverty rate by measure, at survey years", "povChart"),
-        section(3, "Inequality Has Not",
+        p.section(3, "Inequality Has Not",
                 "The distribution has been close to static for four decades, through "
                 "every administration and every growth episode in that period.",
                 [("Gini now", "{gini}".format(**F), "pov.gini",
@@ -158,7 +158,7 @@ def main():
                   "Gini number means in practice.".format(r=F["ratio"]))],
                 "Income share of the bottom 20% and top 10%, at survey years",
                 "distChart"),
-        section(4, "Against The Region",
+        p.section(4, "Against The Region",
                 "Five ASEAN economies at {y}, the latest year all of them have both "
                 "measures. Comparing each country at its own latest print would put "
                 "different years side by side and call the difference a "
@@ -173,7 +173,7 @@ def main():
                   "Poverty falling while inequality holds means growth reached the poor "
                   "&mdash; but reached everyone else at least as much.")],
                 "Gini coefficient and $3.65 poverty rate, ASEAN-5", "aseanChart"),
-        prose_section(5, "What This Page Does Not Cover",
+        p.prose(5, "What This Page Does Not Cover",
                       "The version this replaces charted agricultural wages by region, "
                       "the gender wage gap, farm household income composition, rural "
                       "income distribution and regional employment &mdash; using a 2015 "
@@ -192,7 +192,7 @@ def main():
                         "date. A number that old is not wrong so much as no longer about "
                         "the present, and presenting it beside 2016 employment made it "
                         "look current.")]),
-        prose_section(6, "Method",
+        p.prose(6, "Method",
                       "One fetcher, four CSVs, via the shared helper in "
                       "<code>data/_lib/worldbank.py</code>.",
                       [("Surveys, not years",
@@ -221,10 +221,9 @@ def main():
                         "bound to a query in <code>facts.sql</code>.")]),
     ]
 
-    S.append('''        <section class="section">
+    S.append('''        <section class="section fade-up">
             <div class="container">
                 <div class="section-header fade-up">
-                    <div class="section-number">07</div>
                     <h2>Key Findings &amp; Summary</h2>
                 </div>
                 <div class="insight-card fade-up">
