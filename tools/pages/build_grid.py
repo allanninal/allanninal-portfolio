@@ -456,7 +456,14 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Middle 90%% of hours (p5 to p95)', data: %s,
+                    // order 3 on the bar, 0 on the points. Chart.js sorts datasets
+                    // by order and then draws that list BACKWARDS, so with every
+                    // order equal the bar -- dataset 0 -- paints last, on top of the
+                    // points. The annual-share diamond falls inside the p5-p95 band
+                    // by definition, so it was the one always buried: it sampled as
+                    // rgb(109,113,196), which is the bar's 72%% blue composited over
+                    // the red rather than the red itself.
+                    { label: 'Middle 90%% of hours (p5 to p95)', data: %s, order: 3,
                       backgroundColor: 'rgba(59,130,246,0.72)',
                       borderColor: '#93c5fd', borderWidth: 1 },
                     // pointBackgroundColor, not just borderColor. Chart.js fills a
@@ -464,18 +471,18 @@ def main():
                     // Chart.defaults -- which on this page is near-black, so all
                     // three of these series drew invisibly on a dark background
                     // while the canvas still had plenty of ink in it.
-                    { type: 'line', label: 'Annual share (energy-weighted)',
+                    { type: 'line', label: 'Annual share (energy-weighted)', order: 0,
                       data: %s, borderColor: '#ef4444',
                       backgroundColor: '#ef4444', pointBackgroundColor: '#ef4444',
                       pointBorderColor: '#fff', pointBorderWidth: 1,
                       borderWidth: 0, pointRadius: 7, pointStyle: 'rectRot',
                       showLine: false },
-                    { type: 'line', label: 'Worst hour of the year', data: %s,
+                    { type: 'line', label: 'Worst hour of the year', data: %s, order: 0,
                       borderColor: '#f59e0b', backgroundColor: '#f59e0b',
                       pointBackgroundColor: '#f59e0b', pointBorderColor: '#fff',
                       pointBorderWidth: 1, borderWidth: 0, pointRadius: 5,
                       showLine: false },
-                    { type: 'line', label: 'Best hour of the year', data: %s,
+                    { type: 'line', label: 'Best hour of the year', data: %s, order: 0,
                       borderColor: '#22c55e', backgroundColor: '#22c55e',
                       pointBackgroundColor: '#22c55e', pointBorderColor: '#fff',
                       pointBorderWidth: 1, borderWidth: 0, pointRadius: 5,
@@ -484,6 +491,10 @@ def main():
             },
             options: {
                 responsive: true, maintainAspectRatio: false,
+                // the legend follows draw order unless told otherwise, and the
+                // order above would have moved the band to the end of it.
+                plugins: { legend: { labels: {
+                    sort: (a, b) => a.datasetIndex - b.datasetIndex } } },
                 scales: { y: { min: 0, max: 100,
                                title: { display: true, text: '%% renewable of generation' } } }
             }

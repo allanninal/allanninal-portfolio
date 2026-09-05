@@ -538,15 +538,23 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Senior high enrollees', data: %s,
+                    // order: the bar behind, the line in front. Chart.js sorts
+                    // datasets by `order` and then draws that list backwards, so
+                    // with both left at 0 the bar -- dataset 0 -- paints last and
+                    // covers the line it is meant to sit under.
+                    { label: 'Senior high enrollees', data: %s, order: 2,
                       backgroundColor: '#8b5cf6', yAxisID: 'y' },
-                    { type: 'line', label: 'Senior high teachers', data: %s,
+                    { type: 'line', label: 'Senior high teachers', data: %s, order: 1,
                       borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 3, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },
             options: {
                 responsive: true, maintainAspectRatio: false,
+                // the legend follows draw order unless told otherwise, and the
+                // order above would have put the bar at the end of it.
+                plugins: { legend: { labels: {
+                    sort: (a, b) => a.datasetIndex - b.datasetIndex } } },
                 scales: { y: { position: 'left', beginAtZero: true,
                                title: { display: true, text: 'Pupils' } },
                           y1: { position: 'right', beginAtZero: true,

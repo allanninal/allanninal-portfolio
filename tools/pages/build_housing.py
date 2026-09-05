@@ -536,15 +536,23 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Median asking price (PHP)', data: %s,
+                    // order: the bar behind, the line in front. Chart.js sorts
+                    // datasets by `order` and then draws that list backwards, so
+                    // with both left at 0 the bar -- dataset 0 -- paints last and
+                    // covers the line it is meant to sit under.
+                    { label: 'Median asking price (PHP)', data: %s, order: 2,
                       backgroundColor: 'rgba(59,130,246,0.65)', yAxisID: 'y' },
-                    { type: 'line', label: 'Median price per m² (PHP)', data: %s,
+                    { type: 'line', label: 'Median price per m² (PHP)', data: %s, order: 1,
                       borderColor: '#f59e0b', backgroundColor: '#f59e0b', borderWidth: 3, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },
             options: {
                 responsive: true, maintainAspectRatio: false,
+                // the legend follows draw order unless told otherwise, and the
+                // order above would have put the bar at the end of it.
+                plugins: { legend: { labels: {
+                    sort: (a, b) => a.datasetIndex - b.datasetIndex } } },
                 scales: { y: { position: 'left', beginAtZero: true,
                                title: { display: true, text: 'Median asking price (PHP)' } },
                           y1: { position: 'right', beginAtZero: true,
@@ -582,15 +590,23 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
-                    { label: 'Median asking price (PHP)', data: %s,
+                    // order: the bar behind, the line in front. Chart.js sorts
+                    // datasets by `order` and then draws that list backwards, so
+                    // with both left at 0 the bar -- dataset 0 -- paints last and
+                    // covers the line it is meant to sit under.
+                    { label: 'Median asking price (PHP)', data: %s, order: 2,
                       backgroundColor: %s, yAxisID: 'y' },
-                    { type: 'line', label: 'Listings', data: %s,
+                    { type: 'line', label: 'Listings', data: %s, order: 1,
                       borderColor: '#64748b', backgroundColor: '#64748b', borderWidth: 2, pointRadius: 3,
                       fill: false, yAxisID: 'y1' }
                 ]
             },
             options: {
                 responsive: true, maintainAspectRatio: false,
+                // the legend follows draw order unless told otherwise, and the
+                // order above would have put the bar at the end of it.
+                plugins: { legend: { labels: {
+                    sort: (a, b) => a.datasetIndex - b.datasetIndex } } },
                 scales: { x: { title: { display: true, text: 'Bedrooms' } },
                           y: { position: 'left', beginAtZero: true,
                                title: { display: true, text: 'Median asking price (PHP)' } },

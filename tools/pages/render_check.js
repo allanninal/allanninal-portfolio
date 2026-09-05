@@ -72,21 +72,101 @@ const { chromium } = require('/Users/allanninal/Projects/GuroOS/node_modules/pla
           }
         }
       }
+
+      // What a point is actually painted, rather than what it was told to be.
+      // Chart.js sorts datasets by `order` and then draws that list BACKWARDS, so
+      // when every order is equal, dataset 0 paints LAST -- on top of everything
+      // after it. A bar series declared first therefore covers the point series
+      // that were meant to sit over it, and the check above cannot see it: the
+      // colours are all correctly declared, they are simply painted over.
+      //
+      // So sample the canvas at each point's own centre and compare it with the
+      // colour that point asked for. A point hidden underneath another series
+      // reads as the blend, not as itself.
+      const occluded = [];
+      const rgbOf = (v) => {
+        if (typeof v !== 'string') return null;
+        let m = /^#([0-9a-f]{6})$/i.exec(v.trim());
+        if (m) return [parseInt(m[1].slice(0,2),16), parseInt(m[1].slice(2,4),16),
+                       parseInt(m[1].slice(4,6),16)];
+        m = /^#([0-9a-f]{3})$/i.exec(v.trim());
+        if (m) return m[1].split('').map(h => parseInt(h + h, 16));
+        m = /^rgba?\(([^)]+)\)$/i.exec(v.trim());
+        if (m) {
+          const n = m[1].split(',').map(Number);
+          // a translucent fill blends with whatever is behind it by design
+          if (n.length > 3 && n[3] < 0.98) return null;
+          return [n[0], n[1], n[2]];
+        }
+        return null;                                  // named or gradient: skip
+      };
+      if (window.Chart && Chart.instances) {
+        const dpr = window.devicePixelRatio || 1;
+        for (const c of Object.values(Chart.instances)) {
+          const g = c.canvas.getContext('2d');
+          // every point on the chart, so a point covered by another point can be
+          // told apart from a point covered by a bar
+          const all = [];
+          c.data.datasets.forEach((d, i) => {
+            const meta = c.getDatasetMeta(i);
+            if (meta.hidden) return;
+            (meta.data || []).forEach(e => all.push({ i, x: e.x, y: e.y }));
+          });
+          c.data.datasets.forEach((d, i) => {
+            const r = d.pointRadius;
+            if (!(typeof r === 'number' && r > 0)) return;
+            const want = rgbOf(d.pointBackgroundColor || d.backgroundColor);
+            if (!want) return;
+            const meta = c.getDatasetMeta(i);
+            if (meta.hidden) return;
+            for (let k = 0; k < (meta.data || []).length; k++) {
+              const e = meta.data[k];
+              if (!isFinite(e.x) || !isFinite(e.y)) continue;
+              // a null in the series still gets an element positioned on the
+              // scale, but nothing is painted at it -- education's senior-high
+              // line has six leading nulls and sampled as transparent black
+              if (e.skip || d.data[k] === null || d.data[k] === undefined) continue;
+              // another series' point sitting on this one is a legible overlap,
+              // not an occlusion bug; only flag what a non-point series covered
+              if (all.some(o => o.i !== i && Math.hypot(o.x - e.x, o.y - e.y) < r + 2))
+                continue;
+              let got;
+              try {
+                got = g.getImageData(Math.round(e.x * dpr), Math.round(e.y * dpr),
+                                     1, 1).data;
+              } catch (err) { continue; }
+              const off = Math.max(Math.abs(got[0] - want[0]),
+                                   Math.abs(got[1] - want[1]),
+                                   Math.abs(got[2] - want[2]));
+              if (off > 40) {
+                occluded.push((c.canvas.id || '?') + ' :: ' +
+                  (d.label || '(unlabelled)') + ' wanted rgb(' + want.join(',') +
+                  ') got rgb(' + got[0] + ',' + got[1] + ',' + got[2] + ')');
+                break;                                // one report per dataset
+              }
+            }
+          });
+        }
+      }
+
       return { canvases: document.querySelectorAll('canvas').length, blank, hidden,
-               wide, invisible, h: document.body.scrollHeight };
+               wide, invisible, occluded, h: document.body.scrollHeight };
     });
     const ok = !errs.length && !r.blank.length && !r.hidden.length &&
-               !r.wide && !r.invisible.length;
+               !r.wide && !r.invisible.length && !r.occluded.length;
     if (!ok) bad++;
     console.log((ok ? '  ok   ' : '  FAIL ') + path.split('/').pop() +
       '  canvases=' + r.canvases + ' blank=' + r.blank.length +
       ' hidden=' + r.hidden.length +
       ' nocolour=' + r.invisible.length +
+      ' buried=' + r.occluded.length +
       ' h=' + r.h + (r.wide ? ' H-SCROLL' : ''));
     if (r.blank.length) console.log('         blank: ' + r.blank.join(', '));
     if (r.hidden.length) console.log('         hidden: ' + r.hidden.slice(0,4).join(' | '));
     if (r.invisible.length) console.log('         no backgroundColor: ' +
       r.invisible.slice(0, 5).join(', '));
+    if (r.occluded.length) console.log('         painted over: ' +
+      r.occluded.slice(0, 5).join(', '));
     if (errs.length) console.log('         errors: ' + errs.slice(0, 4).join(' | '));
     await p.close();
   }

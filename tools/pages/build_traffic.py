@@ -565,15 +565,23 @@ def main():
             data: {
                 labels: %s,
                 datasets: [
+                    // order: the bar behind, the line in front. Chart.js sorts
+                    // datasets by `order` and then draws that list backwards, so
+                    // with both left at 0 the bar -- dataset 0 -- paints last and
+                    // covers the line it is meant to sit under.
                     { label: 'Incidents', data: %s, backgroundColor: '#3b82f6',
-                      yAxisID: 'y' },
-                    { type: 'line', label: 'Distinct free-text spellings', data: %s,
+                      yAxisID: 'y', order: 2 },
+                    { type: 'line', label: 'Distinct free-text spellings', data: %s, order: 1,
                       borderColor: '#ef4444', backgroundColor: '#ef4444', borderWidth: 2, pointRadius: 4,
                       fill: false, yAxisID: 'y1' }
                 ]
             },
             options: {
                 responsive: true, maintainAspectRatio: false,
+                // the legend follows draw order unless told otherwise, and the
+                // order above would have put the bar at the end of it.
+                plugins: { legend: { labels: {
+                    sort: (a, b) => a.datasetIndex - b.datasetIndex } } },
                 scales: { y: { position: 'left', beginAtZero: true,
                                title: { display: true, text: 'Incidents' } },
                           y1: { position: 'right', beginAtZero: true,
