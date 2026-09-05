@@ -171,6 +171,10 @@ SPECS = [
          title="The Cheap City Is Not Cheap",
          sub="1,500 asking prices per square metre, against how households actually live",
          stats=[("13&times; &rarr; 2.9&times;", "Gap, per m&sup2;"), ("48.5%", "Safe water"), ("39.9 pts", "Stove gap")]),
+    dict(file="og-traffic.png", icon="&#128739;", pill="Metro Manila Roads",
+         title="17,312 Tweets About Traffic",
+         sub="Half the file is one city &mdash; and lockdown cut the daily rate by 89%",
+         stats=[("50.4%", "One city"), ("28&rarr;3", "Per day, ECQ"), ("14 of 17", "LGUs present")]),
 ]
 
 if __name__ == "__main__":
