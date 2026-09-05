@@ -244,28 +244,46 @@ def main():
             per_model[mo] = ser
             for y in sorted(ser):
                 models.append([name, mo, y, round(ser[y], 2), SRC])
-            pairs = sorted(ser.items())
-            recent = [ser[y] for y in sorted(ser)[-10:]]
-            early = [ser[y] for y in sorted(ser)[:10]]
-            trends.append([
-                name, mo, min(ser), max(ser), len(ser),
-                round(sum(ser.values()) / len(ser), 2),
-                round(ols(pairs) * 10, 3),
-                round(sum(early) / len(early), 2),
-                round(sum(recent) / len(recent), 2),
-                round(sum(recent) / len(recent) - sum(early) / len(early), 2),
-                SRC])
-        # The spread between two reconstructions of the same atmosphere, which is
-        # a floor on how precisely any of this is known.
+        # Every trend below is computed over the years both models cover. ERA5
+        # begins in 1940 and ERA5-Land in 1950, and comparing a 1940-2024 slope
+        # against a 1950-2024 one is not a comparison of models -- it is partly a
+        # comparison of periods, and the earlier decades are the ones with the most
+        # warming to include or exclude. The full-span trend for each model is kept
+        # in its own row, labelled with the span it covers.
         common = sorted(set(per_model[MODELS[0]]) & set(per_model[MODELS[1]]))
+        if len(common) < 50:
+            raise SystemExit("%s: only %d shared year(s) between the two models"
+                             % (name, len(common)))
+
+        def summarise(label, ser, years, basis):
+            yrs = sorted(years)
+            pairs = [(y, ser[y]) for y in yrs]
+            early = [ser[y] for y in yrs[:10]]
+            recent = [ser[y] for y in yrs[-10:]]
+            return [name, label, yrs[0], yrs[-1], len(yrs),
+                    round(sum(ser[y] for y in yrs) / len(yrs), 2),
+                    round(ols(pairs) * 10, 3),
+                    round(sum(early) / len(early), 2),
+                    round(sum(recent) / len(recent), 2),
+                    round(sum(recent) / len(recent) - sum(early) / len(early), 2),
+                    basis, SRC]
+
+        for mo in MODELS:
+            trends.append(summarise(mo, per_model[mo], common, "shared period"))
+            if len(per_model[mo]) != len(common):
+                trends.append(summarise(mo + " (own span)", per_model[mo],
+                                        per_model[mo].keys(), "full model span"))
+
+        # The spread between two reconstructions of the same atmosphere, over the
+        # years they share. This is a floor on how precisely any of it is known.
         gap = [abs(per_model[MODELS[0]][y] - per_model[MODELS[1]][y])
                for y in common]
+        t0 = ols([(y, per_model[MODELS[0]][y]) for y in common]) * 10
+        t1 = ols([(y, per_model[MODELS[1]][y]) for y in common]) * 10
         trends.append([
             name, "model spread", min(common), max(common), len(common),
-            round(sum(gap) / len(gap), 2),
-            round(abs(ols(sorted((y, per_model[MODELS[0]][y]) for y in common)) * 10
-                      - ols(sorted((y, per_model[MODELS[1]][y]) for y in common)) * 10), 3),
-            "", "", round(max(gap), 2), SRC])
+            round(sum(gap) / len(gap), 2), round(abs(t0 - t1), 3),
+            "", "", round(max(gap), 2), "shared period", SRC])
 
     write("ph_weather_annual.csv",
           ["city", "year", "days", "mean_c", "mean_max_c", "mean_min_c",
@@ -286,7 +304,7 @@ def main():
     write("ph_weather_trends.csv",
           ["city", "model", "first_year", "last_year", "years", "mean_c",
            "trend_c_per_decade", "first_decade_mean_c", "last_decade_mean_c",
-           "change_c", "source"], trends)
+           "change_c", "basis", "source"], trends)
 
     ph = [t for t in trends if t[0] == "Manila"]
     cov = [

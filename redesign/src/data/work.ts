@@ -13,7 +13,7 @@ export const dataProjects: WorkItem[] = [
   { name: 'Philippine Food Prices: 62 Foods, 26 Years', href: '/projects/food-prices-analysis.html' },
   { name: 'Philippine Public Education (2010–2021)', href: '/projects/education-analysis.html' },
   { name: 'Most Popular Filipino Names', href: '/projects/philippine-names-analysis.html' },
-  { name: 'Philippine Weather Analysis (2023–2024)', href: '/projects/weather-analysis.html' },
+  { name: 'Philippine Climate: ERA5, 1940–2024', href: '/projects/weather-analysis.html' },
   { name: 'Philippine Housing: Asking Prices per m²', href: '/projects/housing-analysis.html' },
   { name: 'Metro Manila Traffic Incidents (2018–2020)', href: '/projects/traffic-analysis.html' },
   { name: 'Cebu Logistics Analysis (2022–2024)', href: '/projects/cebu-logistics-analysis.html' },

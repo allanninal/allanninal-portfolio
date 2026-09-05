@@ -191,6 +191,10 @@ SPECS = [
          title="Two Thirds Of Every Pacific Storm",
          sub="IBTrACS tracks, 1980&ndash;2024 &mdash; and no month of the year without one",
          stats=[("66.2%", "Of the basin"), ("21.3/yr", "In PH waters"), ("315 km/h", "The record")]),
+    dict(file="og-weather.png", icon="&#127777;", pill="Climate",
+         title="How Much Warmer? Ask Which Model",
+         sub="Two ERA5 reanalyses, 1940&ndash;2024 &mdash; a degree apart, and both warming",
+         stats=[("1.09&deg;C", "Model disagreement"), ("1.9&times;", "On the rate"), ("8 of 9", "Records since 2020")]),
 ]
 
 if __name__ == "__main__":
