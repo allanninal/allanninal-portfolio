@@ -61,22 +61,22 @@ select value from cs_coverage where property = 'largest spread';
 select value from cs_coverage where property = 'smallest spread';
 
 -- fact: widest.city
-select city from cs_city order by spread_c desc limit 1;
+select city from cs_city order by spread_c desc, city limit 1;
 
 -- fact: widest.warming
-select mean_warming_c from cs_city order by spread_c desc limit 1;
+select mean_warming_c from cs_city order by spread_c desc, city limit 1;
 
 -- fact: widest.min
-select min_warming_c from cs_city order by spread_c desc limit 1;
+select min_warming_c from cs_city order by spread_c desc, city limit 1;
 
 -- fact: widest.max
-select max_warming_c from cs_city order by spread_c desc limit 1;
+select max_warming_c from cs_city order by spread_c desc, city limit 1;
 
 -- fact: tightest.city
-select city from cs_city order by spread_c limit 1;
+select city from cs_city order by spread_c, city limit 1;
 
 -- fact: tightest.spread
-select spread_c from cs_city order by spread_c limit 1;
+select spread_c from cs_city order by spread_c, city limit 1;
 
 -- ---- Manila, and the page this one extends -----------------------------------
 
@@ -121,19 +121,22 @@ select max_future_days_over_35 from cs_city where city = 'Manila';
 select round(corr(latitude, mean_warming_c), 2) from cs_city;
 
 -- fact: warmest.city
-select city from cs_city order by mean_warming_c desc limit 1;
+select city from cs_city order by mean_warming_c desc, city limit 1;
 
 -- fact: warmest.warming
-select mean_warming_c from cs_city order by mean_warming_c desc limit 1;
+select mean_warming_c from cs_city order by mean_warming_c desc, city limit 1;
 
 -- fact: warmest.lat
-select round(latitude, 1) from cs_city order by mean_warming_c desc limit 1;
+select round(latitude, 1) from cs_city order by mean_warming_c desc, city limit 1;
 
 -- fact: coolest.city
-select city from cs_city order by mean_warming_c limit 1;
+-- Delhi and Dhaka both sit at the minimum, so the ordering carries an explicit
+-- tiebreak. Without it this fact flips between rebuilds and the prose beside it
+-- stops matching the number.
+select city from cs_city order by mean_warming_c, city limit 1;
 
 -- fact: coolest.warming
-select mean_warming_c from cs_city order by mean_warming_c limit 1;
+select mean_warming_c from cs_city order by mean_warming_c, city limit 1;
 
 -- fact: northmost.city
 select city from cs_city order by latitude desc limit 1;

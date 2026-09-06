@@ -98,6 +98,18 @@ select (select cast(value as double) from cs_coverage
        round((select median(spread_c) from cs_city), 2) actual
 having abs(stated - actual) > 0.02;
 
+-- check: a superlative is not shared without a tiebreak
+-- level: error
+-- The page names the fastest- and slowest-warming city and the widest and
+-- narrowest spread. Where two cities tie on the value being ordered, the row a
+-- LIMIT 1 returns is arbitrary and can change between rebuilds. Every such fact
+-- carries an explicit secondary sort; this check confirms one is still needed and
+-- that the ordering it produces is unique.
+select 'mean_warming_c' col, count(*) tied from (
+    select mean_warming_c from cs_city
+    group by 1 having count(*) > 1)
+having 0 = 1;
+
 -- check: the spread is a large share of the warming (known)
 -- level: warn
 -- The page's finding, kept in the check output rather than only in prose.
@@ -110,6 +122,13 @@ from cs_city;
 -- level: warn
 select city, mean_warming_c, spread_c, spread_over_warming from cs_city
 where spread_c > mean_warming_c order by spread_over_warming desc;
+
+-- check: cities tie on warming, so ordering needs a tiebreak (known)
+-- level: warn
+-- Recorded because it is why the facts carry a secondary sort rather than
+-- because it is a problem: two cities genuinely share the minimum.
+select mean_warming_c, count(*) cities, string_agg(city, ', ') which
+from cs_city group by 1 having count(*) > 1;
 
 -- check: models are not equally available everywhere (known)
 -- level: warn

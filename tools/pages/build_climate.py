@@ -61,10 +61,14 @@ def main():
             m[k] = f(m[k])
 
     C = {c["city"]: c for c in city}
-    byspread = sorted(city, key=lambda c: -c["spread_c"])
-    bywarm = sorted(city, key=lambda c: -c["mean_warming_c"])
-    byhot = sorted(city, key=lambda c: -(c["future_days_over_35"]
-                                         - c["baseline_days_over_35"]))
+    # Every sort carries the city name as a secondary key. Delhi and Dhaka share
+    # the minimum warming exactly, so without it the "slowest-warming city" named
+    # in the prose can change between rebuilds while the number beside it does not.
+    byspread = sorted(city, key=lambda c: (-c["spread_c"], c["city"]))
+    bywarm = sorted(city, key=lambda c: (-c["mean_warming_c"], c["city"]))
+    bycool = sorted(city, key=lambda c: (c["mean_warming_c"], c["city"]))
+    byhot = sorted(city, key=lambda c: (-(c["future_days_over_35"]
+                                          - c["baseline_days_over_35"]), c["city"]))
     exceeds = [c for c in city if c["spread_c"] > c["mean_warming_c"]]
     bylat = sorted(city, key=lambda c: -c["latitude"])
     # Correlation between latitude and warming. Computed rather than assumed: the
@@ -77,7 +81,8 @@ def main():
     sxx = sum((c["latitude"] - mx) ** 2 for c in city)
     syy = sum((c["mean_warming_c"] - my) ** 2 for c in city)
     corr = r(sxy / ((sxx * syy) ** 0.5), 2) if sxx and syy else 0.0
-    mnl, wide, tight, hot = C["Manila"], byspread[0], byspread[-1], byhot[0]
+    tightest = sorted(city, key=lambda c: (c["spread_c"], c["city"]))
+    mnl, wide, tight, hot = C["Manila"], byspread[0], tightest[0], byhot[0]
 
     F = dict(
         ncity=len(city), nmodel=int(f(cov["models offered"])),
@@ -105,7 +110,10 @@ def main():
         mhmin=mnl["min_future_days_over_35"], mhmax=mnl["max_future_days_over_35"],
         warmc=bywarm[0]["city"], warmw=bywarm[0]["mean_warming_c"],
         warmlat=r(bywarm[0]["latitude"], 1),
-        coolc=bywarm[-1]["city"], coolw=bywarm[-1]["mean_warming_c"],
+        coolc=bycool[0]["city"], coolw=bycool[0]["mean_warming_c"],
+        tiedwith=(bycool[1]["city"]
+                  if bycool[1]["mean_warming_c"] == bycool[0]["mean_warming_c"]
+                  else ""),
         northc=bylat[0]["city"], northw=bylat[0]["mean_warming_c"],
         northlat=r(bylat[0]["latitude"], 1),
         corr=corr,
@@ -302,17 +310,19 @@ def main():
                    ("The slowest",
                     "{c}, {v}&deg;C".format(c=F["coolc"], v=F["coolw"]),
                     "coolest.warming",
-                    "Also the city with the widest disagreement in the set, which "
-                    "is the next section and is not a coincidence.")],
+                    "Tied with {t} on exactly that figure &mdash; and also the city "
+                    "with the widest disagreement in the set, which is the next "
+                    "section and is not a coincidence.".format(t=F["tiedwith"]))],
                   "Warming against latitude, one point per city",
                   "latChart"),
 
         p.section(5, "The City The Ensemble Cannot Agree On",
-                  "{coolc} has the lowest mean warming here and the widest range "
-                  "behind it. The models are not slightly apart; they describe two "
-                  "different futures.".format(**F),
+                  "{coolc} is tied with {tiedwith} for the lowest mean warming in "
+                  "this set, and has by far the widest range behind it. The models "
+                  "are not slightly apart; they describe two different "
+                  "futures.".format(**F),
                   [("Ensemble mean", "{v}&deg;C".format(v=F["dw"]), "delhi.warming",
-                    "Lowest of the {n} cities. Read alone it looks like the "
+                    "Equal lowest of the {n} cities. Read alone it looks like the "
                     "least-affected place in the set.".format(n=F["ncity"])),
                    ("The models",
                     "{a}&ndash;{b}&deg;C".format(a=F["dmin"], b=F["dmax"]),
