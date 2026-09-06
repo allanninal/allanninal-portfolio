@@ -84,13 +84,16 @@ where baseline_days_over_35_per_year < 0 or baseline_days_over_35_per_year > 366
 
 -- check: the coverage city count matches the rows
 -- level: error
-select (select value from cs_coverage where property = 'cities') stated,
+-- cs_coverage.value is text, because the same column carries "1991-2010" as a
+-- window alongside the numbers. Every comparison against it has to cast.
+select (select cast(value as integer) from cs_coverage
+        where property = 'cities') stated,
        (select count(*) from cs_city) actual
 having stated <> actual;
 
 -- check: the stated median spread is the median of the rows
 -- level: error
-select (select value from cs_coverage
+select (select cast(value as double) from cs_coverage
         where property = 'median spread between models') stated,
        round((select median(spread_c) from cs_city), 2) actual
 having abs(stated - actual) > 0.02;

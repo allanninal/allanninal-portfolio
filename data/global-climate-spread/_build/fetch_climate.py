@@ -65,24 +65,29 @@ FUT = (2031, 2050)
 PAUSE = 0.35
 RETRY_CAP = 600
 MIN_MODELS = 4          # a spread computed on fewer than this is not an ensemble
+MIN_CITIES = 8          # below this the medians below are not worth reporting
+OFFLINE = "--offline" in sys.argv   # build from cache only; skip anything missing
 MIN_DAYS = 6000         # of ~7305 in a 20-year window; below this the mean is thin
 
+# Sixteen cities, ordered so the seven already collected stay first and the rest
+# widen the latitude range rather than the count. The API is metered by cost per
+# hour, so every city added is an hour of waiting; a spread from Reykjavik at 64N
+# to Sydney at 34S is worth more here than another tropical capital.
+# Ordered by what the analysis needs next, not by geography. The seven tropical
+# cities were collected first and are cached; the high-latitude ones follow,
+# because the one robust geographical signal here is that the far north warms
+# faster and it cannot be shown without Reykjavik and Moscow. The API is metered
+# by cost per hour, so ordering is how you decide what you have if collection
+# stops early.
 CITIES = [
     ("Manila", "PH", 14.60, 120.98), ("Jakarta", "ID", -6.21, 106.85),
     ("Delhi", "IN", 28.61, 77.21), ("Dhaka", "BD", 23.81, 90.41),
     ("Lagos", "NG", 6.52, 3.38), ("Nairobi", "KE", -1.29, 36.82),
-    ("Cairo", "EG", 30.04, 31.24), ("Kinshasa", "CD", -4.44, 15.27),
-    ("Sao Paulo", "BR", -23.55, -46.63), ("Lima", "PE", -12.05, -77.04),
-    ("Mexico City", "MX", 19.43, -99.13), ("Bogota", "CO", 4.71, -74.07),
-    ("New York", "US", 40.71, -74.01), ("Los Angeles", "US", 34.05, -118.24),
-    ("Chicago", "US", 41.88, -87.63), ("Toronto", "CA", 43.65, -79.38),
-    ("London", "GB", 51.51, -0.13), ("Paris", "FR", 48.86, 2.35),
-    ("Berlin", "DE", 52.52, 13.40), ("Madrid", "ES", 40.42, -3.70),
-    ("Moscow", "RU", 55.76, 37.62), ("Istanbul", "TR", 41.01, 28.98),
-    ("Tokyo", "JP", 35.68, 139.69), ("Seoul", "KR", 37.57, 126.98),
-    ("Beijing", "CN", 39.90, 116.41), ("Shanghai", "CN", 31.23, 121.47),
-    ("Sydney", "AU", -33.87, 151.21), ("Reykjavik", "IS", 64.15, -21.94),
-    ("Anchorage", "US", 61.22, -149.90), ("Cape Town", "ZA", -33.92, 18.42),
+    ("Cairo", "EG", 30.04, 31.24), ("Sao Paulo", "BR", -23.55, -46.63),
+    ("Reykjavik", "IS", 64.15, -21.94), ("Moscow", "RU", 55.76, 37.62),
+    ("London", "GB", 51.51, -0.13), ("Sydney", "AU", -33.87, 151.21),
+    ("New York", "US", 40.71, -74.01), ("Tokyo", "JP", 35.68, 139.69),
+    ("Berlin", "DE", 52.52, 13.40), ("Mexico City", "MX", 19.43, -99.13),
 ]
 
 
@@ -106,6 +111,22 @@ def fetch(url, tries=5):
                 json.dump(d, fh)
             return d
         except urllib.error.HTTPError as e:
+            # Open-Meteo distinguishes the hourly allowance from the daily one only
+            # in the body, and the difference matters: an hourly cap clears in
+            # minutes and is worth waiting through, a daily cap does not clear
+            # until tomorrow and retrying it just burns the run. Neither carries a
+            # Retry-After, so the body is the only signal.
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+            if "Daily API request limit" in body:
+                raise SystemExit(
+                    "\nDAILY LIMIT: Open-Meteo says the daily allowance is gone.\n"
+                    "%d response(s) are cached under %s; re-run tomorrow and it "
+                    "resumes from there without re-fetching.\n"
+                    % (len(os.listdir(CACHE)) if os.path.isdir(CACHE) else 0, CACHE))
             asked = float(e.headers.get("Retry-After") or 0)
             if e.code == 429 and asked > RETRY_CAP:
                 raise SystemExit(
@@ -128,10 +149,13 @@ def series(lat, lon, model):
     # of the cost of every call.
     out = {"time": [], "temperature_2m_mean": [], "temperature_2m_max": []}
     for lo, hi in (BASE, FUT):
-        d = fetch(API + "?" + urllib.parse.urlencode(dict(
+        u = API + "?" + urllib.parse.urlencode(dict(
             latitude=lat, longitude=lon, models=model,
             start_date="%d-01-01" % lo, end_date="%d-12-31" % hi,
-            daily="temperature_2m_mean,temperature_2m_max")))
+            daily="temperature_2m_mean,temperature_2m_max"))
+        if OFFLINE and not os.path.exists(_cache_path(u)):
+            raise KeyError("not cached")
+        d = fetch(u)
         day = d.get("daily") or {}
         for k in out:
             out[k].extend(day.get(k) or [])
@@ -160,6 +184,10 @@ def main():
         for m in MODELS:
             try:
                 d = series(lat, lon, m)
+            except KeyError:
+                arows.append([name, cc, m, "not collected",
+                              "offline run; this pair is not in the cache", SRC])
+                continue
             except Exception as e:
                 arows.append([name, cc, m, "error", str(e)[:60], SRC])
                 continue
@@ -206,6 +234,12 @@ def main():
             round(min(hf), 1), round(max(hf), 1), SRC])
         print("  %-14s %d models  warming %.2f C  spread %.2f C"
               % (name, len(got), statistics.mean(w), max(w) - min(w)))
+
+    if len(crows) < MIN_CITIES:
+        raise SystemExit(
+            "\nTOO FEW CITIES: %d complete, need %d. Medians over fewer than that "
+            "describe the cities that happened to be collected first rather than "
+            "anything about the world.\n" % (len(crows), MIN_CITIES))
 
     write("cs_model.csv",
           ["city", "country", "latitude", "longitude", "model",

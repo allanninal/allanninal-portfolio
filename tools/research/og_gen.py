@@ -219,6 +219,10 @@ SPECS = [
          title="The Free-To-Publish Label That Is Not",
          sub="348 journals audited against the registry that asks them directly",
          stats=[("47.31%", "Labelled free, but charge"), ("2.4&times;", "Worse outside hard currency"), ("88 of 90", "Control correct")]),
+    dict(file="og-climatespread.png", icon="&#127777;&#65039;", pill="Global &middot; Climate",
+         title="Every Model Warms. None Agree By How Much.",
+         sub="Seven CMIP6 models, ten cities, 1991&ndash;2010 against 2031&ndash;2050",
+         stats=[("10 of 10", "Cities warmed by every model"), ("0.56&deg;C", "Median model disagreement"), ("0.03&ndash;1.57", "Delhi, across models")]),
 ]
 
 if __name__ == "__main__":
