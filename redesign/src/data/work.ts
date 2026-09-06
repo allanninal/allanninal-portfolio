@@ -10,6 +10,7 @@ export interface WorkItem {
 // Open-data deep dives: mostly Philippine, plus a growing set of global ones.
 // Links resolve at the deployed site root.
 export const dataProjects: WorkItem[] = [
+  { name: 'Where Networks Actually Meet: 1,323 Internet Exchanges', href: '/projects/global-interconnect-analysis.html' },
   { name: 'Safe Water: The Number A Quarter Of The World Lacks', href: '/projects/global-water-analysis.html' },
   { name: 'The European Grid, Hour By Hour', href: '/projects/global-grid-analysis.html' },
   { name: 'What The World Reads: Wikipedia by Country', href: '/projects/global-reading-analysis.html' },

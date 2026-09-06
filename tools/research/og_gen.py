@@ -207,6 +207,10 @@ SPECS = [
          title="A Quarter Of The World Has No Safe-Water Number",
          sub="Two rungs of the WHO/UNICEF ladder, quoted as if they were one",
          stats=[("2.21B", "People, no estimate"), ("18.4 pts", "Median gap"), ("2075", "Universal, at this rate")]),
+    dict(file="og-interconnect.png", icon="&#127760;", pill="Global &middot; Internet",
+         title="The Biggest Internet Exchange Is In S&atilde;o Paulo",
+         sub="1,323 exchanges, 5,861 facilities &mdash; and 93 rooms nobody joined",
+         stats=[("1,860", "Networks, IX.br"), ("93", "Empty exchanges"), ("9.0 vs 21.5", "US vs NL per building")]),
 ]
 
 if __name__ == "__main__":
