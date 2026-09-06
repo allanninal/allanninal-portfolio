@@ -10,6 +10,7 @@ export interface WorkItem {
 // Open-data deep dives: mostly Philippine, plus a growing set of global ones.
 // Links resolve at the deployed site root.
 export const dataProjects: WorkItem[] = [
+  { name: 'Diamond Open Access: Auditing A Label Against DOAJ', href: '/projects/global-openaccess-analysis.html' },
   { name: 'The Same Trade, Counted Twice: Mirror Statistics', href: '/projects/global-trade-mirror-analysis.html' },
   { name: 'Where Networks Actually Meet: 1,323 Internet Exchanges', href: '/projects/global-interconnect-analysis.html' },
   { name: 'Safe Water: The Number A Quarter Of The World Lacks', href: '/projects/global-water-analysis.html' },

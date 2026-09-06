@@ -58,8 +58,12 @@ STATUSES = ["diamond", "gold", "hybrid", "bronze", "green", "closed"]
 BUCKETS = [(0, 500), (500, 1000), (1000, 2000), (2000, 3000),
            (3000, 5000), (5000, 100000)]
 TOP_N = 60                       # countries, by works in YEAR
-AUDIT_CHARGING = 400             # DOAJ journals that say they DO charge a fee
-AUDIT_FREE = 200                 # DOAJ journals that say they do NOT -- the control
+# Sized to the daily allowance. Each journal costs two metered calls (resolve the
+# source, then group its works by oa_status), and the country and year series
+# above cost about 150 more on a cold cache. 450 journals is 900 calls, which
+# fits inside BUDGET with room for retries.
+AUDIT_CHARGING = 300             # DOAJ journals that say they DO charge a fee
+AUDIT_FREE = 150                 # DOAJ journals that say they do NOT -- the control
 PAUSE = 0.28                     # OpenAlex's polite pool allows 10/s; stay well under
 
 # Currencies OpenAlex reliably carries a converted apc_usd for. The split is the
@@ -80,7 +84,10 @@ MIN_AUDIT = 150                  # too small a sample is a failed run, not a res
 #   * every response is cached on disk, so a resumed run re-spends nothing;
 #   * a Retry-After longer than RETRY_CAP aborts with the reset time rather than
 #     sleeping through most of a day.
-BUDGET = 950                     # leave a margin under the 1000/day allowance
+# --offline spends nothing and runs entirely from the cache, stopping the audit
+# at whatever was already paid for. Useful when the allowance is gone but enough
+# journals are cached to exceed MIN_AUDIT.
+BUDGET = 0 if "--offline" in sys.argv else 950
 RETRY_CAP = 600                  # seconds; anything longer is a quota, not a queue
 SPENT = [0]
 
@@ -298,9 +305,21 @@ def main():
     arows, cells = [], collections.Counter()
     by_cur = collections.defaultdict(lambda: [0, 0])
     absent = 0
+    # A run that reaches the allowance mid-audit should use the sample it has
+    # rather than throw it away. Two metered calls are needed per journal, so the
+    # loop stops while there is still room for one more pair; MIN_AUDIT below
+    # then decides whether what was collected is enough to report.
+    budget_limited = False
     for want, q in ((AUDIT_CHARGING, "bibjson.apc.has_apc:true"),
                     (AUDIT_FREE, "bibjson.apc.has_apc:false")):
         for j in harvest(q, want):
+            if SPENT[0] > BUDGET - 3 and not os.path.exists(_cache_path(
+                    "https://api.openalex.org/sources?"
+                    + urllib.parse.urlencode(
+                        {"filter": "issn:%s" % j["issn"], "per_page": 1,
+                         "mailto": MAIL}))):
+                budget_limited = True
+                break
             src = (oa("sources", filter="issn:%s" % j["issn"], per_page=1)
                    .get("results") or [])
             if not src:
@@ -331,6 +350,10 @@ def main():
                           "DOAJ has_apc vs OpenAlex oa_status"])
 
     audited = sum(cells.values())
+    if budget_limited:
+        print("  NOTE: the daily allowance was reached; the audit below is the "
+              "sample collected before it, not the full %d journals."
+              % (AUDIT_CHARGING + AUDIT_FREE))
     if audited < MIN_AUDIT:
         sys.stderr.write("AUDIT TOO SMALL: %d journals resolved, need %d. Either DOAJ "
                          "paging or the OpenAlex source lookup is failing, and a rate "
@@ -392,6 +415,8 @@ def main():
      ["hard-currency journals audited", hard_n, "count", DOAJ_SRC],
      ["other-currency journals audited", oth_n, "count", DOAJ_SRC],
      ["sampled journals absent from OpenAlex", absent, "count", OA_SRC],
+     ["audit stopped by the daily allowance", 1 if budget_limited else 0, "flag",
+      "OpenAlex allows about 1000 requests a day anonymously"],
      ["a work is counted once per author country", 1, "flag",
       "multi-country papers appear in each country's total"],
     ]

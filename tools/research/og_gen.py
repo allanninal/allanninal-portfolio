@@ -215,6 +215,10 @@ SPECS = [
          title="The Same Trade, Counted Twice, Differently",
          sub="2,600 country pairs where both sides report &mdash; and disagree",
          stats=[("$91.6B", "One pair, CN to DE"), ("31.15%", "Median gap"), ("$714B", "Imports minus exports")]),
+    dict(file="og-openaccess.png", icon="&#128214;", pill="Global &middot; Research",
+         title="The Free-To-Publish Label That Is Not",
+         sub="348 journals audited against the registry that asks them directly",
+         stats=[("47.31%", "Labelled free, but charge"), ("2.4&times;", "Worse outside hard currency"), ("88 of 90", "Control correct")]),
 ]
 
 if __name__ == "__main__":
