@@ -211,6 +211,10 @@ SPECS = [
          title="The Biggest Internet Exchange Is In S&atilde;o Paulo",
          sub="1,323 exchanges, 5,861 facilities &mdash; and 93 rooms nobody joined",
          stats=[("1,860", "Networks, IX.br"), ("93", "Empty exchanges"), ("9.0 vs 21.5", "US vs NL per building")]),
+    dict(file="og-trademirror.png", icon="&#128230;", pill="Global &middot; Trade",
+         title="The Same Trade, Counted Twice, Differently",
+         sub="2,600 country pairs where both sides report &mdash; and disagree",
+         stats=[("$91.6B", "One pair, CN to DE"), ("31.15%", "Median gap"), ("$714B", "Imports minus exports")]),
 ]
 
 if __name__ == "__main__":
