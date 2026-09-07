@@ -163,8 +163,9 @@ def main():
     p = Page(PAGE)
     p.hero('''                <h1>A Whole New Tier Of School, Built In Four Years</h1>
                 <p class="{hero_desc}">
-                    DepEd public-school counts for {years} academic years and all
-                    {nreg} regions. Senior high school did not exist until
+                    DepEd public-school counts for <span data-fact="deped.years">{years}</span>
+                    academic years and all
+                    <span data-fact="deped.regions">{nreg}</span> regions. Senior high school did not exist until
                     {sy0}; by {y1} it held {se1:,} pupils. Over the same period
                     teachers grew {gratio} times as fast as enrollment.
                 </p>

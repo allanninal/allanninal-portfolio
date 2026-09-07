@@ -65,7 +65,12 @@ def main():
         ooprank=sum(1 for r in asean if f(r["out_of_pocket_pct_of_health_spend"])
                     >= f(ph["out_of_pocket_pct_of_health_spend"])),
     )
-    F["gain"] = round(F["life"] - F["life60"], 1)
+    # From the raw values, not the rounded display ones. 69.9460 - 59.1750 is
+    # 10.771 and rounds to 10.8; subtracting the displayed 69.9 and 59.2 gives
+    # 10.7, and facts.sql -- which divides the raw values -- says 10.8. The page
+    # carried the wrong one until a check on hero figures caught it.
+    F["gain"] = round(f(last("life_expectancy")["life_expectancy"])
+                      - f(first("life_expectancy")["life_expectancy"]), 1)
     F["tbchange"] = round(F["tb"] - F["tb2000"])
     # From the raw CSV values, not from the rounded display figures. Dividing
     # 625 by a tbbest already rounded to 97 gives 6.4; facts.sql divides the raw
@@ -77,7 +82,8 @@ def main():
     p = Page(PAGE)
     p.hero('''                <h1>Philippine Health, 1960&ndash;{year}</h1>
                 <p class="hero-description">
-                    Life expectancy is up {gain} years since 1960 and infant deaths are
+                    Life expectancy is up <span data-fact="hl.life.gain">{gain}</span> years
+                    since 1960 and infant deaths are
                     down by two thirds. Two things went the other way, and they are the
                     ones worth the page: tuberculosis, and how much of a hospital bill a
                     household pays itself.

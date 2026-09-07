@@ -128,7 +128,8 @@ def main():
         breadcrumb="What The World Reads")
     p.hero('''                <h1>There Is No Such Thing As What The World Is Reading</h1>
                 <p class="{hero_desc}">
-                    One week, {answered} countries, {nproj} language editions of
+                    One week, {answered} countries,
+                    <span data-fact="gw.projects">{nproj}</span> language editions of
                     Wikipedia. The median pair of countries shares {ovmed}% of
                     its most-read articles, {lovzero} of {lovpairs} pairs of
                     language editions share none at all, and India's entire

@@ -86,7 +86,7 @@ def main():
 
     hero = '''                <h1>The 2022 Philippine Election</h1>
                 <p class="hero-description">
-                    {ncand} presidential candidates, {electorate:,} registered voters and
+                    <span data-fact="elec.candidates">{ncand}</span> presidential candidates, {electorate:,} registered voters and
                     the most lopsided result since 1953. Also {invalid:,} ballots that
                     reached a precinct and produced no valid presidential vote &mdash;
                     more than the fourth-placed candidate received.

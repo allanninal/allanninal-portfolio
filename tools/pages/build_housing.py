@@ -174,7 +174,7 @@ def main():
     p.hero('''                <h1>1,500 Asking Prices, And How Filipinos Actually Live</h1>
                 <p class="hero-description">
                     Two datasets that do not describe the same country. A portal
-                    scrape of {n:,} property listings, median ask {mmd} &mdash; and
+                    scrape of <span data-fact="listing.n">{n:,}</span> property listings, median ask {mmd} &mdash; and
                     national figures showing {wsafe}% of households with drinking
                     water that is safely managed and {cook}% cooking on clean fuel.
                 </p>

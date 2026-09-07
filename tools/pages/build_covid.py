@@ -68,7 +68,8 @@ def main():
     hero = '''                <h1>Philippine COVID-19, 2020&ndash;2026</h1>
                 <p class="hero-description">
                     The confirmed toll is {deaths:,} deaths. The excess-mortality
-                    estimate for the same period is {excess:,}. This page is mostly
+                    estimate for the same period is
+                    <span data-fact="cov.excess">{excess:,}</span>. This page is mostly
                     about that gap, and about which of the two numbers a country
                     actually gets quoted.
                 </p>

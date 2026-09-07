@@ -165,7 +165,8 @@ def main():
 
     p.hero('''                <h1>The Biggest Internet Exchange In The World Is In S&atilde;o Paulo</h1>
                 <p class="{hero_desc}">
-                    {nix:,} registered internet exchanges and {nfac:,} colocation
+                    {nix:,} registered internet exchanges and
+                    <span data-fact="gi.facilities">{nfac:,}</span> colocation
                     facilities, read from the registry operators keep about
                     themselves. Counting buildings is the wrong measure: the
                     United States holds {usfacpct}% of the world&rsquo;s

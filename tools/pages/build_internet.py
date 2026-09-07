@@ -74,7 +74,7 @@ def main():
                     Two questions that get answered as if they were one. How many
                     people have a connection &mdash; and how fast are the connections
                     that people test? The first comes from the World Bank, the second
-                    from {q} quarters of Ookla Speedtest tiles, and this page keeps
+                    from <span data-fact="net.quarters">{q}</span> quarters of Ookla Speedtest tiles, and this page keeps
                     them apart.
                 </p>
 

@@ -27,7 +27,7 @@ venv:
 	uv pip install --python $(PY) duckdb pdfplumber tqdm regexploit
 
 # --- validation -------------------------------------------------------------
-check: facts backlinks sources reveal styling scripts sitemap tracked dates blogorder
+check: facts backlinks sources reveal styling scripts sitemap tracked dates blogorder hero
 	@$(PY) data/_lib/check.py
 
 # Prose numbers are typed by hand while reading a CSV -- the same process that
@@ -114,6 +114,9 @@ dates:
 # articles. Cards move verbatim, so hand-written excerpts survive.
 blogorder:
 	@$(PY) tools/pages/blog_order.py --check
+
+hero:
+	@python3 tools/pages/hero.py --check
 
 # .gitignore had `!/build/` on line 3 saying /build is published site content, and
 # a bare `build/` on line 60. Last match wins, so every NEW file under build/ was

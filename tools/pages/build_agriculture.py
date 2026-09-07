@@ -80,7 +80,8 @@ def main():
 
     hero = '''                <h1>Philippine Agriculture, 1961&ndash;2024</h1>
                 <p class="hero-description">
-                    Sixty-four years of FAOSTAT harvests for {ncrops} crops, next to
+                    Sixty-four years of FAOSTAT harvests for
+                    <span data-fact="agri.crops">{ncrops}</span> crops, next to
                     what agriculture is worth and who works in it. Rice output is up
                     {multiple}&times;. Planted area is up {areamult}&times;. Almost all
                     of the difference is yield &mdash; and yield is where the country

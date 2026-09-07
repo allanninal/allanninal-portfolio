@@ -120,7 +120,8 @@ def main():
     p = Page(PAGE)
     p.hero('''                <h1>Two Thirds Of Every Pacific Storm Comes Here</h1>
                 <p class="{hero_desc}">
-                    {n} storms entered Philippine waters across the {years}
+                    {n} storms entered Philippine waters across the
+                    <span data-fact="par.years">{years}</span>
                     finalised satellite-era seasons &mdash; {share}% of every
                     storm in the western Pacific, the busiest basin on earth.
                     {c5} of them reached category 5. This is a track archive,

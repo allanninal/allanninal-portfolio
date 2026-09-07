@@ -156,7 +156,7 @@ def main():
     p = Page(PAGE)
     p.hero('''                <h1>How Much Warmer? That Depends Which Model You Ask</h1>
                 <p class="{hero_desc}">
-                    {obs:,} daily observations across {cities} Philippine grid
+                    <span data-fact="wx.obs">{obs:,}</span> daily observations across {cities} Philippine grid
                     cells, {first} to {last}. Two reanalyses of the same
                     atmosphere put Manila's warming at {mel} and {me5}&nbsp;&deg;C
                     a decade &mdash; so this page reports ranges. Both agree
