@@ -28,31 +28,55 @@ NEW_FOOT = ("Everything above is free to read, end to end &mdash; the architectu
 BLOCK_RE = re.compile(r'<div class="offer__dl">.*?</div>', re.S)
 
 
+MAN = json.loads((WF / "manifest.json").read_text(encoding="utf-8")) \
+    if (WF / "manifest.json").exists() else {}
+
+
 def block(slug):
+    m = MAN.get(slug, {})
+    copy = {
+     "n8n": ("<strong>%d nodes.</strong> Passes n8n&#x27;s own "
+             "<code>validate_workflow</code> with zero errors. Google Sheets, "
+             "OpenAI and Gmail stand in for DynamoDB, Bedrock and SES."
+             % m.get("n8n_nodes", 0)),
+     "make": ("<strong>%d modules</strong>, so about %d runs a month inside the "
+              "free plan&#x27;s 1,000 credits. Structurally checked against "
+              "Make&#x27;s own template corpus; import it to confirm."
+              % (m.get("make_modules", 0), m.get("ceiling", 0))),
+    }
     rows = []
-    for plat, label, what in (
-            ("n8n", "n8n workflow",
-             "importable JSON, validated against n8n&#x27;s own node database"),
-            ("make", "Make scenario",
-             "blueprint JSON for the free plan, plus what it costs in credits")):
+    for plat, label in (("n8n", "n8n workflow"), ("make", "Make scenario")):
         z = WF / f"{slug}-{plat}.zip"
         if not z.exists():
             continue
         kb = round(z.stat().st_size / 1024)
         rows.append(
             f'<li class="offer__item"><span class="offer__name">{label}</span>'
-            f'<span class="offer__what">{what}</span>'
+            f'<span class="offer__what">{copy[plat]}</span>'
             f'<a class="offer__buy" href="/build/assets/workflows/{slug}-{plat}.zip" '
             f'download>Download ({kb} KB)</a></li>')
     if not rows:
         return ""
+    preview = ""
+    if (WF / f"{slug}-flow.svg").exists():
+        preview = (
+            f'<figure class="offer__preview">'
+            f'<img src="/build/assets/workflows/{slug}-flow.svg" loading="lazy" '
+            f'decoding="async" width="940" height="702" '
+            f'alt="The flow: a scheduled trigger reads an intake sheet, makes one '
+            f'model call per {m.get("unit", "unit")}, works out the answer, branches, '
+            f'appends a row per table and sends the result. The steps needing '
+            f'credentials are marked.">'
+            f'<figcaption>What is inside both archives: the same flow, plus a '
+            f'README and this diagram at full size. The credentials each step '
+            f'needs are marked on it.</figcaption></figure>')
     return ('<div class="offer__dl"><p class="offer__label">Run it on n8n or Make '
             '<span class="offer__badge offer__badge--live">Free</span></p>'
+            + preview +
             '<ul class="offer__list">' + "".join(rows) + "</ul>"
-            '<p class="offer__foot">Each archive holds the workflow, a README and a '
-            'diagram of the flow with the credentials it needs. These are ports, not '
-            'equivalents &mdash; per-step IAM and the cost breakdown in part six do not '
-            'survive the move, and the README says exactly how.</p></div>')
+            '<p class="offer__foot">These are ports, not equivalents &mdash; '
+            'per-step IAM and the cost breakdown in part six do not survive the '
+            'move, and each README says exactly how.</p></div>')
 
 
 def main(slugs=None):

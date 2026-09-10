@@ -378,6 +378,17 @@ def build(path, validated=False):
     for name in (f"{slug}.n8n.json", f"{slug}.make.json"):
         (OUT / name).write_text(files[name], encoding="utf-8")
 
+    # a neutral preview of the flow, for the download block on the page
+    (OUT / f"{slug}-flow.svg").write_text(
+        flow_svg(spec, "preview", stores, chain), encoding="utf-8")
+    man_path = OUT / "manifest.json"
+    man = json.loads(man_path.read_text()) if man_path.exists() else {}
+    man[slug] = {"n8n_nodes": len(wf["nodes"]) - 1,   # the sticky note is not a step
+                 "make_modules": per_unit, "ceiling": ceiling,
+                 "unit": unit_of(spec), "stores": stores}
+    man_path.write_text(json.dumps(man, indent=1, sort_keys=True) + "\n",
+                        encoding="utf-8")
+
     stamp = tuple(int(x) for x in spec["date"].split("-")) + (12, 0, 0)
     import tempfile
     for plat, jsonname, rk in (("n8n", f"{slug}.n8n.json", "__n8n_README"),
@@ -513,13 +524,15 @@ def flow_svg(spec, platform, stores, chain):
     slug, name = spec["slug"], spec["name"]
     unit = unit_of(spec)
     n8n_p = platform == "n8n"
+    preview = platform == "preview"
     cad = cadence(dissect(spec)[0])
 
     entry = {"title": "Request received" if cad == "webhook" else
                       ("Monthly close" if cad == "monthly" else "Nightly 02:00"),
              "sub": (["webhook, no auth", "needed"] if cad == "webhook"
-                     else (["scheduled by n8n", "cron or interval"] if n8n_p
-                           else ["Make free plan:", "15 min minimum"])),
+                     else (["scheduled", "nightly or monthly"] if preview
+                           else (["scheduled by n8n", "cron or interval"] if n8n_p
+                                 else ["Make free plan:", "15 min minimum"]))),
              "icon": "clock"}
 
     steps = [
@@ -546,10 +559,10 @@ def flow_svg(spec, platform, stores, chain):
     ]
     note = ("Replace SPREADSHEET_ID and the recipient before the first run. "
             "Credentials are deliberately absent: the import will prompt.")
-    c = L.chain(steps, note=note,
-                account=("n8n workflow" if n8n_p else "Make scenario -- one of "
-                                                      "your two free active slots"),
-                entry=entry)
+    account = ("the same shape on n8n and on Make" if preview else
+               ("n8n workflow" if n8n_p else
+                "Make scenario -- one of your two free active slots"))
+    c = L.chain(steps, note=note, account=account, entry=entry)
     title = f"{name}: the {platform} flow"
     desc = (f"A vertical flow for the {name} {platform} port. It begins at "
             f"{entry['title']}, reads an intake sheet in Google Sheets, makes one "
