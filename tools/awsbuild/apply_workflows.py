@@ -34,6 +34,15 @@ MAN = json.loads((WF / "manifest.json").read_text(encoding="utf-8")) \
 
 def block(slug):
     m = MAN.get(slug, {})
+    fid = m.get("fidelity", "spec")
+    caveat = {
+     "spec": "",
+     "prose": (" Derived from the series&#x27; published reference page rather "
+               "than its source spec, so it is the right shape with the right "
+               "pieces rather than a step-by-step transcription."),
+     "minimal": (" One of the earliest series: only the overall shape could be "
+                 "recovered, so this is a starting skeleton rather than a port."),
+    }[fid]
     copy = {
      "n8n": ("<strong>%d nodes.</strong> Passes n8n&#x27;s own "
              "<code>validate_workflow</code> with zero errors. Google Sheets, "
@@ -44,6 +53,8 @@ def block(slug):
               "Make&#x27;s own template corpus; import it to confirm."
               % (m.get("make_modules", 0), m.get("ceiling", 0))),
     }
+    if caveat:
+        copy = {k: v + caveat for k, v in copy.items()}
     rows = []
     for plat, label in (("n8n", "n8n workflow"), ("make", "Make scenario")):
         z = WF / f"{slug}-{plat}.zip"

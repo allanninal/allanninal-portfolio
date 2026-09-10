@@ -94,6 +94,9 @@ def cadence(funcs):
 
 
 def unit_of(spec):
+    if len(spec.get("parts", [])) < 6 or not isinstance(spec["parts"][5], dict) \
+            or "og" not in spec["parts"][5]:
+        return "item"
     cost = spec["parts"][5]
     m = re.search(r"one model read per ([a-z]+)", cost["og"].lower())
     return m.group(1).strip() if m else "unit"
@@ -171,12 +174,18 @@ def n8n(spec, funcs, stores, chain, ceiling):
                              "combinator": "and"},
               "renameOutput": True,
               "outputKey": strip(s2["exit"]["title"])[:30]} for s2 in exits]
-    branch = add({"parameters": {"rules": {"values": rules},
-                                 "options": {"fallbackOutput": "extra",
-                                             "renameFallbackOutput": "Continue"}},
-                  "id": f"{slug}-branch", "name": strip(chain["steps"][0]["title"]),
-                  "type": SWITCH, "typeVersion": 3.2, "position": [x, y]})
-    link(calc, branch)
+    # Some systems in the series do not branch at all. An empty Switch is not a
+    # workflow, so in that case the fan-out is simply the store writes.
+    if rules:
+        branch = add({"parameters": {"rules": {"values": rules},
+                                     "options": {"fallbackOutput": "extra",
+                                                 "renameFallbackOutput": "Continue"}},
+                      "id": f"{slug}-branch", "name": strip(chain["steps"][0]["title"]),
+                      "type": SWITCH, "typeVersion": 3.2, "position": [x, y]})
+        link(calc, branch)
+    else:
+        branch = calc
+        x -= 220
 
     x += 260
     for i2, store in enumerate(stores):
@@ -190,7 +199,7 @@ def n8n(spec, funcs, stores, chain, ceiling):
             "id": f"{slug}-store-{i2}", "name": f"Append to {store}",
             "type": SHEETS, "typeVersion": 4.5,
             "position": [x, y - 170 + i2 * 170]})
-        link(branch, n, out=min(i2, len(rules)))
+        link(branch, n, out=(min(i2, len(rules)) if rules else 0))
 
     x += 260
     mail = add({"parameters": {"sendTo": "operations@example.com",
@@ -287,9 +296,13 @@ def make(spec, funcs, stores, chain, ceiling):
                parameters={"__IMTCONN__": None})
     routes.append({"flow": [cont, mail]})
 
-    router = mod(MK_ROUTER, MK_ROUTER_V, strip(chain["steps"][0]["title"]))
-    router["routes"] = routes
-    flow.append(router)
+    if exits:
+        router = mod(MK_ROUTER, MK_ROUTER_V, strip(chain["steps"][0]["title"]))
+        router["routes"] = routes
+        flow.append(router)
+    else:
+        # No branch in the article: a straight line of modules.
+        flow.extend(routes[-1]["flow"])
 
     bp = {"name": f"{name} ({spec['date']})", "flow": flow,
           "metadata": {"instant": cad == "webhook", "version": 1,
@@ -324,11 +337,19 @@ def count_modules(flow):
 
 
 # --------------------------------------------------------------------------
-def build(path, validated=False):
-    import zipfile, datetime
-    spec = load_spec(path)
-    slug = spec["slug"]
-    funcs, stores, chain = dissect(spec)
+def build(path, validated=False, entry=None):
+    """`path` is a spec file, or a slug string for a series whose spec is gone."""
+    import zipfile
+    if entry is not None:
+        slug = str(path)
+        spec = spec_from_registry(slug, entry)
+        funcs, stores, fidelity = dissect_html(slug, entry)
+        chain = {"steps": [{"title": "Which route?"}]}   # no branch recoverable
+    else:
+        spec = load_spec(path)
+        slug = spec["slug"]
+        funcs, stores, chain = dissect(spec)
+        fidelity = "spec"
     OUT.mkdir(parents=True, exist_ok=True)
 
     mk = make(spec, funcs, stores, chain, 0)
@@ -337,7 +358,9 @@ def build(path, validated=False):
     wf = n8n(spec, funcs, stores, chain, ceiling)
 
     unit = unit_of(spec)
-    mid = re.search(r"at ([\d,]+ [a-z]+)", spec["parts"][5]["desc"])
+    mid = (re.search(r"at ([\d,]+ [a-z]+)", spec["parts"][5]["desc"])
+           if isinstance(spec["parts"][5], dict) and "desc" in spec["parts"][5]
+           else None)
     note = ("The series' own middle volume tier is %s. Compare it against the "
             "ceiling above before assuming the free plan is enough — for most "
             "of these series it is not, and that is worth knowing on day one "
@@ -348,7 +371,7 @@ def build(path, validated=False):
     files[f"{slug}.n8n.json"] = json.dumps(wf, indent=2) + "\n"
     files[f"{slug}.make.json"] = json.dumps(mk, indent=2) + "\n"
     files["__n8n_README"] = readme(
-        spec, "n8n", f"{slug}.n8n.json", stores,
+        spec, "n8n", f"{slug}.n8n.json", stores, fidelity=fidelity,
         cost_note=("Self-hosting n8n is a different shape entirely: the compute "
                    "is yours and always on, so a quiet month is no longer nearly "
                    "free."),
@@ -358,7 +381,8 @@ def build(path, validated=False):
                   "been executed against live AWS resources."),
         unit_word="workflow")
     files["__make_README"] = readme(
-        spec, "Make", f"{slug}.make.json", stores, modules=per_unit,
+        spec, "Make", f"{slug}.make.json", stores, fidelity=fidelity,
+        modules=per_unit,
         ceiling=ceiling, ceiling_note=note,
         cost_note=("Make prices per operation against a 1,000-credit monthly "
                    "free ceiling, so at the volumes the article assumes this "
@@ -380,12 +404,12 @@ def build(path, validated=False):
 
     # a neutral preview of the flow, for the download block on the page
     (OUT / f"{slug}-flow.svg").write_text(
-        flow_svg(spec, "preview", stores, chain), encoding="utf-8")
+        flow_svg(spec, "preview", stores, chain, funcs), encoding="utf-8")
     man_path = OUT / "manifest.json"
     man = json.loads(man_path.read_text()) if man_path.exists() else {}
     man[slug] = {"n8n_nodes": len(wf["nodes"]) - 1,   # the sticky note is not a step
                  "make_modules": per_unit, "ceiling": ceiling,
-                 "unit": unit_of(spec), "stores": stores}
+                 "unit": unit_of(spec), "stores": stores, "fidelity": fidelity}
     man_path.write_text(json.dumps(man, indent=1, sort_keys=True) + "\n",
                         encoding="utf-8")
 
@@ -395,7 +419,7 @@ def build(path, validated=False):
                                ("make", f"{slug}.make.json", "__make_README")):
         # the flow picture: the README as a diagram
         png = b""
-        svg = flow_svg(spec, plat, stores, chain)
+        svg = flow_svg(spec, plat, stores, chain, funcs)
         with tempfile.TemporaryDirectory() as td:
             sp = pathlib.Path(td) / "f.svg"
             sp.write_text(svg, encoding="utf-8")
@@ -464,6 +488,10 @@ and it is better to know them now than to find out later.
 
 {verified}
 
+## How this was derived
+
+{fidelity_note}
+
 ## Licence and provenance
 
 Generated from the published series. The architecture, the cost breakdown and
@@ -500,9 +528,27 @@ def _wrap(s, w=78):
     import textwrap
     return "\n".join(textwrap.fill(par, w) for par in s.split("\n\n"))
 
+FIDELITY_NOTE = {
+ "spec": ("From the series' own source spec: the Lambda inventory, the branch "
+          "structure and the table schemas are read directly out of it, so the "
+          "steps here line up with the article one for one."),
+ "prose": ("From the series' published engineering reference. That page predates "
+           "the current spec format, so the function list and the stores are "
+           "recovered from it while the branch structure is not. Treat this as "
+           "the right shape with the right pieces, rather than a step-by-step "
+           "transcription -- read part 7 of the series for the detail."),
+ "minimal": ("This is one of the earliest series, and its reference page uses a "
+             "layout from before the function and store lists were structured. "
+             "Only the overall shape could be recovered, so this file is a "
+             "starting skeleton rather than a port. Read the series and expect "
+             "to do real work on it."),
+}
+
+
 def readme(spec, platform, fname, stores, modules=0, ceiling=0, ceiling_note="",
-           verified="", cost_note="", unit_word="workflow"):
+           verified="", cost_note="", unit_word="workflow", fidelity="spec"):
     ceiling_note, verified = _wrap(ceiling_note), _wrap(verified)
+    fidelity_note = _wrap(FIDELITY_NOTE.get(fidelity, FIDELITY_NOTE["spec"]))
     cost_note = _wrap(cost_note, 74).replace("\n", "\n   ")  # sits in a list item
     steps = (N8N_STEPS.format(file=fname) if platform == "n8n"
              else MAKE_STEPS.format(file=fname, modules=modules, ceiling=ceiling,
@@ -511,21 +557,22 @@ def readme(spec, platform, fname, stores, modules=0, ceiling=0, ceiling_note="",
         name=spec["name"], platform=platform, date=spec["date"], site=SITE,
         slug=spec["slug"], file=fname, import_steps=steps,
         tables=", ".join(f"`{spec['slug']}-{s}`" for s in stores),
-        cost_note=cost_note, verified=verified, unit_word=unit_word)
+        cost_note=cost_note, verified=verified, unit_word=unit_word,
+        fidelity_note=fidelity_note)
 
 
 
 # --------------------------------------------------------------------------
 # A picture of the flow, with the credentials and substitutions written onto
 # the steps that need them -- the README as a diagram.
-def flow_svg(spec, platform, stores, chain):
+def flow_svg(spec, platform, stores, chain, funcs=None):
     sys.path.insert(0, str(ROOT / "tools"))
     from awsbuild import layouts as L
     slug, name = spec["slug"], spec["name"]
     unit = unit_of(spec)
     n8n_p = platform == "n8n"
     preview = platform == "preview"
-    cad = cadence(dissect(spec)[0])
+    cad = cadence(funcs if funcs is not None else dissect(spec)[0])
 
     entry = {"title": "Request received" if cad == "webhook" else
                       ("Monthly close" if cad == "monthly" else "Nightly 02:00"),
@@ -593,7 +640,7 @@ const {{ chromium }} = require('/Users/allanninal/Projects/GuroOS/node_modules/p
 (async () => {{
   const b = await chromium.launch();
   const p = await b.newPage({{ viewport: {{ width: 1000, height: 900 }},
-                              deviceScaleFactor: 2 }});
+                              deviceScaleFactor: 1 }});
   await p.goto('file://{svg_path}');
   const el = await p.$('svg');
   await el.screenshot({{ path: '{png_path}' }});
@@ -607,8 +654,127 @@ const {{ chromium }} = require('/Users/allanninal/Projects/GuroOS/node_modules/p
     return pathlib.Path(png_path).exists()
 
 
+
+# --------------------------------------------------------------------------
+# The 75 series dated before 2026-07-09 have no spec on disk. Their published
+# reference page uses an earlier, prose-first layout -- no <table>, no <pre> --
+# but the Lambda inventory and the stores are <li> lists, which is enough for a
+# linear workflow. Anything derived this way is labelled fidelity "prose", and
+# where even the lists are missing it is labelled "minimal". Nothing is guessed
+# into looking like a spec.
+REF_H2 = re.compile(r"<h2[^>]*>(.*?)</h2>(.*?)(?=<h2|\Z)", re.S)
+
+
+def _section(html_s, *wanted):
+    for m in REF_H2.finditer(html_s):
+        head = strip(m.group(1))
+        if any(w.lower() in head.lower() for w in wanted):
+            return m.group(2)
+    return ""
+
+
+def _items(seg):
+    """Raw <li> HTML -- entities intact, because the split points are entities."""
+    return re.findall(r"<li>(.*?)</li>", seg, re.S)
+
+
+def _name_and_rest(li):
+    """<code>thing</code> &mdash; what it does  ->  ("thing", "what it does")."""
+    code = re.search(r"<code>(.*?)</code>", li, re.S)
+    head, _, tail = li.partition("&mdash;")
+    name = strip(code.group(1)) if code else strip(head)
+    return name.strip(" .:"), strip(tail).strip()
+
+
+def dissect_html(slug, entry):
+    ref = next((p["slug"] for p in entry["parts"] if "reference" in p["slug"]), None)
+    f = ROOT / "build" / (ref or f"{slug}-engineering-reference") / "index.html"
+    fidelity = "minimal"
+    funcs, stores = [], []
+    if f.exists():
+        s = f.read_text(encoding="utf-8")
+        for li in _items(_section(s, "Lambda")):
+            name, rest = _name_and_rest(li)
+            if name and 2 < len(name) < 60 and " " not in name:
+                funcs.append({"name": name, "trigger": rest[:90] or "scheduled",
+                              "does": rest[:70] or name})
+        for li in _items(_section(s, "Storage", "Data store", "data model", "DynamoDB", "S3, SES")):
+            # "DynamoDB &middot; <code>ar-sends</code> &mdash; one row per dispatch"
+            if "&middot;" not in li and "<code>" not in li:
+                continue
+            code = re.search(r"<code>(.*?)</code>", li, re.S)
+            if not code:
+                continue
+            raw = strip(code.group(1)).strip()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{2,40}", raw):
+                continue
+            # Older pages come in two shapes: "DynamoDB &middot; <code>x</code>"
+            # and a bare "<code>x</code> &mdash; PK ...". Only the first carries a
+            # kind to filter on; the second is already inside the storage section.
+            if "&middot;" in li:
+                kind = strip(li.split("&middot;")[0]).strip().lower()
+                if kind and not any(k in kind for k in ("dynamodb", "s3", "table",
+                                                        "bucket", "store")):
+                    continue
+            stores.append(raw.split("-")[-1].split(".")[-1])
+        if funcs and stores:
+            fidelity = "prose"
+    if not funcs:
+        funcs = [{"name": p["slug"], "trigger": "scheduled",
+                  "does": p["title"][:70]} for p in entry["parts"][1:4]]
+    if not stores:
+        stores = ["records"]
+    seen, out = set(), []
+    for st in stores:
+        if st not in seen:
+            seen.add(st)
+            out.append(st)
+    return funcs[:6], out[:3], fidelity
+
+
+def spec_from_registry(slug, entry):
+    """A spec-shaped dict for a series whose spec file is gone."""
+    return {"slug": slug, "name": entry["name"], "date": entry["date"],
+            "tagline": entry["tagline"], "parts": entry["parts"]}
+
+def spec_index():
+    """slug -> spec path, for the series whose spec is still on disk."""
+    out = {}
+    for f in sorted((ROOT / "tools" / "awsbuild" / "specs").glob("day*.py")):
+        m2 = re.search(r'^SLUG = "([a-z0-9-]+)"', f.read_text(encoding="utf-8"), re.M)
+        if m2:
+            out[m2.group(1)] = f
+    return out
+
+
+def build_all(only=None):
+    reg = json.loads((ROOT / "tools" / "awsbuild" / "registry.json")
+                     .read_text(encoding="utf-8"))
+    idx = spec_index()
+    rows = []
+    for slug in sorted(reg, key=lambda k: reg[k]["date"]):
+        if only and slug not in only:
+            continue
+        try:
+            if slug in idx:
+                spec, wf, mk, per, ceil = build(idx[slug])
+            else:
+                spec, wf, mk, per, ceil = build(slug, entry=reg[slug])
+            rows.append((slug, len(wf["nodes"]), per, ceil, None))
+        except Exception as exc:            # noqa: BLE001 -- report, do not abort
+            rows.append((slug, 0, 0, 0, f"{type(exc).__name__}: {exc}"))
+    return rows
+
+
 if __name__ == "__main__":
-    for a in sys.argv[1:]:
-        spec, wf, mk, per_unit, ceiling = build(pathlib.Path(a))
-        print(f"{spec['slug']:32} n8n={len(wf['nodes'])} nodes  "
-              f"make={per_unit} modules  free ceiling ~{ceiling}/mo")
+    if sys.argv[1:2] == ["--all"]:
+        rows = build_all()
+        bad = [r for r in rows if r[4]]
+        print(f"built {len(rows) - len(bad)}/{len(rows)} series")
+        for slug, _n, _m, _c, err in bad:
+            print("  FAILED", slug, "->", err)
+    else:
+        for a in sys.argv[1:]:
+            spec, wf, mk, per_unit, ceiling = build(pathlib.Path(a))
+            print(f"{spec['slug']:32} n8n={len(wf['nodes'])} nodes  "
+                  f"make={per_unit} modules  free ceiling ~{ceiling}/mo")
